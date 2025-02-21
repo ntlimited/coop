@@ -4,9 +4,12 @@
 #include <cstdint>
 
 #include "embedded_list.h"
-#include "execution_handle.h"
+#include "handle.h"
 #include "scheduler_state.h"
 #include "spawn_configuration.h"
+
+namespace coop
+{
 
 struct Segment
 {
@@ -30,55 +33,55 @@ struct Segment
 };
 
 struct Coordinator;
-struct Manager;
+struct Cooperator;
 
-// An ExecutionContext is what code runs "in."
+// An Context is what code runs "in."
 //
-struct ExecutionContext : EmbeddedListHookups<ExecutionContext, int, 0>
-                        , EmbeddedListHookups<ExecutionContext, int, 1>
+struct Context : EmbeddedListHookups<Context, int, 0>
+                        , EmbeddedListHookups<Context, int, 1>
 {
-    // Embedded lists for tracking the set of lists that execution contexts can never be in more
-    // than one of, e.g. there are multiple `ContextStateList`s in the manager, but contexts are
-    // never in both active and yielded, etc. Or in two different manager's active list...
+    // Embedded lists for tracking the set of lists that contexts can never be in more
+    // than one of, e.g. there are multiple `ContextStateList`s in the cooperator, but contexts are
+    // never in both active and yielded, etc. Or in two different cooperator's active list...
     //
-    using AllContextsList = EmbeddedList<ExecutionContext, int, 0>;
-    using ContextStateList = EmbeddedList<ExecutionContext, int, 1>;
+    using AllContextsList = EmbeddedList<Context, int, 0>;
+    using ContextStateList = EmbeddedList<Context, int, 1>;
 
-	ExecutionContext(
+	Context(
         SpawnConfiguration const& config,
-        ExecutionHandle* handle,
-        Manager* manager)
+        Handle* handle,
+        Cooperator* cooperator)
     : m_blockingOn(nullptr)
     , m_blockingBehind(nullptr)
     , m_handle(handle)
 	, m_state(SchedulerState::YIELDED)
 	, m_priority(config.priority)
     , m_currentPriority(config.priority)
-    , m_manager(manager)
+    , m_cooperator(cooperator)
     , m_killed(false)
 	{
         if (m_handle)
         {
-            m_handle->m_executionContext = this;
+            m_handle->m_context = this;
         }
 		m_segment.m_size = config.stackSize;
 	}
 
-    ~ExecutionContext()
+    ~Context()
     {
         if (m_handle)
         {
-            m_handle->m_executionContext = nullptr;
+            m_handle->m_context = nullptr;
         }
     }
 
-    // Return control to the manager so that it can schedule other contexts
+    // Return control to the cooperator so that it can schedule other contexts
     //
     bool Yield(bool force = false);
 
-    Manager* GetManager()
+    Cooperator* GetCooperator()
     {
-        return m_manager;
+        return m_cooperator;
     }
 
     bool IsKilled() const
@@ -92,7 +95,7 @@ struct ExecutionContext : EmbeddedListHookups<ExecutionContext, int, 0>
     // Blocking state: what resources that the 
     //
     Coordinator* m_blockingOn;
-    ExecutionContext* m_blockingBehind;
+    Context* m_blockingBehind;
     
     // Enter the block caused by the given coordinator
     //
@@ -100,21 +103,21 @@ struct ExecutionContext : EmbeddedListHookups<ExecutionContext, int, 0>
 
     // Unblock the given context, switching to it if requested.
     //
-    void Unblock(ExecutionContext* c, const bool schedule);
+    void Unblock(Context* c, const bool schedule);
 
   private:
-    friend struct ExecutionHandle;
+    friend struct Handle;
     void Kill()
     {
         m_killed = true;
     }
 
   public:
-    ExecutionHandle* m_handle;
+    Handle* m_handle;
 	SchedulerState m_state;
 	int m_priority;
 	int m_currentPriority;
-    Manager* m_manager;
+    Cooperator* m_cooperator;
     bool m_killed;
 
     // The jmp_buf operates as the 'bookmark' to jump back into when the context is active.
@@ -126,3 +129,4 @@ struct ExecutionContext : EmbeddedListHookups<ExecutionContext, int, 0>
 	Segment m_segment;
 };
 
+} // end namespace coop

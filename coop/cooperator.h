@@ -6,9 +6,12 @@
 #include <semaphore>
 
 #include "embedded_list.h"
-#include "execution_context.h"
+#include "context.h"
 #include "fixed_list.h"
 #include "spawn_configuration.h"
+
+namespace coop
+{
 
 enum class SchedulerJumpResult
 {
@@ -19,14 +22,16 @@ enum class SchedulerJumpResult
     RESUMED,
 };
 
-struct ExecutionHandle;
+struct Handle;
 struct Launchable;
 
-struct Manager
+// A Cooperator manages multiple contexts
+//
+struct Cooperator
 {
-    thread_local static Manager* thread_manager;
+    thread_local static Cooperator* thread_cooperator;
 
-	Manager()
+	Cooperator()
 	: m_scheduled(nullptr)
 	, m_submissionSemaphore(0)
 	, m_submissionAvailabilitySemaphore(8)
@@ -36,30 +41,30 @@ struct Manager
 
     void Launch();
 
-	// Spawn is an in-context API that code running under a manager is allowed to invoke
-	// on its own manager, as that physical thread has uncontended access to manager internals
+	// Spawn is an in-context API that code running under a cooperator is allowed to invoke
+	// on its own cooperator, as that physical thread has uncontended access to the internals
     //
-    // Under the hood 'Submit' is actually channeled into 'Spawn' by the manager, so this is
+    // Under the hood 'Submit' is actually channeled into 'Spawn' by the cooperator, so this is
     // actually the entry point for all contexts.
 	//
 	template<typename Fn>
-	bool Spawn(Fn const& fn, ExecutionHandle* handle = nullptr);
+	bool Spawn(Fn const& fn, Handle* handle = nullptr);
 
 	template<typename Fn>
 	bool Spawn(
         SpawnConfiguration const& config,
         Fn const& fn,
-        ExecutionHandle* handle = nullptr);
+        Handle* handle = nullptr);
 
 
-    bool Launch(Launchable& launch, ExecutionHandle* handle = nullptr);
+    bool Launch(Launchable& launch, Handle* handle = nullptr);
     
     bool Launch(
         SpawnConfiguration const& config,
         Launchable& launch,
-        ExecutionHandle* handle = nullptr);
+        Handle* handle = nullptr);
 
-    using Submission = void(*)(ExecutionContext*, void*);
+    using Submission = void(*)(Context*, void*);
 
 	struct ExecutionSubmission
 	{
@@ -69,12 +74,12 @@ struct Manager
 	};
 
 	// Submit is the out-of-context version of Spawn that uses pthread_create style arguments
-	// (doesn't get the sexy lambda syntax) because we need to pass control to the manager's
+	// (doesn't get the sexy lambda syntax) because we need to pass control to the cooperator's
 	// thread and can't guarantee lifetimes.
 	//
-	// This also (a) locks in a way that the manager will actually have to contend for in the
+	// This also (a) locks in a way that the cooperator will actually have to contend for in the
 	// worst case and (b) has funky guarantees around scheduling; submitted executions are
-	// periodically picked up by the manager while spawned executions have control immediately
+	// periodically picked up by the cooperator while spawned executions have control immediately
 	// passed to them.
 	//
 	// In general, this is expected to be used rarely.
@@ -86,15 +91,15 @@ struct Manager
    
     // Internal API for passing control to the given context
     //
-    void Resume(ExecutionContext* ctx);
+    void Resume(Context* ctx);
 
-    // The other half of `Yield()` which resumes into the manager's code
+    // The other half of `Yield()` which resumes into the cooperator's code
     //
-    void YieldFrom(ExecutionContext* ctx);
+    void YieldFrom(Context* ctx);
 
-    void Block(ExecutionContext* ctx);
+    void Block(Context* ctx);
 
-    void Unblock(ExecutionContext* ctx, const bool schedule);
+    void Unblock(Context* ctx, const bool schedule);
 
     bool SpawnSubmitted(bool wait = false);
 
@@ -106,11 +111,11 @@ struct Manager
     void SanityCheck();
 
   private:
-    void HandleManagerResumption(const SchedulerJumpResult res);
+    void HandleCooperatorResumption(const SchedulerJumpResult res);
 
     bool m_shutdown;
 
-	ExecutionContext* m_scheduled;
+	Context* m_scheduled;
 	std::jmp_buf m_jmpBuf;
 
 	std::counting_semaphore<8> m_submissionSemaphore;
@@ -119,13 +124,15 @@ struct Manager
 
     FixedList<ExecutionSubmission, 8> m_submissions;
 
-    ExecutionContext::AllContextsList m_executionContexts;
-    ExecutionContext::ContextStateList m_yielded;
-    ExecutionContext::ContextStateList m_blocked;
+    Context::AllContextsList m_contexts;
+    Context::ContextStateList m_yielded;
+    Context::ContextStateList m_blocked;
 };
 
-void* AllocateExecutionContext(SpawnConfiguration const& config);
+void* AllocateContext(SpawnConfiguration const& config);
 
 void LongJump(std::jmp_buf& buf, SchedulerJumpResult result);
 
-#include "iomgr.hpp"
+} // end namespace coop
+
+#include "cooperator.hpp"

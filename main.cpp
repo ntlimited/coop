@@ -1,34 +1,47 @@
 #include <fcntl.h>
 #include <vector>
 #include <netinet/in.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 
-#include "coordinator.h"
-#include "iomgr.h"
-#include "launchable.h"
-#include "manager_thread.h"
-#include "epoll.h"
-#include "tcp_server.h"
+#include "coop/coordinator.h"
+#include "coop/cooperator.h"
+#include "coop/launchable.h"
+#include "coop/thread.h"
+#include "coop/network/epoll_router.h"
+#include "coop/network/tcp_server.h"
 
-struct EchoHandler : TCPHandler
+// Demo program that currently sets up a TCP echo server by:
+//
+// - creating a coordinator and starting its thread
+// - launching a master task that does the actual work
+// - creating a Router implementation for handling eventing
+// - creating a TCP server that will use the router for dispatching events
+// - attaching an echo handler to serve sockets connected through the server
+//
+
+struct EchoHandler : coop::network::TCPHandler
 {
     EchoHandler(int fd)
-    : TCPHandler(fd)
+    : coop::network::TCPHandler(fd)
     {
     }
 
-    bool Recv(ExecutionContext* ctx, void* buffer, const size_t bytes) final
+    bool Recv(coop::Context* ctx, void* buffer, const size_t bytes) final
     {
         return Send(ctx, buffer, bytes);
     }
 };
 
-struct EchoHandlerFactory : TCPHandlerFactory
+struct EchoHandlerFactory : coop::network::TCPHandlerFactory
 {
-    TCPHandler* Handler(int fd) final
+    coop::network::TCPHandler* Handler(int fd) final
     {
         return new EchoHandler(fd);
+    }
+
+    void Delete(coop::network::TCPHandler* h)
+    {
+        delete h;
     }
 };
 
@@ -50,36 +63,35 @@ int bind_and_listen(int port)
     return serverFd;
 }
 
-void SpawningTask(ExecutionContext* ctx, void*)
+void SpawningTask(coop::Context* ctx, void*)
 {
-	auto* mgr = ctx->GetManager();
-    
-    // Handles for the epoll we will use to manage eventing, and the listener which will
-    // accept connections on a socket and be alerted via epoll
-    //
-    ExecutionHandle epollHandle, listenerHandle;
-
     int serverFd = bind_and_listen(8888);
     int epollFd = epoll_create(32);
 
     assert(epollFd >= 0 && serverFd >= 0);
+    
+	auto* co = ctx->GetCooperator();
+
+    // Handles for the epoll we will use to manage eventing, and the listener which will
+    // accept connections on a socket and be alerted via epoll
+    //
+    coop::Handle routerHandle;
+    coop::Handle serverHandle;
 
     // Begin the epoll controller and its TCP handler loop
     //
     EchoHandlerFactory factory;
-    TCPServer server(serverFd, &factory);
-
-    EpollController l(epollFd);
-    assert(server.Register(&l));
+    coop::network::EpollRouter router(epollFd);
+    coop::network::TCPServer server(serverFd, &factory);
+    server.Register(&router);
     
-    mgr->Launch(l, &epollHandle);
-    mgr->Launch(server, &listenerHandle);
-
+    co->Launch(router, &routerHandle);
+    co->Launch(server, &serverHandle);
 
     // Kill epoll and wait for it to die.
     //
     // epollHandle.Kill();
-    while (epollHandle)
+    while (routerHandle)
     {
         ctx->Yield();
     }
@@ -87,9 +99,9 @@ void SpawningTask(ExecutionContext* ctx, void*)
 
 int main()
 {
-	Manager manager;
-    ManagerThread mt(&manager);
+	coop::Cooperator cooperator;
+    coop::Thread mt(&cooperator);
 
-	manager.Submit(&SpawningTask);
+	cooperator.Submit(&SpawningTask);
 	return 0;
 }

@@ -1,5 +1,8 @@
 #pragma once
 
+namespace coop
+{
+
 // A Coordinator is the cooperator version of lock semantics, allowing tasks to wait for each
 // other natively. The concept is simple: we can just check if the coordinator is held, and if
 // so, yield ourselves into blocked state and add ourselves to the coordinator's blocked list.
@@ -12,7 +15,7 @@
 // and/or completely implemented.
 //
 
-struct ExecutionContext;
+struct Context;
 
 // The coordinator primitive maintains a waiter list of contexts that blocked on acquiring the
 // coordinator. All APIs must be called with the current context.
@@ -24,22 +27,22 @@ struct Coordinator
 
     Coordinator();
 
-    bool TryAcquire(ExecutionContext*);
+    bool TryAcquire(Context*);
 
-    void Acquire(ExecutionContext*);
+    void Acquire(Context*);
 
     // Release the coordinator, unblocking the context (if one exists) at the head of the wait
     // list. By default (schedule = true), the unblocked context will immediately be switched to
     // and execute; alternatively, Release can be made to return immediately and simply switch
     // the unblocked context to yield.
     //
-    void Release(ExecutionContext*, const bool schedule = true);
+    void Release(Context*, const bool schedule = true);
 
   private:
-    ExecutionContext* m_heldBy;
+    Context* m_heldBy;
 
-    ExecutionContext* m_head;
-    ExecutionContext* m_tail;
+    Context* m_head;
+    Context* m_tail;
 };
 
 struct CoordinatedSemaphore
@@ -49,12 +52,14 @@ struct CoordinatedSemaphore
     {
     }
 
-    bool TryAcquire(ExecutionContext*);
+    bool TryAcquire(Context*);
 
-    void Acquire(ExecutionContext*);
-    void Release(ExecutionContext*);
+    void Acquire(Context*);
+    void Release(Context*);
 
   private:
     int m_avail;
     Coordinator m_coordinator;
 };
+
+} // end namespace coop

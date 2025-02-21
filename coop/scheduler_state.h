@@ -1,5 +1,8 @@
 #pragma once
 
+namespace coop
+{
+
 enum class SchedulerState
 {
 	YIELDED,
@@ -7,3 +10,4 @@ enum class SchedulerState
 	RUNNING,
 };
 
+} // end namespace coop

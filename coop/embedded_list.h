@@ -3,6 +3,9 @@
 #include <cstddef>
 #include <stdio.h>
 
+namespace coop
+{
+
 template<typename T, typename Tag, const Tag N = 0>
 struct EmbeddedList;
 
@@ -23,6 +26,11 @@ struct EmbeddedListHookups
     }
 
 protected:
+    // These methods are only intended to be called by the list they're a member of, as otherwise
+    // various guarantees may not be honored.
+    //
+    // TODO add some pointer tricks in debug to assert over this
+    //
     friend List;
 
     void Pop()
@@ -130,3 +138,5 @@ struct EmbeddedList
         return reinterpret_cast<ptrdiff_t>((Hookups*)((T*)0x1000)) - (ptrdiff_t)0x1000;
     }
 };
+
+} // end namespace coop

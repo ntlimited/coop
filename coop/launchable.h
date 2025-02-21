@@ -1,6 +1,9 @@
 #pragma once
 
-struct ExecutionContext;
+namespace coop
+{
+
+struct Context;
 
 // Launchable allows for some mild syntactic sugar by skipping the spawn lambda
 //
@@ -10,5 +13,7 @@ struct Launchable
     {
     }
 
-    virtual void Launch(ExecutionContext*) = 0;
+    virtual void Launch(Context*) = 0;
 };
+
+} // end namespace coop

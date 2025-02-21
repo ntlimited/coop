@@ -2,7 +2,10 @@
 
 #include "coordinator.h"
 
-#include "execution_context.h"
+#include "context.h"
+
+namespace coop
+{
 
 Coordinator::Coordinator()
 : m_heldBy(nullptr)
@@ -11,7 +14,7 @@ Coordinator::Coordinator()
 {
 }
 
-bool Coordinator::TryAcquire(ExecutionContext* ctx)
+bool Coordinator::TryAcquire(Context* ctx)
 {
     if (m_heldBy == nullptr)
     {
@@ -22,7 +25,7 @@ bool Coordinator::TryAcquire(ExecutionContext* ctx)
     return false;
 }
 
-void Coordinator::Acquire(ExecutionContext* ctx)
+void Coordinator::Acquire(Context* ctx)
 {
     if (m_heldBy == nullptr)
     {
@@ -48,7 +51,7 @@ void Coordinator::Acquire(ExecutionContext* ctx)
     ctx->Block(this);
 }
 
-void Coordinator::Release(ExecutionContext* ctx, const bool schedule /* = true */)
+void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 {
     assert(m_heldBy);
     if (m_head)
@@ -62,7 +65,7 @@ void Coordinator::Release(ExecutionContext* ctx, const bool schedule /* = true *
     }
 }
 
-bool CoordinatedSemaphore::TryAcquire(ExecutionContext* ctx)
+bool CoordinatedSemaphore::TryAcquire(Context* ctx)
 {
     if (m_avail > 0)
     {
@@ -78,7 +81,7 @@ bool CoordinatedSemaphore::TryAcquire(ExecutionContext* ctx)
     return false;
 }
 
-void CoordinatedSemaphore::Acquire(ExecutionContext* ctx)
+void CoordinatedSemaphore::Acquire(Context* ctx)
 {
     if (TryAcquire(ctx))
     {
@@ -92,7 +95,7 @@ void CoordinatedSemaphore::Acquire(ExecutionContext* ctx)
     m_coordinator.Acquire(ctx);
 }
 
-void CoordinatedSemaphore::Release(ExecutionContext* ctx)
+void CoordinatedSemaphore::Release(Context* ctx)
 {
     // If the avail count is 0 or higher, there are no waiters on the coordinator
     //
@@ -105,3 +108,5 @@ void CoordinatedSemaphore::Release(ExecutionContext* ctx)
 
     m_coordinator.Release(ctx);
 }
+
+} // end namespace coop

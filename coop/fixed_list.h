@@ -1,5 +1,8 @@
 #pragma once
 
+namespace coop
+{
+
 template<typename T, size_t C>
 struct FixedList
 {
@@ -74,3 +77,5 @@ struct FixedList
 	size_t m_head;
 	size_t m_tail;
 };
+
+} // end namespace coop

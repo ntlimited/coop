@@ -2,6 +2,9 @@
 
 #include <cstddef>
 
+namespace coop
+{
+
 struct SpawnConfiguration
 {
 	int priority;
@@ -12,3 +15,5 @@ static const SpawnConfiguration s_defaultConfiguration = {
 	.priority = 0,
 	.stackSize = 16384,
 };
+
+} // end namespace coop

@@ -4,29 +4,32 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "iomgr.h"
+#include "cooperator.h"
 #include "launchable.h"
 
-bool Manager::Launch(
+namespace coop
+{
+
+bool Cooperator::Launch(
     Launchable& launch,
-    ExecutionHandle* handle /* = nullptr */)
+    Handle* handle /* = nullptr */)
 {
     return Launch(s_defaultConfiguration, launch, handle);
 }
  
 
-bool Manager::Launch(
+bool Cooperator::Launch(
         SpawnConfiguration const& config,
         Launchable& launch,
-        ExecutionHandle* handle /* = nullptr */)
+        Handle* handle /* = nullptr */)
 {
-    return Spawn(config, [&launch](ExecutionContext* ctx)
+    return Spawn(config, [&launch](Context* ctx)
     {
         launch.Launch(ctx);
     }, handle /* out */);
 }
 
-bool Manager::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
+bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
 {
     // Block on there being a slot available to submit to. This means the bool return is
 	// currently irrelevant, but this should get extended to support a timeout at least.
@@ -45,14 +48,14 @@ bool Manager::Submit(Submission func, void* arg, SpawnConfiguration const& confi
     return ret;
 }
 
-void Manager::HandleManagerResumption(const SchedulerJumpResult res)
+void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
 {
     switch (res)
     {
         // The point is that this gets called in the other cases
         //
         case SchedulerJumpResult::DEFAULT:
-        // This is never used to jump back into the manager
+        // This is never used to jump back into the cooperator
         //
         case SchedulerJumpResult::RESUMED:
         {
@@ -60,7 +63,7 @@ void Manager::HandleManagerResumption(const SchedulerJumpResult res)
         }
         case SchedulerJumpResult::EXITED:
         {
-            m_executionContexts.Remove(m_scheduled);
+            m_contexts.Remove(m_scheduled);
             delete m_scheduled;
             break;
         }
@@ -81,9 +84,9 @@ void Manager::HandleManagerResumption(const SchedulerJumpResult res)
     SanityCheck();
 }
 
-void Manager::Launch()
+void Cooperator::Launch()
 {
-    Manager::thread_manager = this;
+    Cooperator::thread_cooperator = this;
 
     while (!m_yielded.IsEmpty() || !m_shutdown)
     {
@@ -106,7 +109,7 @@ void Manager::Launch()
 
             // Pop off a context and resume it
             //
-            ExecutionContext* ctx;
+            Context* ctx;
             m_yielded.Pop(ctx);
 
             Resume(ctx);
@@ -119,7 +122,7 @@ void Manager::Launch()
 	}
 }
 
-void Manager::YieldFrom(ExecutionContext* ctx)
+void Cooperator::YieldFrom(Context* ctx)
 {
     // This is where all jmpBuf saving for contexts occurs presently
     //
@@ -132,9 +135,9 @@ void Manager::YieldFrom(ExecutionContext* ctx)
     return;
 }
 
-void Manager::Resume(ExecutionContext* ctx)
+void Cooperator::Resume(Context* ctx)
 {
-    // We must be running this from "within" the manager vs with a running context
+    // We must be running this from "within" the cooperator vs with a running context
     //
     assert(!m_scheduled);
     assert(ctx->m_state == SchedulerState::YIELDED);
@@ -151,11 +154,11 @@ void Manager::Resume(ExecutionContext* ctx)
     }
     else
     {
-        HandleManagerResumption((static_cast<SchedulerJumpResult>(ret)));
+        HandleCooperatorResumption((static_cast<SchedulerJumpResult>(ret)));
     }
 }
 
-void Manager::Block(ExecutionContext* ctx)
+void Cooperator::Block(Context* ctx)
 {
     // Someone else is registering a (yielded) context as being blocked
     //
@@ -188,7 +191,7 @@ void Manager::Block(ExecutionContext* ctx)
     return;
 }
 
-void Manager::Unblock(ExecutionContext* ctx, const bool schedule)
+void Cooperator::Unblock(Context* ctx, const bool schedule)
 {
     // Currently, never gets run from outside of an execution context
     //
@@ -230,7 +233,7 @@ void Manager::Unblock(ExecutionContext* ctx, const bool schedule)
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
 }
 
-bool Manager::SpawnSubmitted(bool wait /* = false */)
+bool Cooperator::SpawnSubmitted(bool wait /* = false */)
 {
     if (wait)
     {
@@ -251,7 +254,7 @@ bool Manager::SpawnSubmitted(bool wait /* = false */)
 	m_submissionLock.unlock();
     m_submissionAvailabilitySemaphore.release();
 
-	Spawn(submitted.config, [&](ExecutionContext* ctx)
+	Spawn(submitted.config, [&](Context* ctx)
     {
 		submitted.func(ctx, submitted.arg);
     });
@@ -261,11 +264,11 @@ bool Manager::SpawnSubmitted(bool wait /* = false */)
     return true;
 }
 
-void Manager::SanityCheck()
+void Cooperator::SanityCheck()
 {
     int yielded = 0;
     int blocked = 0;
-    m_executionContexts.Visit([this, &yielded, &blocked](ExecutionContext* ctx) -> bool
+    m_contexts.Visit([this, &yielded, &blocked](Context* ctx) -> bool
     {
         switch (ctx->m_state)
         {
@@ -281,14 +284,14 @@ void Manager::SanityCheck()
         return true;
     });
 
-    m_yielded.Visit([&yielded](ExecutionContext* ctx) -> bool
+    m_yielded.Visit([&yielded](Context* ctx) -> bool
     {
         yielded--;
         assert(ctx->m_state == SchedulerState::YIELDED);
         return true;
     });
     assert(yielded == 0);
-    m_blocked.Visit([&blocked](ExecutionContext* ctx) -> bool
+    m_blocked.Visit([&blocked](Context* ctx) -> bool
     {
         blocked--;
         assert(ctx->m_state == SchedulerState::BLOCKED);
@@ -297,12 +300,12 @@ void Manager::SanityCheck()
     assert(blocked == 0);
 }
 
-void* AllocateExecutionContext(SpawnConfiguration const& config)
+void* AllocateContext(SpawnConfiguration const& config)
 {
     // Enforce 128 byte alignment at both top and bottom
     //
     assert((config.stackSize & 127) == 0);
-	return malloc(sizeof(ExecutionContext) + config.stackSize);
+	return malloc(sizeof(Context) + config.stackSize);
 }
 
 void LongJump(std::jmp_buf& buf, SchedulerJumpResult result)
@@ -310,4 +313,6 @@ void LongJump(std::jmp_buf& buf, SchedulerJumpResult result)
 	longjmp(buf, static_cast<int>(result));
 }
 
-thread_local Manager* Manager::thread_manager;
+thread_local Cooperator* Cooperator::thread_cooperator;
+
+} // end namespace coop

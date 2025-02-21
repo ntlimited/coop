@@ -32,7 +32,6 @@ struct TCPHandler : Launchable
     bool Send(Context* ctx, void* buffer, const size_t bytes);
 
   private:
-    int         m_fd;
     Coordinator m_coordinator;
     Handle      m_handle;
 };

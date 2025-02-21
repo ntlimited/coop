@@ -22,7 +22,7 @@ namespace network
 //
 struct EpollRouter : Router
 {
-    using MaskConverter = InOutHupErrPri<uint32_t,EPOLLIN,EPOLLOUT,EPOLLHUP,EPOLLPRI,EPOLLERR>;
+    using MaskConverter = InOutHupErrPri<uint32_t,EPOLLIN,EPOLLOUT,EPOLLHUP,EPOLLERR,EPOLLPRI>;
     static constexpr size_t MAX_EVENTS = 512;
 
     // The EpollRouter is given an already configured (`epoll_create`'d) fd to operate on.

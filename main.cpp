@@ -49,12 +49,18 @@ int bind_and_listen(int port)
 {
     int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     assert(serverFd > 0);
+
+    int on = 1;
+    int ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    assert(ret == 0);
+
+
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    int ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
+    ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
     assert(ret == 0);
 
     ret = listen(serverFd, 32);

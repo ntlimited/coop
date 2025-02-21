@@ -67,6 +67,7 @@ bool EpollRouter::Register(Handle* handle)
     // immediately
     //
     event.events = MaskConverter()(mask) | EPOLLET;
+
     event.data.ptr = reinterpret_cast<void*>(coordinator);
 
     int res = epoll_ctl(m_epollFd, EPOLL_CTL_ADD, fd, &event);

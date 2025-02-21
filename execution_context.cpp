@@ -13,8 +13,9 @@ bool ExecutionContext::Yield(const bool force /* = false */)
     return true;
 }
 
-void ExecutionContext::Block(Coordinator*)
+void ExecutionContext::Block(Coordinator* c)
 {
+    m_blockingOn = c;
     m_manager->Block(this);
 }
 
@@ -23,5 +24,6 @@ void ExecutionContext::Unblock(ExecutionContext* other, const bool schedule)
     // `this` is the currently executing context (as always), `other` is the context to schedule
     // over this one
     //
+    other->m_blockingOn = nullptr;
     m_manager->Unblock(other, schedule);
 }

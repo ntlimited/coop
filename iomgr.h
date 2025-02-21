@@ -5,6 +5,8 @@
 #include <mutex>
 #include <semaphore>
 
+#include "embedded_list.h"
+#include "execution_context.h"
 #include "fixed_list.h"
 #include "spawn_configuration.h"
 
@@ -17,8 +19,8 @@ enum class SchedulerJumpResult
     RESUMED,
 };
 
-struct ExecutionContext;
 struct ExecutionHandle;
+struct Launchable;
 
 struct Manager
 {
@@ -32,7 +34,7 @@ struct Manager
 	{
 	}
 
-	void Launch();
+    void Launch();
 
 	// Spawn is an in-context API that code running under a manager is allowed to invoke
 	// on its own manager, as that physical thread has uncontended access to manager internals
@@ -44,7 +46,18 @@ struct Manager
 	bool Spawn(Fn const& fn, ExecutionHandle* handle = nullptr);
 
 	template<typename Fn>
-	bool Spawn(SpawnConfiguration const& config, Fn const& fn, ExecutionHandle* handle = nullptr);
+	bool Spawn(
+        SpawnConfiguration const& config,
+        Fn const& fn,
+        ExecutionHandle* handle = nullptr);
+
+
+    bool Launch(Launchable& launch, ExecutionHandle* handle = nullptr);
+    
+    bool Launch(
+        SpawnConfiguration const& config,
+        Launchable& launch,
+        ExecutionHandle* handle = nullptr);
 
     using Submission = void(*)(ExecutionContext*, void*);
 
@@ -69,7 +82,7 @@ struct Manager
 	// TODO some kind of more coherent guarantees (like that submissions are picked up on the
 	// next context switch/yield)
 	//
-	bool Submit(Submission func, void* arg, SpawnConfiguration const& config = s_defaultConfiguration);
+	bool Submit(Submission func, void* arg = nullptr, SpawnConfiguration const& config = s_defaultConfiguration);
    
     // Internal API for passing control to the given context
     //
@@ -90,6 +103,8 @@ struct Manager
         m_shutdown = true;
     }
 
+    void SanityCheck();
+
   private:
     void HandleManagerResumption(const SchedulerJumpResult res);
 
@@ -102,11 +117,11 @@ struct Manager
 	std::counting_semaphore<8> m_submissionAvailabilitySemaphore;
 	std::mutex m_submissionLock;
 
-	FixedList<ExecutionSubmission, 8> m_submissions;
-	FixedList<ExecutionContext*, 128> m_executionContexts;
-	FixedList<ExecutionContext*, 128> m_active;
-	FixedList<ExecutionContext*, 128> m_yielded;
-	FixedList<ExecutionContext*, 128> m_blocked;
+    FixedList<ExecutionSubmission, 8> m_submissions;
+
+    ExecutionContext::AllContextsList m_executionContexts;
+    ExecutionContext::ContextStateList m_yielded;
+    ExecutionContext::ContextStateList m_blocked;
 };
 
 void* AllocateExecutionContext(SpawnConfiguration const& config);

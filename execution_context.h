@@ -3,6 +3,7 @@
 #include <csetjmp>
 #include <cstdint>
 
+#include "embedded_list.h"
 #include "execution_handle.h"
 #include "scheduler_state.h"
 #include "spawn_configuration.h"
@@ -33,8 +34,16 @@ struct Manager;
 
 // An ExecutionContext is what code runs "in."
 //
-struct ExecutionContext
+struct ExecutionContext : EmbeddedListHookups<ExecutionContext, int, 0>
+                        , EmbeddedListHookups<ExecutionContext, int, 1>
 {
+    // Embedded lists for tracking the set of lists that execution contexts can never be in more
+    // than one of, e.g. there are multiple `ContextStateList`s in the manager, but contexts are
+    // never in both active and yielded, etc. Or in two different manager's active list...
+    //
+    using AllContextsList = EmbeddedList<ExecutionContext, int, 0>;
+    using ContextStateList = EmbeddedList<ExecutionContext, int, 1>;
+
 	ExecutionContext(
         SpawnConfiguration const& config,
         ExecutionHandle* handle,
@@ -46,6 +55,7 @@ struct ExecutionContext
 	, m_priority(config.priority)
     , m_currentPriority(config.priority)
     , m_manager(manager)
+    , m_killed(false)
 	{
         if (m_handle)
         {
@@ -66,9 +76,19 @@ struct ExecutionContext
     //
     bool Yield(bool force = false);
 
+    Manager* GetManager()
+    {
+        return m_manager;
+    }
 
-private:
+    bool IsKilled() const
+    {
+        return m_killed;
+    }
+
+  private:
     friend struct Coordinator;
+
     // Blocking state: what resources that the 
     //
     Coordinator* m_blockingOn;
@@ -82,12 +102,20 @@ private:
     //
     void Unblock(ExecutionContext* c, const bool schedule);
 
-public:
+  private:
+    friend struct ExecutionHandle;
+    void Kill()
+    {
+        m_killed = true;
+    }
+
+  public:
     ExecutionHandle* m_handle;
 	SchedulerState m_state;
 	int m_priority;
 	int m_currentPriority;
     Manager* m_manager;
+    bool m_killed;
 
     // The jmp_buf operates as the 'bookmark' to jump back into when the context is active.
     //

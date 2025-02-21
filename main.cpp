@@ -1,56 +1,88 @@
+#include <fcntl.h>
 #include <vector>
+#include <netinet/in.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
 
 #include "coordinator.h"
 #include "iomgr.h"
+#include "launchable.h"
 #include "manager_thread.h"
+#include "epoll.h"
+#include "tcp_server.h"
 
-void SpawningTask(ExecutionContext* ctx, void* arg)
+struct EchoHandler : TCPHandler
 {
-	auto* mgr = reinterpret_cast<Manager*>(arg);
-	printf("In spawning task %p with manager %p\n", ctx, ctx->m_manager);
-
-    std::vector<ExecutionHandle*> subtasks;
-
-    Coordinator coord;
-
-    coord.Acquire(ctx);
-
-    int i = 0;
-    while (i++ < 10)
+    EchoHandler(int fd)
+    : TCPHandler(fd)
     {
-        ExecutionHandle* h = new ExecutionHandle;
-        bool success = mgr->Spawn([&](ExecutionContext* ctx)
-        {
-            printf("Entering %p\n", ctx);
-            coord.Acquire(ctx);
-            printf("Exiting %p with i=%d\n", ctx, ++i);
-            coord.Release(ctx);
-        }, h);
-        if (success)
-        {
-            subtasks.push_back(h);
-        }
-        else
-        {
-            delete h;
-        }
     }
 
-    printf("Spawning completed\n");
-    coord.Release(ctx);
-    printf("Resumed after release\n");
-
-    for (auto* handle : subtasks)
+    bool Recv(ExecutionContext* ctx, void* buffer, const size_t bytes) final
     {
-        while (*handle)
-        {
-            printf("Waiting on handle %p with context %p to finish\n", handle, handle->m_executionContext);
-            ctx->Yield(true);
-        }
+        return Send(ctx, buffer, bytes);
     }
+};
 
-    printf("Done waiting for tasks to halt\n");
-    mgr->Shutdown();
+struct EchoHandlerFactory : TCPHandlerFactory
+{
+    TCPHandler* Handler(int fd) final
+    {
+        return new EchoHandler(fd);
+    }
+};
+
+int bind_and_listen(int port)
+{
+    int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    assert(serverFd > 0);
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    int ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
+    assert(ret == 0);
+
+    ret = listen(serverFd, 32);
+    assert(ret == 0);
+
+    return serverFd;
+}
+
+void SpawningTask(ExecutionContext* ctx, void*)
+{
+	auto* mgr = ctx->GetManager();
+    
+    // Handles for the epoll we will use to manage eventing, and the listener which will
+    // accept connections on a socket and be alerted via epoll
+    //
+    ExecutionHandle epollHandle, listenerHandle;
+
+    int serverFd = bind_and_listen(8888);
+    int epollFd = epoll_create(32);
+
+    assert(epollFd >= 0 && serverFd >= 0);
+
+    // Begin the epoll controller and its TCP handler loop
+    //
+    EchoHandlerFactory factory;
+    TCPServer server(serverFd, &factory);
+
+    EpollController l(epollFd);
+    assert(server.Register(&l));
+    
+    mgr->Launch(l, &epollHandle);
+    mgr->Launch(server, &listenerHandle);
+
+
+    // Kill epoll and wait for it to die.
+    //
+    // epollHandle.Kill();
+    while (epollHandle)
+    {
+        ctx->Yield();
+    }
 }
 
 int main()
@@ -58,6 +90,6 @@ int main()
 	Manager manager;
     ManagerThread mt(&manager);
 
-	manager.Submit(&SpawningTask, reinterpret_cast<void*>(&manager));
+	manager.Submit(&SpawningTask);
 	return 0;
 }

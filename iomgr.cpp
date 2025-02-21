@@ -2,8 +2,29 @@
 #include <new>
 #include <thread>
 #include <stdio.h>
+#include <string.h>
 
 #include "iomgr.h"
+#include "launchable.h"
+
+bool Manager::Launch(
+    Launchable& launch,
+    ExecutionHandle* handle /* = nullptr */)
+{
+    return Launch(s_defaultConfiguration, launch, handle);
+}
+ 
+
+bool Manager::Launch(
+        SpawnConfiguration const& config,
+        Launchable& launch,
+        ExecutionHandle* handle /* = nullptr */)
+{
+    return Spawn(config, [&launch](ExecutionContext* ctx)
+    {
+        launch.Launch(ctx);
+    }, handle /* out */);
+}
 
 bool Manager::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
 {
@@ -39,27 +60,25 @@ void Manager::HandleManagerResumption(const SchedulerJumpResult res)
         }
         case SchedulerJumpResult::EXITED:
         {
-            printf("Context %p has exicted\n", m_scheduled);
-            delete m_scheduled;
             m_executionContexts.Remove(m_scheduled);
+            delete m_scheduled;
             break;
         }
         case SchedulerJumpResult::YIELDED:
         {
-            printf("Context %p has yielded\n", m_scheduled);
             m_scheduled->m_state = SchedulerState::YIELDED;
 			m_yielded.Push(m_scheduled);
             break;
         }
         case SchedulerJumpResult::BLOCKED:
         {
-            printf("Context %p has been blocked\n", m_scheduled);
             m_scheduled->m_state = SchedulerState::BLOCKED;
             m_blocked.Push(m_scheduled);
             break;
         }
     }
     m_scheduled = nullptr;
+    SanityCheck();
 }
 
 void Manager::Launch()
@@ -122,6 +141,8 @@ void Manager::Resume(ExecutionContext* ctx)
    
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
+
+    SanityCheck();
    
     auto ret = setjmp(m_jmpBuf);
     if (!ret)
@@ -144,6 +165,8 @@ void Manager::Block(ExecutionContext* ctx)
         ctx->m_state = SchedulerState::BLOCKED;
         m_yielded.Remove(ctx);
         m_blocked.Push(ctx);
+
+        SanityCheck();
         return;
     }
 
@@ -187,8 +210,6 @@ void Manager::Unblock(ExecutionContext* ctx, const bool schedule)
     // Yield from the current context and jump into the unblocked one immediately if we were told
     // to schedule it.
     //
-
-    printf("Unblocking %p from %p, yielding and resuming\n", ctx, m_scheduled);
 
     auto ret = setjmp(m_scheduled->m_jmpBuf);
     if (!ret)
@@ -234,7 +255,46 @@ bool Manager::SpawnSubmitted(bool wait /* = false */)
     {
 		submitted.func(ctx, submitted.arg);
     });
+
+    SanityCheck();
+
     return true;
+}
+
+void Manager::SanityCheck()
+{
+    int yielded = 0;
+    int blocked = 0;
+    m_executionContexts.Visit([this, &yielded, &blocked](ExecutionContext* ctx) -> bool
+    {
+        switch (ctx->m_state)
+        {
+            case SchedulerState::YIELDED:
+                yielded++;
+                break;
+            case SchedulerState::BLOCKED:
+                blocked++;
+                break;
+            case SchedulerState::RUNNING:
+                assert(ctx == m_scheduled);
+        }
+        return true;
+    });
+
+    m_yielded.Visit([&yielded](ExecutionContext* ctx) -> bool
+    {
+        yielded--;
+        assert(ctx->m_state == SchedulerState::YIELDED);
+        return true;
+    });
+    assert(yielded == 0);
+    m_blocked.Visit([&blocked](ExecutionContext* ctx) -> bool
+    {
+        blocked--;
+        assert(ctx->m_state == SchedulerState::BLOCKED);
+        return true;
+    });
+    assert(blocked == 0);
 }
 
 void* AllocateExecutionContext(SpawnConfiguration const& config)

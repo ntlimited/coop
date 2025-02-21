@@ -12,7 +12,7 @@ bool Manager::Spawn(Fn const& fn, ExecutionHandle* handle /* = nullptr */)
 template<typename Fn>
 bool Manager::Spawn(SpawnConfiguration const& config, Fn const& fn, ExecutionHandle* handle /* = nullptr */)
 {
-    if (m_shutdown || !m_executionContexts.CanPush())
+    if (m_shutdown)
 	{
         return false;
 	}
@@ -47,6 +47,9 @@ bool Manager::Spawn(SpawnConfiguration const& config, Fn const& fn, ExecutionHan
     {
         executionContext->m_state = SchedulerState::RUNNING;
 		m_scheduled = executionContext;
+
+        SanityCheck();
+
         auto* ctx = executionContext;
         auto* entry = &fn;
 		void* top = ctx->m_segment.Top();

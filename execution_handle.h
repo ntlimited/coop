@@ -18,6 +18,8 @@ struct ExecutionHandle
     {
     }
 
+    void Kill();
+
     operator bool() const
     {
         return !!m_executionContext;

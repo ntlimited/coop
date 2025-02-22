@@ -39,6 +39,11 @@ struct Cooperator
 	{
 	}
 
+    Context* Scheduled()
+    {
+        return m_scheduled;
+    }
+
     void Launch();
 
 	// Spawn is an in-context API that code running under a cooperator is allowed to invoke

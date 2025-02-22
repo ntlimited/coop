@@ -15,17 +15,39 @@ namespace coop
 // and/or completely implemented.
 //
 
+// In general, base Coordinator instances should be passed in to higher level coordination
+// mechanisms vs embedded within them, which allows for simpler composition.
+//
+
 struct Context;
 
+// CoordinatorExtension is a type that has access to certain Coordiantor internals which are
+// used for composing higher-level functionality on top of the mechanics that Coordinators
+// implement for the cooperative multitasking system regarding blocking state transitions.
+//
+struct CoordinatorExtension;
+
 // The coordinator primitive maintains a waiter list of contexts that blocked on acquiring the
-// coordinator. All APIs must be called with the current context.
+// Coordinator. Acquire methods must be called with the current context but release doesn't
+// currently matter. This is something I should make an actual call on.
 //
 struct Coordinator
 {
     Coordinator(const Coordinator&) = delete;
     Coordinator(Coordinator&&) = delete;
 
+    // Start out held
+    //
+    Coordinator(Context* ctx)
+    {
+        Acquire(ctx);
+    }
+    
+    // Start out unheld
+    //
     Coordinator();
+
+    bool IsHeld() const;
 
     bool TryAcquire(Context*);
 
@@ -37,6 +59,12 @@ struct Coordinator
     // the unblocked context to yield.
     //
     void Release(Context*, const bool schedule = true);
+
+  protected:
+    friend struct CoordinatorExtension;
+    void AddAsBlocked(Context* ctx);
+    bool RemoveAsBlocked(Context* ctx); 
+    bool HeldBy(Context* ctx);
 
   private:
     Context* m_heldBy;

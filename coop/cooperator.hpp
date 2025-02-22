@@ -62,6 +62,13 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
         );
 		(*entry)(ctx);
 
+        // This deletion must be done while the context is still in its own stack, so that it can
+        // context switch to anyone waiting on the signal safely. We also can't simply unblock them
+        // because then there's an insane contract where you could be signalled for wakeup by a
+        // (once you wake up) deallocated Coordinator you're still holding onto.
+        //
+        ctx->~Context();
+
         // When the code in the func finishes, exit the context by resuming into
         // the scheduler's code. Regardless of where it was when it gave up control
         //

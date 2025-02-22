@@ -14,6 +14,11 @@ Coordinator::Coordinator()
 {
 }
 
+bool Coordinator::IsHeld() const
+{
+    return !!m_heldBy;
+}
+
 bool Coordinator::TryAcquire(Context* ctx)
 {
     if (m_heldBy == nullptr)
@@ -33,6 +38,32 @@ void Coordinator::Acquire(Context* ctx)
         return;
     }
 
+    AddAsBlocked(ctx);
+
+    // Block the context on the this coordinator
+    //
+    ctx->Block(this);
+}
+
+void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
+{
+    assert(m_heldBy);
+    if (!m_head)
+    {
+        m_heldBy = nullptr;
+        return;
+    }
+
+    // Pop the head off the list and pass ownership of the coordinator.
+    //
+    auto* unblock = m_head;
+    m_heldBy = unblock;
+    m_head = m_head->m_blockingBehind;
+    ctx->Unblock(unblock, schedule);
+}
+
+void Coordinator::AddAsBlocked(Context* ctx)
+{
     // Put on the tail of the linkedlist. We could do priority shenanigans here at some point
     //
     if (m_head == nullptr)
@@ -45,24 +76,39 @@ void Coordinator::Acquire(Context* ctx)
         m_tail->m_blockingBehind = ctx;
         m_tail = ctx;
     }
-
-    // Block the context on the this coordinator
-    //
-    ctx->Block(this);
 }
 
-void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
+bool Coordinator::RemoveAsBlocked(Context* ctx)
 {
-    assert(m_heldBy);
-    if (m_head)
+    // In this case, if ctx was also the tail, it doesn't matter because we just nulled out the
+    // head of the list and will use that to check later.
+    //
+    if (m_head == ctx)
     {
-        // Pop the head off the list and pass ownership of the coordinator.
-        //
-        auto* unblock = m_head;
-        m_heldBy = unblock;
         m_head = m_head->m_blockingBehind;
-        ctx->Unblock(unblock, schedule);
+        return true;
     }
+        
+    auto* head = m_head;
+    while (head)
+    {
+        if (head->m_blockingBehind == ctx)
+        {
+            head->m_blockingBehind = ctx->m_blockingBehind;
+            if (m_tail == ctx)
+            {
+                m_tail = head;
+            }
+            return true;
+        }
+        head = head->m_blockingBehind;
+    }
+    return false;
+}
+
+bool Coordinator::HeldBy(Context* ctx)
+{
+    return m_heldBy == ctx;
 }
 
 bool CoordinatedSemaphore::TryAcquire(Context* ctx)

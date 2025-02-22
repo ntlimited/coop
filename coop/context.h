@@ -3,8 +3,10 @@
 #include <csetjmp>
 #include <cstdint>
 
+#include "coordinator.h"
 #include "embedded_list.h"
 #include "handle.h"
+#include "ref.h"
 #include "scheduler_state.h"
 #include "spawn_configuration.h"
 
@@ -35,31 +37,37 @@ struct Segment
 struct Coordinator;
 struct Cooperator;
 
+static constexpr int CONTEXT_LIST_ALL = 0;
+static constexpr int CONTEXT_LIST_STATE = 1;
+
 // An Context is what code runs "in."
 //
-struct Context : EmbeddedListHookups<Context, int, 0>
-                        , EmbeddedListHookups<Context, int, 1>
+struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
+               , EmbeddedListHookups<Context, int, CONTEXT_LIST_STATE>
+               , Reffed<Context>
 {
     // Embedded lists for tracking the set of lists that contexts can never be in more
     // than one of, e.g. there are multiple `ContextStateList`s in the cooperator, but contexts are
     // never in both active and yielded, etc. Or in two different cooperator's active list...
     //
-    using AllContextsList = EmbeddedList<Context, int, 0>;
-    using ContextStateList = EmbeddedList<Context, int, 1>;
+    using AllContextsList = EmbeddedList<Context, int, CONTEXT_LIST_ALL>;
+    using ContextStateList = EmbeddedList<Context, int, CONTEXT_LIST_STATE>;
 
 	Context(
         SpawnConfiguration const& config,
         Handle* handle,
         Cooperator* cooperator)
-    : m_blockingOn(nullptr)
+    : Reffed<Context>(this)
+    , m_blockingOn(nullptr)
     , m_blockingBehind(nullptr)
     , m_handle(handle)
 	, m_state(SchedulerState::YIELDED)
 	, m_priority(config.priority)
     , m_currentPriority(config.priority)
     , m_cooperator(cooperator)
-    , m_killed(false)
 	{
+        TakeRef();
+        m_killedCoordinator.Acquire(this);
         if (m_handle)
         {
             m_handle->m_context = this;
@@ -67,13 +75,7 @@ struct Context : EmbeddedListHookups<Context, int, 0>
 		m_segment.m_size = config.stackSize;
 	}
 
-    ~Context()
-    {
-        if (m_handle)
-        {
-            m_handle->m_context = nullptr;
-        }
-    }
+    ~Context();
 
     // Return control to the cooperator so that it can schedule other contexts
     //
@@ -86,7 +88,7 @@ struct Context : EmbeddedListHookups<Context, int, 0>
 
     bool IsKilled() const
     {
-        return m_killed;
+        return !m_killedCoordinator.IsHeld();
     }
 
   private:
@@ -109,7 +111,7 @@ struct Context : EmbeddedListHookups<Context, int, 0>
     friend struct Handle;
     void Kill()
     {
-        m_killed = true;
+        m_killedCoordinator.Release(this);
     }
 
   public:
@@ -118,7 +120,7 @@ struct Context : EmbeddedListHookups<Context, int, 0>
 	int m_priority;
 	int m_currentPriority;
     Cooperator* m_cooperator;
-    bool m_killed;
+    Coordinator m_killedCoordinator;
 
     // The jmp_buf operates as the 'bookmark' to jump back into when the context is active.
     //

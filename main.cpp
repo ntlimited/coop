@@ -1,14 +1,17 @@
+#include <cstring>
 #include <fcntl.h>
 #include <vector>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "coop/coordinate.h"
 #include "coop/coordinator.h"
 #include "coop/cooperator.h"
 #include "coop/launchable.h"
 #include "coop/thread.h"
 #include "coop/network/epoll_router.h"
 #include "coop/network/tcp_server.h"
+#include "coop/time/driver.h"
 
 // Demo program that currently sets up a TCP echo server by:
 //
@@ -28,8 +31,28 @@ struct EchoHandler : coop::network::TCPHandler
 
     bool Recv(coop::Context* ctx, void* buffer, const size_t bytes) final
     {
-        return Send(ctx, buffer, bytes);
+        auto* copied = malloc(bytes);
+        if (!copied)
+        {
+            return false;
+        }
+        memcpy(copied, buffer, bytes);
+
+        if (ctx->GetCooperator()->Spawn([=,this](coop::Context* taskCtx)
+        {
+            m_coordinator.Acquire(taskCtx);
+            Send(ctx, copied, bytes);
+            m_coordinator.Release(taskCtx);
+            free(copied);
+        }))
+        {
+            return true;
+        }
+        free(copied);
+        return false;
     }
+
+    coop::Coordinator m_coordinator;
 };
 
 struct EchoHandlerFactory : coop::network::TCPHandlerFactory
@@ -53,7 +76,6 @@ int bind_and_listen(int port)
     int on = 1;
     int ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     assert(ret == 0);
-
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -83,6 +105,7 @@ void SpawningTask(coop::Context* ctx, void*)
     //
     coop::Handle routerHandle;
     coop::Handle serverHandle;
+    coop::Handle timerHandle;
 
     // Begin the epoll controller and its TCP handler loop
     //
@@ -93,6 +116,24 @@ void SpawningTask(coop::Context* ctx, void*)
     
     co->Launch(router, &routerHandle);
     co->Launch(server, &serverHandle);
+
+    coop::time::Driver timeDriver;
+    co->Launch(timeDriver, &timerHandle);
+
+    co->Spawn([&](coop::Context* ctx)
+    {
+        coop::Coordinator coord;
+        coop::time::Handle h(std::chrono::milliseconds(10), &coord);
+
+        while (!ctx->IsKilled())
+        {
+            printf("Submitting timer to driver\n");
+            h.Submit(&timeDriver);
+            h.Wait(ctx);
+            assert(!coord.IsHeld());
+            printf("Timer triggered!\n");
+        }
+    });
 
     // Kill epoll and wait for it to die.
     //

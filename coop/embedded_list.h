@@ -6,14 +6,14 @@
 namespace coop
 {
 
-template<typename T, typename Tag, const Tag N = 0>
+template<typename T, typename Tag = int, const Tag N = 0>
 struct EmbeddedList;
 
 // EmbeddedListHookups works in conjunction with EmbeddedList to allow doubly linked
 // lists that are safe to use within a manager's thread. The optional `Tag` templating allows multiple
 // such lists in the context if we decide we want it.
 //
-template<typename T, typename Tag, const Tag N = 0>
+template<typename T, typename Tag = int, const Tag N = 0>
 struct EmbeddedListHookups
 {
     using Hookups = EmbeddedListHookups<T, Tag, N>;
@@ -25,7 +25,7 @@ struct EmbeddedListHookups
     {
     }
 
-protected:
+  protected:
     // These methods are only intended to be called by the list they're a member of, as otherwise
     // various guarantees may not be honored.
     //
@@ -52,10 +52,10 @@ private:
     Hookups* next;
 };
 
-template<typename T, typename Tag  = int, const Tag N /* = 0 */>
+template<typename T, typename Tag /* = int */, const Tag N /* = 0 */>
 struct EmbeddedList
 {
-    using Hookups = EmbeddedListHookups<T, Tag, N>::Hookups;
+    using Hookups = typename EmbeddedListHookups<T, Tag, N>::Hookups;
 
     EmbeddedList()
     {

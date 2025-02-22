@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 namespace coop
 {
 
@@ -27,6 +29,14 @@ struct Context;
 //
 struct CoordinatorExtension;
 
+
+// CoordinatorPatterns allow the Coordinator type to have different contracts under the hood
+// for different purposes.
+//
+// In theory, this could be replaced by a class heirarchy but I didn't want to introduce that
+// at this point. This became necessary in the first place in order to allow the equivalent of
+//
+
 // The coordinator primitive maintains a waiter list of contexts that blocked on acquiring the
 // Coordinator. Acquire methods must be called with the current context but release doesn't
 // currently matter. This is something I should make an actual call on.
@@ -35,17 +45,18 @@ struct Coordinator
 {
     Coordinator(const Coordinator&) = delete;
     Coordinator(Coordinator&&) = delete;
-
-    // Start out held
-    //
-    Coordinator(Context* ctx)
-    {
-        Acquire(ctx);
-    }
     
     // Start out unheld
     //
     Coordinator();
+
+    // Start out held
+    //
+    Coordinator(Context* ctx)
+    : Coordinator()
+    {
+        Acquire(ctx);
+    }
 
     bool IsHeld() const;
 
@@ -65,12 +76,15 @@ struct Coordinator
     void AddAsBlocked(Context* ctx);
     bool RemoveAsBlocked(Context* ctx); 
     bool HeldBy(Context* ctx);
+    void Shutdown();
 
   private:
     Context* m_heldBy;
 
     Context* m_head;
     Context* m_tail;
+
+    bool m_shutdown;
 };
 
 struct CoordinatedSemaphore

@@ -11,6 +11,7 @@ Coordinator::Coordinator()
 : m_heldBy(nullptr)
 , m_head(nullptr)
 , m_tail(nullptr)
+, m_shutdown(false)
 {
 }
 
@@ -21,6 +22,11 @@ bool Coordinator::IsHeld() const
 
 bool Coordinator::TryAcquire(Context* ctx)
 {
+    if (m_shutdown)
+    {
+        return true;
+    }
+
     if (m_heldBy == nullptr)
     {
         m_heldBy = ctx;
@@ -32,6 +38,11 @@ bool Coordinator::TryAcquire(Context* ctx)
 
 void Coordinator::Acquire(Context* ctx)
 {
+    if (m_shutdown)
+    {
+        return;
+    }
+
     if (m_heldBy == nullptr)
     {
         m_heldBy = ctx;
@@ -47,7 +58,16 @@ void Coordinator::Acquire(Context* ctx)
 
 void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 {
-    assert(m_heldBy);
+    assert(m_shutdown || m_heldBy);
+
+    // We allow multiple release of shutdown coordinators as the acquire/release contract no
+    // longer applies.
+    //
+    if (m_shutdown && !m_heldBy)
+    {
+        return;
+    }
+
     if (!m_head)
     {
         m_heldBy = nullptr;
@@ -109,6 +129,15 @@ bool Coordinator::RemoveAsBlocked(Context* ctx)
 bool Coordinator::HeldBy(Context* ctx)
 {
     return m_heldBy == ctx;
+}
+
+// Shutting down a coordinator means that the instance will act as a 'signal': callers of Acquire
+// APIs will be told they have taken the coordinator, and release calls will become no-ops.
+//
+// This is very useful for, e.g., kill conditions.
+//
+void Coordinator::Shutdown()
+{
 }
 
 bool CoordinatedSemaphore::TryAcquire(Context* ctx)

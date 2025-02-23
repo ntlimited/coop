@@ -4,7 +4,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "coop/coordinate.h"
 #include "coop/coordinator.h"
 #include "coop/cooperator.h"
 #include "coop/embedded_list.h"

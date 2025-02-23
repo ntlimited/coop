@@ -1,5 +1,7 @@
 #pragma once
 
+#include <utility>
+
 #include "coordinator.h"
 #include "context.h"
 #include "coordinator_extension.h"
@@ -24,7 +26,7 @@ struct MultiCoordinator<Coordinator*>
             return coordinator;
         }
 
-        Coordinate ord(context);
+        Coordinatedd ord(context);
         CoordinatorExtension().AddAsBlocked(coordinator, &ord);
         CoordinatorExtension().Block(context);
 
@@ -56,7 +58,7 @@ struct MultiCoordinator<Coordinator*, Args...> : MultiCoordinator<Args...>
             return coordinator;
         }
 
-        Coordinate ord(context);
+        Coordinatedd ord(context);
 
         CoordinatorExtension().AddAsBlocked(coordinator, &ord);
 
@@ -90,6 +92,7 @@ struct MultiCoordinator<Coordinator*, Args...> : MultiCoordinator<Args...>
     }
 };
 
+// The Coordinatedd
 template<typename... Args>
 Coordinator* Coordinate(Context* ctx, Args... args)
 {

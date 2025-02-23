@@ -3,7 +3,7 @@
 namespace coop
 {
 
-struct Coordinate;
+struct Coordinated;
 struct Coordinator;
 struct Context;
 
@@ -13,9 +13,9 @@ struct CoordinatorExtension
 {
     void Block(Context* c);
 
-    void AddAsBlocked(Coordinator* c, Coordinate* ord);
+    void AddAsBlocked(Coordinator* c, Coordinated* ord);
 
-    void RemoveAsBlocked(Coordinator* c, Coordinate* ord);
+    void RemoveAsBlocked(Coordinator* c, Coordinated* ord);
 
     bool HeldBy(Coordinator* c, Context* ctx);
 

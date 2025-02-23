@@ -47,7 +47,7 @@ void Coordinator::Acquire(Context* ctx)
         return;
     }
 
-    Coordinate coord(ctx);
+    Coordinated coord(ctx);
     AddAsBlocked(&coord);
 
     // Block the context on the this coordinator
@@ -74,7 +74,7 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 
     // Pass control to the next in line blocked on the coordinator, if it exists.
     //
-    Coordinate* next;
+    Coordinated* next;
     if (!m_blocking.Pop(next))
     {
         return;
@@ -84,12 +84,12 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
     ctx->Unblock(m_heldBy, schedule);
 }
 
-void Coordinator::AddAsBlocked(Coordinate* c)
+void Coordinator::AddAsBlocked(Coordinated* c)
 {
     m_blocking.Push(c);
 }
 
-void Coordinator::RemoveAsBlocked(Coordinate* c)
+void Coordinator::RemoveAsBlocked(Coordinated* c)
 {
     m_blocking.Remove(c);
 }
@@ -111,7 +111,7 @@ void Coordinator::Shutdown(Context* ctx)
 
     // Unblock everyone coordinating on this instance
     //
-    Coordinate* ord;
+    Coordinated* ord;
     while (m_blocking.Pop(ord))
     {
         ctx->Unblock(ord->GetContext());

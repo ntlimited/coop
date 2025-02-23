@@ -11,18 +11,18 @@ struct Coordinator;
 struct Context;
 struct CoordinatorExtension;
 
-// Coordinate is an internal type used to maintain the necessary metadata for coordinated
+// Coordinated is an internal type used to maintain the necessary metadata for coordinated
 // operations. It is also usable with the CoordinatorExtension type that launders access to
 // its internal APIs in order to create higher-level coordination constructs.
 //
 // TODO any value to including the Coordinator in the struct? Probably not and would likely
 // lead to bad patterns.
 //
-struct Coordinate : EmbeddedListHookups<Coordinate>
+struct Coordinated : EmbeddedListHookups<Coordinated>
 {
-    using List = EmbeddedList<Coordinate>;
+    using List = EmbeddedList<Coordinated>;
 
-    Coordinate(Context* ctx)
+    Coordinated(Context* ctx)
     : m_context(ctx)
     {
     }
@@ -71,14 +71,14 @@ struct Coordinator
 
   protected:
     friend struct CoordinatorExtension;
-    void AddAsBlocked(Coordinate*);
-    void RemoveAsBlocked(Coordinate*); 
+    void AddAsBlocked(Coordinated*);
+    void RemoveAsBlocked(Coordinated*); 
     bool HeldBy(Context* ctx);
     void Shutdown(Context* ctx);
 
   private:
     Context* m_heldBy;
-    Coordinate::List m_blocking;
+    Coordinated::List m_blocking;
 
     bool m_shutdown;
 };

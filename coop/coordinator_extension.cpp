@@ -11,12 +11,12 @@ void CoordinatorExtension::Block(Context* c)
     c->Block();
 }
 
-void CoordinatorExtension::AddAsBlocked(Coordinator* c, Coordinate* ord)
+void CoordinatorExtension::AddAsBlocked(Coordinator* c, Coordinated* ord)
 {
     c->AddAsBlocked(ord);
 }
 
-void CoordinatorExtension::RemoveAsBlocked(Coordinator* c, Coordinate* ord)
+void CoordinatorExtension::RemoveAsBlocked(Coordinator* c, Coordinated* ord)
 {
     c->RemoveAsBlocked(ord);
 }

@@ -38,6 +38,20 @@ struct Handle : EmbeddedListHookups<Handle>
         assert(m_interval != Interval(0));
     }
 
+    ~Handle()
+    {
+        // When the handle is being destroyed, it must not be in a ticker bucket or it will
+        // explode.
+        //
+        if (m_deadline)
+        {
+            assert(!Disconnected());
+            Pop();
+        }
+
+        assert(Disconnected());
+    }
+
     // Submit the handle to trigger in the future
     //
     void Submit(Ticker* ticker);
@@ -63,7 +77,7 @@ struct Handle : EmbeddedListHookups<Handle>
     //
     void Deadline(Context* ctx);
 
-    size_t SetDeadline(size_t epoch);
+    size_t SetDeadline(size_t epoch, int resolution);
 
     size_t GetDeadline() const;
 

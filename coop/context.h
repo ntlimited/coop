@@ -84,12 +84,21 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         return m_cooperator;
     }
 
+    // The Killed system for contexts (and presumably most things) functions using a coordinator
+    // that initially is held by the context itself, and then shutdown as a kill signal.
+    //
     bool IsKilled() const
     {
         return !m_killedCoordinator.IsHeld();
     }
 
+    Coordinator* GetKilledSignal()
+    {
+        return &m_killedCoordinator;
+    }
+
   private:
+    friend struct Cooperator;
     friend struct Coordinator;
     friend struct CoordinatorExtension;
 
@@ -103,10 +112,12 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
 
   private:
     friend struct Handle;
-    void Kill()
-    {
-        m_killedCoordinator.Release(this);
-    }
+    
+    // Keeping with the concept that all Context APIs should only be called when it is actively
+    // scheduled in the cooperator, this kills the other given context. In practice, it's also
+    // simply necessary that we leverage the current context to coordinate downstream events.
+    //
+    void Kill(Context* other);
 
   public:
     Handle* m_handle;

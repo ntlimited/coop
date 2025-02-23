@@ -40,21 +40,34 @@ struct EmbeddedListHookups
     {
         prev->next = next;
         next->prev = prev;
+        next = nullptr;
+        prev = nullptr;
+    }
+
+    bool Disconnected() const
+    {
+        return next == prev;
     }
 
     void InsertBefore(Hookups* other)
     {
+        assert(other != this);
+        assert(other->prev != this);
+
         other->prev->next = this;
         this->prev = other->prev;
-        other->prev = this;
-        this->next = other;
-    }
 
-private:
+        this->next = other;
+        other->prev = this;
+    }
+ private:
     Hookups* prev;
     Hookups* next;
 };
 
+// An EmbeddedList has some typecasting magic and a pair of dummy list hookups to allow us to
+// simplify some edge cases.
+//
 template<typename T, typename Tag /* = int */, const Tag N /* = 0 */>
 struct EmbeddedList
 {
@@ -106,6 +119,35 @@ struct EmbeddedList
     void Remove(Hookups* h)
     {
         h->Pop();
+        size--;
+    }
+
+    void SanityCheck(Hookups* checkFor = nullptr)
+    {
+        bool found = false;
+        auto* at = head.next;
+        int n = 0;
+        while (at != &tail)
+        {
+            if (at == checkFor)
+            {
+                found = true;
+            }
+            at = at->next;
+            n++;
+        }
+        assert(found || !checkFor);
+        assert(n == size);
+
+        at = tail.prev;
+        while (at != &head)
+        {
+            at = at->prev;
+            if (0 > n--)
+            {
+                assert(false);
+            }
+        }
     }
 
     template<typename Fn>

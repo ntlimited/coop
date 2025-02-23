@@ -2,10 +2,18 @@
 
 #include "context.h"
 #include "scheduler_state.h"
+#include "self.h"
 
 namespace coop
 {
 
+// This is an incredibly cool syntax, but it is incredibly dangerous and misleading too. While it works,
+// the nature of lambdas being passed in is that Spawn([&](Context*) { ... }) is stack allocating in a
+// way not guaranteed after `Spawn()` returns, e.g. after the control returns to the spawning context
+// from the spawned context.
+//
+// This is not a problem per se
+//
 template<typename Fn>
 bool Cooperator::Spawn(Fn const& fn, Handle* handle /* = nullptr */)
 {
@@ -53,21 +61,30 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
 
         SanityCheck();
 
-        auto* ctx = spawnCtx;
-        auto* entry = &fn;
-		void* top = ctx->m_segment.Top();
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+        // TODO: this would need a rework when proper stack handing etc is added, right now it's
+        // effective but goofy.
+        //
+        memcpy(spawnCtx->m_segment.Bottom(), &fn, sizeof(Fn));
+#pragma GCC diagnostic pop
+		void* top = spawnCtx->m_segment.Top();
         asm volatile(
 			"mov %[rs], %%rsp \n"
             : [ rs ] "+r" (top) ::
         );
-		(*entry)(ctx);
+
+        {
+            (*((Fn*)(Self()->m_segment.Bottom())))(Self());
+        }
 
         // This deletion must be done while the context is still in its own stack, so that it can
         // context switch to anyone waiting on the signal safely. We also can't simply unblock them
         // because then there's an insane contract where you could be signalled for wakeup by a
         // (once you wake up) deallocated Coordinator you're still holding onto.
         //
-        ctx->~Context();
+        Self()->~Context();
 
         // When the code in the func finishes, exit the context by resuming into
         // the scheduler's code. Regardless of where it was when it gave up control

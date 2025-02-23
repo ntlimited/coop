@@ -1,4 +1,5 @@
 #include <csetjmp>
+#include <mutex>
 #include <new>
 #include <thread>
 #include <stdio.h>
@@ -299,6 +300,9 @@ void Cooperator::SanityCheck()
         return true;
     });
 
+    assert(yielded == YieldedCount());
+    assert(blocked == BlockedCount());
+
     m_yielded.Visit([&yielded](Context* ctx) -> bool
     {
         yielded--;
@@ -313,6 +317,84 @@ void Cooperator::SanityCheck()
         return true;
     });
     assert(blocked == 0);
+}
+
+namespace
+{
+
+struct BoundaryCrossingKillArgs
+{
+    Handle* handle;
+    std::mutex mutex;
+};
+
+void BoundaryCrossingKill(Context* taskCtx, void* args)
+{
+    auto* bc = reinterpret_cast<BoundaryCrossingKillArgs*>(args);
+
+    taskCtx->GetCooperator()->BoundarySafeKill(bc->handle, true /* crossed */);
+
+    bc->mutex.unlock();
+}
+
+} // end anonymous namespace
+
+void Cooperator::BoundarySafeKill(Handle* handle, const bool crossed /* = false */)
+{
+    if (this == Cooperator::thread_cooperator)
+    {
+        // Context killing is something that Coordinators work for, and the Coordinator system
+        // assumes we have a context at all times. This makes good semantic sense: the cooperator
+        // 'native' context never coordinates with that mechanic.
+        //
+        // Eventually we will need (TODO) a shutdown/mass kill type operation where it will make
+        // sense for the cooperator to be the one deciding to issue kill commands; this should be
+        // refactored of course but in general I think it's actually a good pattern that the
+        // cooperator can schedule work against itself; we should likely add a return system to
+        // the Handle construct that allows for passing across the lives-in-a-context as well as
+        // the lives-in-the-cooperator-thread boundaries.
+        //
+        assert(m_scheduled);
+        if (!crossed)
+        {
+            // We were called originally from the cooperator's thread, so this is guaranteed safe
+            //
+            m_scheduled->Kill(handle->m_context);
+        }
+        else
+        {
+            // We transitioned into the cooperator's thread and can't guarantee that the context
+            // was not destroyed during the jump. Instead, have to look at all the contexts to find
+            // a match, and then (ABA) need to look at its handle, as that should not have been
+            // reusable until this kill has completed and the owner that tried to kill with it
+            // has the chance to consider reuse.
+            //
+            m_contexts.Visit([&](Context* check)
+            {
+                if (check != handle->m_context)
+                {
+                    return true;
+                }
+                    
+                if (check->m_handle == handle)
+                {
+                    m_scheduled->Kill(handle->m_context);
+                }
+
+                // Either way, we're not going to find a match past this
+                //
+                return false;
+            });
+        }
+        return;
+    }
+
+    BoundaryCrossingKillArgs args;
+    args.mutex.lock();
+    args.handle = handle;
+
+    Submit(&BoundaryCrossingKill, &args);
+    args.mutex.unlock();
 }
 
 void* AllocateContext(SpawnConfiguration const& config)

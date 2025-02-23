@@ -2,7 +2,7 @@
 #include "timeout_coordinator.h"
 
 #include "coop/context.h"
-
+#if 0
 namespace coop
 {
 
@@ -59,3 +59,4 @@ bool TimeoutCoordinator::TryAcquire(Driver* driver, Context* ctx)
 
 } // end namespace coop::time
 } // end namespace coop
+#endif

@@ -8,10 +8,16 @@
 #include "embedded_list.h"
 #include "context.h"
 #include "fixed_list.h"
+#include "handle.h"
 #include "spawn_configuration.h"
 
 namespace coop
 {
+
+namespace time
+{
+    struct Ticker;
+} // end namespace coop::time
 
 enum class SchedulerJumpResult
 {
@@ -113,6 +119,10 @@ struct Cooperator
         m_shutdown = true;
     }
 
+    bool SetTicker(time::Ticker*);
+
+    time::Ticker* GetTicker();
+
     void SanityCheck();
 
   private:
@@ -121,6 +131,8 @@ struct Cooperator
     bool m_shutdown;
 
 	Context* m_scheduled;
+    time::Ticker* m_ticker;
+    Handle m_tickerHandle;
 	std::jmp_buf m_jmpBuf;
 
 	std::counting_semaphore<8> m_submissionSemaphore;
@@ -129,6 +141,10 @@ struct Cooperator
 
     FixedList<ExecutionSubmission, 8> m_submissions;
 
+    // TODO this is a super dirty thing where the context removes itself from the
+    // contexts list when it destructs.
+    //
+    friend struct Context;
     Context::AllContextsList m_contexts;
     Context::ContextStateList m_yielded;
     Context::ContextStateList m_blocked;

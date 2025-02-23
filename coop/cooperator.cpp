@@ -7,6 +7,8 @@
 #include "cooperator.h"
 #include "launchable.h"
 
+#include "time/ticker.h"
+
 namespace coop
 {
 
@@ -15,8 +17,7 @@ bool Cooperator::Launch(
     Handle* handle /* = nullptr */)
 {
     return Launch(s_defaultConfiguration, launch, handle);
-}
- 
+} 
 
 bool Cooperator::Launch(
         SpawnConfiguration const& config,
@@ -63,8 +64,7 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         }
         case SchedulerJumpResult::EXITED:
         {
-            m_contexts.Remove(m_scheduled);
-            delete m_scheduled;
+            free(m_scheduled);
             break;
         }
         case SchedulerJumpResult::YIELDED:
@@ -262,6 +262,21 @@ bool Cooperator::SpawnSubmitted(bool wait /* = false */)
     SanityCheck();
 
     return true;
+}
+
+bool Cooperator::SetTicker(time::Ticker* t)
+{
+    if (!Launch(*t, &m_tickerHandle))
+    {
+        return false;
+    }
+    m_ticker = t;
+    return true;
+}
+
+time::Ticker* Cooperator::GetTicker()
+{
+    return m_ticker;
 }
 
 void Cooperator::SanityCheck()

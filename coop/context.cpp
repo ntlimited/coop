@@ -1,5 +1,6 @@
 #include "context.h"
 #include "cooperator.h"
+#include "coordinator_extension.h"
 
 namespace coop
 {
@@ -11,14 +12,7 @@ Context::~Context()
     //
     if (m_killedCoordinator.IsHeld())
     {
-        // We were not 'killed' officially and must alert anyone who was waiting on that
-        //
-        m_killedCoordinator.Release(this);
-
-        // Once anyone waiting on our kill coordinator got signaled by it, they know that it is
-        // invalid
-        //
-        m_killedCoordinator.Acquire(this);
+        CoordinatorExtension().Shutdown(&m_killedCoordinator, this);
     }
 
     RemoveRef();
@@ -28,6 +22,8 @@ Context::~Context()
     {
         m_handle->m_context = nullptr;
     }
+
+    m_cooperator->m_contexts.Remove(this);
 }
 
 bool Context::Yield(const bool force /* = false */)
@@ -42,18 +38,16 @@ bool Context::Yield(const bool force /* = false */)
     return true;
 }
 
-void Context::Block(Coordinator* c)
+void Context::Block()
 {
-    m_blockingOn = c;
     m_cooperator->Block(this);
 }
 
-void Context::Unblock(Context* other, const bool schedule)
+void Context::Unblock(Context* other, const bool schedule /* = true */)
 {
     // `this` is the currently executing context (as always), `other` is the context to schedule
     // over this one
     //
-    other->m_blockingOn = nullptr;
     m_cooperator->Unblock(other, schedule);
 }
 

@@ -22,11 +22,11 @@ namespace time
 //
 // Conveniently, this maps to the binary representation of these deadlines
 //
-struct Driver : Launchable
+struct Ticker : Launchable
 {
     static constexpr int BUCKETS = 32;
 
-    Driver();
+    Ticker();
 
     void Launch(Context* ctx) final;
     
@@ -37,7 +37,7 @@ struct Driver : Launchable
     bool Accept(Handle* handle);
 
   private:
-    void ProcessBucket(int idx, size_t now);
+    bool ProcessBucket(int idx, size_t now);
 
     // `Now` returns the unix-epoch based number of passed 'Intervals' of time.
     //
@@ -48,15 +48,17 @@ struct Driver : Launchable
     int BucketFor(size_t interval) const;
 
     // TimeoutList is an embedded list which contexts can only be in one of at once, which logically
-    // makes sense that a context would only be in one of, both across drivers and across buckets.
+    // makes sense that a context would only be in one of, both across tickers and across buckets.
     //
     // Buckets are power-of-two based ranges where bucket 0 corresponds to contexts to unblock
     // within the next 0 - 1 * Interval, bucket 1 from 1 - 2, 2 from 2-4, etc.
     //
-    // Each time the driver awakes, based on the number of [interval] passed, buckets are rotated
+    // Each time the ticker awakes, based on the number of [interval] passed, buckets are rotated
     //
-    using TimeoutList = Handle::List;
-    TimeoutList m_buckets[BUCKETS];
+    struct {
+        Handle::List list;
+        size_t lastChecked;
+    } m_buckets[BUCKETS];
 
     Context* m_context;
     size_t m_epoch;

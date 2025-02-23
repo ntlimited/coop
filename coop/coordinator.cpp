@@ -9,8 +9,6 @@ namespace coop
 
 Coordinator::Coordinator()
 : m_heldBy(nullptr)
-, m_head(nullptr)
-, m_tail(nullptr)
 , m_shutdown(false)
 {
 }
@@ -49,16 +47,20 @@ void Coordinator::Acquire(Context* ctx)
         return;
     }
 
-    AddAsBlocked(ctx);
+    Coordinate coord(ctx);
+    AddAsBlocked(&coord);
 
     // Block the context on the this coordinator
     //
-    ctx->Block(this);
+    ctx->Block();
 }
 
 void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 {
-    assert(m_shutdown || m_heldBy);
+    if (m_shutdown)
+    {
+        return;
+    }
 
     // We allow multiple release of shutdown coordinators as the acquire/release contract no
     // longer applies.
@@ -68,62 +70,28 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
         return;
     }
 
-    if (!m_head)
+    m_heldBy = nullptr;
+
+    // Pass control to the next in line blocked on the coordinator, if it exists.
+    //
+    Coordinate* next;
+    if (!m_blocking.Pop(next))
     {
-        m_heldBy = nullptr;
         return;
     }
 
-    // Pop the head off the list and pass ownership of the coordinator.
-    //
-    auto* unblock = m_head;
-    m_heldBy = unblock;
-    m_head = m_head->m_blockingBehind;
-    ctx->Unblock(unblock, schedule);
+    m_heldBy = next->GetContext();
+    ctx->Unblock(m_heldBy, schedule);
 }
 
-void Coordinator::AddAsBlocked(Context* ctx)
+void Coordinator::AddAsBlocked(Coordinate* c)
 {
-    // Put on the tail of the linkedlist. We could do priority shenanigans here at some point
-    //
-    if (m_head == nullptr)
-    {
-        m_head = ctx;
-        m_tail = ctx;
-    }
-    else
-    {
-        m_tail->m_blockingBehind = ctx;
-        m_tail = ctx;
-    }
+    m_blocking.Push(c);
 }
 
-bool Coordinator::RemoveAsBlocked(Context* ctx)
+void Coordinator::RemoveAsBlocked(Coordinate* c)
 {
-    // In this case, if ctx was also the tail, it doesn't matter because we just nulled out the
-    // head of the list and will use that to check later.
-    //
-    if (m_head == ctx)
-    {
-        m_head = m_head->m_blockingBehind;
-        return true;
-    }
-        
-    auto* head = m_head;
-    while (head)
-    {
-        if (head->m_blockingBehind == ctx)
-        {
-            head->m_blockingBehind = ctx->m_blockingBehind;
-            if (m_tail == ctx)
-            {
-                m_tail = head;
-            }
-            return true;
-        }
-        head = head->m_blockingBehind;
-    }
-    return false;
+    m_blocking.Remove(c);
 }
 
 bool Coordinator::HeldBy(Context* ctx)
@@ -136,52 +104,18 @@ bool Coordinator::HeldBy(Context* ctx)
 //
 // This is very useful for, e.g., kill conditions.
 //
-void Coordinator::Shutdown()
+void Coordinator::Shutdown(Context* ctx)
 {
-}
+    m_shutdown = true;
+    m_heldBy = nullptr;
 
-bool CoordinatedSemaphore::TryAcquire(Context* ctx)
-{
-    if (m_avail > 0)
-    {
-        // Transitioning from 1 to 0 means taking the coordinator
-        //
-        if (!--m_avail)
-        {
-            m_coordinator.Acquire(ctx);
-        }
-        return true;
-    }
-    
-    return false;
-}
-
-void CoordinatedSemaphore::Acquire(Context* ctx)
-{
-    if (TryAcquire(ctx))
-    {
-        return;
-    }
-
-    // m_avail is 0 or lower and the coordinator is held
+    // Unblock everyone coordinating on this instance
     //
-
-    m_avail--;
-    m_coordinator.Acquire(ctx);
-}
-
-void CoordinatedSemaphore::Release(Context* ctx)
-{
-    // If the avail count is 0 or higher, there are no waiters on the coordinator
-    //
-    if (m_avail++ >= 0)
+    Coordinate* ord;
+    while (m_blocking.Pop(ord))
     {
-        // m_avail is now 1 or greater
-        //
-        return;
+        ctx->Unblock(ord->GetContext());
     }
-
-    m_coordinator.Release(ctx);
 }
 
 } // end namespace coop

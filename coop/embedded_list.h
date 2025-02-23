@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <stdio.h>
+
+#include "tricks.h"
 
 namespace coop
 {
@@ -97,7 +100,7 @@ struct EmbeddedList
 
     bool IsEmpty() const
     {
-        return size == 0;
+        return head.next == &tail;
     }
 
     void Remove(Hookups* h)
@@ -130,12 +133,8 @@ struct EmbeddedList
 
     static T* Cast(Hookups* h)
     {
-        return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(h) - RawCastOffset());
-    }
-
-    static constexpr ptrdiff_t RawCastOffset()
-    {
-        return reinterpret_cast<ptrdiff_t>((Hookups*)((T*)0x1000)) - (ptrdiff_t)0x1000;
+        auto* v2 = detail::ascend_cast<T, Hookups>(h);
+        return v2;
     }
 };
 

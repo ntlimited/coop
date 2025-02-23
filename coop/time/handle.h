@@ -16,10 +16,10 @@ struct Coordinator;
 namespace time
 {
 
-struct Driver;
+struct Ticker;
 
 // A coop::time::Handle allows coordinating with a future trigger. Using a handle involves first
-// submitting it to a driver, and then waiting on it. This can fairly easily be strung together
+// submitting it to a ticker, and then waiting on it. This can fairly easily be strung together
 // into all kinds of high level mechanics by creating a bunch of contexts; however, these are
 // 'userland' versions of what the time package offers natively.
 //
@@ -40,7 +40,7 @@ struct Handle : EmbeddedListHookups<Handle>
 
     // Submit the handle to trigger in the future
     //
-    void Submit(Driver* driver);
+    void Submit(Ticker* ticker);
 
     // Wait for the handle's deadline to bet hit. This contract is slightly looser than ideal,
     // because we don't want to let an un-submitted handle be waited on, but it's also possible
@@ -54,9 +54,9 @@ struct Handle : EmbeddedListHookups<Handle>
     void Cancel(Context* ctx);
 
   private:
-    friend Driver;
+    friend Ticker;
     
-    // Deadline is invoked when the deadline is hit in the driver
+    // Deadline is invoked when the deadline is hit in the ticker
     //
     void Deadline(Context* ctx);
 

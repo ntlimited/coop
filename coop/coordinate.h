@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coordinator.h"
+#include "context.h"
 #include "coordinator_extension.h"
 
 namespace coop
@@ -10,7 +11,7 @@ template<typename... Args>
 struct MultiCoordinator;
 
 template<>
-struct MultiCoordinator<Coordinator*> : CoordinatorExtension
+struct MultiCoordinator<Coordinator*>
 {
     MultiCoordinator()
     {
@@ -23,13 +24,16 @@ struct MultiCoordinator<Coordinator*> : CoordinatorExtension
             return coordinator;
         }
 
-        coordinator->Acquire(context);
-        if (HeldBy(coordinator, context))
+        Coordinate ord(context);
+        CoordinatorExtension().AddAsBlocked(coordinator, &ord);
+        CoordinatorExtension().Block(context);
+
+        if (CoordinatorExtension().HeldBy(coordinator, context))
         {
             return coordinator;
         }
-
-        RemoveAsBlocked(coordinator, context);
+    
+        CoordinatorExtension().RemoveAsBlocked(coordinator, &ord);
         return nullptr;
     }
 
@@ -37,7 +41,7 @@ struct MultiCoordinator<Coordinator*> : CoordinatorExtension
 };
 
 template<typename... Args>
-struct MultiCoordinator<Coordinator*, Args...> : MultiCoordinator<Args...>, CoordinatorExtension
+struct MultiCoordinator<Coordinator*, Args...> : MultiCoordinator<Args...>
 {
     using Chained = MultiCoordinator<Args...>;
 
@@ -52,17 +56,36 @@ struct MultiCoordinator<Coordinator*, Args...> : MultiCoordinator<Args...>, Coor
             return coordinator;
         }
 
-        AddAsBlocked(coordinator, context);
-        if (auto* held = Chained()(context, std::forward<Args>(args)...))
+        Coordinate ord(context);
+
+        CoordinatorExtension().AddAsBlocked(coordinator, &ord);
+
+        // This is where we actually end up blocking for a coordinator
+        //
+        auto* held = Chained()(context, std::forward<Args>(args)...);
+
+        // Note that we can end up holding multiple coordinators if we do not immediately resume
+        // execution after the first is taken by us (e.g., Release with schedule = false). In that
+        // case, choose only one to surface, currently prioritizing the first passed into the
+        // method.
+        //
+        auto* here = CoordinatorExtension().HeldBy(coordinator, context);
+
+        if (held)
         {
-            RemoveAsBlocked(coordinator, context);
-            return held;
+            if (here)
+            {
+                held->Release(context);
+            }
+            return here;
         }
-        if (HeldBy(coordinator, context))
+
+        if (here)
         {
             return coordinator;
         }
-        RemoveAsBlocked(coordinator, context);
+
+        CoordinatorExtension().RemoveAsBlocked(coordinator, &ord);
         return nullptr;
     }
 };

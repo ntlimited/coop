@@ -4,6 +4,8 @@
 
 #include "coordinator.h"
 #include "coordinator_extension.h"
+#include "self.h"
+#include "tricks.h"
 
 namespace coop
 {
@@ -54,7 +56,7 @@ struct Reffed
     // used for the lifetime of a Context.
     //
     Reffed(Context* ctx)
-    : m_refs(0)
+    : m_refs(1)
     , m_zeroSignal(ctx)
     {
     }
@@ -75,7 +77,7 @@ struct Reffed
         {
             // I don't feel great about this; is it an excuse to use Self?
             //
-            m_zeroSignal.Release(nullptr);
+            CoordinatorExtension().Shutdown(&m_zeroSignal, ::coop::Self());
             return;
         }
         assert(m_refs > 0);
@@ -83,12 +85,7 @@ struct Reffed
 
     T* Cast()
     {
-        return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(this) - RawCastOffset());
-    }
-
-    static constexpr ptrdiff_t RawCastOffset()
-    {
-        return reinterpret_cast<ptrdiff_t>((Reffed*)((T*)0x1000)) - (ptrdiff_t)0x1000;
+        return detail::ascend_cast<T, Reffed>(this);
     }
 
   protected:

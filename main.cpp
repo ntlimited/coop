@@ -7,11 +7,13 @@
 #include "coop/coordinate.h"
 #include "coop/coordinator.h"
 #include "coop/cooperator.h"
+#include "coop/embedded_list.h"
 #include "coop/launchable.h"
 #include "coop/thread.h"
 #include "coop/network/epoll_router.h"
 #include "coop/network/tcp_server.h"
-#include "coop/time/driver.h"
+#include "coop/time/ticker.h"
+#include "coop/tricks.h"
 
 // Demo program that currently sets up a TCP echo server by:
 //
@@ -22,10 +24,13 @@
 // - attaching an echo handler to serve sockets connected through the server
 //
 
-struct EchoHandler : coop::network::TCPHandler
+struct EchoHandler : coop::network::TCPHandler, ::coop::EmbeddedListHookups<EchoHandler>
 {
+    using List = ::coop::EmbeddedList<EchoHandler>;
+
     EchoHandler(int fd)
     : coop::network::TCPHandler(fd)
+    , m_totalBytes(0)
     {
     }
 
@@ -38,11 +43,12 @@ struct EchoHandler : coop::network::TCPHandler
         }
         memcpy(copied, buffer, bytes);
 
-        if (ctx->GetCooperator()->Spawn([=,this](coop::Context* taskCtx)
+        if (ctx->GetCooperator()->Spawn([&](coop::Context* taskCtx)
         {
             m_coordinator.Acquire(taskCtx);
-            Send(ctx, copied, bytes);
+            Send(taskCtx, copied, bytes);
             m_coordinator.Release(taskCtx);
+            m_totalBytes += bytes;
             free(copied);
         }))
         {
@@ -53,19 +59,41 @@ struct EchoHandler : coop::network::TCPHandler
     }
 
     coop::Coordinator m_coordinator;
+    size_t m_totalBytes;
 };
 
 struct EchoHandlerFactory : coop::network::TCPHandlerFactory
 {
     coop::network::TCPHandler* Handler(int fd) final
     {
-        return new EchoHandler(fd);
+        auto* h = new EchoHandler(fd);
+        if (!h)
+        {
+            return nullptr;
+        }
+
+        m_handlers.Push(h);
+        return h;
     }
 
     void Delete(coop::network::TCPHandler* h)
     {
+        m_handlers.Remove(coop::detail::ascend_cast<EchoHandler>(h));
         delete h;
     }
+
+    void PrintStatus()
+    {
+        printf("---- EchoHandlerFactory ----\n");
+        printf("Currently connected: %lu sessions\n", m_handlers.Size());
+        m_handlers.Visit([](EchoHandler* h)
+        {
+            printf("- %lu total bytes\n", h->m_totalBytes);
+            return true;
+        });
+    }
+
+    EchoHandler::List m_handlers;
 };
 
 int bind_and_listen(int port)
@@ -97,15 +125,17 @@ void SpawningTask(coop::Context* ctx, void*)
     int epollFd = epoll_create(32);
 
     assert(epollFd >= 0 && serverFd >= 0);
-    
+
 	auto* co = ctx->GetCooperator();
+
+    coop::time::Ticker timeTicker;
+    co->SetTicker(&timeTicker);
 
     // Handles for the epoll we will use to manage eventing, and the listener which will
     // accept connections on a socket and be alerted via epoll
     //
     coop::Handle routerHandle;
     coop::Handle serverHandle;
-    coop::Handle timerHandle;
 
     // Begin the epoll controller and its TCP handler loop
     //
@@ -113,25 +143,21 @@ void SpawningTask(coop::Context* ctx, void*)
     coop::network::EpollRouter router(epollFd);
     coop::network::TCPServer server(serverFd, &factory);
     server.Register(&router);
-    
+
     co->Launch(router, &routerHandle);
     co->Launch(server, &serverHandle);
-
-    coop::time::Driver timeDriver;
-    co->Launch(timeDriver, &timerHandle);
 
     co->Spawn([&](coop::Context* ctx)
     {
         coop::Coordinator coord;
-        coop::time::Handle h(std::chrono::milliseconds(10), &coord);
+        coop::time::Handle h(std::chrono::seconds(1), &coord);
 
         while (!ctx->IsKilled())
         {
-            printf("Submitting timer to driver\n");
-            h.Submit(&timeDriver);
+            h.Submit(&timeTicker);
             h.Wait(ctx);
             assert(!coord.IsHeld());
-            printf("Timer triggered!\n");
+            factory.PrintStatus();
         }
     });
 

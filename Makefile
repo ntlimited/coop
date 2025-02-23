@@ -22,3 +22,7 @@ OBJECTS=$(patsubst %.cpp,obj/%.o,${SOURCE})
 
 bin/iomgr: main.cpp ${OBJECTS}
 	${CC} ${CXXFLAGS} $^ -o $@
+
+clean:
+	rm $$(find obj/ -name *.o)
+	rm bin/iomgr

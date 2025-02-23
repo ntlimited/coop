@@ -35,6 +35,7 @@ struct Segment
 };
 
 struct Coordinator;
+struct CoordinatorExtension;
 struct Cooperator;
 
 static constexpr int CONTEXT_LIST_ALL = 0;
@@ -58,15 +59,12 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         Handle* handle,
         Cooperator* cooperator)
     : Reffed<Context>(this)
-    , m_blockingOn(nullptr)
-    , m_blockingBehind(nullptr)
     , m_handle(handle)
 	, m_state(SchedulerState::YIELDED)
 	, m_priority(config.priority)
     , m_currentPriority(config.priority)
     , m_cooperator(cooperator)
 	{
-        TakeRef();
         m_killedCoordinator.Acquire(this);
         if (m_handle)
         {
@@ -93,19 +91,15 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
 
   private:
     friend struct Coordinator;
+    friend struct CoordinatorExtension;
 
-    // Blocking state: what resources that the 
-    //
-    Coordinator* m_blockingOn;
-    Context* m_blockingBehind;
-    
     // Enter the block caused by the given coordinator
     //
-    void Block(Coordinator* c);
+    void Block();
 
     // Unblock the given context, switching to it if requested.
     //
-    void Unblock(Context* c, const bool schedule);
+    void Unblock(Context* c, const bool schedule = true);
 
   private:
     friend struct Handle;

@@ -1,6 +1,6 @@
 #include "coop/time/handle.h"
 
-#include "coop/time/driver.h"
+#include "coop/time/ticker.h"
 
 namespace coop
 {
@@ -8,11 +8,11 @@ namespace coop
 namespace time
 {
 
-void Handle::Submit(Driver* driver)
+void Handle::Submit(Ticker* ticker)
 {
     assert(!m_deadline);
     assert(!m_coordinator->IsHeld());
-    driver->Accept(this);
+    ticker->Accept(this);
 }
 
 

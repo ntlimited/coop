@@ -24,7 +24,32 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
 
     Coordinated(Context* ctx)
     : m_context(ctx)
+    , m_satisfied(false)
     {
+    }
+
+    // Fun classes of bugs around this
+    //
+    ~Coordinated()
+    {
+        assert(Disconnected());
+    }
+
+    bool Satisfied() const
+    {
+        return m_satisfied;
+    }
+
+    // The satisfied flag is set when the Coordinated instance is pulled off the blocked list and
+    // its context is passed control. This is almost isomorphic to the 'heldBy' tracking in the
+    // Coordinator instance itself, but there is a nuance with "reentrancy" in the case where we
+    // compose the Coordinate(...) functionality and we need to distinguish the fact that an
+    // instance was already held by the same context (and it is waiting on another to unlock it
+    // out of band, e.g. a kill signal...)
+    //
+    operator bool() const
+    {
+        return m_satisfied;
     }
 
   private:
@@ -37,6 +62,7 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
     }
 
     Context*    m_context;
+    bool        m_satisfied;
 };
 
 struct Coordinator
@@ -69,14 +95,14 @@ struct Coordinator
     //
     void Release(Context*, const bool schedule = true);
 
-  protected:
+//  protected:
     friend struct CoordinatorExtension;
     void AddAsBlocked(Coordinated*);
     void RemoveAsBlocked(Coordinated*); 
     bool HeldBy(Context* ctx);
     void Shutdown(Context* ctx);
 
-  private:
+//  private:
     Context* m_heldBy;
     Coordinated::List m_blocking;
 

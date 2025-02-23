@@ -8,7 +8,7 @@ SOURCE+=${SOURCE_COOP_NETWORK}
 SOURCE+=${SOURCE_COOP_TIME}
 
 CC=g++
-CXXFLAGS=-I. --std=c++20 -g
+CXXFLAGS=-I. --std=c++20 -g -O0
 
 default: bin/iomgr
 
@@ -24,5 +24,4 @@ bin/iomgr: main.cpp ${OBJECTS}
 	${CC} ${CXXFLAGS} $^ -o $@
 
 clean:
-	rm $$(find obj/ -name *.o)
-	rm bin/iomgr
+	rm -f bin/iomgr $$(find obj/ -name *.o)

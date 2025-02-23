@@ -38,10 +38,11 @@ struct Cooperator
     thread_local static Cooperator* thread_cooperator;
 
 	Cooperator()
-	: m_scheduled(nullptr)
+    : m_shutdown(false)
+    , m_ticker(nullptr)
+	, m_scheduled(nullptr)
 	, m_submissionSemaphore(0)
 	, m_submissionAvailabilitySemaphore(8)
-    , m_shutdown(false)
 	{
 	}
 
@@ -114,6 +115,8 @@ struct Cooperator
 
     bool SpawnSubmitted(bool wait = false);
 
+    // TODO do this properly and add more nuances around in vs out of cooperator-safe ooepratins.
+    //
     void Shutdown()
     {
         m_shutdown = true;
@@ -123,9 +126,30 @@ struct Cooperator
 
     time::Ticker* GetTicker();
 
+    size_t ContextsCount() const
+    {
+        return m_contexts.Size();
+    }
+
+    size_t YieldedCount() const
+    {
+        return m_yielded.Size();
+    }
+
+    size_t BlockedCount() const
+    {
+        return m_blocked.Size();
+    }
+
     void SanityCheck();
 
+    // Ideally this would be better protected
+    //
+    void BoundarySafeKill(Handle*, const bool crossed = false);
+   
+    // Wow this is dirty, see the hpp
   private:
+
     void HandleCooperatorResumption(const SchedulerJumpResult res);
 
     bool m_shutdown;
@@ -133,6 +157,7 @@ struct Cooperator
 	Context* m_scheduled;
     time::Ticker* m_ticker;
     Handle m_tickerHandle;
+
 	std::jmp_buf m_jmpBuf;
 
 	std::counting_semaphore<8> m_submissionSemaphore;

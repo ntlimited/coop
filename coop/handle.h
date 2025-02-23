@@ -4,14 +4,16 @@ namespace coop
 {
 
 struct Context;
+struct Cooperator;
 
-// A Handle allows interaction with a context from outside of the context itself. It is
-// only safe to touch from within the cooperator's physical thread - it is not even safe to try to
-// access the context or its properties otherwise.
+// Handle is the mechanism for working with contexts executing in a cooperator, both in and outsidee
+// of cooperating contexts. Handle lifetimes must be guaranteed for as long as the execution of the
+// spawned context.
 //
-// APIs that are intended to be invoked on a context externally should always be wired
-// through the handle; APIs that are for a context to run within itself should live on the
-// context
+// In theory, this is the obvious mechanism to add "return things" to the spawn concept. However,
+// that's only really needed for outside-of-cooperator work that will probably want fancier ways
+// to do things in general than what's easy to do right now, and the intra-context case, there
+// isn't really any sufficiently magic syntax beyond union hijinks.
 //
 struct Handle
 {
@@ -30,6 +32,7 @@ struct Handle
 
   private:
     friend Context;
+    friend Cooperator;
 	Context* m_context;
 };
 

@@ -51,4 +51,9 @@ void Context::Unblock(Context* other, const bool schedule /* = true */)
     m_cooperator->Unblock(other, schedule);
 }
 
+void Context::Kill(Context* other)
+{
+    CoordinatorExtension().Shutdown(&other->m_killedCoordinator, other);
+}
+
 } // end namespace coop

@@ -47,6 +47,9 @@ struct Handle : EmbeddedListHookups<Handle>
     // that a handle which was satisfied during a yield is waited on after that point and at
     // that time it is not "submitted" anymore. So this is kind of C_I friendly.
     //
+    // Note that you also can just Acquire the coordinator directly; as long as you release before
+    // you resubmit it to the Ticket, it's fine.
+    //
     void Wait(Context* ctx);
     
     // Cancel the handle before it was triggered. Note that this is a delicate contract.

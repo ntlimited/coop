@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 
 #include "coop/coordinator.h"
+#include "coop/coordinate.h"
 #include "coop/cooperator.h"
 #include "coop/embedded_list.h"
 #include "coop/launchable.h"
@@ -35,26 +36,30 @@ struct EchoHandler : coop::network::TCPHandler, ::coop::EmbeddedListHookups<Echo
 
     bool Recv(coop::Context* ctx, void* buffer, const size_t bytes) final
     {
-        auto* copied = malloc(bytes);
+        void* copied = malloc(bytes);
         if (!copied)
         {
             return false;
         }
         memcpy(copied, buffer, bytes);
 
-        if (ctx->GetCooperator()->Spawn([&](coop::Context* taskCtx)
+        bool ok = ctx->GetCooperator()->Spawn([&](coop::Context* taskCtx)
         {
+            auto* myCopied = copied;
             m_coordinator.Acquire(taskCtx);
-            Send(taskCtx, copied, bytes);
+            Send(taskCtx, myCopied, bytes);
             m_coordinator.Release(taskCtx);
             m_totalBytes += bytes;
             free(copied);
-        }))
+        });
+
+        if (!ok)
         {
-            return true;
+            free(copied);
+            return false;
         }
-        free(copied);
-        return false;
+            
+        return true;
     }
 
     coop::Coordinator m_coordinator;
@@ -145,20 +150,89 @@ void SpawningTask(coop::Context* ctx, void*)
 
     co->Launch(router, &routerHandle);
     co->Launch(server, &serverHandle);
+    auto* factoryPtr = &factory;
 
-    co->Spawn([&](coop::Context* ctx)
+    printf("In base frame, factory ptr ptr is %p\n", &factoryPtr);
+
+    co->Spawn([factoryPtr](coop::Context* statusCtx)
     {
+        printf("Status loop started, factory pointer is %p; ptr ptr is %p\n", factoryPtr, &factoryPtr);
         coop::Coordinator coord;
         coop::time::Handle h(std::chrono::seconds(1), &coord);
 
-        while (!ctx->IsKilled())
+        while (!statusCtx->IsKilled())
         {
-            h.Submit(&timeTicker);
-            h.Wait(ctx);
-            assert(!coord.IsHeld());
-            factory.PrintStatus();
+            h.Submit(statusCtx->GetCooperator()->GetTicker());
+            h.Wait(statusCtx);
+
+            factoryPtr->PrintStatus();
+            printf("---- Cooperator ----\n");
+            printf("Total: %lu\nYielded: %lu\nBlocked: %lu\n",
+                statusCtx->GetCooperator()->ContextsCount(),
+                statusCtx->GetCooperator()->YieldedCount(),
+                statusCtx->GetCooperator()->BlockedCount());
         }
     });
+        
+    printf("Status loop yielded, factory pointer is %p\n", &factory);
+
+    // Fun with coordination mechanisms
+    //
+    coop::Handle toyHandle;
+    co->Spawn([&](coop::Context* toyCtx)
+    {
+        coop::Coordinator fast;
+        coop::Coordinator slow;
+
+        coop::time::Handle fastHandle(std::chrono::seconds(3), &fast);
+        coop::time::Handle slowHandle(std::chrono::seconds(5), &slow);
+            
+        fastHandle.Submit(toyCtx->GetCooperator()->GetTicker());
+        slowHandle.Submit(toyCtx->GetCooperator()->GetTicker());
+
+        printf("Preparing to start playing with timers and coordinate()\n");
+
+        while (!toyCtx->IsKilled())
+        {
+
+            auto* acquired = coop::CoordinateWithKill(toyCtx, &fast, &slow);
+            if (acquired == &fast)
+            {
+                printf("Fast won!\n");
+                fast.Release(toyCtx);
+                fastHandle.Submit(toyCtx->GetCooperator()->GetTicker());
+            }
+            else if (acquired == &slow)
+            {
+                printf("Slow won!\n");
+                slow.Release(toyCtx);
+                slowHandle.Submit(toyCtx->GetCooperator()->GetTicker());
+            }
+            else
+            {
+                printf("We were killed :(\n");
+            }
+        }
+        printf("Toy example finished\n");
+    }, &toyHandle);
+
+    coop::Coordinator latch;
+    coop::time::Handle latchWait(std::chrono::seconds(15), &latch);
+    latchWait.Submit(&timeTicker);
+
+    printf("Preparing to kill toy in 30s\n");
+
+    latch.Acquire(ctx);
+    
+    printf("Killing toy example\n");
+    toyHandle.Kill();
+
+    while (toyHandle)
+    {
+        ctx->Yield();
+    }
+
+    printf("Killed toy handle\n");
 
     // Kill epoll and wait for it to die.
     //

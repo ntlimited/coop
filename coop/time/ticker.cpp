@@ -6,8 +6,10 @@ namespace coop
 namespace time
 {
 
-Ticker::Ticker()
+Ticker::Ticker(int resolution /* = 0 */)
 : m_context(nullptr)
+, m_epoch(0)
+, m_resolution(resolution)
 {
 }
 
@@ -34,7 +36,7 @@ void Ticker::Launch(Context* ctx)
             continue;
         }
 
-        m_epoch = Now();
+        m_epoch = now;
 
         // We do not process bucket 0 because this phase will move items into bucket 0 for us to
         // handle afterwards
@@ -67,7 +69,7 @@ bool Ticker::Accept(Handle* handle)
 {
     // The handle knows its interval to trigger at, but we need to set a deadline based on 'now'
     //
-    auto deadline = handle->SetDeadline(m_epoch);
+    auto deadline = handle->SetDeadline(m_epoch, m_resolution);
     auto bucket = BucketFor(deadline);
 
     m_buckets[bucket].list.Push(handle);
@@ -117,8 +119,10 @@ bool Ticker::ProcessBucket(int idx, size_t now)
             return true;
         }
 
+        assert(moveTo < idx);
+
         bucket.list.Remove(handle);
-        m_buckets[idx].list.Push(handle);
+        m_buckets[moveTo].list.Push(handle);
 
         // Keep iterating
         //
@@ -132,12 +136,12 @@ size_t Ticker::Now() const
 {
     return std::chrono::duration_cast<Interval>(
         std::chrono::system_clock::now().time_since_epoch()
-    ).count();
+    ).count() >> m_resolution;
 }
 
 int Ticker::BucketFor(size_t interval) const
 {
-    auto b = (sizeof(interval)<<3) - __builtin_clzl(interval);
+    auto b = ((sizeof(interval)<<3) - __builtin_clzl(interval)) - m_resolution;
     if (b >= BUCKETS)
     {
         b = BUCKETS - 1;

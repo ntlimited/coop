@@ -1,5 +1,6 @@
 #pragma once
 
+#include <type_traits>
 #include <cassert>
 
 #include "coordinator.h"
@@ -55,6 +56,11 @@ struct Reffed
     // A Reffed type must be tied to the lifetime of a Context, which also works out with it being
     // used for the lifetime of a Context.
     //
+    // TODO this is a very obvious place to build some kind of context-based gc where we could
+    // attach hazard lists, but in theory there shouldn't be much else natively that requires
+    // this kind of treatment; contexts are special as even conceptually they have something of
+    // a zombie state
+    //
     Reffed(Context* ctx)
     : m_refs(1)
     , m_zeroSignal(ctx)
@@ -75,8 +81,6 @@ struct Reffed
     {
         if (!--m_refs)
         {
-            // I don't feel great about this; is it an excuse to use Self?
-            //
             CoordinatorExtension().Shutdown(&m_zeroSignal, ::coop::Self());
             return;
         }

@@ -10,7 +10,8 @@ SOURCE+=${SOURCE_COOP_TIME}
 CC=g++
 CXXFLAGS=-I. --std=c++20 -g -O0
 
-default: bin/iomgr
+default: clean
+	make -j16 bin/iomgr
 
 obj:
 	mkdir obj obj/time obj/network

@@ -69,7 +69,10 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
         //
         memcpy(spawnCtx->m_segment.Bottom(), &fn, sizeof(Fn));
 #pragma GCC diagnostic pop
+
 		void* top = spawnCtx->m_segment.Top();
+        // After this point, we have 
+        //
         asm volatile(
 			"mov %[rs], %%rsp \n"
             : [ rs ] "+r" (top) ::

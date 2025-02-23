@@ -171,6 +171,7 @@ void SpawningTask(coop::Context* ctx, void*)
                 statusCtx->GetCooperator()->ContextsCount(),
                 statusCtx->GetCooperator()->YieldedCount(),
                 statusCtx->GetCooperator()->BlockedCount());
+            break;
         }
     });
         

@@ -20,13 +20,14 @@ namespace time
 // * Bucket 2 stores deadlines between [2, 4)
 // * Bucket N stores deadlines between [1<<(N-1), 1<<N)
 //
-// Conveniently, this maps to the binary representation of these deadlines
+// We can keep the metadata for the last time that we checked a bucket, and then scan from left
+// to right each time 'now' changes.
 //
 struct Ticker : Launchable
 {
     static constexpr int BUCKETS = 32;
 
-    Ticker();
+    Ticker(int resolution = 0);
 
     void Launch(Context* ctx) final;
     
@@ -62,6 +63,7 @@ struct Ticker : Launchable
 
     Context* m_context;
     size_t m_epoch;
+    int m_resolution;
 };
 
 } // end namespace coop::time

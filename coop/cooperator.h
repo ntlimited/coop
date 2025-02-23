@@ -173,6 +173,7 @@ struct Cooperator
     Context::AllContextsList m_contexts;
     Context::ContextStateList m_yielded;
     Context::ContextStateList m_blocked;
+    Context::ContextStateList m_zombie;
 };
 
 void* AllocateContext(SpawnConfiguration const& config);

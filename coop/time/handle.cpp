@@ -40,9 +40,9 @@ void Handle::Deadline(Context* ctx)
     GetCoordinator()->Release(ctx);
 }
 
-size_t Handle::SetDeadline(size_t epoch)
+size_t Handle::SetDeadline(size_t epoch, int resolution)
 {
-    auto intervals = m_interval.count();
+    auto intervals = m_interval.count() >> resolution;
     m_deadline = epoch + intervals;
     return intervals;
 }

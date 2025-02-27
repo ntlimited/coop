@@ -21,7 +21,13 @@ namespace time
 // * Bucket N stores deadlines between [1<<(N-1), 1<<N)
 //
 // We can keep the metadata for the last time that we checked a bucket, and then scan from left
-// to right each time 'now' changes.
+// to right each time 'now' changes. As long as we scan bucket 1 every tick, bucket 2 every other,
+// and so on based on the left boundary, we will always move events properly (generally one bucket
+// at a time).
+//
+// The unit of operation for Tickers is a Handle, which pairs a deadline in the future with a
+// coordinator to be released at or after that moment. This is then submitted to a ticker, and
+// the contract is honored with
 //
 struct Ticker : Launchable
 {
@@ -34,6 +40,8 @@ struct Ticker : Launchable
     // Submit the given coordinator to be released after `interval` has passed. If submission succeeds,
     // then the coordinator and handle lifetime must exceed when `interval` passes, or until the
     // handle is cancelled.
+    //
+    // It is expected that the 
     //
     bool Accept(Handle* handle);
 

@@ -147,9 +147,9 @@ struct Cooperator
     //
     void BoundarySafeKill(Handle*, const bool crossed = false);
    
-    // Wow this is dirty, see the hpp
+    void PrintContextTree(Context* ctx = nullptr, int indent = 0) ;
+  
   private:
-
     void HandleCooperatorResumption(const SchedulerJumpResult res);
 
     bool m_shutdown;

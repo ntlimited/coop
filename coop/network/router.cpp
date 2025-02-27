@@ -22,5 +22,4 @@ void Router::SetRouter(Handle* h)
 }
 
 } // end namespace coop::network
-
 } // end namespace coop

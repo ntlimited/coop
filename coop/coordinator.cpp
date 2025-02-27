@@ -53,6 +53,8 @@ void Coordinator::Acquire(Context* ctx)
     // Block the context on the this coordinator
     //
     ctx->Block();
+
+    return;
 }
 
 void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
@@ -79,6 +81,12 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
     {
         return;
     }
+
+    m_blocking.Visit([&](Coordinated* others)
+    {
+        assert(others->m_context != next->m_context);
+        return true;
+    });
 
     // Mark the coordinated instance as having been satisfied by gaining the lock now
     // that we've popped it from the list
@@ -110,7 +118,7 @@ bool Coordinator::HeldBy(Context* ctx)
 //
 // This is very useful for, e.g., kill conditions.
 //
-void Coordinator::Shutdown(Context* ctx)
+void Coordinator::Shutdown(Context* ctx, const bool schedule /* = true */)
 {
     m_shutdown = true;
     m_heldBy = nullptr;
@@ -121,7 +129,7 @@ void Coordinator::Shutdown(Context* ctx)
     while (m_blocking.Pop(ord))
     {
         ord->m_satisfied = true;
-        ctx->Unblock(ord->GetContext());
+        ctx->Unblock(ord->GetContext(), schedule);
     }
 }
 

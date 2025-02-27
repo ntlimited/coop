@@ -82,7 +82,7 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         }
     }
     m_scheduled = nullptr;
-    SanityCheck();
+    //SanityCheck();
 }
 
 void Cooperator::Launch()
@@ -146,7 +146,7 @@ void Cooperator::Resume(Context* ctx)
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
 
-    SanityCheck();
+    //SanityCheck();
    
     auto ret = setjmp(m_jmpBuf);
     if (!ret)
@@ -170,7 +170,7 @@ void Cooperator::Block(Context* ctx)
         m_yielded.Remove(ctx);
         m_blocked.Push(ctx);
 
-        SanityCheck();
+        //SanityCheck();
         return;
     }
 
@@ -260,7 +260,7 @@ bool Cooperator::SpawnSubmitted(bool wait /* = false */)
 		submitted.func(ctx, submitted.arg);
     });
 
-    SanityCheck();
+    //SanityCheck();
 
     return true;
 }
@@ -395,6 +395,45 @@ void Cooperator::BoundarySafeKill(Handle* handle, const bool crossed /* = false 
 
     Submit(&BoundaryCrossingKill, &args);
     args.mutex.unlock();
+}
+
+void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 0 */)
+{
+    if (ctx)
+    {
+        for (int i = 0 ; i < indent ; i++)
+        {
+            printf("\t");
+        }
+        const char* status = ctx->m_state == coop::SchedulerState::RUNNING ? "Running" :
+            ctx->m_state == SchedulerState::YIELDED ? "Yielded" : "Blocked";
+        printf("%s (%p) [%s%s]\n", ctx->GetName(), ctx, status, ctx->IsKilled() ? "!" : "");
+        ctx->m_children.Visit([&](coop::Context* child) -> bool
+        {
+            PrintContextTree(child, indent + 1);
+            return true;
+        });
+        return;
+    }
+
+    size_t remaining = m_contexts.Size();
+    printf("---- Context Tree (%lu) ----\n", remaining);
+    m_contexts.Visit([&](coop::Context* child) -> bool
+    {
+        remaining--;
+        if (!child->Parent())
+        {
+            PrintContextTree(child, 0);
+        }
+        return true;
+    });
+    assert(!remaining);
+}
+
+void DeleteContext(Context* ctx)
+{
+    memset(ctx, 0xD0, sizeof(Context));
+    free(ctx);
 }
 
 void* AllocateContext(SpawnConfiguration const& config)

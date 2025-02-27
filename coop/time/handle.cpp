@@ -1,6 +1,9 @@
-#include "coop/time/handle.h"
+#include "handle.h"
 
-#include "coop/time/ticker.h"
+#include "ticker.h"
+
+#include "coop/cooperator.h"
+#include "coop/self.h"
 
 namespace coop
 {
@@ -8,10 +11,28 @@ namespace coop
 namespace time
 {
 
-void Handle::Submit(Ticker* ticker)
+Handle::~Handle()
 {
+    // When the handle is being destroyed, it must not be in a ticker bucket or it will
+    // explode.
+    //
+    if (m_deadline)
+    {
+        assert(!Disconnected());
+        m_list->Remove(this);
+    }
+
+    assert(Disconnected());
+}
+
+void Handle::Submit(Ticker* ticker /* = nullptr */)
+{
+    if (!ticker)
+    {
+        ticker = Self()->GetCooperator()->GetTicker();
+    }
     assert(!m_deadline);
-    assert(!m_coordinator->IsHeld());
+    assert(Disconnected());
     ticker->Accept(this);
 }
 
@@ -19,24 +40,40 @@ void Handle::Submit(Ticker* ticker)
 void Handle::Wait(Context* ctx)
 {
     GetCoordinator()->Acquire(ctx);
-    GetCoordinator()->Release(ctx);
 }
 
-void Handle::Cancel(Context* ctx)
-{    
-    assert(m_deadline);
+void Handle::Cancel()
+{
+    if (!m_deadline)
+    {
+        assert(Disconnected());
+        return;
+    }
+    
+    assert(!Disconnected());
 
     // Remove ourselves from the list for whatever bucket we're in
     //
-    Pop();
-    m_coordinator->Release(ctx);
+    m_list->Remove(this);
     m_deadline = 0;
 }
 
 void Handle::Deadline(Context* ctx)
 {
+    // Must have had deadline scheduled
+    //
     assert(m_deadline);
+
+    // Must have already been disconnected from the bucket holding the handle
+    //
+    assert(Disconnected());
+
+    // Reset deadline as we no longer have one
+    //
     m_deadline = 0;
+
+    // Signal
+    //
     GetCoordinator()->Release(ctx);
 }
 

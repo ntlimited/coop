@@ -15,6 +15,7 @@ Ticker::Ticker(int resolution /* = 0 */)
 
 void Ticker::Launch(Context* ctx)
 {
+    ctx->SetName("ticker");
     m_context = ctx;
 
     // Epoch is the arbitrary time the last full bucket cycle completed, which starts at the
@@ -52,28 +53,32 @@ void Ticker::Launch(Context* ctx)
         // Process has finished populating this bucket with "execute immediately" events
         //
 
-        m_buckets[0].list.Visit([this, ctx](Handle* handle)
+        Handle* handle;
+        while (m_buckets[0].list.Pop(handle))
         {
             // Remove the handle before switching so that it can get re-submitted if the caller
             // code needs to do so
             //
-            m_buckets[0].list.Remove(handle);
+            handle->m_list = nullptr;
             handle->Deadline(ctx);
-
-            return true;
-        });
+        }
     }
 }
 
 bool Ticker::Accept(Handle* handle)
 {
+    // Technically this doesn't have to be the case, but it's unlikely enough right now that I don't
+    // feel bad about this.
+    //
+    assert(handle->GetCoordinator()->IsHeld());
+
     // The handle knows its interval to trigger at, but we need to set a deadline based on 'now'
     //
     auto deadline = handle->SetDeadline(m_epoch, m_resolution);
     auto bucket = BucketFor(deadline);
 
     m_buckets[bucket].list.Push(handle);
-    handle->GetCoordinator()->Acquire(m_context);
+    handle->m_list = &m_buckets[bucket].list;
     return true;
 }
 
@@ -108,6 +113,7 @@ bool Ticker::ProcessBucket(int idx, size_t now)
         {
             bucket.list.Remove(handle);
             m_buckets[0].list.Push(handle);
+            handle->m_list = &m_buckets[0].list;
             return true;
         }
 
@@ -123,6 +129,7 @@ bool Ticker::ProcessBucket(int idx, size_t now)
 
         bucket.list.Remove(handle);
         m_buckets[moveTo].list.Push(handle);
+        handle->m_list = &m_buckets[moveTo].list;
 
         // Keep iterating
         //

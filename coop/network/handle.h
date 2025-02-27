@@ -4,6 +4,8 @@
 
 #include "event_mask.h"
 
+#include "coop/embedded_list.h"
+
 namespace coop
 {
 
@@ -24,12 +26,22 @@ struct Router;
 // * Eventually, the handle is unregistered and it/its associated data can be disposed of safely
 //
 // Currently, handles carry around the router with them which allows for some neat syntax tricks,
+// and also is how the non-abstract parts of the router contract are implemented.
 //
-struct Handle
+// Note that handles are completely pure eventing constructs.
+//
+struct Handle : EmbeddedListHookups<Handle>
 {
+    // The embedded list for handles is used for tracking which handles are registered to which
+    // routers
+    //
+    using List = EmbeddedList<Handle>;
+
     Handle(int fd, EventMask mask, Coordinator* coordinator);
     Handle(Handle const&) = delete;
     Handle(Handle&&) = delete;
+
+    ~Handle();
 
     bool SetNonBlocking();
 

@@ -23,7 +23,7 @@ bool Cooperator::Spawn(Fn const& fn, Handle* handle /* = nullptr */)
 template<typename Fn>
 bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* handle /* = nullptr */)
 {
-    if (m_shutdown)
+    if (m_shutdown || (m_scheduled && m_scheduled->IsKilled()))
 	{
         return false;
 	}
@@ -33,8 +33,7 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
 	{
         return false;
 	}
-	auto* spawnCtx = new (alloc) Context(config, handle, this);
-
+	auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
     m_contexts.Push(spawnCtx);
 
 	// Depending on whether we're running this from the cooperator's own stack or

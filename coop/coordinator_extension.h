@@ -20,6 +20,8 @@ struct CoordinatorExtension
     bool HeldBy(Coordinator* c, Context* ctx);
 
     void Shutdown(Coordinator* c, Context* ctx);
+
+    void SetContext(Coordinated* c, Context* ctx);
 };
 
 } // end namespace coop

@@ -31,4 +31,9 @@ void CoordinatorExtension::Shutdown(Coordinator* c, Context* ctx)
     c->Shutdown(ctx);
 }
 
+void CoordinatorExtension::SetContext(Coordinated* c, Context* ctx)
+{
+    c->SetContext(ctx);
+}
+
 } // end namespace coop

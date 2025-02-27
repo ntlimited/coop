@@ -23,6 +23,8 @@ struct Ticker;
 // into all kinds of high level mechanics by creating a bunch of contexts; however, these are
 // 'userland' versions of what the time package offers natively.
 //
+// 
+//
 struct Handle : EmbeddedListHookups<Handle>
 {
     using List = EmbeddedList<Handle>;
@@ -38,37 +40,30 @@ struct Handle : EmbeddedListHookups<Handle>
         assert(m_interval != Interval(0));
     }
 
-    ~Handle()
-    {
-        // When the handle is being destroyed, it must not be in a ticker bucket or it will
-        // explode.
-        //
-        if (m_deadline)
-        {
-            assert(!Disconnected());
-            Pop();
-        }
-
-        assert(Disconnected());
-    }
-
-    // Submit the handle to trigger in the future
+    // Because this happens in a context, it's safe to unilaterally do this apart from that the
+    // accounting for the list gets messed up. We could just record the list in a separate
+    // field but not a big deal at this instant.
     //
-    void Submit(Ticker* ticker);
+    ~Handle();
 
-    // Wait for the handle's deadline to bet hit. This contract is slightly looser than ideal,
-    // because we don't want to let an un-submitted handle be waited on, but it's also possible
-    // that a handle which was satisfied during a yield is waited on after that point and at
-    // that time it is not "submitted" anymore. So this is kind of C_I friendly.
+    // Submit the handle to trigger in the future. The native ticker for the cooperator running the
+    // context (which must be active, of course) will be used if one is not specified.
     //
-    // Note that you also can just Acquire the coordinator directly; as long as you release before
-    // you resubmit it to the Ticket, it's fine.
+    // This is also just sugar for ticker->Accept(handle), but it also allows just using the
+    // current 'native' ticker.
+    //
+    void Submit(Ticker* ticker = nullptr);
+
+    // This is just "sugar" for acquiring the submitted coordinator. It may be more useful in the
+    // future though?
+    //
+    // Also should have a better way of specifying "this is the current context always"
     //
     void Wait(Context* ctx);
     
-    // Cancel the handle before it was triggered. Note that this is a delicate contract.
+    // Cancel the handle if it is still submitted.
     //
-    void Cancel(Context* ctx);
+    void Cancel();
 
   private:
     friend Ticker;
@@ -87,6 +82,7 @@ struct Handle : EmbeddedListHookups<Handle>
     Interval m_interval;
     Coordinator* m_coordinator;
     size_t m_deadline;
+    List* m_list;
 };
 
 } // end namespace coop::time

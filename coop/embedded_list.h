@@ -44,13 +44,18 @@ struct EmbeddedListHookups
         prev = nullptr;
     }
 
+// TODO should this just be public for debug asserts?
+//
+public:
     bool Disconnected() const
     {
         return next == prev;
     }
+protected:
 
     void InsertBefore(Hookups* other)
     {
+        assert(Disconnected());
         assert(other != this);
         assert(other->prev != this);
 
@@ -61,6 +66,12 @@ struct EmbeddedListHookups
         other->prev = this;
     }
  private:
+    T* Cast()
+    {
+        auto* v2 = detail::ascend_cast<T, Hookups>(this);
+        return v2;
+    }
+
     Hookups* prev;
     Hookups* next;
 };
@@ -95,7 +106,7 @@ struct EmbeddedList
             return false;
         }
 
-        out = Cast(head.next);
+        out = head.next->Cast();
         head.next->Pop();
         size--;
         return true;
@@ -103,7 +114,7 @@ struct EmbeddedList
 
     T* Peek()
     {
-        return Cast(head.next);
+        return head.next->Cast();
     }
 
     size_t Size() const
@@ -150,6 +161,10 @@ struct EmbeddedList
         }
     }
 
+    // NOTE this is a dangerous as hell contract as yielding while within this method can lead to
+    // completely broken contracts; the nodes we are moving over may be unhooked from this list and
+    // rehooked into completely different ones.
+    //
     template<typename Fn>
     void Visit(Fn const& fn)
     {
@@ -158,7 +173,7 @@ struct EmbeddedList
         {
             // Iterate forward now incase it gets removed and relinked somewhere else
             //
-            auto* casted = Cast(at);
+            auto* casted = at->Cast();
             at = at->next;
             
             if (!fn(casted))
@@ -172,12 +187,6 @@ struct EmbeddedList
     Hookups head;
     Hookups tail;
     size_t size;
-
-    static T* Cast(Hookups* h)
-    {
-        auto* v2 = detail::ascend_cast<T, Hookups>(h);
-        return v2;
-    }
 };
 
 } // end namespace coop

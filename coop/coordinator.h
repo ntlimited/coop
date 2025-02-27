@@ -28,6 +28,12 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
     {
     }
 
+    Coordinated()
+    : m_context(nullptr)
+    , m_satisfied(false)
+    {
+    }
+
     // Fun classes of bugs around this
     //
     ~Coordinated()
@@ -56,6 +62,11 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
     friend struct Coordinator;
     friend struct CoordinatorExtension;
 
+    void SetContext(Context* ctx)
+    {
+        m_context = ctx;
+    }
+
     Context* GetContext()
     {
         return m_context;
@@ -65,6 +76,12 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
     bool        m_satisfied;
 };
 
+// Coordinator is the sole coordination primitive for contexts. It is heavily used and non-virtual,
+// which also means that higher level constructs are not themselves Coordinators.
+//
+// It is generally better form to take a pointer to a cooperator as an argument to build higher
+// level items, versus embed one's own Coordinator.
+//
 struct Coordinator
 {
     Coordinator(const Coordinator&) = delete;
@@ -84,8 +101,14 @@ struct Coordinator
 
     bool IsHeld() const;
 
+    // TryAcquire, Acquire, and Release all act in the manner that one would expect from a mutex
+    // analogue. For timeout based behaviors, see the coop::time package and the multi coordinator
+    // aka 'CoordinateWith' functionality.
+    //
     bool TryAcquire(Context*);
 
+    // Acquire can fail in the event that the Coordinator has been shut down
+    //
     void Acquire(Context*);
 
     // Release the coordinator, unblocking the context (if one exists) at the head of the wait
@@ -95,12 +118,19 @@ struct Coordinator
     //
     void Release(Context*, const bool schedule = true);
 
-//  protected:
+    // The lack of move and copy semantics make this true
+    //
+    bool operator==(Coordinator* other) const
+    {
+        return this == other;
+    }
+  
+  protected:
     friend struct CoordinatorExtension;
     void AddAsBlocked(Coordinated*);
     void RemoveAsBlocked(Coordinated*); 
     bool HeldBy(Context* ctx);
-    void Shutdown(Context* ctx);
+    void Shutdown(Context* ctx, const bool schedule = true);
 
 //  private:
     Context* m_heldBy;

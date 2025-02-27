@@ -2,6 +2,7 @@
 
 #include "event_mask.h"
 
+#include "coop/embedded_list.h"
 #include "coop/launchable.h"
 
 namespace coop
@@ -45,13 +46,14 @@ struct Router : Launchable
     Coordinator* GetCoordinator(Handle* h) const;
     void SetRouter(Handle* h);
 
-  private:
     friend Handle;
     virtual bool Unregister(Handle*) = 0;
     virtual bool Update(Handle*, const EventMask) = 0;
 
-  private:
     Context* m_context;
+
+  private:
+    EmbeddedList<Handle> m_list;
 };
 
 } // end namespace coop::network

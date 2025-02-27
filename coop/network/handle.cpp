@@ -22,6 +22,14 @@ Handle::Handle(int fd, EventMask mask, Coordinator* coordinator)
 {
 }
 
+// Similar to other logic, better to make sure you're cleaning up, add an auto class if you want
+// hand holding
+Handle::~Handle()
+{
+    assert(!Registered());
+    assert(Disconnected());
+}
+
 bool Handle::SetNonBlocking()
 {
     if (fcntl(GetFD(), F_SETFL, fcntl(GetFD(), F_GETFL) | O_NONBLOCK) == 0)
@@ -36,6 +44,7 @@ void Handle::Unregister()
 {
     assert(Registered());
     m_router->Unregister(this);
+    m_router->m_list.Remove(this);
     m_router = nullptr;
 }
 
@@ -81,6 +90,7 @@ void Handle::SetRouter(Router* router)
 {
     assert(!Registered());
     m_router = router;
+    m_router->m_list.Push(this);
 }
 
 Coordinator* Handle::GetCoordinator()

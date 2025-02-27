@@ -11,7 +11,7 @@ CC=g++
 CXXFLAGS=-I. --std=c++20 -g -O0
 
 default: clean
-	make -j16 bin/iomgr
+	make -j16 bin/server bin/client
 
 obj:
 	mkdir obj obj/time obj/network
@@ -21,7 +21,10 @@ obj/%.o: %.cpp
 
 OBJECTS=$(patsubst %.cpp,obj/%.o,${SOURCE})
 
-bin/iomgr: main.cpp ${OBJECTS}
+bin/server: server.cpp ${OBJECTS}
+	${CC} ${CXXFLAGS} $^ -o $@
+
+bin/client: client.cpp ${OBJECTS}
 	${CC} ${CXXFLAGS} $^ -o $@
 
 clean:

@@ -5,10 +5,12 @@
 #include <unistd.h>
 #include <string.h>
 
+#include "tcp_handler.h"
 #include "tcp_server.h"
 
 #include "coop/context.h"
 #include "coop/cooperator.h"
+#include "coop/multi_coordinator.h"
 
 namespace coop
 {
@@ -47,18 +49,26 @@ bool TCPHandler::Register(Router* r)
 
 void TCPHandler::Launch(Context* ctx)
 {
+    ctx->SetName("TCPHandler");
     char buffer[4096];
         
-    while (1)
+    while (!ctx->IsKilled())
     {
         int ret = recv(m_handle.GetFD(), &buffer[0], 4096, 0);
         if (ret <= 0)
         {
+            printf("!! error in recv: %d (%s)\n", errno, strerror(errno));
             if (ret & (EWOULDBLOCK | EAGAIN))
             {
                 // Wait for another signal
                 //
-                m_coordinator.Acquire(ctx);
+                if (m_coordinator != CoordinateWithKill(ctx, &m_coordinator))
+                {
+                    // Our context was killed before our coordinator triggered
+                    //
+                    assert(ctx->IsKilled());
+                    return;
+                }
                 continue;
             }
             break;
@@ -69,8 +79,6 @@ void TCPHandler::Launch(Context* ctx)
             break;
         }
     }
-  exit:
-    delete this;
 }
 
 bool TCPHandler::Send(Context* ctx, void* buffer, size_t bytes)
@@ -94,13 +102,22 @@ bool TCPHandler::Send(Context* ctx, void* buffer, size_t bytes)
 
     while (remaining)
     {
-        int sent = send(m_handle.GetFD(), sending, remaining, 0);
+        // MSG_NOSIGNAL: ignore sigpipe. This came up when testing a delayed task that waits to echo
+        // back data, and would still be alive after the TCPHandler itself was destructed. This could
+        // probably be handled with more elegant lifetime management but it's not worth it for a toy
+        // framework.
+        //
+        int sent = send(m_handle.GetFD(), sending, remaining, MSG_NOSIGNAL);
         if (sent < 0)
         {
             if (sent & (EAGAIN | EWOULDBLOCK))
             {
                 // Wait on the coordinator again
                 //
+                if (&m_coordinator != CoordinateWithKill(ctx, &m_coordinator))
+                {
+                    break;
+                }
                 m_coordinator.Acquire(ctx);
                 continue;
             }
@@ -119,7 +136,7 @@ bool TCPHandler::Send(Context* ctx, void* buffer, size_t bytes)
     {
         m_handle -= OUT;
     }
-    return true;
+    return remaining == 0;
 }
 
 } // end namespace network

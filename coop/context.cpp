@@ -7,12 +7,15 @@ namespace coop
 
 Context::~Context()
 {
-    // Anyone waiting on this to die will get signaled before it's actually dead. Per the Spawn
-    // docs, this must be decoupled from
+    if (m_parent)
+    {
+        Detach();
+    }
+    // Properly kill this if we were not already. Note that this propagates down to child contexts
     //
     if (m_killedCoordinator.IsHeld())
     {
-        CoordinatorExtension().Shutdown(&m_killedCoordinator, this);
+        Kill(this);
     }
 
     RemoveRef();
@@ -51,9 +54,14 @@ void Context::Unblock(Context* other, const bool schedule /* = true */)
     m_cooperator->Unblock(other, schedule);
 }
 
-void Context::Kill(Context* other)
+void Context::Kill(Context* other, const bool schedule /* = true */)
 {
     CoordinatorExtension().Shutdown(&other->m_killedCoordinator, other);
+    other->m_children.Visit([&](Context* child)
+    {
+        Kill(child, schedule);
+        return true;
+    });
 }
 
 } // end namespace coop

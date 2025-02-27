@@ -23,6 +23,7 @@ EpollRouter::EpollRouter(int epollFd)
 void EpollRouter::Launch(Context* ctx)
 {
     m_ctx = ctx;
+    ctx->SetName("EpollRouter");
     while (!ctx->IsKilled())
     {
         // For obvious reasons, we perform a non-blocking wait
@@ -47,7 +48,9 @@ void EpollRouter::Launch(Context* ctx)
         while (at < ret)
         {
             auto& evt = m_events[at++];
-            reinterpret_cast<Coordinator*>(evt.data.ptr)->Release(ctx);
+            auto* handle = reinterpret_cast<Handle*>(evt.data.ptr);
+            printf("got an epoll event for %d (%d)\n", handle->GetFD(), evt.events);
+            GetCoordinator(handle)->Release(ctx);
         }
 
         ctx->Yield();
@@ -58,9 +61,13 @@ void EpollRouter::Launch(Context* ctx)
 //
 bool EpollRouter::Register(Handle* handle)
 {
+    // This is a sloppy contract, but it's painful to properly acquire a context in certain codepaths
+    // prior to instantiating and registering handles.
+    //
+    GetCoordinator(handle)->TryAcquire(m_context);
+
     int fd = handle->GetFD();
     EventMask mask = handle->GetMask();
-    Coordinator* coordinator = GetCoordinator(handle);
     struct epoll_event event;
 
     // We will only trigger (e.g. release the coordinator) once per event, even if do not process it
@@ -68,23 +75,21 @@ bool EpollRouter::Register(Handle* handle)
     //
     event.events = MaskConverter()(mask) | EPOLLET;
 
-    event.data.ptr = reinterpret_cast<void*>(coordinator);
+    event.data.ptr = reinterpret_cast<void*>(handle);
 
     int res = epoll_ctl(m_epollFd, EPOLL_CTL_ADD, fd, &event);
         
     if (res < 0)
     {
         printf("epoll_ctl failed: %d (%s)\n", errno, strerror(errno));
+        assert(false);
         // TODO error handling
         //
         return false;
     }
 
-    // We acquire the coordinator and will release it when we get events triggered off of epoll
-    //
-    coordinator->TryAcquire(m_ctx);
-
-    // Handle will know to make future callbacks to this router
+    // Handle will know to make future callbacks to this router. Note that this is also the entry
+    // point for other mandatory logic for Register to complete.
     //
     SetRouter(handle);
     return true;

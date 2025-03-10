@@ -28,7 +28,6 @@ struct EmbeddedListHookups
     {
     }
 
-  protected:
     // These methods are only intended to be called by the list they're a member of, as otherwise
     // various guarantees may not be honored.
     //
@@ -38,20 +37,20 @@ struct EmbeddedListHookups
 
     void Pop()
     {
-        prev->next = next;
-        next->prev = prev;
+        prev->SetNext(next);
+        next->SetPrev(prev);
+        
         next = nullptr;
         prev = nullptr;
     }
 
-// TODO should this just be public for debug asserts?
-//
-public:
+    // TODO lock down visibility
+    //
+    
     bool Disconnected() const
     {
         return next == prev;
     }
-protected:
 
     void InsertBefore(Hookups* other)
     {
@@ -59,18 +58,32 @@ protected:
         assert(other != this);
         assert(other->prev != this);
 
-        other->prev->next = this;
-        this->prev = other->prev;
-
-        this->next = other;
-        other->prev = this;
+        other->prev->SetNext(this);
+        SetPrev(other->prev);
+        SetNext(other);
+        other->SetPrev(this);
     }
- private:
+
     T* Cast()
     {
         auto* v2 = detail::ascend_cast<T, Hookups>(this);
         return v2;
     }
+
+private:
+    void SetNext(Hookups* n)
+    {
+        assert(n);
+        assert(reinterpret_cast<uintptr_t>(n) > 0x10000);
+        next = n;
+    }
+    void SetPrev(Hookups* p)
+    {
+        assert(p);
+        assert(reinterpret_cast<uintptr_t>(p) > 0x10000);
+        prev = p;
+    }
+public:
 
     Hookups* prev;
     Hookups* next;
@@ -84,6 +97,32 @@ struct EmbeddedList
 {
     using Hookups = typename EmbeddedListHookups<T, Tag, N>::Hookups;
 
+    struct Iterator
+    {
+        Hookups* hookups;
+
+        T* operator*()
+        {
+            return hookups->Cast();
+        }
+
+        T* operator->()
+        {
+            return hookups->Cast();
+        }
+
+        Iterator& operator++()
+        {
+            hookups = hookups->next;
+            return *this;
+        }
+
+        bool operator==(Iterator const& other) const
+        {
+            return hookups == other.hookups;
+        }
+    };
+
     EmbeddedList()
     {
         head.prev = nullptr;
@@ -91,6 +130,16 @@ struct EmbeddedList
         tail.prev = &head;
         tail.next = nullptr;
         size = 0;
+    }
+
+    Iterator begin()
+    {
+        return Iterator(head.next);
+    }
+
+    Iterator end()
+    {
+        return Iterator(&tail);
     }
 
     void Push(Hookups* item)

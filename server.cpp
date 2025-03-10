@@ -12,11 +12,14 @@
 #include "coop/launchable.h"
 #include "coop/thread.h"
 #include "coop/network/epoll_router.h"
+#include "coop/network/poll_router.h"
 #include "coop/network/tcp_handler.h"
 #include "coop/network/tcp_server.h"
 #include "coop/time/sleep.h"
 #include "coop/time/ticker.h"
 #include "coop/tricks.h"
+
+#include "HTTPRequest.hpp"
 
 // Demo program that currently sets up a TCP echo server by:
 //
@@ -31,8 +34,8 @@ struct EchoHandler : coop::network::TCPHandler
 {
     using List = ::coop::EmbeddedList<EchoHandler>;
 
-    EchoHandler(int fd, void*)
-    : coop::network::TCPHandler(fd)
+    EchoHandler(coop::Context* ctx, int fd, void*)
+    : coop::network::TCPHandler(ctx, fd)
     , m_totalBytes(0)
     {
     }
@@ -121,14 +124,13 @@ void SpawningTask(coop::Context* ctx, void*)
 {
     ctx->SetName("SpawningTask");
     int serverFd = bind_and_listen(8888);
-    int epollFd = epoll_create(32);
+    // int epollFd = epoll_create(32);
 
-    assert(epollFd >= 0 && serverFd >= 0);
+    // assert(epollFd >= 0 && serverFd >= 0);
 
 	auto* co = ctx->GetCooperator();
-
-    coop::time::Ticker timeTicker;
-    co->SetTicker(&timeTicker);
+    auto* ticker = co->Launch<coop::time::Ticker>();
+    co->SetTicker(ticker);
 
     // Handles for the epoll we will use to manage eventing, and the listener which will
     // accept connections on a socket and be alerted via epoll
@@ -138,12 +140,11 @@ void SpawningTask(coop::Context* ctx, void*)
 
     // Begin the epoll controller and its TCP handler loop
     //
-    coop::network::EpollRouter router(epollFd);
-    coop::network::TCPServer<EchoHandler, void*>  server(serverFd, nullptr);
-    server.Register(&router);
+    // coop::network::EpollRouter router(epollFd);
 
-    co->Launch(router, &routerHandle);
-    co->Launch(server, &serverHandle);
+    auto* router = co->Launch<coop::network::PollRouter>(&routerHandle);
+    auto* server = co->Launch<coop::network::TCPServer<EchoHandler, void*>>(&serverHandle, serverFd, nullptr);
+    server->Register(router);
 
     co->Spawn([=](coop::Context* statusCtx)
     {
@@ -164,14 +165,11 @@ void SpawningTask(coop::Context* ctx, void*)
             statusCtx->GetCooperator()->PrintContextTree();
         }
     });
-        
-    // Kill epoll and wait for it to die.
+
+    // Wait for either the router or us to get killed
+
     //
-    // epollHandle.Kill();
-    while (routerHandle)
-    {
-        ctx->Yield();
-    }
+    coop::CoordinateWithKill(ctx, routerHandle.GetKilledSignal());
 }
 
 int main()

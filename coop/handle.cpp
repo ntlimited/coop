@@ -7,6 +7,11 @@
 namespace coop
 {
 
+Coordinator* Handle::GetKilledSignal()
+{
+    return m_context->GetKilledSignal();
+}
+
 void Handle::Kill()
 {
     m_context->GetCooperator()->BoundarySafeKill(this, false);

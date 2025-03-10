@@ -8,6 +8,13 @@
 #include "event_mask.h"
 #include "router.h"
 
+#include "coop/cooperator.h"
+#include "coop/context.h"
+#include "coop/self.h"
+#include "coop/coordinator_extension.h"
+#include "coop/multi_coordinator.h"
+#include "coop/time/sleep.h"
+
 namespace coop
 {
 
@@ -81,6 +88,32 @@ bool Handle::operator-=(EventMask mask)
     return SetMask(m_mask & ~mask);
 }
 
+bool Handle::Wait(Context* ctx)
+{
+    if (CoordinateWithKill(m_coordinator) == m_coordinator)
+    {
+        return true;
+    }
+
+    // We were killed
+    //
+    return false;
+}
+
+bool Handle::Wait(Context* ctx, time::Interval i)
+{
+    auto* t = ctx->GetCooperator()->GetTicker();
+    if (!t)
+    {
+        return false;
+    }
+
+    time::Sleeper s(ctx, t, i);
+    s.Submit();
+    Coordinator* acq = CoordinateWithKill(ctx, m_coordinator, s.GetCoordinator());
+    return acq == m_coordinator;
+}
+
 int Handle::GetFD() const
 {
     return m_fd;
@@ -96,6 +129,11 @@ void Handle::SetRouter(Router* router)
 Coordinator* Handle::GetCoordinator()
 {
     return m_coordinator;
+}
+
+Handle::Data& Handle::GetData()
+{
+    return m_data;
 }
 
 } // end namespace coop::network

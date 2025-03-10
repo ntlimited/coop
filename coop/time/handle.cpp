@@ -71,7 +71,7 @@ void Handle::Deadline(Context* ctx)
     // Reset deadline as we no longer have one
     //
     m_deadline = 0;
-
+    
     // Signal
     //
     GetCoordinator()->Release(ctx);

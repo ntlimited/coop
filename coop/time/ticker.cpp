@@ -6,31 +6,24 @@ namespace coop
 namespace time
 {
 
-Ticker::Ticker(int resolution /* = 0 */)
-: m_context(nullptr)
+Ticker::Ticker(Context* ctx, int resolution /* = 0 */)
+: m_context(ctx)
 , m_epoch(0)
 , m_resolution(resolution)
 {
-}
-
-void Ticker::Launch(Context* ctx)
-{
     ctx->SetName("ticker");
-    m_context = ctx;
-
-    // Epoch is the arbitrary time the last full bucket cycle completed, which starts at the
-    // current time when the ticker starts and moves forward if (which would take a long time)
-    // we spend more than 1^BUCKETS * INTERVAL time alive.
-    //
     for (int i = 0 ; i < BUCKETS ; i++)
     {
         m_buckets[i].lastChecked = 0;
     }
-    
+}
+
+void Ticker::Launch()
+{
     m_epoch = Now();
-    while (!ctx->IsKilled())
+    while (!m_context->IsKilled())
     {
-        ctx->Yield();
+        m_context->Yield();
         size_t now = Now();
         if (m_epoch == now)
         {
@@ -50,9 +43,10 @@ void Ticker::Launch(Context* ctx)
             }
         }
 
-        // Process has finished populating this bucket with "execute immediately" events
+        // Process has finished populating this bucket with "execute immediately" events. Note that
+        // we have to use the 'while pop' pattern here or we get into unsafe traversal territory
+        // with yielding control during the `Deadline(ctx)` call
         //
-
         Handle* handle;
         while (m_buckets[0].list.Pop(handle))
         {
@@ -60,11 +54,14 @@ void Ticker::Launch(Context* ctx)
             // code needs to do so
             //
             handle->m_list = nullptr;
-            handle->Deadline(ctx);
+            handle->Deadline(m_context);
         }
     }
 }
 
+// Accepting a handle and then cancelling it only costs us a few math operations and a linked list
+// hookup/removal. Lengthy timeouts especially are unlikely to cost us more than one traversal cost
+//
 bool Ticker::Accept(Handle* handle)
 {
     // Technically this doesn't have to be the case, but it's unlikely enough right now that I don't
@@ -107,7 +104,7 @@ bool Ticker::ProcessBucket(int idx, size_t now)
     {
         // Moving to bucket 0 means we'll immediately execute it once we get there; we could
         // handle it immediately but this should also mean that we prioritize tasks that had
-        // tighter deadlines (will be ahead in the  
+        // tighter deadlines as well as they'll be in lower buckets natively.
         //
         if (handle->GetDeadline() < now)
         {
@@ -126,7 +123,7 @@ bool Ticker::ProcessBucket(int idx, size_t now)
         }
 
         assert(moveTo < idx);
-
+            
         bucket.list.Remove(handle);
         m_buckets[moveTo].list.Push(handle);
         handle->m_list = &m_buckets[moveTo].list;

@@ -13,24 +13,6 @@
 namespace coop
 {
 
-bool Cooperator::Launch(
-    Launchable& launch,
-    Handle* handle /* = nullptr */)
-{
-    return Launch(s_defaultConfiguration, launch, handle);
-} 
-
-bool Cooperator::Launch(
-        SpawnConfiguration const& config,
-        Launchable& launch,
-        Handle* handle /* = nullptr */)
-{
-    return Spawn(config, [&launch](Context* ctx)
-    {
-        launch.Launch(ctx);
-    }, handle /* out */);
-}
-
 bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
 {
     // Block on there being a slot available to submit to. This means the bool return is
@@ -267,10 +249,6 @@ bool Cooperator::SpawnSubmitted(bool wait /* = false */)
 
 bool Cooperator::SetTicker(time::Ticker* t)
 {
-    if (!Launch(*t, &m_tickerHandle))
-    {
-        return false;
-    }
     m_ticker = t;
     return true;
 }
@@ -407,7 +385,14 @@ void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 
         }
         const char* status = ctx->m_state == coop::SchedulerState::RUNNING ? "Running" :
             ctx->m_state == SchedulerState::YIELDED ? "Yielded" : "Blocked";
-        printf("%s (%p) [%s%s]\n", ctx->GetName(), ctx, status, ctx->IsKilled() ? "!" : "");
+        printf("%s (%p) [%s%s] {yields=%lu, blocks=%lu,ticks=%lu}\n",
+            ctx->GetName(),
+            ctx,
+            status,
+            ctx->IsKilled() ? "!" : "",
+            ctx->m_statistics.yields,
+            ctx->m_statistics.blocks,
+            ctx->m_statistics.ticks);
         ctx->m_children.Visit([&](coop::Context* child) -> bool
         {
             PrintContextTree(child, indent + 1);

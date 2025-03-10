@@ -14,17 +14,16 @@ namespace coop
 namespace network
 {
 
-EpollRouter::EpollRouter(int epollFd)
-: m_epollFd(epollFd)
-, m_ctx(nullptr)
+EpollRouter::EpollRouter(Context* ctx, int epollFd)
+: Router(ctx)
+, m_epollFd(epollFd)
 {
+    ctx->SetName("EpollRouter");
 }
 
-void EpollRouter::Launch(Context* ctx)
+void EpollRouter::Launch()
 {
-    m_ctx = ctx;
-    ctx->SetName("EpollRouter");
-    while (!ctx->IsKilled())
+    while (!m_context->IsKilled())
     {
         // For obvious reasons, we perform a non-blocking wait
         //
@@ -34,13 +33,13 @@ void EpollRouter::Launch(Context* ctx)
         //
         if (!ret)
         {
-            ctx->Yield();
+            m_context->Yield();
             continue;
         }
         if (ret < 0)
         {
             printf("epoll_wait error: %d (%s)\n", errno, strerror(errno));
-            ctx->Yield();
+            m_context->Yield();
             continue;
         }
 
@@ -50,10 +49,17 @@ void EpollRouter::Launch(Context* ctx)
             auto& evt = m_events[at++];
             auto* handle = reinterpret_cast<Handle*>(evt.data.ptr);
             printf("got an epoll event for %d (%d)\n", handle->GetFD(), evt.events);
-            GetCoordinator(handle)->Release(ctx);
+            if (GetCoordinator(handle)->IsHeld())
+            {
+                GetCoordinator(handle)->Release(m_context);
+            }
+            else
+            {
+                printf("missed wakeup\n");
+            }
         }
 
-        ctx->Yield();
+        m_context->Yield();
     }
 }
 
@@ -122,7 +128,7 @@ bool EpollRouter::Update(Handle* handle, const EventMask mask)
 
     // Lock the coordinator before we hand back control so that we don't try to alert it
     //
-    GetCoordinator(handle)->TryAcquire(m_ctx);
+    GetCoordinator(handle)->TryAcquire(m_context);
     return true;
 }
 

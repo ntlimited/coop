@@ -27,21 +27,43 @@ namespace time
 //
 // The unit of operation for Tickers is a Handle, which pairs a deadline in the future with a
 // coordinator to be released at or after that moment. This is then submitted to a ticker, and
-// the contract is honored with
+// the contract is honored with as good a guarantee as the system can reasonably give for how
+// loaded it is.
+//
+// Virtually all operations are constant overhead; the worst case is submitting many handles with
+// deadlines 4-8 "resolutions" in the future, which would likely engender ~4 linkedlist insert/pops
+// each.
 //
 struct Ticker : Launchable
 {
+    // The ticker will fully scan every single handle every (1 << (BUCKETS + RESOLUTION)) Intervals
+    // of time. With defaults, this is on the order of a month. If set down to, for example, 16, this
+    // would mean that we would examine the deadline for a handle let active for a month thousands of
+    // times, in comparison to ~32. Whether this is important to consider is questionable on a couple
+    // different fronts.
+    //
     static constexpr int BUCKETS = 32;
+    
+    // The 'resolution' of the ticker depends on two factors: first, the `Interval` for the system
+    // that it is compiled for. Second, the 'resolution' is a bitshift (e.g. exponentially growing)
+    // method of rounding. This has a couple direct effects:
+    // - The resolution sets how fine-grained the concept of "immediately" is. With a resolution of
+    //   3, scheduling 7 intervals into the future is the same as 1.
+    // - Tuning down the resolution decreases the amount of bookkeeping overhead
+    //
+    static constexpr int DEFAULT_RESOLUTION = 3;
 
-    Ticker(int resolution = 0);
+    Ticker(Context* ctx, int resolution = DEFAULT_RESOLUTION);
 
-    void Launch(Context* ctx) final;
+    // The ticker never blocks and busy-waits performing gettime. The amount of work beyond this
+    // is controlled to be extremely low (if it is doing a lot of work, it is because there is a
+    // lot of non-timer work going on).
+    //
+    void Launch() final;
     
     // Submit the given coordinator to be released after `interval` has passed. If submission succeeds,
     // then the coordinator and handle lifetime must exceed when `interval` passes, or until the
     // handle is cancelled.
-    //
-    // It is expected that the 
     //
     bool Accept(Handle* handle);
 

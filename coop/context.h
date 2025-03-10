@@ -70,28 +70,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         Context* parent,
         SpawnConfiguration const& config,
         Handle* handle,
-        Cooperator* cooperator)
-    : Reffed<Context>(this)
-    , m_parent(parent)
-    , m_handle(handle)
-	, m_state(SchedulerState::YIELDED)
-	, m_priority(config.priority)
-    , m_currentPriority(config.priority)
-    , m_cooperator(cooperator)
-	{
-        m_killedCoordinator.Acquire(this);
-        if (m_handle)
-        {
-            m_handle->m_context = this;
-        }
-
-        if (m_parent)
-        {
-            assert(!m_parent->IsKilled());
-            m_parent->m_children.Push(this);
-        }
-		m_segment.m_size = config.stackSize;
-	}
+        Cooperator* cooperator);
   public:
 
     ~Context();
@@ -177,6 +156,14 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     Coordinator m_killedCoordinator;
     ContextChildrenList m_children;
     const char* m_name;
+
+    struct
+    {
+        size_t ticks;
+        size_t yields;
+        size_t blocks;
+    } m_statistics;
+    int64_t m_lastRdtsc;
 
     // The jmp_buf operates as the 'bookmark' to jump back into when the context is active.
     //

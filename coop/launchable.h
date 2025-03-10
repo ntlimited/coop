@@ -13,7 +13,7 @@ struct Launchable
     {
     }
 
-    virtual void Launch(Context*) = 0;
+    virtual void Launch() = 0;
 };
 
 } // end namespace coop

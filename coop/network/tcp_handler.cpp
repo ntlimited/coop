@@ -18,9 +18,11 @@ namespace coop
 namespace network
 {
 
-TCPHandler::TCPHandler(int fd)
-: m_handle(fd, IN | OUT | HUP | ERR, &m_coordinator)
+TCPHandler::TCPHandler(Context* ctx, int fd)
+: m_context(ctx)
+, m_handle(fd, IN | HUP | ERR, &m_coordinator)
 {
+    ctx->SetName("TCPHandler");
 }
 
 TCPHandler::~TCPHandler()
@@ -47,12 +49,11 @@ bool TCPHandler::Register(Router* r)
     return true;
 }
 
-void TCPHandler::Launch(Context* ctx)
+void TCPHandler::Launch()
 {
-    ctx->SetName("TCPHandler");
     char buffer[4096];
         
-    while (!ctx->IsKilled())
+    while (!m_context->IsKilled())
     {
         int ret = recv(m_handle.GetFD(), &buffer[0], 4096, 0);
         if (ret <= 0)
@@ -62,11 +63,11 @@ void TCPHandler::Launch(Context* ctx)
             {
                 // Wait for another signal
                 //
-                if (m_coordinator != CoordinateWithKill(ctx, &m_coordinator))
+                if (m_coordinator != CoordinateWithKill(m_context, &m_coordinator))
                 {
                     // Our context was killed before our coordinator triggered
                     //
-                    assert(ctx->IsKilled());
+                    assert(m_context->IsKilled());
                     return;
                 }
                 continue;
@@ -74,7 +75,7 @@ void TCPHandler::Launch(Context* ctx)
             break;
         }
 
-        if (!Recv(ctx, &buffer[0], ret))
+        if (!Recv(m_context, &buffer[0], ret))
         {
             break;
         }

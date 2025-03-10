@@ -5,10 +5,12 @@
 #include "event_mask.h"
 
 #include "coop/embedded_list.h"
+#include "coop/time/interval.h"
 
 namespace coop
 {
 
+struct Context;
 struct Coordinator;
 
 namespace network
@@ -28,7 +30,9 @@ struct Router;
 // Currently, handles carry around the router with them which allows for some neat syntax tricks,
 // and also is how the non-abstract parts of the router contract are implemented.
 //
-// Note that handles are completely pure eventing constructs.
+// Note that handles are completely pure eventing constructs, it's someone else's job to do the
+// actual I/O send/recv operations. This is quite possibly something that will get merged into
+// a singular construct with io_uring given the chance but here we are.
 //
 struct Handle : EmbeddedListHookups<Handle>
 {
@@ -38,10 +42,25 @@ struct Handle : EmbeddedListHookups<Handle>
     using List = EmbeddedList<Handle>;
 
     Handle(int fd, EventMask mask, Coordinator* coordinator);
+    Handle(Coordinator* coordinator)
+    : m_fd(-1)
+    , m_mask(0)
+    , m_coordinator(coordinator)
+    {
+
+    }
     Handle(Handle const&) = delete;
     Handle(Handle&&) = delete;
 
     ~Handle();
+
+    void Configure(int fd, EventMask mask)
+    {
+        assert(fd >= 0);
+        assert(m_fd == -1);
+        m_fd = fd;
+        m_mask = mask;
+    }
 
     bool SetNonBlocking();
 
@@ -58,24 +77,31 @@ struct Handle : EmbeddedListHookups<Handle>
     bool operator+=(EventMask mask);
 
     bool operator-=(EventMask mask);
+    
+    bool Wait(Context* ctx);
+
+    bool Wait(Context* ctx, time::Interval i);
+
+    union Data {
+        float       f32;
+        double      f64;
+        uint64_t    u64;
+        int64_t     i64;
+        void*       ptr;
+    };
 
   private:
     friend Router;
     void SetRouter(Router* router);
     Coordinator* GetCoordinator();
+    Data& GetData();
 
     int             m_fd;
     Coordinator*    m_coordinator;
     EventMask       m_mask;
     Router*         m_router;
 
-    union {
-        float       f32;
-        double      f64;
-        uint64_t    u64;
-        int64_t     i64;
-        void*       ptr;
-    } m_data;
+    Data m_data;
 };
 
 } // end namespace coop::network

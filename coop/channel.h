@@ -103,6 +103,8 @@ struct TypedBaseChannel : public BaseChannel
     size_t m_capacity;
 };
 
+// If there's a way to get rid of the `Base::` stuttering everywhere I didn't find or remember one.
+//
 template<typename T>
 struct RecvChannel : virtual TypedBaseChannel<T>
 {

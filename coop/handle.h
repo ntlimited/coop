@@ -5,6 +5,7 @@ namespace coop
 
 struct Context;
 struct Cooperator;
+struct Coordinator;
 
 // Handle is the mechanism for working with contexts executing in a cooperator, both in and outsidee
 // of cooperating contexts. Handle lifetimes must be guaranteed for as long as the execution of the
@@ -24,6 +25,8 @@ struct Handle
     }
 
     void Kill();
+
+    Coordinator* GetKilledSignal();
 
     operator bool() const
     {

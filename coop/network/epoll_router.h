@@ -27,11 +27,11 @@ struct EpollRouter : Router
 
     // The EpollRouter is given an already configured (`epoll_create`'d) fd to operate on.
     //
-    EpollRouter(int epollFd);
+    EpollRouter(Context* ctx, int epollFd);
 
     // The router must be launched before it is used
     //
-    void Launch(Context* ctx) final;
+    void Launch() final;
 
     bool Register(Handle*) final;
 
@@ -40,7 +40,6 @@ struct EpollRouter : Router
     bool Update(Handle*, const EventMask) final;
 
   private:
-    Context*            m_ctx;
     int                 m_epollFd;
     struct epoll_event  m_events[MAX_EVENTS];
 };

@@ -16,6 +16,13 @@ Coordinator* Router::GetCoordinator(Handle* h) const
     return h->GetCoordinator();
 }
 
+// Same as above
+//
+Handle::Data& Router::GetData(Handle* h) const
+{
+    return h->m_data;
+}
+
 void Router::SetRouter(Handle* h)
 {
     h->SetRouter(this);

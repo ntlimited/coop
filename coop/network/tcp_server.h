@@ -31,8 +31,9 @@ struct TCPServer : Launchable
     // Handler must be an implementation of TCPHandler which among other things means it can be10
     //
     static_assert(std::is_base_of<TCPHandler, Handler>::value);
-    TCPServer(int fd, Arg arg)
-    : m_router(nullptr)
+    TCPServer(Context* ctx, int fd, Arg arg)
+    : m_context(ctx)
+    , m_router(nullptr)
     , m_arg(std::move(arg))
     , m_handle(fd, IN | HUP | ERR, &m_coordinator)
     {
@@ -60,27 +61,28 @@ struct TCPServer : Launchable
         return true;
     }
 
-    void Launch(Context* ctx) final
+    void Launch() final
     {
-        ctx->SetName("TCPServer");
-        while (!ctx->IsKilled())
+        while (!m_context->IsKilled())
         {
             int fd = accept(m_handle.GetFD(), nullptr, nullptr);
             if (fd >= 0)
             {
-                if (!ctx->GetCooperator()->Spawn([&](Context* handlerContext)
+                bool spawned = m_context->GetCooperator()->Spawn([&](Context* handlerContext)
                 {
                     // Instantiate the handler on itself and then launch it per the usual interface
                     //
-                    Handler h(fd, m_arg);
+                    Handler h(handlerContext, fd, m_arg);
                     if (!h.Register(m_router))
                     {
                         close(fd);
                         return;
                     }
-                    h.Launch(handlerContext);
+                    h.Launch();
                     close(fd);
-                }))
+                });
+
+                if (!spawned)
                 {
                     close(fd);
                 }
@@ -89,7 +91,9 @@ struct TCPServer : Launchable
 
             if (errno & (EAGAIN | EWOULDBLOCK))
             {
-                m_coordinator.Acquire(ctx);
+                printf("Waiting on signal for new connection\n");
+                m_coordinator.Acquire(m_context);
+                printf("Signal acquired\n");
                 continue;
             }
 
@@ -98,6 +102,7 @@ struct TCPServer : Launchable
     }
 
   private:
+    Context*            m_context;
     Router*             m_router;
     Arg                 m_arg;
     Coordinator         m_coordinator;

@@ -71,7 +71,7 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
     {
         return;
     }
-
+    assert(m_heldBy);
     m_heldBy = nullptr;
 
     // Pass control to the next in line blocked on the coordinator, if it exists.

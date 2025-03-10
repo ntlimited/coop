@@ -27,21 +27,19 @@ void ClientTask(coop::Context* ctx, void*)
     assert(fd >= 0);
 
     coop::Handle tickerHandle;
-    coop::time::Ticker ticker;
-    co->SetTicker(&ticker);
-    co->Launch(ticker, &tickerHandle);
+    auto* ticker = co->Launch<coop::time::Ticker>(&tickerHandle);
+    co->SetTicker(ticker);
 
     coop::Handle routerHandle;
-    coop::network::EpollRouter router(epollFd);
-    co->Launch(router, &routerHandle);
+    auto* router = co->Launch<coop::network::EpollRouter>(&routerHandle, epollFd);
 
     coop::Coordinator inCoord(ctx);
     coop::network::Handle inHandle(STDIN_FILENO, ::coop::network::IN, &inCoord);
     inHandle.SetNonBlocking();
-    router.Register(&inHandle);
+    router->Register(&inHandle);
 
     coop::network::Socket client(fd);
-    assert(client.Register(&router));
+    assert(client.Register(router));
 
     client.SendAll(ctx, "hello world", sizeof("hello world"));
 

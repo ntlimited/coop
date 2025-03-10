@@ -1,6 +1,7 @@
 #pragma once
 
 #include "event_mask.h"
+#include "handle.h"
 
 #include "coop/embedded_list.h"
 #include "coop/launchable.h"
@@ -32,11 +33,16 @@ struct Handle;
 //
 struct Router : Launchable
 {
+    Router(Context* ctx)
+    : m_context(ctx)
+    {
+    }
+
     virtual ~Router()
     {
     }
 
-    virtual void Launch(Context*) = 0;
+    virtual void Launch() = 0;
 
     // Users register handles against a router and then interact with the handle from then on.
     //
@@ -44,6 +50,8 @@ struct Router : Launchable
 
   protected:
     Coordinator* GetCoordinator(Handle* h) const;
+    Handle::Data& GetData(Handle* h) const;
+    
     void SetRouter(Handle* h);
 
     friend Handle;
@@ -52,8 +60,8 @@ struct Router : Launchable
 
     Context* m_context;
 
-  private:
-    EmbeddedList<Handle> m_list;
+    using HandleList = EmbeddedList<Handle>;
+    HandleList m_list;
 };
 
 } // end namespace coop::network

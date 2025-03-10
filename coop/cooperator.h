@@ -68,13 +68,39 @@ struct Cooperator
         Fn const& fn,
         Handle* handle = nullptr);
 
+    // Launch is an alternative, in-context API where Launchable types can be constructed and
+    // given their own context to execute in.
+    //
+    // This is a slightly dangerous API in two ways:
+    //  (1) The context that is passed into the constructor is not the current context
+    //  (2) The returned instance may already be destructed.
+    //
+    // The former is unfortunate and would be nice to patch up. The latter is just the nature of
+    // things; if you know enough about the type to want to touch it after, then you should also
+    // know enough to know if it is safe.
+    //
+    template<typename T, typename... Args>
+    T* Launch(SpawnConfiguration const&, Handle*, Args&&...);
 
-    bool Launch(Launchable& launch, Handle* handle = nullptr);
-    
-    bool Launch(
-        SpawnConfiguration const& config,
-        Launchable& launch,
-        Handle* handle = nullptr);
+    template<typename T, typename... Args>
+    T* Launch(SpawnConfiguration const& config, Args&&... args)
+    {
+        Handle* h = nullptr;
+        return Launch<T>(config, h, std::forward<Args&&>(args)...);
+    }
+
+    template<typename T, typename... Args>
+    T* Launch(Handle* h, Args&&... args)
+    {
+        return Launch<T>(s_defaultConfiguration, h, std::forward<Args&&>(args)...);
+    }
+
+    template<typename T, typename... Args>
+    T* Launch(Args&&... args)
+    {
+        Handle* h = nullptr;
+        return Launch<T>(s_defaultConfiguration, h, std::forward<Args&&>(args)...);
+    }
 
     using Submission = void(*)(Context*, void*);
 

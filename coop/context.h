@@ -6,8 +6,6 @@
 #include "coordinator.h"
 #include "channel.h"
 #include "embedded_list.h"
-#include "handle.h"
-#include "ref.h"
 #include "scheduler_state.h"
 #include "spawn_configuration.h"
 
@@ -53,7 +51,6 @@ static constexpr int CONTEXT_LIST_CHILDREN = 2;
 struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
                , EmbeddedListHookups<Context, int, CONTEXT_LIST_STATE>
                , EmbeddedListHookups<Context, int, CONTEXT_LIST_CHILDREN>
-               , Reffed<Context>
 {
     // Embedded lists for tracking the set of lists that contexts can never be in more
     // than one of, e.g. there are multiple `ContextStateList`s in the cooperator, but contexts are
@@ -62,6 +59,8 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     using AllContextsList = EmbeddedList<Context, int, CONTEXT_LIST_ALL>;
     using ContextStateList = EmbeddedList<Context, int, CONTEXT_LIST_STATE>;
     using ContextChildrenList = EmbeddedList<Context, int, CONTEXT_LIST_CHILDREN>;
+
+    struct Handle;
 
   protected:
     friend struct Cooperator;
@@ -89,10 +88,11 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     //
     bool IsKilled() const
     {
-        
         return !m_killedCoordinator.IsHeld();
     }
 
+    // The KilledSignal 
+    //
     Coordinator* GetKilledSignal()
     {
         return &m_killedCoordinator;
@@ -117,12 +117,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     // parent is. If you have a reason to use this, it is assumed you're able to make sure no
     // there's a coherent contract where no one else is going to or already detached it.
     //
-    void Detach()
-    {
-        assert(m_parent);
-        m_parent->m_children.Remove(this);
-        m_parent = nullptr;
-    }
+    void Detach();
 
   private:
     friend struct Cooperator;
@@ -155,6 +150,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     Cooperator* m_cooperator;
     Coordinator m_killedCoordinator;
     ContextChildrenList m_children;
+    Coordinator m_lastChild;
     const char* m_name;
 
     struct
@@ -172,6 +168,38 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
 	// Must be last member
 	//
 	Segment m_segment;
+};
+
+// Handle is the mechanism for working with contexts executing in a cooperator, both in and outsidee
+// of cooperating contexts. Handle lifetimes must be guaranteed for as long as the execution of the
+// spawned context.
+//
+// In theory, this is the obvious mechanism to add "return things" to the spawn concept. However,
+// that's only really needed for outside-of-cooperator work that will probably want fancier ways
+// to do things in general than what's easy to do right now, and the intra-context case, there
+// isn't really any sufficiently magic syntax beyond union hijinks.
+//
+struct Context::Handle
+{
+    Handle(Handle const&) = delete;
+    Handle(Handle&&) = delete;
+    Handle()
+    {
+    }
+
+    void Kill();
+
+    Coordinator* GetKilledSignal();
+
+    operator bool() const
+    {
+        return !!m_context;
+    }
+
+  private:
+    friend Context;
+    friend Cooperator;
+	Context* m_context;
 };
 
 } // end namespace coop

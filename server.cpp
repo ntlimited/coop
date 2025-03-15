@@ -18,6 +18,8 @@
 #include "coop/time/sleep.h"
 #include "coop/time/ticker.h"
 #include "coop/tricks.h"
+#include "coop/io/io.h"
+#include "coop/io/uring.h"
 
 #include "HTTPRequest.hpp"
 
@@ -29,73 +31,6 @@
 // - creating a TCP server that will use the router for dispatching events
 // - attaching an echo handler to serve sockets connected through the server
 //
-
-struct EchoHandler : coop::network::TCPHandler
-{
-    using List = ::coop::EmbeddedList<EchoHandler>;
-
-    EchoHandler(coop::Context* ctx, int fd, void*)
-    : coop::network::TCPHandler(ctx, fd)
-    , m_totalBytes(0)
-    {
-    }
-
-    // Recv is the code invoked when data arrives on the socket. Returning false
-    //
-    bool Recv(coop::Context* ctx, void* buffer, const size_t bytes) final
-    {
-        void* copied = malloc(bytes);
-        if (!copied)
-        {
-            return false;
-        }
-        memcpy(copied, buffer, bytes);
-
-        // Some profligate task spawning and coordination hijinks
-        //
-        bool ok = ctx->GetCooperator()->Spawn([=,this](coop::Context* taskCtx)
-        {
-            taskCtx->SetName("delayed_send");
-            auto* myCopied = copied;
-
-            coop::time::Sleeper s(
-                taskCtx,
-                taskCtx->GetCooperator()->GetTicker(),
-                std::chrono::seconds(1));
-
-            s.Submit();
-            
-            if (s.GetCoordinator() != CoordinateWithKill(taskCtx, s.GetCoordinator()))
-            {
-                return;
-            }
-
-
-            if (m_coordinator != CoordinateWithKill(taskCtx, &m_coordinator))
-            {
-                return;
-            }
-
-            if (Send(taskCtx, myCopied, bytes))
-            {
-                m_totalBytes += bytes;
-            }
-            m_coordinator.Release(taskCtx);
-            free(copied);
-        });
-
-        if (!ok)
-        {
-            free(copied);
-            return false;
-        }
-            
-        return true;
-    }
-
-    coop::Coordinator m_coordinator;
-    size_t m_totalBytes;
-};
 
 int bind_and_listen(int port)
 {
@@ -124,27 +59,71 @@ void SpawningTask(coop::Context* ctx, void*)
 {
     ctx->SetName("SpawningTask");
     int serverFd = bind_and_listen(8888);
-    // int epollFd = epoll_create(32);
-
-    // assert(epollFd >= 0 && serverFd >= 0);
 
 	auto* co = ctx->GetCooperator();
     auto* ticker = co->Launch<coop::time::Ticker>();
     co->SetTicker(ticker);
+    auto* uring = co->Launch<coop::io::Uring>(64);
+    co->SetUring(uring);
 
-    // Handles for the epoll we will use to manage eventing, and the listener which will
-    // accept connections on a socket and be alerted via epoll
-    //
-    coop::Handle routerHandle;
-    coop::Handle serverHandle;
+    coop::Context::Handle serverHandle;
 
-    // Begin the epoll controller and its TCP handler loop
-    //
-    // coop::network::EpollRouter router(epollFd);
 
-    auto* router = co->Launch<coop::network::PollRouter>(&routerHandle);
-    auto* server = co->Launch<coop::network::TCPServer<EchoHandler, void*>>(&serverHandle, serverFd, nullptr);
-    server->Register(router);
+    co->Spawn([=](coop::Context* serverCtx)
+    {
+        serverCtx->SetName("UringHandler");
+        coop::io::Descriptor desc(serverFd, uring);
+
+        while (!serverCtx->IsKilled())
+        {
+            int fd = coop::io::Accept(desc);
+            assert(fd >= 0);
+
+            co->Spawn([=](coop::Context* clientCtx)
+            {
+                coop::io::Descriptor client(fd);
+
+                char buffer[1025];
+
+                while (!clientCtx->IsKilled())
+                {
+                    int ret = coop::io::Recv(client, &buffer[0], 1024);
+                    if (!ret)
+                    {
+                        // Short read, disconnected
+                        //
+                        break;
+                    }
+
+                    if (ret < 0)
+                    {
+                        assert(false);
+                        break;
+                    }
+                    buffer[ret++] = '\n';
+
+                    int at = 0;
+                    while (ret)
+                    {
+                        int sent = coop::io::Send(client, &buffer[at], ret);
+                        if (sent == 0)
+                        {
+                            close(fd);
+                            return;
+                        }
+
+                        assert(sent > 0);
+                        at += sent;
+                        ret -= sent;
+                    }
+                }
+
+                close(fd);
+            });
+
+            serverCtx->Yield();
+        }
+    }, &serverHandle);
 
     co->Spawn([=](coop::Context* statusCtx)
     {
@@ -167,9 +146,8 @@ void SpawningTask(coop::Context* ctx, void*)
     });
 
     // Wait for either the router or us to get killed
-
     //
-    coop::CoordinateWithKill(ctx, routerHandle.GetKilledSignal());
+    ctx->GetKilledSignal()->Acquire(ctx);
 }
 
 int main()

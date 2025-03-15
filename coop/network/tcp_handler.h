@@ -41,8 +41,6 @@ struct TCPHandler : Launchable
         return m_handle;
     }
 
-    Context*    m_context;
-
   private:
     Coordinator m_coordinator;
     Handle      m_handle;

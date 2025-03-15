@@ -26,11 +26,11 @@ void ClientTask(coop::Context* ctx, void*)
     printf("errno? %d %s\n", errno, strerror(errno));
     assert(fd >= 0);
 
-    coop::Handle tickerHandle;
+    coop::Context::Handle tickerHandle;
     auto* ticker = co->Launch<coop::time::Ticker>(&tickerHandle);
     co->SetTicker(ticker);
 
-    coop::Handle routerHandle;
+    coop::Context::Handle routerHandle;
     auto* router = co->Launch<coop::network::EpollRouter>(&routerHandle, epollFd);
 
     coop::Coordinator inCoord(ctx);

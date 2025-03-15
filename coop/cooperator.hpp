@@ -17,13 +17,13 @@ namespace coop
 // This is not a problem per se
 //
 template<typename Fn>
-bool Cooperator::Spawn(Fn const& fn, Handle* handle /* = nullptr */)
+bool Cooperator::Spawn(Fn const& fn, Context::Handle* handle /* = nullptr */)
 {
     return Spawn(s_defaultConfiguration, fn, handle);
 }
 	
 template<typename Fn>
-bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* handle /* = nullptr */)
+bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::Handle* handle /* = nullptr */)
 {
     if (m_shutdown || (m_scheduled && m_scheduled->IsKilled()))
 	{
@@ -35,6 +35,10 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
 	{
         return false;
 	}
+
+    // After this point we'll count it as time spent in the context
+    //
+    m_ticks += rdtsc() - m_lastRdtsc;
 	auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
     m_contexts.Push(spawnCtx);
 
@@ -72,7 +76,7 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
 #pragma GCC diagnostic pop
 
 		void* top = spawnCtx->m_segment.Top();
-        // After this point, we have 
+        // After this point, we have moved to the stack we allocated
         //
         asm volatile(
 			"mov %[rs], %%rsp \n"
@@ -80,6 +84,12 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
         );
 
         {
+            // This is pretty wonderfully obtuse, but it allows us to skip touching any potentially
+            // compiled code relying on stack offsets that no longer are valid.
+            //
+            // Probably there's a nicer way to communicate this fact to the compiler, but another
+            // time perhaps?
+            //
             (*((Fn*)(Self()->m_segment.Bottom())))(Self());
         }
 
@@ -87,6 +97,8 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
         // context switch to anyone waiting on the signal safely. We also can't simply unblock them
         // because then there's an insane contract where you could be signalled for wakeup by a
         // (once you wake up) deallocated Coordinator you're still holding onto.
+        //
+        // Same rule as above for why we are using Self() here
         //
         Self()->~Context();
 
@@ -117,7 +129,7 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Handle* h
 // TODO dedupe this ridiculous copy/paste from Spawn.
 //
 template<typename T, typename... Args>
-T* Cooperator::Launch(SpawnConfiguration const& config, Handle* handle, Args&&... args)
+T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle, Args&&... args)
 {
     static_assert(std::is_base_of<Launchable, T>::value);
 
@@ -131,12 +143,13 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Handle* handle, Args&&..
 	{
         return nullptr;
 	}
+
+    m_ticks += rdtsc() - m_lastRdtsc;
 	auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
     m_contexts.Push(spawnCtx);
 
-	// Depending on whether we're running this from the cooperator's own stack or
-    // not.
-	//
+	// Currently this has no reason to ever get invoked from the cooperator itself.
+    //
     Context* lastCtx = m_scheduled;
 	auto& buf = (lastCtx ? lastCtx->m_jmpBuf : m_jmpBuf);
     bool isSelf = !lastCtx;
@@ -155,7 +168,8 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Handle* handle, Args&&..
     auto* addr = spawnCtx->m_segment.Bottom();
     auto* launchable = new (spawnCtx->m_segment.Bottom()) T(
         spawnCtx,
-        std::forward<Args>(args)...);
+        std::forward<Args&&>(args)...
+    );
 
 	void* top = spawnCtx->m_segment.Top();
 

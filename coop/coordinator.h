@@ -96,7 +96,7 @@ struct Coordinator
     Coordinator(Context* ctx)
     : Coordinator()
     {
-        Acquire(ctx);
+        m_heldBy = ctx;
     }
 
     bool IsHeld() const;
@@ -110,6 +110,10 @@ struct Coordinator
     // Acquire can fail in the event that the Coordinator has been shut down
     //
     void Acquire(Context*);
+
+    // Dumb helper for acquire-and-release
+    //
+    void Flash(Context*);
 
     // Release the coordinator, unblocking the context (if one exists) at the head of the wait
     // list. By default (schedule = true), the unblocked context will immediately be switched to

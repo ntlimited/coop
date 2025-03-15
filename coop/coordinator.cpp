@@ -57,6 +57,16 @@ void Coordinator::Acquire(Context* ctx)
     return;
 }
 
+void Coordinator::Flash(Context* ctx)
+{
+    if (!m_heldBy)
+    {
+        return;
+    }
+    Acquire(ctx);
+    Release(ctx);
+}
+
 void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 {
     if (m_shutdown)
@@ -82,11 +92,12 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
         return;
     }
 
-    m_blocking.Visit([&](Coordinated* others)
-    {
-        assert(others->m_context != next->m_context);
-        return true;
-    });
+    // m_blocking.Visit([&](Coordinated* others)
+    // {
+    //     assert(others->m_context != next->m_context);
+    //     return true;
+    // });
+    //
 
     // Mark the coordinated instance as having been satisfied by gaining the lock now
     // that we've popped it from the list

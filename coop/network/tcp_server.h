@@ -32,11 +32,12 @@ struct TCPServer : Launchable
     //
     static_assert(std::is_base_of<TCPHandler, Handler>::value);
     TCPServer(Context* ctx, int fd, Arg arg)
-    : m_context(ctx)
+    : Launchable(ctx)
     , m_router(nullptr)
     , m_arg(std::move(arg))
     , m_handle(fd, IN | HUP | ERR, &m_coordinator)
     {
+        ctx->SetName("TCPServer");
     }
 
     ~TCPServer()
@@ -63,12 +64,12 @@ struct TCPServer : Launchable
 
     void Launch() final
     {
-        while (!m_context->IsKilled())
+        while (!GetContext()->IsKilled())
         {
             int fd = accept(m_handle.GetFD(), nullptr, nullptr);
             if (fd >= 0)
             {
-                bool spawned = m_context->GetCooperator()->Spawn([&](Context* handlerContext)
+                bool spawned = GetContext()->GetCooperator()->Spawn([&](Context* handlerContext)
                 {
                     // Instantiate the handler on itself and then launch it per the usual interface
                     //
@@ -91,9 +92,7 @@ struct TCPServer : Launchable
 
             if (errno & (EAGAIN | EWOULDBLOCK))
             {
-                printf("Waiting on signal for new connection\n");
-                m_coordinator.Acquire(m_context);
-                printf("Signal acquired\n");
+                m_coordinator.Acquire(GetContext());
                 continue;
             }
 
@@ -102,7 +101,6 @@ struct TCPServer : Launchable
     }
 
   private:
-    Context*            m_context;
     Router*             m_router;
     Arg                 m_arg;
     Coordinator         m_coordinator;

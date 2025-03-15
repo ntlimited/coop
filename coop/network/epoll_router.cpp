@@ -23,7 +23,7 @@ EpollRouter::EpollRouter(Context* ctx, int epollFd)
 
 void EpollRouter::Launch()
 {
-    while (!m_context->IsKilled())
+    while (!GetContext()->IsKilled())
     {
         // For obvious reasons, we perform a non-blocking wait
         //
@@ -33,13 +33,13 @@ void EpollRouter::Launch()
         //
         if (!ret)
         {
-            m_context->Yield();
+            GetContext()->Yield();
             continue;
         }
         if (ret < 0)
         {
             printf("epoll_wait error: %d (%s)\n", errno, strerror(errno));
-            m_context->Yield();
+            GetContext()->Yield();
             continue;
         }
 
@@ -51,7 +51,7 @@ void EpollRouter::Launch()
             printf("got an epoll event for %d (%d)\n", handle->GetFD(), evt.events);
             if (GetCoordinator(handle)->IsHeld())
             {
-                GetCoordinator(handle)->Release(m_context);
+                GetCoordinator(handle)->Release(GetContext());
             }
             else
             {
@@ -59,7 +59,7 @@ void EpollRouter::Launch()
             }
         }
 
-        m_context->Yield();
+        GetContext()->Yield();
     }
 }
 
@@ -70,7 +70,7 @@ bool EpollRouter::Register(Handle* handle)
     // This is a sloppy contract, but it's painful to properly acquire a context in certain codepaths
     // prior to instantiating and registering handles.
     //
-    GetCoordinator(handle)->TryAcquire(m_context);
+    GetCoordinator(handle)->TryAcquire(GetContext());
 
     int fd = handle->GetFD();
     EventMask mask = handle->GetMask();
@@ -128,7 +128,7 @@ bool EpollRouter::Update(Handle* handle, const EventMask mask)
 
     // Lock the coordinator before we hand back control so that we don't try to alert it
     //
-    GetCoordinator(handle)->TryAcquire(m_context);
+    GetCoordinator(handle)->TryAcquire(GetContext());
     return true;
 }
 

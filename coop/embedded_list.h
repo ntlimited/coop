@@ -21,6 +21,7 @@ struct EmbeddedListHookups
 {
     using Hookups = EmbeddedListHookups<T, Tag, N>;
     using List = EmbeddedList<T, Tag, N>;
+    using Ptr = T*;
 
     EmbeddedListHookups()
     : prev(nullptr)
@@ -34,6 +35,15 @@ struct EmbeddedListHookups
     // TODO add some pointer tricks in debug to assert over this
     //
     friend List;
+
+    // Replaces the current item with the other in whatever list it happens to currently live in.
+    //
+    void Replace(Hookups* other)
+    {
+        assert(!Disconnected());
+        other->InsertBefore(this);
+        Pop();
+    }
 
     void Pop()
     {
@@ -64,27 +74,26 @@ struct EmbeddedListHookups
         other->SetPrev(this);
     }
 
-    T* Cast()
+    Ptr Cast()
     {
         auto* v2 = detail::ascend_cast<T, Hookups>(this);
         return v2;
     }
 
 private:
+    // Silly little helpers to make it easier to debug issues
+    //
     void SetNext(Hookups* n)
     {
         assert(n);
-        assert(reinterpret_cast<uintptr_t>(n) > 0x10000);
         next = n;
     }
     void SetPrev(Hookups* p)
     {
         assert(p);
-        assert(reinterpret_cast<uintptr_t>(p) > 0x10000);
         prev = p;
     }
 public:
-
     Hookups* prev;
     Hookups* next;
 };
@@ -96,17 +105,18 @@ template<typename T, typename Tag /* = int */, const Tag N /* = 0 */>
 struct EmbeddedList
 {
     using Hookups = typename EmbeddedListHookups<T, Tag, N>::Hookups;
+    using Ptr = Hookups::Ptr;
 
     struct Iterator
     {
         Hookups* hookups;
 
-        T* operator*()
+        Ptr operator*()
         {
             return hookups->Cast();
         }
 
-        T* operator->()
+        Ptr operator->()
         {
             return hookups->Cast();
         }
@@ -148,7 +158,7 @@ struct EmbeddedList
         size++;
     }
 
-    bool Pop(T*& out)
+    bool Pop(Ptr& out)
     {
         if (IsEmpty())
         {
@@ -161,7 +171,7 @@ struct EmbeddedList
         return true;
     }
 
-    T* Peek()
+    Ptr Peek()
     {
         return head.next->Cast();
     }

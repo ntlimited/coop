@@ -7,11 +7,11 @@ namespace time
 {
 
 Ticker::Ticker(Context* ctx, int resolution /* = 0 */)
-: m_context(ctx)
+: Launchable(ctx)
 , m_epoch(0)
 , m_resolution(resolution)
 {
-    ctx->SetName("ticker");
+    ctx->SetName("Ticker");
     for (int i = 0 ; i < BUCKETS ; i++)
     {
         m_buckets[i].lastChecked = 0;
@@ -21,9 +21,9 @@ Ticker::Ticker(Context* ctx, int resolution /* = 0 */)
 void Ticker::Launch()
 {
     m_epoch = Now();
-    while (!m_context->IsKilled())
+    while (!GetContext()->IsKilled())
     {
-        m_context->Yield();
+        GetContext()->Yield();
         size_t now = Now();
         if (m_epoch == now)
         {
@@ -54,7 +54,7 @@ void Ticker::Launch()
             // code needs to do so
             //
             handle->m_list = nullptr;
-            handle->Deadline(m_context);
+            handle->Deadline(GetContext());
         }
     }
 }

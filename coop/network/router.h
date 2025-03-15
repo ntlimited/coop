@@ -34,7 +34,7 @@ struct Handle;
 struct Router : Launchable
 {
     Router(Context* ctx)
-    : m_context(ctx)
+    : Launchable(ctx)
     {
     }
 
@@ -57,8 +57,6 @@ struct Router : Launchable
     friend Handle;
     virtual bool Unregister(Handle*) = 0;
     virtual bool Update(Handle*, const EventMask) = 0;
-
-    Context* m_context;
 
     using HandleList = EmbeddedList<Handle>;
     HandleList m_list;

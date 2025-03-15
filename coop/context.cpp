@@ -5,27 +5,12 @@
 namespace coop
 {
 
-namespace
-{
-    int64_t rdtsc()
-    {
-        uint32_t hi, lo;
-#ifdef __NEVER__
-        __asm__ __volatile__(
-            "xorl %%eax,%%eax \n        cpuid" ::: "%rax", "%rcx", "%rdx");
-#endif
-        __asm__ __volatile__("rdtsc" : "=a"(lo),"=d"(hi));
-        return static_cast<int64_t>((uint64_t)hi << 32 | lo);
-    }
-}
-
 Context::Context(
         Context* parent,
         SpawnConfiguration const& config,
         Handle* handle,
         Cooperator* cooperator)
-: Reffed<Context>(this)
-, m_parent(parent)
+: m_parent(parent)
 , m_handle(handle)
 , m_state(SchedulerState::YIELDED)
 , m_priority(config.priority)
@@ -42,20 +27,23 @@ Context::Context(
     {
         assert(!m_parent->IsKilled());
         m_parent->m_children.Push(this);
+        m_parent->m_lastChild.TryAcquire(this);
     }
 	m_segment.m_size = config.stackSize;
 
     m_statistics.ticks = 0;
     m_statistics.yields = 0;
     m_statistics.blocks = 0;
-    m_lastRdtsc = rdtsc();
+    m_lastRdtsc = m_cooperator->rdtsc();
 }
+
 Context::~Context()
 {
     if (m_parent)
     {
         Detach();
     }
+
     // Properly kill this if we were not already. Note that this propagates down to child contexts
     //
     if (m_killedCoordinator.IsHeld())
@@ -63,14 +51,14 @@ Context::~Context()
         Kill(this);
     }
 
-    RemoveRef();
-    m_zeroSignal.Acquire(this);
-
     if (m_handle)
     {
         m_handle->m_context = nullptr;
     }
 
+    // Wait on the last child before we allow the context to be cleaned up
+    //
+    m_lastChild.Acquire(this);
     m_cooperator->m_contexts.Remove(this);
 }
 
@@ -83,18 +71,29 @@ bool Context::Yield(const bool force /* = false */)
     ++m_statistics.yields;
     m_currentPriority = m_priority;
 
-    m_statistics.ticks += rdtsc() - m_lastRdtsc;
+    m_statistics.ticks += m_cooperator->rdtsc() - m_lastRdtsc;
     m_cooperator->YieldFrom(this);
-    m_lastRdtsc = rdtsc();
+    m_lastRdtsc = m_cooperator->rdtsc();
     return true;
+}
+
+void Context::Detach()
+{
+    assert(m_parent);
+    m_parent->m_children.Remove(this);
+    if (m_parent->m_children.IsEmpty())
+    {
+        m_parent->m_lastChild.Release(this, false /* schedule */);
+    }
+    m_parent = nullptr;
 }
 
 void Context::Block()
 {
     ++m_statistics.blocks;
-    m_statistics.ticks += rdtsc() - m_lastRdtsc;
+    m_statistics.ticks += m_cooperator->rdtsc() - m_lastRdtsc;
     m_cooperator->Block(this);
-    m_lastRdtsc = rdtsc();
+    m_lastRdtsc = m_cooperator->rdtsc();
 }
 
 void Context::Unblock(Context* other, const bool schedule /* = true */)

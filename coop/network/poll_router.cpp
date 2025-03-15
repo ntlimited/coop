@@ -51,7 +51,7 @@ void PollRouter::Iterate(EmbeddedList<Handle>::Iterator& iter)
             if (GetCoordinator(*begin)->IsHeld())
             {
                 printf("Signaling fd %d\n", fds[checking].fd);
-                GetCoordinator(*begin)->Release(m_context);
+                GetCoordinator(*begin)->Release(GetContext());
             }
             else
             {
@@ -66,7 +66,7 @@ void PollRouter::Iterate(EmbeddedList<Handle>::Iterator& iter)
 
 void PollRouter::Launch()
 {
-    while (!m_context->IsKilled())
+    while (!GetContext()->IsKilled())
     {
         auto it = m_list.begin();
         while (it != m_list.end())
@@ -74,7 +74,7 @@ void PollRouter::Launch()
             Iterate(it);
         }
 
-        m_context->Yield();
+        GetContext()->Yield();
     }
 }
 

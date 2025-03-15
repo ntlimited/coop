@@ -34,6 +34,8 @@ bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& co
 
 void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
 {
+    m_lastRdtsc = rdtsc();
+
     switch (res)
     {
         // The point is that this gets called in the other cases
@@ -64,12 +66,12 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         }
     }
     m_scheduled = nullptr;
-    //SanityCheck();
 }
 
 void Cooperator::Launch()
 {
     Cooperator::thread_cooperator = this;
+    m_lastRdtsc = rdtsc();
 
     while (!m_yielded.IsEmpty() || !m_shutdown)
     {
@@ -96,6 +98,7 @@ void Cooperator::Launch()
             m_yielded.Pop(ctx);
 
             Resume(ctx);
+            m_lastRdtsc = rdtsc();
 
             if (!m_submissions.IsEmpty())
             {
@@ -128,11 +131,10 @@ void Cooperator::Resume(Context* ctx)
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
 
-    //SanityCheck();
-   
     auto ret = setjmp(m_jmpBuf);
     if (!ret)
     {
+        m_ticks += rdtsc() - m_lastRdtsc;
         LongJump(ctx->m_jmpBuf, SchedulerJumpResult::RESUMED);
     }
     else
@@ -152,7 +154,6 @@ void Cooperator::Block(Context* ctx)
         m_yielded.Remove(ctx);
         m_blocked.Push(ctx);
 
-        //SanityCheck();
         return;
     }
 
@@ -242,8 +243,6 @@ bool Cooperator::SpawnSubmitted(bool wait /* = false */)
 		submitted.func(ctx, submitted.arg);
     });
 
-    //SanityCheck();
-
     return true;
 }
 
@@ -256,6 +255,11 @@ bool Cooperator::SetTicker(time::Ticker* t)
 time::Ticker* Cooperator::GetTicker()
 {
     return m_ticker;
+}
+
+io::Uring* Cooperator::GetUring()
+{
+    return m_uring;
 }
 
 void Cooperator::SanityCheck()
@@ -302,77 +306,102 @@ namespace
 
 struct BoundaryCrossingKillArgs
 {
-    Handle* handle;
+    Context::Handle* handle;
     std::mutex mutex;
 };
 
 void BoundaryCrossingKill(Context* taskCtx, void* args)
 {
+    // We cannot just do taskCtx->Kill(...) because we need to validate the handle/context. We could
+    // refactor that logic here, technically, but it's got some nice clarity in its current form, imo.
+    //
     auto* bc = reinterpret_cast<BoundaryCrossingKillArgs*>(args);
-
     taskCtx->GetCooperator()->BoundarySafeKill(bc->handle, true /* crossed */);
-
     bc->mutex.unlock();
 }
 
 } // end anonymous namespace
 
-void Cooperator::BoundarySafeKill(Handle* handle, const bool crossed /* = false */)
+// BoundarySafeKill is invoked by Handles, which can be called within the cooperator's thread or
+// from outside of it (boundary crossing).
+//
+void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /* = false */)
 {
-    if (this == Cooperator::thread_cooperator)
+    if (this != Cooperator::thread_cooperator)
     {
-        // Context killing is something that Coordinators work for, and the Coordinator system
-        // assumes we have a context at all times. This makes good semantic sense: the cooperator
-        // 'native' context never coordinates with that mechanic.
-        //
-        // Eventually we will need (TODO) a shutdown/mass kill type operation where it will make
-        // sense for the cooperator to be the one deciding to issue kill commands; this should be
-        // refactored of course but in general I think it's actually a good pattern that the
-        // cooperator can schedule work against itself; we should likely add a return system to
-        // the Handle construct that allows for passing across the lives-in-a-context as well as
-        // the lives-in-the-cooperator-thread boundaries.
-        //
-        assert(m_scheduled);
-        if (!crossed)
-        {
-            // We were called originally from the cooperator's thread, so this is guaranteed safe
-            //
-            m_scheduled->Kill(handle->m_context);
-        }
-        else
-        {
-            // We transitioned into the cooperator's thread and can't guarantee that the context
-            // was not destroyed during the jump. Instead, have to look at all the contexts to find
-            // a match, and then (ABA) need to look at its handle, as that should not have been
-            // reusable until this kill has completed and the owner that tried to kill with it
-            // has the chance to consider reuse.
-            //
-            m_contexts.Visit([&](Context* check)
-            {
-                if (check != handle->m_context)
-                {
-                    return true;
-                }
-                    
-                if (check->m_handle == handle)
-                {
-                    m_scheduled->Kill(handle->m_context);
-                }
+        assert(!crossed);
 
-                // Either way, we're not going to find a match past this
-                //
-                return false;
-            });
-        }
+        // This is the "boundary crossing" part
+        //
+        BoundaryCrossingKillArgs args;
+        args.mutex.lock();
+        args.handle = handle;
+
+        Submit(&BoundaryCrossingKill, &args);
+
+        // This gets unlocked in the submitted func; technically we don't need to do this but
+        // it preserves the same contract as when we kill from inside the boundary and don't
+        // return until the acutal kill logic has gotten to run for the targetted context
+        //
+        args.mutex.lock();
         return;
     }
 
-    BoundaryCrossingKillArgs args;
-    args.mutex.lock();
-    args.handle = handle;
+    if (crossed)
+    {
+        bool valid = false;
 
-    Submit(&BoundaryCrossingKill, &args);
-    args.mutex.unlock();
+        // We transitioned into the cooperator's thread and can't guarantee that the context
+        // was not destroyed during the jump. Instead, have to look at all the contexts to find
+        // a match, and then (ABA) need to look at its handle, as that should not have been
+        // reusable until this kill has completed and the owner that tried to kill with it
+        // has the chance to consider reuse.
+        //
+        m_contexts.Visit([&](Context* check)
+        {
+            if (check != handle->m_context)
+            {
+                return true;
+            }
+                    
+            if (check->m_handle == handle)
+            {
+                valid = true;
+            }
+
+            // Either way, we're not going to find a match past this
+            //
+            return false;
+        });
+        if (!valid)
+        {
+            // Already gone
+            //
+            return;
+        }
+    }
+    
+    // We are now certain that (a) we're in the cooperator's thread and (b) we have a valid context
+    // to kill
+    //
+
+    if (m_scheduled)
+    {
+        // We were called originally from the cooperator's thread, so this is guaranteed
+        // safe
+        //
+        m_scheduled->Kill(handle->m_context);
+    }
+    else
+    {
+        // May need to plumb failure back through here; however this code path currently should
+        // never happen because we don't kill handles from within the cooperator itself (today).
+        //
+        std::ignore = Spawn([&](Context* ctx)
+        {
+            ctx->Kill(handle->m_context);
+        });
+    }
 }
 
 void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 0 */)
@@ -402,7 +431,7 @@ void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 
     }
 
     size_t remaining = m_contexts.Size();
-    printf("---- Context Tree (%lu) ----\n", remaining);
+    printf("---- Context Tree (%lu, ticks=%ld) ----\n", remaining, m_ticks);
     m_contexts.Visit([&](coop::Context* child) -> bool
     {
         remaining--;
@@ -413,6 +442,20 @@ void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 
         return true;
     });
     assert(!remaining);
+}
+
+int64_t Cooperator::rdtsc() const
+{
+    uint32_t hi, lo;
+// cpuid forces a partial barrier preventing reordering, but we don't use rdtsc in a way that
+// remotely cares about that.
+//
+#ifdef __NEVER__
+    __asm__ __volatile__(
+       "xorl %%eax,%%eax \n        cpuid" ::: "%rax", "%rcx", "%rdx");
+#endif
+    __asm__ __volatile__("rdtsc" : "=a"(lo),"=d"(hi));
+    return static_cast<int64_t>((uint64_t)hi << 32 | lo);
 }
 
 void DeleteContext(Context* ctx)

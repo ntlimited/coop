@@ -4,6 +4,8 @@
 #include <utility>
 
 #include "coop/coordinator.h"
+#include "coop/coordinator_extension.h"
+#include "coop/self.h"
 
 namespace coop
 {

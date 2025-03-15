@@ -19,7 +19,7 @@ namespace network
 {
 
 TCPHandler::TCPHandler(Context* ctx, int fd)
-: m_context(ctx)
+: Launchable(ctx)
 , m_handle(fd, IN | HUP | ERR, &m_coordinator)
 {
     ctx->SetName("TCPHandler");
@@ -53,7 +53,7 @@ void TCPHandler::Launch()
 {
     char buffer[4096];
         
-    while (!m_context->IsKilled())
+    while (!GetContext()->IsKilled())
     {
         int ret = recv(m_handle.GetFD(), &buffer[0], 4096, 0);
         if (ret <= 0)
@@ -63,11 +63,11 @@ void TCPHandler::Launch()
             {
                 // Wait for another signal
                 //
-                if (m_coordinator != CoordinateWithKill(m_context, &m_coordinator))
+                if (m_coordinator != CoordinateWithKill(GetContext(), &m_coordinator))
                 {
                     // Our context was killed before our coordinator triggered
                     //
-                    assert(m_context->IsKilled());
+                    assert(GetContext()->IsKilled());
                     return;
                 }
                 continue;
@@ -75,7 +75,7 @@ void TCPHandler::Launch()
             break;
         }
 
-        if (!Recv(m_context, &buffer[0], ret))
+        if (!Recv(GetContext(), &buffer[0], ret))
         {
             break;
         }

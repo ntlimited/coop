@@ -16,19 +16,19 @@ namespace coop
 bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
 {
     // Block on there being a slot available to submit to. This means the bool return is
-	// currently irrelevant, but this should get extended to support a timeout at least.
+    // currently irrelevant, but this should get extended to support a timeout at least.
     //
-	m_submissionAvailabilitySemaphore.acquire();
+    m_submissionAvailabilitySemaphore.acquire();
 
     m_submissionLock.lock();
-	auto ret =  m_submissions.Push(ExecutionSubmission{func, arg, config});
+    auto ret =  m_submissions.Push(ExecutionSubmission{func, arg, config});
     m_submissionLock.unlock();
-	if (ret)
+    if (ret)
     {
-		// Signal that there is work to be picked up.
+        // Signal that there is work to be picked up.
         //
-		m_submissionSemaphore.release();
-	}
+        m_submissionSemaphore.release();
+    }
     return ret;
 }
 
@@ -55,7 +55,7 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         case SchedulerJumpResult::YIELDED:
         {
             m_scheduled->m_state = SchedulerState::YIELDED;
-			m_yielded.Push(m_scheduled);
+            m_yielded.Push(m_scheduled);
             break;
         }
         case SchedulerJumpResult::BLOCKED:
@@ -75,10 +75,10 @@ void Cooperator::Launch()
 
     while (!m_yielded.IsEmpty() || !m_shutdown)
     {
-		if (m_yielded.IsEmpty())
+        if (m_yielded.IsEmpty())
         {
             SpawnSubmitted(true /* wait */);
-			continue;
+            continue;
         }
         else
         {
@@ -105,7 +105,7 @@ void Cooperator::Launch()
                 break;
             }
         }
-	}
+    }
 }
 
 void Cooperator::YieldFrom(Context* ctx)
@@ -230,17 +230,17 @@ bool Cooperator::SpawnSubmitted(bool wait /* = false */)
             return false;
         }
     }
-	m_submissionLock.lock();
+    m_submissionLock.lock();
 
-	ExecutionSubmission submitted;
+    ExecutionSubmission submitted;
     m_submissions.Pop(submitted);
 
-	m_submissionLock.unlock();
+    m_submissionLock.unlock();
     m_submissionAvailabilitySemaphore.release();
 
-	Spawn(submitted.config, [&](Context* ctx)
+    Spawn(submitted.config, [&](Context* ctx)
     {
-		submitted.func(ctx, submitted.arg);
+        submitted.func(ctx, submitted.arg);
     });
 
     return true;
@@ -469,12 +469,12 @@ void* AllocateContext(SpawnConfiguration const& config)
     // Enforce 128 byte alignment at both top and bottom
     //
     assert((config.stackSize & 127) == 0);
-	return malloc(sizeof(Context) + config.stackSize);
+    return malloc(sizeof(Context) + config.stackSize);
 }
 
 void LongJump(std::jmp_buf& buf, SchedulerJumpResult result)
 {
-	longjmp(buf, static_cast<int>(result));
+    longjmp(buf, static_cast<int>(result));
 }
 
 thread_local Cooperator* Cooperator::thread_cooperator;

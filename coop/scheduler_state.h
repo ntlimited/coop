@@ -5,9 +5,9 @@ namespace coop
 
 enum class SchedulerState
 {
-	YIELDED,
-	BLOCKED,
-	RUNNING,
+    YIELDED,
+    BLOCKED,
+    RUNNING,
 };
 
 } // end namespace coop

@@ -9,7 +9,7 @@ namespace
 
 void ThreadTarget(Cooperator* mgr)
 {
-	mgr->Launch();
+    mgr->Launch();
 }
 
 } // end anonymous namespace

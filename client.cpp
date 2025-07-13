@@ -51,9 +51,9 @@ void ClientTask(coop::Context* ctx, void*)
 
 int main()
 {
-	coop::Cooperator cooperator;
+    coop::Cooperator cooperator;
     coop::Thread mt(&cooperator);
 
-	cooperator.Submit(&ClientTask);
+    cooperator.Submit(&ClientTask);
     return 0;
 }

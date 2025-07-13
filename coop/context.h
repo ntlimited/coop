@@ -14,23 +14,23 @@ namespace coop
 
 struct Segment
 {
-	size_t m_size;
-	uint8_t	m_bottom[0] __attribute__((aligned(128)));
-	
-	size_t Size() const
-	{
-		return m_size;
-	}
+    size_t m_size;
+    uint8_t    m_bottom[0] __attribute__((aligned(128)));
+    
+    size_t Size() const
+    {
+        return m_size;
+    }
 
-	void* Bottom()
-	{
-		return reinterpret_cast<void*>(&m_bottom[0]);
-	}
+    void* Bottom()
+    {
+        return reinterpret_cast<void*>(&m_bottom[0]);
+    }
 
-	void* Top()
-	{
-		return reinterpret_cast<void*>(&m_bottom[m_size]);
-	}
+    void* Top()
+    {
+        return reinterpret_cast<void*>(&m_bottom[m_size]);
+    }
 };
 
 struct Coordinator;
@@ -65,7 +65,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
   protected:
     friend struct Cooperator;
 
-	Context(
+    Context(
         Context* parent,
         SpawnConfiguration const& config,
         Handle* handle,
@@ -144,9 +144,9 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
   public:
     Context* m_parent;
     Handle* m_handle;
-	SchedulerState m_state;
-	int m_priority;
-	int m_currentPriority;
+    SchedulerState m_state;
+    int m_priority;
+    int m_currentPriority;
     Cooperator* m_cooperator;
     Coordinator m_killedCoordinator;
     ContextChildrenList m_children;
@@ -163,11 +163,11 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
 
     // The jmp_buf operates as the 'bookmark' to jump back into when the context is active.
     //
-	std::jmp_buf m_jmpBuf;
+    std::jmp_buf m_jmpBuf;
 
-	// Must be last member
-	//
-	Segment m_segment;
+    // Must be last member
+    //
+    Segment m_segment;
 };
 
 // Handle is the mechanism for working with contexts executing in a cooperator, both in and outsidee
@@ -199,7 +199,7 @@ struct Context::Handle
   private:
     friend Context;
     friend Cooperator;
-	Context* m_context;
+    Context* m_context;
 };
 
 } // end namespace coop

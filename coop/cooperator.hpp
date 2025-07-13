@@ -22,32 +22,32 @@ bool Cooperator::Spawn(Fn const& fn, Context::Handle* handle /* = nullptr */)
 {
     return Spawn(s_defaultConfiguration, fn, handle);
 }
-	
+    
 template<typename Fn>
 bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::Handle* handle /* = nullptr */)
 {
     if (m_shutdown || (m_scheduled && m_scheduled->IsKilled()))
-	{
+    {
         return false;
-	}
+    }
 
-	auto* alloc = AllocateContext(config);
+    auto* alloc = AllocateContext(config);
     if (!alloc)
-	{
+    {
         return false;
-	}
+    }
 
     // After this point we'll count it as time spent in the context
     //
     m_ticks += rdtsc() - m_lastRdtsc;
-	auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
+    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
     m_contexts.Push(spawnCtx);
 
-	// Depending on whether we're running this from the cooperator's own stack or
+    // Depending on whether we're running this from the cooperator's own stack or
     // not.
-	//
+    //
     Context* lastCtx = m_scheduled;
-	auto& buf = (lastCtx ? lastCtx->m_jmpBuf : m_jmpBuf);
+    auto& buf = (lastCtx ? lastCtx->m_jmpBuf : m_jmpBuf);
     bool isSelf = !lastCtx;
 
     if (lastCtx)
@@ -57,13 +57,13 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
         m_scheduled = nullptr;
     }
 
-	// Actually start executing.
+    // Actually start executing.
     //
     auto jmpRet = setjmp(buf);
     if (!jmpRet)
     {
         spawnCtx->m_state = SchedulerState::RUNNING;
-		m_scheduled = spawnCtx;
+        m_scheduled = spawnCtx;
 
         SanityCheck();
 
@@ -76,11 +76,11 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
         memcpy(spawnCtx->m_segment.Bottom(), &fn, sizeof(Fn));
 #pragma GCC diagnostic pop
 
-		void* top = spawnCtx->m_segment.Top();
+        void* top = spawnCtx->m_segment.Top();
         // After this point, we have moved to the stack we allocated
         //
         asm volatile(
-			"mov %[rs], %%rsp \n"
+            "mov %[rs], %%rsp \n"
             : [ rs ] "+r" (top) ::
         );
 
@@ -135,24 +135,24 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
     static_assert(std::is_base_of<Launchable, T>::value);
 
     if (m_shutdown || (m_scheduled && m_scheduled->IsKilled()))
-	{
+    {
         return nullptr;
-	}
+    }
 
-	auto* alloc = AllocateContext(s_defaultConfiguration);
+    auto* alloc = AllocateContext(s_defaultConfiguration);
     if (!alloc)
-	{
+    {
         return nullptr;
-	}
+    }
 
     m_ticks += rdtsc() - m_lastRdtsc;
-	auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
+    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
     m_contexts.Push(spawnCtx);
 
-	// Currently this has no reason to ever get invoked from the cooperator itself.
+    // Currently this has no reason to ever get invoked from the cooperator itself.
     //
     Context* lastCtx = m_scheduled;
-	auto& buf = (lastCtx ? lastCtx->m_jmpBuf : m_jmpBuf);
+    auto& buf = (lastCtx ? lastCtx->m_jmpBuf : m_jmpBuf);
     bool isSelf = !lastCtx;
 
     if (lastCtx)
@@ -162,7 +162,7 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
         m_scheduled = nullptr;
     }
     spawnCtx->m_state = SchedulerState::RUNNING;
-	m_scheduled = spawnCtx;
+    m_scheduled = spawnCtx;
 
     SanityCheck();
 
@@ -172,15 +172,15 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
         std::forward<Args&&>(args)...
     );
 
-	void* top = spawnCtx->m_segment.Top();
+    void* top = spawnCtx->m_segment.Top();
 
-	// Actually start executing.
+    // Actually start executing.
     //
     auto jmpRet = setjmp(buf);
     if (!jmpRet)
     {
         asm volatile(
-			"mov %[rs], %%rsp \n"
+            "mov %[rs], %%rsp \n"
             : [ rs ] "+r" (top) ::
         );
 

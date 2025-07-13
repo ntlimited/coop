@@ -115,7 +115,7 @@ void SpawningTask(coop::Context* ctx, void*)
     ctx->SetName("SpawningTask");
     int serverFd = bind_and_listen(8888);
 
-	auto* co = ctx->GetCooperator();
+    auto* co = ctx->GetCooperator();
     auto* ticker = co->Launch<coop::time::Ticker>();
     co->SetTicker(ticker);
     auto* uring = co->Launch<coop::io::Uring>(64);
@@ -169,9 +169,9 @@ void SpawningTask(coop::Context* ctx, void*)
 
 int main()
 {
-	coop::Cooperator cooperator;
+    coop::Cooperator cooperator;
     coop::Thread mt(&cooperator);
 
-	cooperator.Submit(&SpawningTask);
-	return 0;
+    cooperator.Submit(&SpawningTask);
+    return 0;
 }

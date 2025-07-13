@@ -1,16 +1,15 @@
 #pragma once
 
-#include "handle.h"
-
 namespace coop
 {
 
 namespace io
 {
 
-Handle Accept(Context* ctx, Coordinator* coord, Descriptor& desc);
+struct Descriptor;
+struct Handle;
 
-int Accept(Context* ctx, Descriptor& desc);
+bool Accept(Handle& handle, Descriptor& desc);
 
 int Accept(Descriptor& desc);
 

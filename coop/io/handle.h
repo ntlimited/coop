@@ -26,20 +26,8 @@ struct Handle : EmbeddedListHookups<Handle>
 
     Handle(Handle const&) = delete;
     Handle(Handle&&) = delete;
-    
-    // TODO this contract is weird because I wanted to do a cute trick with operator int() without
-    // using Self() to get the current context. It's probably bad and I should feel bad.
-    //
-    Handle(Context*, Descriptor*, Coordinator*, struct io_uring_sqe*);
-
-    Handle(int result)
-    : m_context(nullptr)
-    , m_coord(nullptr)
-    , m_descriptor(nullptr)
-    , m_result(result)
-    {
-        printf("Created io handle at %p\n", this);
-    }
+  
+    Handle(Context*, Descriptor&, Coordinator*);
 
     // Either we have completed the operation and are done or we were cancelled.
     //
@@ -50,6 +38,8 @@ struct Handle : EmbeddedListHookups<Handle>
 
     operator int();
 
+    void Submit(struct io_uring_sqe*);
+
     // Cancel is weird because we have to guarantee that the cancel is acked before we actually stop.
     // io_uring probably does do a CQE for this if I had to guess.
     //
@@ -58,12 +48,13 @@ struct Handle : EmbeddedListHookups<Handle>
 
     // Invoked when the completion queue event is received.
     //
-    void Complete(Context* ctx, struct io_uring_cqe*);
+    void Complete(struct io_uring_cqe*);
 
-    static void Callback(Context* ctx, struct io_uring_cqe* cqe);
+    static void Callback(struct io_uring_cqe* cqe);
 
-  private:
-    Descriptor*     m_descriptor;
+    // TODO visibility
+    //
+    Descriptor&     m_descriptor;
     Coordinator*    m_coord;
     Context*        m_context;
 

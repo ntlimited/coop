@@ -29,7 +29,7 @@ void Uring::Launch()
             assert(false);
         }
         assert(ret == 0);
-        Handle::Callback(GetContext(), cqe);
+        Handle::Callback(cqe);
     }
 }
 

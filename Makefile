@@ -10,8 +10,8 @@ SOURCE+=${SOURCE_COOP_TIME}
 SOURCE+=${SOURCE_COOP_IO}
 
 CC=g++
-CXXFLAGS=-I. --std=c++20 -g -O0
-LDFLAGS=-luring
+CXXFLAGS=-I. --std=c++20 -g -O0 -Wcpp
+LDFLAGS=-luring -lwolfssl
 
 default: clean
 	make -j16 bin/server bin/client

@@ -79,8 +79,13 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
 // Coordinator is the sole coordination primitive for contexts. It is heavily used and non-virtual,
 // which also means that higher level constructs are not themselves Coordinators.
 //
-// It is generally better form to take a pointer to a cooperator as an argument to build higher
+// It is generally better form to take a pointer to a Coordinator as an argument to build higher
 // level items, versus embed one's own Coordinator.
+//
+// The `Shutdown` mechanic is something that feels less clean than the rest of the concept; this is
+// required so that we can do some tricks that make our lives much easier in a few very specific
+// places in the core library. If this gets some traction in a future project, then looking at perf
+// data is probably the best way to feel out how worthwhile it is to clean this up.
 //
 struct Coordinator
 {

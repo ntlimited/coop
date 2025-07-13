@@ -1,88 +1,50 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"
+#include "coop/embedded_list.h"
 #include "coop/multi_coordinator.h"
 #include "coop/thread.h"
-#include "coop/network/dial.h"
-#include "coop/network/epoll_router.h"
-#include "coop/network/handle.h"
-#include "coop/network/socket.h"
 #include "coop/time/ticker.h"
+#include "coop/io/io.h"
+#include "coop/io/handle.h"
+#include "coop/io/uring.h"
 
 void ClientTask(coop::Context* ctx, void*)
 {
     ctx->SetName("ClientTask");
 
     auto* co = ctx->GetCooperator();
+    co->SetTicker(co->Launch<coop::time::Ticker>());
+    co->SetUring(co->Launch<coop::io::Uring>(64));
 
-    int epollFd = epoll_create(2);
-    assert(epollFd >= 0);
-    printf("errno? %d %s\n", errno, strerror(errno));
-
-    int fd = coop::network::Dial("127.0.0.1", 8888);
-    printf("errno? %d %s\n", errno, strerror(errno));
-    assert(fd >= 0);
-
-    coop::Context::Handle tickerHandle;
-    auto* ticker = co->Launch<coop::time::Ticker>(&tickerHandle);
-    co->SetTicker(ticker);
-
-    coop::Context::Handle routerHandle;
-    auto* router = co->Launch<coop::network::EpollRouter>(&routerHandle, epollFd);
-
-    coop::Coordinator inCoord(ctx);
-    coop::network::Handle inHandle(STDIN_FILENO, ::coop::network::IN, &inCoord);
-    inHandle.SetNonBlocking();
-    router->Register(&inHandle);
-
-    coop::network::Socket client(fd);
-    assert(client.Register(router));
-
-    client.SendAll(ctx, "hello world", sizeof("hello world"));
-
-    while (!ctx->IsKilled())
+    // Set up 16 children that will do 
+    for (int i = 0 ; i < 16 ; i++)
     {
-        printf("Waiting on inCoord or client coordinator\n");
-        switch (coop::CoordinateWith(ctx, &inCoord, client.GetCoordinator()))
+        co->Spawn([co](coop::Context* childCtx)
         {
-            case 0:
-                // Data available for inHandle
-                //
-                {
-                    char buffer[128];
-                    int ret = read(STDIN_FILENO, &buffer[0], 128);
-                    if (ret < 0)
-                    {
-                        printf("Error reading stdin: %d (%s)\n", errno, strerror(errno));
-                        return;
-                    }
-                    printf("Read from stdin\n");
-                    client.SendAll(ctx, &buffer[0], ret);
-                }
-                // Fallthrough to try and send data off of the list
-                //
-            case 1:
-                {
-                    char buffer[128];
-                    while (int ret = client.Recv(ctx, &buffer[0], 128, MSG_DONTWAIT))
-                    {
-                        if (ret < 0)
-                        {
-                            printf("Error reading from client: %d (%s)\n", errno, strerror(errno));
-                            return;
-                        }
-                        buffer[ret] = 0;
-                        printf("Received: %s\n", buffer);
-                    }
-                }
-            default:
-                // We were killed
-                //
-                break;
-        }
+            int fd = socket(AF_INET , SOCK_STREAM | SOCK_NONBLOCK, 0);
+            coop::io::Descriptor remote(fd);
+            if (coop::io::Connect(remote, "192.168.0.136", 8888))
+            {
+                assert(false);
+            }
+
+            coop::Coordinator   sc, rc;
+            coop::io::Handle    sh(childCtx, remote, &sc);
+            coop::io::Handle    rh(childCtx, remote, &rc);
+
+            char buff1[1024], buff2[1024];
+            char *rb = &buff1[0], *sb = &buff2[0];
+
+            while (!childCtx->IsKilled())
+            {
+                
+            }
+        });
     }
 }
 

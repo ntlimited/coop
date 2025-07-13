@@ -1,6 +1,6 @@
 #pragma once
 
-#include "handle.h"
+#include <stddef.h>
 
 namespace coop
 {
@@ -8,9 +8,10 @@ namespace coop
 namespace io
 {
 
-Handle Recv(Context*, Coordinator* coord, Descriptor& desc, void* buf, size_t size, int flags = 0);
+struct Descriptor;
+struct Handle;
 
-int Recv(Context* ctx, Descriptor& desc, void* buf, size_t size, int flags = 0);
+bool Recv(Handle& handle, void* buf, size_t size, int flags = 0);
 
 int Recv(Descriptor& desc, void* buf, size_t size, int flags = 0);
 

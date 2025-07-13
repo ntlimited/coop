@@ -28,5 +28,10 @@ Descriptor::~Descriptor()
     m_ring->Unregister(this);
 }
 
+int Descriptor::Close()
+{
+    return close(m_fd);
+}
+
 } // end namespace io
 } // end namespace coop

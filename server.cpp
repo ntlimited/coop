@@ -5,6 +5,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcpp"
+// #include <wolfssl/ssl.h>
+#pragma GCC diagnostic pop
+
 #include "coop/coordinator.h"
 #include "coop/cooperator.h"
 #include "coop/multi_coordinator.h"
@@ -31,6 +36,56 @@
 // - creating a TCP server that will use the router for dispatching events
 // - attaching an echo handler to serve sockets connected through the server
 //
+
+struct ClientHandler : coop::Launchable
+{
+    ClientHandler(coop::Context* ctx, int fd)
+    : coop::Launchable(ctx)
+    , m_fd(fd)
+    {
+        ctx->SetName("ConnectionHandler");
+    }
+
+    virtual void Launch() final
+    {
+        char buffer[4096];
+
+        while (!GetContext()->IsKilled())
+        {
+            int ret = coop::io::Recv(m_fd, &buffer[0], 4096);
+            if (!ret)
+            {
+                // Short read, disconnected
+                //
+                break;
+            }
+
+            if (ret < 0)
+            {
+                assert(false);
+                break;
+            }
+
+            int at = 0;
+            while (ret)
+            {
+                int sent = coop::io::Send(m_fd, &buffer[at], ret);
+                if (sent == 0)
+                {
+                    m_fd.Close();
+                    return;
+                }
+
+                assert(sent > 0);
+                at += sent;
+                ret -= sent;
+            }
+        }
+        m_fd.Close();
+    }
+    
+    coop::io::Descriptor m_fd;
+};
 
 int bind_and_listen(int port)
 {
@@ -79,48 +134,10 @@ void SpawningTask(coop::Context* ctx, void*)
             int fd = coop::io::Accept(desc);
             assert(fd >= 0);
 
-            co->Spawn([=](coop::Context* clientCtx)
-            {
-                coop::io::Descriptor client(fd);
+            co->Launch<ClientHandler>(fd);
 
-                char buffer[1025];
-
-                while (!clientCtx->IsKilled())
-                {
-                    int ret = coop::io::Recv(client, &buffer[0], 1024);
-                    if (!ret)
-                    {
-                        // Short read, disconnected
-                        //
-                        break;
-                    }
-
-                    if (ret < 0)
-                    {
-                        assert(false);
-                        break;
-                    }
-                    buffer[ret++] = '\n';
-
-                    int at = 0;
-                    while (ret)
-                    {
-                        int sent = coop::io::Send(client, &buffer[at], ret);
-                        if (sent == 0)
-                        {
-                            close(fd);
-                            return;
-                        }
-
-                        assert(sent > 0);
-                        at += sent;
-                        ret -= sent;
-                    }
-                }
-
-                close(fd);
-            });
-
+            // The above accept yields too, but why not be nice
+            //
             serverCtx->Yield();
         }
     }, &serverHandle);

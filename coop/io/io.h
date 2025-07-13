@@ -1,6 +1,7 @@
 #pragma once
 
 #include "accept.h"
+#include "connect.h"
 #include "recv.h"
 #include "send.h"
 

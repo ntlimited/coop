@@ -1,21 +1,17 @@
 #pragma once
 
-#include "handle.h"
+#include <stddef.h>
 
 namespace coop
 {
-
-struct Context;
-struct Coordinator;
 
 namespace io
 {
 
 struct Descriptor;
+struct Handle;
 
-Handle Send(Context* ctx, Coordinator* coord, Descriptor& desc, void* buf, size_t size, int flags = 0);
-
-int Send(Context* ctx, Descriptor& desc, void* buf, size_t size, int flags = 0);
+bool Send(Handle& h, void* buf, size_t size, int flags = 0);
 
 int Send(Descriptor& desc, void* buf, size_t size, int flags = 0);
 

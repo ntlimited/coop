@@ -29,7 +29,7 @@ Context::Context(
         m_parent->m_children.Push(this);
         m_parent->m_lastChild.TryAcquire(this);
     }
-	m_segment.m_size = config.stackSize;
+    m_segment.m_size = config.stackSize;
 
     m_statistics.ticks = 0;
     m_statistics.yields = 0;

@@ -7,25 +7,14 @@
 
 #include "embedded_list.h"
 #include "context.h"
+#include "cooperator_configuration.h"
 #include "fixed_list.h"
 #include "spawn_configuration.h"
+#include "io/uring.h"
+#include "time/ticker.h"
 
 namespace coop
 {
-
-namespace time
-{
-
-    struct Ticker;
-
-} // end namespace coop::time
-
-namespace io
-{
-
-    struct Uring;
-
-} // end namespace coop::io
 
 enum class SchedulerJumpResult
 {
@@ -44,12 +33,12 @@ struct Cooperator
 {
     thread_local static Cooperator* thread_cooperator;
 
-    Cooperator()
+    Cooperator(CooperatorConfiguration const& config = s_defaultCooperatorConfiguration)
     : m_lastRdtsc(0)
     , m_ticks(0)
     , m_shutdown(false)
-    , m_ticker(nullptr)
-    , m_uring(nullptr)
+    , m_ticker(config.tickerResolution)
+    , m_uring(config.uringEntries)
     , m_scheduled(nullptr)
     , m_submissionSemaphore(0)
     , m_submissionAvailabilitySemaphore(8)
@@ -113,7 +102,7 @@ struct Cooperator
     }
 
     using Submission = void(*)(Context*, void*);
-    
+
     // Submit is the out-of-context version of Spawn that uses pthread_create style arguments
     // (doesn't get the sexy lambda syntax) because we need to pass control to the cooperator's
     // thread and can't guarantee lifetimes.
@@ -132,7 +121,7 @@ struct Cooperator
         Submission func,
         void* arg = nullptr,
         SpawnConfiguration const& config = s_defaultConfiguration);
-   
+
     // Internal API for passing control to the given context
     //
     void Resume(Context* ctx);
@@ -152,19 +141,19 @@ struct Cooperator
     void Shutdown()
     {
         m_shutdown = true;
+        m_tickerHandle.Kill();
+        m_uringHandle.Kill();
     }
 
-    bool SetTicker(time::Ticker*);
-
-    bool SetUring(io::Uring* ur)
+    time::Ticker* GetTicker()
     {
-        m_uring = ur;
-        return true;
+        return &m_ticker;
     }
 
-    time::Ticker* GetTicker();
-
-    io::Uring* GetUring();
+    io::Uring* GetUring()
+    {
+        return &m_uring;
+    }
 
     size_t ContextsCount() const
     {
@@ -186,9 +175,9 @@ struct Cooperator
     // Ideally this would be better protected
     //
     void BoundarySafeKill(Context::Handle*, const bool crossed = false);
-   
+
     void PrintContextTree(Context* ctx = nullptr, int indent = 0) ;
-  
+
   private:
     // Shared logic for entering a newly created context. Handles saving the spawning context's
     // state, setting up the new stack via ucontext, and switching to it. Used by both Spawn and
@@ -201,7 +190,7 @@ struct Cooperator
     static void ContextEntryPoint(int lo, int hi);
 
     void HandleCooperatorResumption(const SchedulerJumpResult res);
-    
+
     int64_t rdtsc() const;
 
     int64_t m_lastRdtsc;
@@ -210,13 +199,13 @@ struct Cooperator
     bool            m_shutdown;
     Context*        m_scheduled;
 
-    time::Ticker*   m_ticker;
+    time::Ticker    m_ticker;
     Context::Handle m_tickerHandle;
-    io::Uring*      m_uring;
+    io::Uring       m_uring;
     Context::Handle m_uringHandle;
 
     std::jmp_buf    m_jmpBuf;
-    
+
     struct ExecutionSubmission
     {
         Submission          func;

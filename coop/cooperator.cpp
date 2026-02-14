@@ -9,8 +9,6 @@
 #include "cooperator.h"
 #include "launchable.h"
 
-#include "time/ticker.h"
-
 namespace coop
 {
 
@@ -73,6 +71,9 @@ void Cooperator::Launch()
 {
     Cooperator::thread_cooperator = this;
     m_lastRdtsc = rdtsc();
+
+    Spawn([this](Context* ctx) { m_ticker.Run(ctx); }, &m_tickerHandle);
+    Spawn([this](Context* ctx) { m_uring.Run(ctx); }, &m_uringHandle);
 
     while (!m_yielded.IsEmpty() || !m_shutdown)
     {
@@ -244,22 +245,6 @@ bool Cooperator::SpawnSubmitted(bool wait /* = false */)
     });
 
     return true;
-}
-
-bool Cooperator::SetTicker(time::Ticker* t)
-{
-    m_ticker = t;
-    return true;
-}
-
-time::Ticker* Cooperator::GetTicker()
-{
-    return m_ticker;
-}
-
-io::Uring* Cooperator::GetUring()
-{
-    return m_uring;
 }
 
 void Cooperator::SanityCheck()

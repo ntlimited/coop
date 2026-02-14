@@ -14,12 +14,13 @@ namespace io
 
 // Work loop
 //
-void Uring::Launch()
+void Uring::Run(Context* ctx)
 {
-    while (!GetContext()->IsKilled())
-    { 
-        GetContext()->Yield();
-        
+    Init();
+    while (!ctx->IsKilled())
+    {
+        ctx->Yield();
+
         struct io_uring_cqe* cqe;
         int ret = io_uring_peek_cqe(&m_ring, &cqe);
         if (ret == -EAGAIN || ret == -EINTR)

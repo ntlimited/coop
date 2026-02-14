@@ -11,10 +11,7 @@
 #include "coop/embedded_list.h"
 #include "coop/multi_coordinator.h"
 #include "coop/thread.h"
-#include "coop/time/ticker.h"
 #include "coop/io/io.h"
-#include "coop/io/handle.h"
-#include "coop/io/uring.h"
 #include "coop/io/ssl/ssl.h"
 
 void ClientTask(coop::Context* ctx, void* arg)
@@ -25,8 +22,6 @@ void ClientTask(coop::Context* ctx, void* arg)
         useSsl ? "ssl" : "plaintext", useSsl ? 8889 : 8888);
 
     auto* co = ctx->GetCooperator();
-    co->SetTicker(co->Launch<coop::time::Ticker>());
-    co->SetUring(co->Launch<coop::io::Uring>(64));
 
     coop::io::ssl::Context sslCtx(coop::io::ssl::Mode::Client);
     auto* sslCtxPtr = &sslCtx;

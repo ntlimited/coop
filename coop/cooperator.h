@@ -190,6 +190,16 @@ struct Cooperator
     void PrintContextTree(Context* ctx = nullptr, int indent = 0) ;
   
   private:
+    // Shared logic for entering a newly created context. Handles saving the spawning context's
+    // state, setting up the new stack via ucontext, and switching to it. Used by both Spawn and
+    // Launch to eliminate duplication.
+    //
+    void EnterContext(Context* ctx);
+
+    // Trampoline invoked by makecontext when a new context starts executing.
+    //
+    static void ContextEntryPoint(int lo, int hi);
+
     void HandleCooperatorResumption(const SchedulerJumpResult res);
     
     int64_t rdtsc() const;

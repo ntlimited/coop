@@ -10,6 +10,7 @@ namespace coop
 struct Coordinator;
 struct Context;
 struct CoordinatorExtension;
+struct Signal;
 
 // Coordinated is an internal type used to maintain the necessary metadata for coordinated
 // operations. It is also usable with the CoordinatorExtension type that launders access to
@@ -61,6 +62,7 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
   private:
     friend struct Coordinator;
     friend struct CoordinatorExtension;
+    friend struct Signal;
 
     void SetContext(Context* ctx)
     {
@@ -82,16 +84,11 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
 // It is generally better form to take a pointer to a Coordinator as an argument to build higher
 // level items, versus embed one's own Coordinator.
 //
-// The `Shutdown` mechanic is something that feels less clean than the rest of the concept; this is
-// required so that we can do some tricks that make our lives much easier in a few very specific
-// places in the core library. If this gets some traction in a future project, then looking at perf
-// data is probably the best way to feel out how worthwhile it is to clean this up.
-//
 struct Coordinator
 {
     Coordinator(const Coordinator&) = delete;
     Coordinator(Coordinator&&) = delete;
-    
+
     // Start out unheld
     //
     Coordinator();
@@ -112,8 +109,6 @@ struct Coordinator
     //
     bool TryAcquire(Context*);
 
-    // Acquire can fail in the event that the Coordinator has been shut down
-    //
     void Acquire(Context*);
 
     // Dumb helper for acquire-and-release
@@ -133,19 +128,18 @@ struct Coordinator
     {
         return this == other;
     }
-  
+
   protected:
     friend struct CoordinatorExtension;
+    friend struct Signal;
+
     void AddAsBlocked(Coordinated*);
-    void RemoveAsBlocked(Coordinated*); 
+    void RemoveAsBlocked(Coordinated*);
     bool HeldBy(Context* ctx);
-    void Shutdown(Context* ctx, const bool schedule = true);
 
 //  private:
     Context* m_heldBy;
     Coordinated::List m_blocking;
-
-    bool m_shutdown;
 };
 
 } // end namespace coop

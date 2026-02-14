@@ -9,7 +9,6 @@ namespace coop
 
 Coordinator::Coordinator()
 : m_heldBy(nullptr)
-, m_shutdown(false)
 {
 }
 
@@ -20,11 +19,6 @@ bool Coordinator::IsHeld() const
 
 bool Coordinator::TryAcquire(Context* ctx)
 {
-    if (m_shutdown)
-    {
-        return true;
-    }
-
     if (m_heldBy == nullptr)
     {
         m_heldBy = ctx;
@@ -36,11 +30,6 @@ bool Coordinator::TryAcquire(Context* ctx)
 
 void Coordinator::Acquire(Context* ctx)
 {
-    if (m_shutdown)
-    {
-        return;
-    }
-
     if (m_heldBy == nullptr)
     {
         m_heldBy = ctx;
@@ -69,19 +58,13 @@ void Coordinator::Flash(Context* ctx)
 
 void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 {
-    if (m_shutdown)
-    {
-        return;
-    }
-
-    // We allow multiple release of shutdown coordinators as the acquire/release contract no
-    // longer applies.
+    // Allow no-op release when the coordinator is not held. This supports Signal::Notify which
+    // clears m_heldBy before MultiCoordinator cleanup can call Release.
     //
-    if (m_shutdown && !m_heldBy)
+    if (!m_heldBy)
     {
         return;
     }
-    assert(m_heldBy);
     m_heldBy = nullptr;
 
     // Pass control to the next in line blocked on the coordinator, if it exists.
@@ -91,13 +74,6 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
     {
         return;
     }
-
-    // m_blocking.Visit([&](Coordinated* others)
-    // {
-    //     assert(others->m_context != next->m_context);
-    //     return true;
-    // });
-    //
 
     // Mark the coordinated instance as having been satisfied by gaining the lock now
     // that we've popped it from the list
@@ -122,26 +98,6 @@ void Coordinator::RemoveAsBlocked(Coordinated* c)
 bool Coordinator::HeldBy(Context* ctx)
 {
     return m_heldBy == ctx;
-}
-
-// Shutting down a coordinator means that the instance will act as a 'signal': callers of Acquire
-// APIs will be told they have taken the coordinator, and release calls will become no-ops.
-//
-// This is very useful for, e.g., kill conditions.
-//
-void Coordinator::Shutdown(Context* ctx, const bool schedule /* = true */)
-{
-    m_shutdown = true;
-    m_heldBy = nullptr;
-
-    // Unblock everyone coordinating on this instance
-    //
-    Coordinated* ord;
-    while (m_blocking.Pop(ord))
-    {
-        ord->m_satisfied = true;
-        ctx->Unblock(ord->GetContext(), schedule);
-    }
 }
 
 } // end namespace coop

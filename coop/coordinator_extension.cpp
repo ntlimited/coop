@@ -26,11 +26,6 @@ bool CoordinatorExtension::HeldBy(Coordinator* c, Context* ctx)
     return c->HeldBy(ctx);
 }
 
-void CoordinatorExtension::Shutdown(Coordinator* c, Context* ctx)
-{
-    c->Shutdown(ctx);
-}
-
 void CoordinatorExtension::SetContext(Coordinated* c, Context* ctx)
 {
     c->SetContext(ctx);

@@ -6,7 +6,7 @@
 namespace coop
 {
 
-Coordinator* Context::Handle::GetKilledSignal()
+Signal* Context::Handle::GetKilledSignal()
 {
     // TODO add some "you're in the right cooperator" asserts here and everywhere
     //

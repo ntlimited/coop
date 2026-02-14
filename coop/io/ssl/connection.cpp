@@ -18,9 +18,10 @@ namespace io
 namespace ssl
 {
 
-Connection::Connection(Context& ctx, Descriptor& desc)
+Connection::Connection(Context& ctx, Descriptor& desc, char* buffer, size_t bufferSize)
 : m_desc(desc)
-, m_buffer(new char[BUFFER_SIZE])
+, m_buffer(buffer)
+, m_bufferSize(bufferSize)
 {
     m_ssl = SSL_new(ctx.m_ctx);
     assert(m_ssl);
@@ -51,7 +52,6 @@ Connection::Connection(Context& ctx, Descriptor& desc)
 Connection::~Connection()
 {
     SSL_free(m_ssl);
-    delete[] m_buffer;
 }
 
 // Drain any pending data from OpenSSL's write BIO and send it over the wire via io::Send. This
@@ -63,7 +63,7 @@ int Connection::FlushWrite()
 {
     while (BIO_ctrl_pending(m_wbio) > 0)
     {
-        int n = BIO_read(m_wbio, m_buffer, BUFFER_SIZE);
+        int n = BIO_read(m_wbio, m_buffer, m_bufferSize);
         if (n <= 0)
         {
             break;
@@ -92,7 +92,7 @@ int Connection::FlushWrite()
 //
 int Connection::FeedRead()
 {
-    int n = io::Recv(m_desc, m_buffer, BUFFER_SIZE);
+    int n = io::Recv(m_desc, m_buffer, m_bufferSize);
     if (n <= 0)
     {
         spdlog::trace("ssl feed_read fd={} recv={}", m_desc.m_fd, n);

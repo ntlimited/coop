@@ -90,7 +90,7 @@ struct TLSClientHandler : coop::Launchable
     TLSClientHandler(coop::Context* ctx, int fd, coop::io::ssl::Context* sslCtx)
     : coop::Launchable(ctx)
     , m_fd(fd)
-    , m_conn(*sslCtx, m_fd)
+    , m_conn(*sslCtx, m_fd, m_tlsBuffer, sizeof(m_tlsBuffer))
     {
         ctx->SetName("TLSConnectionHandler");
     }
@@ -139,6 +139,7 @@ struct TLSClientHandler : coop::Launchable
     }
 
     coop::io::Descriptor       m_fd;
+    char                       m_tlsBuffer[coop::io::ssl::Connection::BUFFER_SIZE];
     coop::io::ssl::Connection  m_conn;
 };
 
@@ -245,7 +246,7 @@ void SpawningTask(coop::Context* ctx, void*)
 
     // Wait for either the router or us to get killed
     //
-    ctx->GetKilledSignal()->Acquire(ctx);
+    ctx->GetKilledSignal()->Wait(ctx);
 }
 
 int main()

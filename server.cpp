@@ -5,11 +5,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcpp"
-// #include <wolfssl/ssl.h>
-#pragma GCC diagnostic pop
-
 #include "coop/coordinator.h"
 #include "coop/cooperator.h"
 #include "coop/multi_coordinator.h"
@@ -25,16 +20,17 @@
 #include "coop/tricks.h"
 #include "coop/io/io.h"
 #include "coop/io/uring.h"
+#include "coop/io/ssl/ssl.h"
 
 #include "HTTPRequest.hpp"
 
-// Demo program that currently sets up a TCP echo server by:
+// Demo program that sets up two TCP echo servers:
 //
-// - creating a coordinator and starting its thread
-// - launching a master task that does the actual work
-// - creating a Router implementation for handling eventing
-// - creating a TCP server that will use the router for dispatching events
-// - attaching an echo handler to serve sockets connected through the server
+// - A plaintext echo server on port 8888
+// - A TLS echo server on port 8889
+//
+// Both use the same cooperative uring-based I/O. The TLS version demonstrates coop::io::ssl usage
+// — note how similar TLSClientHandler is to the plaintext ClientHandler.
 //
 
 struct ClientHandler : coop::Launchable
@@ -87,6 +83,60 @@ struct ClientHandler : coop::Launchable
     coop::io::Descriptor m_fd;
 };
 
+struct TLSClientHandler : coop::Launchable
+{
+    TLSClientHandler(coop::Context* ctx, int fd, coop::io::ssl::Context* sslCtx)
+    : coop::Launchable(ctx)
+    , m_fd(fd)
+    , m_conn(*sslCtx, m_fd)
+    {
+        ctx->SetName("TLSConnectionHandler");
+    }
+
+    virtual void Launch() final
+    {
+        if (m_conn.Handshake() < 0)
+        {
+            m_fd.Close();
+            return;
+        }
+
+        char buffer[4096];
+
+        while (!GetContext()->IsKilled())
+        {
+            int ret = coop::io::ssl::Recv(m_conn, &buffer[0], 4096);
+            if (!ret)
+            {
+                break;
+            }
+
+            if (ret < 0)
+            {
+                break;
+            }
+
+            int at = 0;
+            while (ret)
+            {
+                int sent = coop::io::ssl::Send(m_conn, &buffer[at], ret);
+                if (sent <= 0)
+                {
+                    m_fd.Close();
+                    return;
+                }
+
+                at += sent;
+                ret -= sent;
+            }
+        }
+        m_fd.Close();
+    }
+
+    coop::io::Descriptor       m_fd;
+    coop::io::ssl::Connection  m_conn;
+};
+
 int bind_and_listen(int port)
 {
     int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -114,6 +164,7 @@ void SpawningTask(coop::Context* ctx, void*)
 {
     ctx->SetName("SpawningTask");
     int serverFd = bind_and_listen(8888);
+    int tlsServerFd = bind_and_listen(8889);
 
     auto* co = ctx->GetCooperator();
     auto* ticker = co->Launch<coop::time::Ticker>();
@@ -121,12 +172,19 @@ void SpawningTask(coop::Context* ctx, void*)
     auto* uring = co->Launch<coop::io::Uring>(64);
     co->SetUring(uring);
 
+    // TLS configuration — shared across all TLS connections
+    //
+    coop::io::ssl::Context sslCtx(coop::io::ssl::Mode::Server);
+    assert(sslCtx.LoadCertificate("cert.pem"));
+    assert(sslCtx.LoadPrivateKey("key.pem"));
+
     coop::Context::Handle serverHandle;
 
-
+    // Plaintext echo server on port 8888
+    //
     co->Spawn([=](coop::Context* serverCtx)
     {
-        serverCtx->SetName("UringHandler");
+        serverCtx->SetName("PlaintextAcceptor");
         coop::io::Descriptor desc(serverFd, uring);
 
         while (!serverCtx->IsKilled())
@@ -135,12 +193,27 @@ void SpawningTask(coop::Context* ctx, void*)
             assert(fd >= 0);
 
             co->Launch<ClientHandler>(fd);
-
-            // The above accept yields too, but why not be nice
-            //
             serverCtx->Yield();
         }
     }, &serverHandle);
+
+    // TLS echo server on port 8889
+    //
+    auto* sslCtxPtr = &sslCtx;
+    co->Spawn([=](coop::Context* tlsCtx)
+    {
+        tlsCtx->SetName("TLSAcceptor");
+        coop::io::Descriptor desc(tlsServerFd, uring);
+
+        while (!tlsCtx->IsKilled())
+        {
+            int fd = coop::io::Accept(desc);
+            assert(fd >= 0);
+
+            co->Launch<TLSClientHandler>(fd, sslCtxPtr);
+            tlsCtx->Yield();
+        }
+    });
 
     co->Spawn([=](coop::Context* statusCtx)
     {

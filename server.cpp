@@ -18,10 +18,8 @@
 #include "coop/network/tcp_handler.h"
 #include "coop/network/tcp_server.h"
 #include "coop/time/sleep.h"
-#include "coop/time/ticker.h"
 #include "coop/tricks.h"
 #include "coop/io/io.h"
-#include "coop/io/uring.h"
 #include "coop/io/ssl/ssl.h"
 
 #include "HTTPRequest.hpp"
@@ -175,16 +173,20 @@ void SpawningTask(coop::Context* ctx, void*)
     int tlsServerFd = bind_and_listen(8889);
 
     auto* co = ctx->GetCooperator();
-    auto* ticker = co->Launch<coop::time::Ticker>();
-    co->SetTicker(ticker);
-    auto* uring = co->Launch<coop::io::Uring>(64);
-    co->SetUring(uring);
 
     // TLS configuration — shared across all TLS connections
     //
     coop::io::ssl::Context sslCtx(coop::io::ssl::Mode::Server);
-    assert(sslCtx.LoadCertificate("cert.pem"));
-    assert(sslCtx.LoadPrivateKey("key.pem"));
+
+    char certBuf[8192];
+    int certLen = coop::io::ReadFile("cert.pem", certBuf, sizeof(certBuf));
+    assert(certLen > 0);
+    assert(sslCtx.LoadCertificate(certBuf, certLen));
+
+    char keyBuf[8192];
+    int keyLen = coop::io::ReadFile("key.pem", keyBuf, sizeof(keyBuf));
+    assert(keyLen > 0);
+    assert(sslCtx.LoadPrivateKey(keyBuf, keyLen));
 
     coop::Context::Handle serverHandle;
 
@@ -193,7 +195,7 @@ void SpawningTask(coop::Context* ctx, void*)
     co->Spawn([=](coop::Context* serverCtx)
     {
         serverCtx->SetName("PlaintextAcceptor");
-        coop::io::Descriptor desc(serverFd, uring);
+        coop::io::Descriptor desc(serverFd);
 
         while (!serverCtx->IsKilled())
         {
@@ -212,7 +214,7 @@ void SpawningTask(coop::Context* ctx, void*)
     co->Spawn([=](coop::Context* tlsCtx)
     {
         tlsCtx->SetName("TLSAcceptor");
-        coop::io::Descriptor desc(tlsServerFd, uring);
+        coop::io::Descriptor desc(tlsServerFd);
 
         while (!tlsCtx->IsKilled())
         {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>
 #include <liburing.h>
 #include <tuple>
 #include <utility>
@@ -8,10 +9,11 @@
 
 #include "coop/coordinator.h"
 #include "coop/embedded_list.h"
-#include "coop/launchable.h"
 
 namespace coop
 {
+
+struct Context;
 
 namespace io
 {
@@ -20,31 +22,34 @@ namespace io
 // expected that most developers will need to interact with the uring in any direct fashion:
 // instead, the
 //
-struct Uring : Launchable
+struct Uring
 {
     static constexpr size_t REGISTERED_SIZE = 64;
 
     using DescriptorList = EmbeddedList<Descriptor>;
 
-    Uring(Context* ctx, int entries)
-    : Launchable(ctx)
+    Uring(int entries)
+    : m_entries(entries)
     , m_registeredCount(0)
     , m_cleanGeneration(0)
     , m_dirtyGeneration(1)
     {
-        int ret = io_uring_queue_init(entries, &m_ring, 0);
-        assert(ret == 0);
-        std::ignore = ret;
+        memset(&m_ring, 0, sizeof(m_ring));
 
-        // memset blah blah blah
-        //
         for (int i = 0 ; i < REGISTERED_SIZE ; i++)
         {
             m_registered[i] = -1;
         }
     }
 
-    void Launch();
+    void Init()
+    {
+        int ret = io_uring_queue_init(m_entries, &m_ring, 0);
+        assert(ret == 0);
+        std::ignore = ret;
+    }
+
+    void Run(Context* ctx);
 
     // TODO lock down the guts
     //
@@ -56,7 +61,7 @@ struct Uring : Launchable
 
     struct  io_uring m_ring;
     DescriptorList m_descriptors;
-    
+
     // TODO: io_uring has (optional) epoll-esque registration semantics which allows for less
     // overhead over time as kernel structures can be maintained. This is something I'm still
     // feeling out as to how it works; in short, we have a "best effort" system where if we have
@@ -84,6 +89,7 @@ struct Uring : Launchable
     // syscall are.
     //
     int32_t m_registered[REGISTERED_SIZE];
+    int     m_entries;
     int     m_registeredCount;
     int     m_cleanGeneration;
     int     m_dirtyGeneration;

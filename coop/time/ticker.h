@@ -3,11 +3,10 @@
 #include "handle.h"
 #include "interval.h"
 
-#include "coop/context.h"
-#include "coop/launchable.h"
-
 namespace coop
 {
+
+struct Context;
 
 namespace time
 {
@@ -34,7 +33,7 @@ namespace time
 // deadlines 4-8 "resolutions" in the future, which would likely engender ~4 linkedlist insert/pops
 // each.
 //
-struct Ticker : Launchable
+struct Ticker
 {
     // The ticker will fully scan every single handle every (1 << (BUCKETS + RESOLUTION)) Intervals
     // of time. With defaults, this is on the order of a month. If set down to, for example, 16, this
@@ -43,7 +42,7 @@ struct Ticker : Launchable
     // different fronts.
     //
     static constexpr int BUCKETS = 32;
-    
+
     // The 'resolution' of the ticker depends on two factors: first, the `Interval` for the system
     // that it is compiled for. Second, the 'resolution' is a bitshift (e.g. exponentially growing)
     // method of rounding. This has a couple direct effects:
@@ -53,14 +52,14 @@ struct Ticker : Launchable
     //
     static constexpr int DEFAULT_RESOLUTION = 3;
 
-    Ticker(Context* ctx, int resolution = DEFAULT_RESOLUTION);
+    Ticker(int resolution = DEFAULT_RESOLUTION);
 
     // The ticker never blocks and busy-waits performing gettime. The amount of work beyond this
     // is controlled to be extremely low (if it is doing a lot of work, it is because there is a
     // lot of non-timer work going on).
     //
-    void Launch() final;
-    
+    void Run(Context* ctx);
+
     // Submit the given coordinator to be released after `interval` has passed. If submission succeeds,
     // then the coordinator and handle lifetime must exceed when `interval` passes, or until the
     // handle is cancelled.
@@ -73,7 +72,7 @@ struct Ticker : Launchable
     // `Now` returns the unix-epoch based number of passed 'Intervals' of time.
     //
     size_t Now() const;
-    
+
     // Return the offset to the bucket that a timer for the given interval should go into
     //
     int BucketFor(size_t interval) const;
@@ -91,7 +90,6 @@ struct Ticker : Launchable
         size_t lastChecked;
     } m_buckets[BUCKETS];
 
-    Context* m_context;
     size_t m_epoch;
     int m_resolution;
 };

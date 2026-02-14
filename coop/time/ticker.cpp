@@ -1,29 +1,30 @@
 #include "coop/time/ticker.h"
 
+#include "coop/context.h"
+
 namespace coop
 {
 
 namespace time
 {
 
-Ticker::Ticker(Context* ctx, int resolution /* = 0 */)
-: Launchable(ctx)
-, m_epoch(0)
+Ticker::Ticker(int resolution /* = DEFAULT_RESOLUTION */)
+: m_epoch(0)
 , m_resolution(resolution)
 {
-    ctx->SetName("Ticker");
     for (int i = 0 ; i < BUCKETS ; i++)
     {
         m_buckets[i].lastChecked = 0;
     }
 }
 
-void Ticker::Launch()
+void Ticker::Run(Context* ctx)
 {
+    ctx->SetName("Ticker");
     m_epoch = Now();
-    while (!GetContext()->IsKilled())
+    while (!ctx->IsKilled())
     {
-        GetContext()->Yield();
+        ctx->Yield();
         size_t now = Now();
         if (m_epoch == now)
         {
@@ -53,7 +54,7 @@ void Ticker::Launch()
             // code needs to do so
             //
             handle->m_list = nullptr;
-            handle->Deadline(GetContext());
+            handle->Deadline(ctx);
         }
     }
 }
@@ -122,7 +123,7 @@ bool Ticker::ProcessBucket(int idx, size_t now)
         }
 
         assert(moveTo < idx);
-            
+
         bucket.list.Remove(handle);
         m_buckets[moveTo].list.Push(handle);
         handle->m_list = &m_buckets[moveTo].list;

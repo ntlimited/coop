@@ -27,6 +27,11 @@ add_library(coop STATIC ${COOP_SOURCES})
 target_include_directories(coop PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_options(coop PRIVATE -Wcpp)
 
+# Cooperative threading uses longjmp across user-allocated stacks. glibc's _FORTIFY_SOURCE
+# replaces longjmp with __longjmp_chk which validates stack pointers against a single-stack
+# model, producing false positives. Disable it for the library.
+target_compile_definitions(coop PRIVATE _FORTIFY_SOURCE=0)
+
 # External libraries
 find_library(URING_LIB uring REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)

@@ -52,16 +52,6 @@ For obvious reasons, thread locals are shunned _other than_ the two requisite th
 enough way of writing APIs that operate on "the current task" and probably we should just defer to
 always pulling it off the thread local (e.g. `coop::Self()`) but that's a problem for another day.
 
-## Random other things
-
-### `io` vs `network`
-
-When sketching the framework out, things started with well trodden \*nix eventing systems, e.g.
-`poll`/`epoll`. These gave way to saying to hell with it and pulling in `io_uring` and are the
-(effectively deprecated) `network` package and `io` package respectively. As should be clear
-from the language so far, `io` is the right one to use and `network` will be rm rf'd sooner or
-later. 
-
 ## Awful shitty TODOs
 
 ### Compiler friendliness and stack hacks

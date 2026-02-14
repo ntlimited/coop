@@ -69,8 +69,8 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 
     // Pass control to the next in line blocked on the coordinator, if it exists.
     //
-    Coordinated* next;
-    if (!m_blocking.Pop(next))
+    auto* next = m_blocking.Pop();
+    if (!next)
     {
         return;
     }

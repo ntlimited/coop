@@ -47,8 +47,7 @@ void Ticker::Launch()
         // we have to use the 'while pop' pattern here or we get into unsafe traversal territory
         // with yielding control during the `Deadline(ctx)` call
         //
-        Handle* handle;
-        while (m_buckets[0].list.Pop(handle))
+        while (auto* handle = m_buckets[0].list.Pop())
         {
             // Remove the handle before switching so that it can get re-submitted if the caller
             // code needs to do so

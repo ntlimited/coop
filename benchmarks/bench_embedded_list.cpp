@@ -93,11 +93,10 @@ static void BM_Push(benchmark::State& state)
         {
             list.Push(pool[i]);
         }
-        benchmark::DoNotOptimize(list.Size());
+        benchmark::DoNotOptimize(list.IsEmpty());
 
         state.PauseTiming();
-        Node* out;
-        while (list.Pop(out)) {}
+        while (list.Pop()) {}
         state.ResumeTiming();
     }
 }
@@ -124,8 +123,7 @@ static void BM_Pop(benchmark::State& state)
         }
         state.ResumeTiming();
 
-        Node* out;
-        while (list.Pop(out))
+        while (auto* out = list.Pop())
         {
             benchmark::DoNotOptimize(out);
         }
@@ -155,8 +153,7 @@ static void BM_PushPopChurn(benchmark::State& state)
     for (auto _ : state)
     {
         list.Push(churnNode);
-        Node* out;
-        list.Pop(out);
+        auto* out = list.Pop();
         benchmark::DoNotOptimize(out);
         churnNode = out;
     }
@@ -247,11 +244,10 @@ static void BM_RemoveMiddle(benchmark::State& state)
         state.ResumeTiming();
 
         list.Remove(pool[n / 2]);
-        benchmark::DoNotOptimize(list.Size());
+        benchmark::DoNotOptimize(list.IsEmpty());
 
         state.PauseTiming();
-        Node* out;
-        while (list.Pop(out)) {}
+        while (list.Pop()) {}
         state.ResumeTiming();
     }
 }

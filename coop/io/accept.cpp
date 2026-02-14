@@ -21,7 +21,7 @@ namespace io
 
 bool Accept(Handle& handle, Descriptor& desc)
 {
-    auto* sqe = io_uring_get_sqe(&desc.m_ring->m_ring);
+    auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);
     if (!sqe)
     {
         return false;

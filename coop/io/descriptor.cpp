@@ -6,7 +6,6 @@
 #include "uring.h"
 
 #include "coop/context.h"
-#include "coop/cooperator.h"
 #include "coop/embedded_list.h"
 #include "coop/self.h"
 
@@ -17,7 +16,7 @@ namespace io
 {
 
 Descriptor::Descriptor(int fd, Uring* ring /* = nullptr */)
-: m_ring(ring ? ring : Self()->GetCooperator()->GetUring())
+: m_ring(ring ? ring : GetUring())
 , m_fd(fd)
 , m_registered(nullptr)
 , m_generation(0)

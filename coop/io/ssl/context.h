@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <openssl/ssl.h>
 
 namespace coop
@@ -27,12 +28,13 @@ enum class Mode : uint8_t
 //
 // Usage:
 //
+//     // From PEM buffers (no file I/O):
 //     ssl::Context ctx(ssl::Mode::Server);
-//     ctx.LoadCertificate("cert.pem");
-//     ctx.LoadPrivateKey("key.pem");
+//     ctx.LoadCertificate(pemData, pemLen);
+//     ctx.LoadPrivateKey(keyData, keyLen);
 //
 //     // Then for each accepted connection:
-//     ssl::Connection conn(ctx, descriptor);
+//     ssl::Connection conn(ctx, descriptor, buffer, bufferSize);
 //
 struct Context
 {
@@ -42,13 +44,13 @@ struct Context
     Context(Mode mode);
     ~Context();
 
-    // Load a PEM-encoded certificate file. Returns true on success.
+    // Load a PEM-encoded certificate chain from memory. Returns true on success.
     //
-    bool LoadCertificate(const char* path);
+    bool LoadCertificate(const char* pem, size_t len);
 
-    // Load a PEM-encoded private key file. Returns true on success.
+    // Load a PEM-encoded private key from memory. Returns true on success.
     //
-    bool LoadPrivateKey(const char* path);
+    bool LoadPrivateKey(const char* pem, size_t len);
 
     SSL_CTX* m_ctx;
     Mode     m_mode;

@@ -18,6 +18,7 @@ struct Uring;
 struct Descriptor : EmbeddedListHookups<Descriptor>
 {
     Descriptor(int fd, Uring* ring = nullptr);
+
     ~Descriptor();
 
     int Close();

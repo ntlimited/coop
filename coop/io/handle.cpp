@@ -19,7 +19,19 @@ Handle::Handle(
     Context* context,
     Descriptor& descriptor,
     Coordinator* coordinator)
-: m_descriptor(descriptor)
+: m_ring(descriptor.m_ring)
+, m_descriptor(&descriptor)
+, m_coord(coordinator)
+, m_context(context)
+{
+}
+
+Handle::Handle(
+    Context* context,
+    Uring* ring,
+    Coordinator* coordinator)
+: m_ring(ring)
+, m_descriptor(nullptr)
 , m_coord(coordinator)
 , m_context(context)
 {
@@ -27,13 +39,16 @@ Handle::Handle(
 
 void Handle::Submit(struct io_uring_sqe* sqe)
 {
-    spdlog::trace("handle submit fd={} ctx={}", m_descriptor.m_fd, m_context->GetName());
+    spdlog::trace("handle submit ctx={}", m_context->GetName());
 
     m_coord->TryAcquire(m_context);
-    m_descriptor.m_handles.Push(this);
+    if (m_descriptor)
+    {
+        m_descriptor->m_handles.Push(this);
+    }
 
     io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(this));
-    io_uring_submit(&m_descriptor.m_ring->m_ring);
+    io_uring_submit(&m_ring->m_ring);
 }
 
 Handle::operator int()
@@ -45,12 +60,13 @@ Handle::operator int()
 void Handle::Complete(struct io_uring_cqe* cqe)
 {
     m_result = cqe->res;
-    spdlog::trace("handle complete fd={} result={}", m_descriptor.m_fd, m_result);
-    io_uring_cqe_seen(&m_descriptor.m_ring->m_ring, cqe);
+    spdlog::trace("handle complete result={}", m_result);
+    io_uring_cqe_seen(&m_ring->m_ring, cqe);
 
-    // TODO is this useful even?
-    //
-    this->Pop();
+    if (m_descriptor)
+    {
+        this->Pop();
+    }
     m_coord->Release(m_context, false /* schedule */);
 }
 

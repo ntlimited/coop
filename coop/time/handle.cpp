@@ -2,7 +2,6 @@
 
 #include "ticker.h"
 
-#include "coop/cooperator.h"
 #include "coop/self.h"
 
 namespace coop
@@ -29,7 +28,7 @@ void Handle::Submit(Ticker* ticker /* = nullptr */)
 {
     if (!ticker)
     {
-        ticker = Self()->GetCooperator()->GetTicker();
+        ticker = GetTicker();
     }
     assert(!m_deadline);
     assert(Disconnected());

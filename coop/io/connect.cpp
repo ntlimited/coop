@@ -22,14 +22,14 @@ namespace io
 
 bool Connect(Handle& handle, const struct sockaddr* addr, socklen_t addrLen)
 {
-    auto* sqe = io_uring_get_sqe(&handle.m_descriptor.m_ring->m_ring);
+    auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);
     if (!sqe)
     {
         return false;
     }
 
-    spdlog::trace("connect fd={}", handle.m_descriptor.m_fd);
-    io_uring_prep_connect(sqe, handle.m_descriptor.m_fd, addr, addrLen);
+    spdlog::trace("connect fd={}", handle.m_descriptor->m_fd);
+    io_uring_prep_connect(sqe, handle.m_descriptor->m_fd, addr, addrLen);
     handle.Submit(sqe);
     return true;
 }

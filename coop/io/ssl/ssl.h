@@ -27,8 +27,8 @@
 //
 //   // Setup (once per listener)
 //   ssl::Context sslCtx(ssl::Mode::Server);
-//   sslCtx.LoadCertificate("cert.pem");
-//   sslCtx.LoadPrivateKey("key.pem");
+//   sslCtx.LoadCertificateFile("cert.pem");
+//   sslCtx.LoadPrivateKeyFile("key.pem");
 //
 //   // Per connection (after io::Accept returns an fd)
 //   io::Descriptor desc(fd);

@@ -1,6 +1,11 @@
 #include "context.h"
 
 #include <cassert>
+
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+
 #include <spdlog/spdlog.h>
 
 namespace coop
@@ -26,32 +31,85 @@ Context::~Context()
     SSL_CTX_free(m_ctx);
 }
 
-bool Context::LoadCertificate(const char* path)
+bool Context::LoadCertificate(const char* pem, size_t len)
 {
-    bool ok = SSL_CTX_use_certificate_chain_file(m_ctx, path) == 1;
-    if (ok)
+    BIO* bio = BIO_new_mem_buf(pem, static_cast<int>(len));
+    if (!bio)
     {
-        spdlog::info("ssl loaded certificate path={}", path);
+        spdlog::error("ssl failed to create bio for certificate");
+        return false;
     }
-    else
+
+    // First certificate in the chain is the leaf
+    //
+    X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    if (!cert)
     {
-        spdlog::error("ssl failed to load certificate path={}", path);
+        spdlog::error("ssl failed to parse leaf certificate");
+        BIO_free(bio);
+        return false;
     }
-    return ok;
+
+    if (SSL_CTX_use_certificate(m_ctx, cert) != 1)
+    {
+        spdlog::error("ssl failed to set leaf certificate");
+        X509_free(cert);
+        BIO_free(bio);
+        return false;
+    }
+    X509_free(cert);
+
+    // Remaining certificates are intermediates in the chain
+    //
+    ERR_clear_error();
+    X509* chain;
+    while ((chain = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr)
+    {
+        if (SSL_CTX_add_extra_chain_cert(m_ctx, chain) != 1)
+        {
+            spdlog::error("ssl failed to add chain certificate");
+            X509_free(chain);
+            BIO_free(bio);
+            return false;
+        }
+        // SSL_CTX_add_extra_chain_cert takes ownership on success, do not free
+        //
+    }
+
+    BIO_free(bio);
+    spdlog::info("ssl loaded certificate chain len={}", len);
+    return true;
 }
 
-bool Context::LoadPrivateKey(const char* path)
+bool Context::LoadPrivateKey(const char* pem, size_t len)
 {
-    bool ok = SSL_CTX_use_PrivateKey_file(m_ctx, path, SSL_FILETYPE_PEM) == 1;
-    if (ok)
+    BIO* bio = BIO_new_mem_buf(pem, static_cast<int>(len));
+    if (!bio)
     {
-        spdlog::info("ssl loaded private key path={}", path);
+        spdlog::error("ssl failed to create bio for private key");
+        return false;
     }
-    else
+
+    EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+
+    if (!key)
     {
-        spdlog::error("ssl failed to load private key path={}", path);
+        spdlog::error("ssl failed to parse private key");
+        return false;
     }
-    return ok;
+
+    int ret = SSL_CTX_use_PrivateKey(m_ctx, key);
+    EVP_PKEY_free(key);
+
+    if (ret != 1)
+    {
+        spdlog::error("ssl failed to set private key");
+        return false;
+    }
+
+    spdlog::info("ssl loaded private key len={}", len);
+    return true;
 }
 
 } // end namespace coop::io::ssl

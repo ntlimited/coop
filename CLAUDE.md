@@ -9,9 +9,9 @@ The `coop` project is a low level library for cooperative multitasking in C++. I
 
 ## Code Organization
 ```
-
-coop/       - Source files (.cpp)
-build/      - Build artifacts (git-ignored)
+coop/           - Source files (.cpp)
+build/debug/    - Debug build artifacts (git-ignored)
+build/release/  - Release build artifacts (git-ignored)
 ```
 
 ## Coding Standards

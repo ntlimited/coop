@@ -4,6 +4,7 @@
 #include "connection.h"
 #include "recv.h"
 #include "send.h"
+#include "stream.h"
 
 // coop::io::ssl provides a TLS layer on top of coop's io module. It uses OpenSSL 3.x with memory
 // BIOs to bridge the TLS state machine with io_uring — all socket I/O flows through the same

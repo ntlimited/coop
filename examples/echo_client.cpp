@@ -31,9 +31,23 @@ void ClientTask(coop::Context* ctx, void* arg)
             if (coop::io::Connect(remote, "127.0.0.1", port))
             {
                 spdlog::warn("client connect failed fd={}", fd);
-                remote.Close();
                 return;
             }
+
+            auto DoEcho = [](coop::io::Stream& stream, const char* label)
+            {
+                char msg[64];
+                int len = snprintf(msg, sizeof(msg), "hello over %s\n", label);
+                char recv[1024];
+
+                stream.SendAll(msg, len);
+                int n = stream.Recv(recv, sizeof(recv));
+                if (n > 0)
+                {
+                    recv[n] = '\0';
+                    spdlog::info("{} echo: {}", label, recv);
+                }
+            };
 
             if (useSsl)
             {
@@ -42,37 +56,16 @@ void ClientTask(coop::Context* ctx, void* arg)
                 if (conn.Handshake() < 0)
                 {
                     spdlog::warn("client tls handshake failed fd={}", fd);
-                    remote.Close();
                     return;
                 }
 
-                char send[] = "hello over tls\n";
-                char recv[1024];
-
-                coop::io::ssl::Send(conn, send, strlen(send));
-                int n = coop::io::ssl::Recv(conn, recv, sizeof(recv));
-                if (n > 0)
-                {
-                    recv[n] = '\0';
-                    spdlog::info("tls echo: {}", recv);
-                }
-
-                remote.Close();
+                coop::io::ssl::SecureStream stream(conn);
+                DoEcho(stream, "tls");
             }
             else
             {
-                char send[] = "hello over plaintext\n";
-                char recv[1024];
-
-                coop::io::Send(remote, send, strlen(send));
-                int n = coop::io::Recv(remote, recv, sizeof(recv));
-                if (n > 0)
-                {
-                    recv[n] = '\0';
-                    spdlog::info("plaintext echo: {}", recv);
-                }
-
-                remote.Close();
+                coop::io::PlaintextStream stream(remote);
+                DoEcho(stream, "plaintext");
             }
         });
     }

@@ -77,6 +77,21 @@ int Send(Connection& conn, const void* buf, size_t size)
     }
 }
 
+int SendAll(Connection& conn, const void* buf, size_t size)
+{
+    size_t offset = 0;
+    while (offset < size)
+    {
+        int sent = Send(conn, (const char*)buf + offset, size - offset);
+        if (sent <= 0)
+        {
+            return sent;
+        }
+        offset += sent;
+    }
+    return (int)size;
+}
+
 } // end namespace coop::io::ssl
 } // end namespace coop::io
 } // end namespace coop

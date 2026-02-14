@@ -28,13 +28,28 @@ Descriptor::Descriptor(int fd, Uring* ring /* = nullptr */)
 
 Descriptor::~Descriptor()
 {
+    if (m_fd >= 0)
+    {
+        int fd = m_fd;
+        int result = Close();
+        if (result < 0) [[unlikely]]
+        {
+            spdlog::warn("descriptor close in destructor failed fd={} result={}", fd, result);
+        }
+    }
     m_ring->Unregister(this);
 }
 
 int Descriptor::Close()
 {
+    if (m_fd < 0)
+    {
+        return 0;
+    }
     spdlog::debug("descriptor close fd={}", m_fd);
-    return io::Close(*this);
+    int result = io::Close(*this);
+    m_fd = -1;
+    return result;
 }
 
 } // end namespace io

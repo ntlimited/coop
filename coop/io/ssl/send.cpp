@@ -1,8 +1,10 @@
 #include "send.h"
 
 #include <openssl/ssl.h>
+#include <spdlog/spdlog.h>
 
 #include "connection.h"
+#include "coop/io/descriptor.h"
 
 namespace coop
 {
@@ -24,6 +26,7 @@ namespace ssl
 //
 int Send(Connection& conn, const void* buf, size_t size)
 {
+    spdlog::trace("ssl send fd={} size={}", conn.m_desc.m_fd, size);
     for (;;)
     {
         int ret = SSL_write(conn.m_ssl, buf, size);
@@ -31,6 +34,7 @@ int Send(Connection& conn, const void* buf, size_t size)
         {
             // Plaintext was encrypted. Push the ciphertext out.
             //
+            spdlog::trace("ssl send fd={} written={}", conn.m_desc.m_fd, ret);
             if (conn.FlushWrite() < 0)
             {
                 return -1;
@@ -42,6 +46,7 @@ int Send(Connection& conn, const void* buf, size_t size)
         switch (err)
         {
         case SSL_ERROR_WANT_WRITE:
+            spdlog::trace("ssl send fd={} WANT_WRITE", conn.m_desc.m_fd);
             if (conn.FlushWrite() < 0)
             {
                 return -1;
@@ -51,6 +56,7 @@ int Send(Connection& conn, const void* buf, size_t size)
         case SSL_ERROR_WANT_READ:
             // Can happen during TLS renegotiation.
             //
+            spdlog::trace("ssl send fd={} WANT_READ", conn.m_desc.m_fd);
             if (conn.FlushWrite() < 0)
             {
                 return -1;
@@ -65,6 +71,7 @@ int Send(Connection& conn, const void* buf, size_t size)
             return 0;
 
         default:
+            spdlog::warn("ssl send fd={} error={}", conn.m_desc.m_fd, err);
             return -1;
         }
     }

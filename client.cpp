@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include <spdlog/spdlog.h>
+
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"
 #include "coop/embedded_list.h"
@@ -19,6 +21,8 @@ void ClientTask(coop::Context* ctx, void* arg)
 {
     ctx->SetName("ClientTask");
     bool useSsl = arg != nullptr;
+    spdlog::info("client starting mode={} port={}",
+        useSsl ? "ssl" : "plaintext", useSsl ? 8889 : 8888);
 
     auto* co = ctx->GetCooperator();
     co->SetTicker(co->Launch<coop::time::Ticker>());
@@ -37,7 +41,9 @@ void ClientTask(coop::Context* ctx, void* arg)
             coop::io::Descriptor remote(fd);
             if (coop::io::Connect(remote, "127.0.0.1", port))
             {
-                assert(false);
+                spdlog::warn("client connect failed fd={}", fd);
+                remote.Close();
+                return;
             }
 
             if (useSsl)
@@ -45,6 +51,7 @@ void ClientTask(coop::Context* ctx, void* arg)
                 coop::io::ssl::Connection conn(*sslCtxPtr, remote);
                 if (conn.Handshake() < 0)
                 {
+                    spdlog::warn("client tls handshake failed fd={}", fd);
                     remote.Close();
                     return;
                 }
@@ -57,7 +64,7 @@ void ClientTask(coop::Context* ctx, void* arg)
                 if (n > 0)
                 {
                     recv[n] = '\0';
-                    printf("TLS echo: %s", recv);
+                    spdlog::info("tls echo: {}", recv);
                 }
 
                 remote.Close();
@@ -72,7 +79,7 @@ void ClientTask(coop::Context* ctx, void* arg)
                 if (n > 0)
                 {
                     recv[n] = '\0';
-                    printf("Plaintext echo: %s", recv);
+                    spdlog::info("plaintext echo: {}", recv);
                 }
 
                 remote.Close();

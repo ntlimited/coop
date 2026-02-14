@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <openssl/err.h>
+#include <spdlog/spdlog.h>
 
 #include "context.h"
 #include "coop/io/descriptor.h"
@@ -19,6 +20,7 @@ namespace ssl
 
 Connection::Connection(Context& ctx, Descriptor& desc)
 : m_desc(desc)
+, m_buffer(new char[BUFFER_SIZE])
 {
     m_ssl = SSL_new(ctx.m_ctx);
     assert(m_ssl);
@@ -49,6 +51,7 @@ Connection::Connection(Context& ctx, Descriptor& desc)
 Connection::~Connection()
 {
     SSL_free(m_ssl);
+    delete[] m_buffer;
 }
 
 // Drain any pending data from OpenSSL's write BIO and send it over the wire via io::Send. This
@@ -65,6 +68,7 @@ int Connection::FlushWrite()
         {
             break;
         }
+        spdlog::trace("ssl flush_write fd={} wbio_bytes={}", m_desc.m_fd, n);
 
         int at = 0;
         while (at < n)
@@ -72,6 +76,7 @@ int Connection::FlushWrite()
             int sent = io::Send(m_desc, &m_buffer[at], n - at);
             if (sent <= 0)
             {
+                spdlog::warn("ssl flush_write fd={} send failed={}", m_desc.m_fd, sent);
                 return -1;
             }
             at += sent;
@@ -90,11 +95,13 @@ int Connection::FeedRead()
     int n = io::Recv(m_desc, m_buffer, BUFFER_SIZE);
     if (n <= 0)
     {
+        spdlog::trace("ssl feed_read fd={} recv={}", m_desc.m_fd, n);
         return n;
     }
 
     int written = BIO_write(m_rbio, m_buffer, n);
     assert(written == n);
+    spdlog::trace("ssl feed_read fd={} recv={} rbio_fed={}", m_desc.m_fd, n, written);
     return written;
 }
 
@@ -109,6 +116,7 @@ int Connection::FeedRead()
 //
 int Connection::Handshake()
 {
+    spdlog::debug("ssl handshake start fd={}", m_desc.m_fd);
     for (;;)
     {
         int ret = SSL_do_handshake(m_ssl);
@@ -116,6 +124,7 @@ int Connection::Handshake()
         {
             // Handshake complete. Flush any final output (e.g. Finished message).
             //
+            spdlog::debug("ssl handshake complete fd={}", m_desc.m_fd);
             return FlushWrite();
         }
 
@@ -123,6 +132,7 @@ int Connection::Handshake()
         switch (err)
         {
         case SSL_ERROR_WANT_WRITE:
+            spdlog::trace("ssl handshake fd={} WANT_WRITE", m_desc.m_fd);
             if (FlushWrite() < 0)
             {
                 return -1;
@@ -132,6 +142,7 @@ int Connection::Handshake()
         case SSL_ERROR_WANT_READ:
             // Flush first — the handshake may have produced output before asking for input.
             //
+            spdlog::trace("ssl handshake fd={} WANT_READ", m_desc.m_fd);
             if (FlushWrite() < 0)
             {
                 return -1;
@@ -143,6 +154,7 @@ int Connection::Handshake()
             break;
 
         default:
+            spdlog::error("ssl handshake fd={} failed err={}", m_desc.m_fd, err);
             return -1;
         }
     }

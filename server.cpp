@@ -5,6 +5,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <spdlog/spdlog.h>
+
 #include "coop/coordinator.h"
 #include "coop/cooperator.h"
 #include "coop/multi_coordinator.h"
@@ -97,9 +99,11 @@ struct TLSClientHandler : coop::Launchable
     {
         if (m_conn.Handshake() < 0)
         {
+            spdlog::warn("tls handshake failed fd={}", m_fd.m_fd);
             m_fd.Close();
             return;
         }
+        spdlog::info("tls handshake ok fd={}", m_fd.m_fd);
 
         char buffer[4096];
 
@@ -116,6 +120,7 @@ struct TLSClientHandler : coop::Launchable
                 break;
             }
 
+            spdlog::debug("tls echo fd={} bytes={}", m_fd.m_fd, ret);
             int at = 0;
             while (ret)
             {
@@ -163,6 +168,8 @@ int bind_and_listen(int port)
 void SpawningTask(coop::Context* ctx, void*)
 {
     ctx->SetName("SpawningTask");
+    spdlog::info("server starting plaintext=8888 tls=8889");
+
     int serverFd = bind_and_listen(8888);
     int tlsServerFd = bind_and_listen(8889);
 
@@ -192,6 +199,7 @@ void SpawningTask(coop::Context* ctx, void*)
             int fd = coop::io::Accept(desc);
             assert(fd >= 0);
 
+            spdlog::info("plaintext accepted fd={}", fd);
             co->Launch<ClientHandler>(fd);
             serverCtx->Yield();
         }
@@ -210,6 +218,7 @@ void SpawningTask(coop::Context* ctx, void*)
             int fd = coop::io::Accept(desc);
             assert(fd >= 0);
 
+            spdlog::info("tls accepted fd={}", fd);
             co->Launch<TLSClientHandler>(fd, sslCtxPtr);
             tlsCtx->Yield();
         }
@@ -226,8 +235,7 @@ void SpawningTask(coop::Context* ctx, void*)
         while (!statusCtx->IsKilled())
         {
             s.Sleep();
-            printf("---- Cooperator ----\n");
-            printf("Total: %lu\nYielded: %lu\nBlocked: %lu\n",
+            spdlog::info("cooperator total={} yielded={} blocked={}",
                 statusCtx->GetCooperator()->ContextsCount(),
                 statusCtx->GetCooperator()->YieldedCount(),
                 statusCtx->GetCooperator()->BlockedCount());

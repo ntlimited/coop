@@ -1,5 +1,7 @@
 #include "descriptor.h"
 
+#include <spdlog/spdlog.h>
+
 #include "uring.h"
 
 #include "coop/context.h"
@@ -20,6 +22,7 @@ Descriptor::Descriptor(int fd, Uring* ring /* = nullptr */)
 , m_generation(0)
 {
     assert(m_ring);
+    spdlog::debug("descriptor create fd={}", m_fd);
     m_ring->Register(this);
 }
 
@@ -30,6 +33,7 @@ Descriptor::~Descriptor()
 
 int Descriptor::Close()
 {
+    spdlog::debug("descriptor close fd={}", m_fd);
     return close(m_fd);
 }
 

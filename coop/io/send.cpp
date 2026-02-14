@@ -16,7 +16,7 @@ namespace coop
 namespace io
 {
 
-bool Send(Handle& handle, void* buf, size_t size, int flags /* = 0 */)
+bool Send(Handle& handle, const void* buf, size_t size, int flags /* = 0 */)
 {
     auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);
     if (!sqe)
@@ -30,7 +30,7 @@ bool Send(Handle& handle, void* buf, size_t size, int flags /* = 0 */)
     return true;
 }
 
-int Send(Descriptor& desc, void* buf, size_t size, int flags /* = 0 */)
+int Send(Descriptor& desc, const void* buf, size_t size, int flags /* = 0 */)
 {
     Coordinator coord;
     Handle handle(Self(), desc, &coord);
@@ -42,6 +42,21 @@ int Send(Descriptor& desc, void* buf, size_t size, int flags /* = 0 */)
     int result = handle;
     spdlog::trace("send fd={} size={} result={}", desc.m_fd, size, result);
     return result;
+}
+
+int SendAll(Descriptor& desc, const void* buf, size_t size, int flags /* = 0 */)
+{
+    size_t offset = 0;
+    while (offset < size)
+    {
+        int sent = Send(desc, (const char*)buf + offset, size - offset, flags);
+        if (sent <= 0)
+        {
+            return sent;
+        }
+        offset += sent;
+    }
+    return (int)size;
 }
 
 } // end namespace coop::io

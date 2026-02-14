@@ -8,6 +8,7 @@
 #include "read_file.h"
 #include "recv.h"
 #include "send.h"
+#include "stream.h"
 
 // coop::io offers a very direct abstraction for blocking i/o and its user facing unit is the
 // Descriptor, which wraps a file descriptor. Methods are made available as e.g. coop::io::Recv

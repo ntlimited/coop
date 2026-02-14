@@ -27,7 +27,7 @@ struct Descriptor : EmbeddedListHookups<Descriptor>
     //
     Uring* m_ring;
 
-    const int32_t   m_fd;
+    int32_t         m_fd;
     
     // See notes in uring.h
     //

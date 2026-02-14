@@ -14,6 +14,11 @@
 //
 // Either way it was fun making the diamond pattern work.
 //
+// TODO: the main value here would be that in theory, this supporting `Shutdown` would make the
+// coordinator not have to natively support it instead (e.g. we want the "always immediately select
+// the cancelled channel" semantics from golang). However the nuance above regarding our version
+// (multi-coordinator patterns) means that we're kind of stuck between things.
+//
 
 namespace coop
 {
@@ -22,10 +27,22 @@ namespace coop
 // subtly different logic in the send/recv implementations. Or maybe not and that's why it's
 // subtly different.
 //
+// The basic contract here is that we have two coordinators used to allow blocking on the channel's
+// two sides: e.g. waiting for someone to send when we're recv-ing, and waiting for someone to recv
+// when we're send-ing. This is complicated by the 'shutdown' semantic but not that terribly. In
+// short, we need to make sure the following invariants are true (outside of the shutdown case):
+//
+//  - If the channel is empty, the recv coordinator is held
+//  - If the channel is full, the send coordinator is held
+//
+// This means that we must start out with m_recv held initially in all cases, and that we must
+// start out with m_send held in the 0-capacity channel case.
+//
 struct BaseChannel
 {
-    BaseChannel()
+    BaseChannel(Context* ctx)
     : m_shutdown(false)
+    , m_recv(ctx)
     {
     }
 
@@ -73,12 +90,17 @@ struct TypedBaseChannel : public BaseChannel
     TypedBaseChannel(TypedBaseChannel const& other) = delete;
     TypedBaseChannel(TypedBaseChannel&&) = delete;
 
-    TypedBaseChannel(T* buffer, size_t capacity)
-    : m_buffer(buffer)
+    TypedBaseChannel(Context* ctx, T* buffer, size_t capacity)
+    : BaseChannel(ctx)
+    , m_buffer(buffer)
     , m_head(0)
     , m_tail(0)
     , m_capacity(capacity)
     {
+        if (!m_capacity)
+        {
+            m_send.Acquire(ctx);
+        }
     }
 
     virtual ~TypedBaseChannel()
@@ -198,6 +220,8 @@ struct SendChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
+        // TODO should probably assert on this
+        //
         SendImpl(value);
         
         if (Base::IsFull())
@@ -233,6 +257,8 @@ struct SendChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
+        // TODO should probably assert on this
+        //
         Base::SendImpl(value);
         
         // If there is space, let go of the coordinator so that the preconditions still stand. This
@@ -270,17 +296,21 @@ struct SendChannel : virtual TypedBaseChannel<T>
 template<typename T>
 struct Channel : RecvChannel<T>, SendChannel<T>
 {
-    Channel(T* buffer, size_t capacity)
-    : TypedBaseChannel<T>(buffer, capacity)
+    Channel(Context* ctx, T* buffer, size_t capacity)
+    : TypedBaseChannel<T>(ctx, buffer, capacity)
     {
     }
 };
 
+// TODO this is missing the whole SendChannel/RecvChannel bit that was the point of a lot of the
+// TypedChannel<T> shenanigans.
+//
 template<>
 struct Channel<void> : BaseChannel
 {
-    Channel(int capacity, int used = 0)
-    : m_size(used)
+    Channel(Context* ctx, int capacity, int used = 0)
+    : BaseChannel(ctx)
+    , m_size(used)
     , m_capacity(capacity)
     {
         assert(m_capacity < m_size);

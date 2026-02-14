@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "close.h"
 #include "uring.h"
 
 #include "coop/context.h"
@@ -34,7 +35,7 @@ Descriptor::~Descriptor()
 int Descriptor::Close()
 {
     spdlog::debug("descriptor close fd={}", m_fd);
-    return close(m_fd);
+    return io::Close(*this);
 }
 
 } // end namespace io

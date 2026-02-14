@@ -32,8 +32,7 @@ void Signal::Notify(Context* ctx, bool schedule /* = true */)
 
     // Unblock everyone waiting on the signal
     //
-    Coordinated* ord;
-    while (m_coord.m_blocking.Pop(ord))
+    while (auto* ord = m_coord.m_blocking.Pop())
     {
         ord->m_satisfied = true;
         ctx->Unblock(ord->GetContext(), schedule);

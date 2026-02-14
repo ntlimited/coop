@@ -95,8 +95,7 @@ void Cooperator::Launch()
 
             // Pop off a context and resume it
             //
-            Context* ctx;
-            m_yielded.Pop(ctx);
+            auto* ctx = m_yielded.Pop();
 
             Resume(ctx);
             m_lastRdtsc = rdtsc();

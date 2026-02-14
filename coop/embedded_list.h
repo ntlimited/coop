@@ -2,7 +2,6 @@
 
 #include <cassert>
 #include <cstddef>
-#include <stdio.h>
 
 #include "tricks.h"
 
@@ -59,7 +58,7 @@ struct EmbeddedListHookups
     
     bool Disconnected() const
     {
-        return next == prev;
+        return next == nullptr;
     }
 
     void InsertBefore(Hookups* other)
@@ -113,6 +112,7 @@ struct EmbeddedList
 
         Ptr operator*()
         {
+            __builtin_prefetch(hookups->next, 0, 0);
             return hookups->Cast();
         }
 
@@ -135,69 +135,83 @@ struct EmbeddedList
 
     EmbeddedList()
     {
-        head.prev = nullptr;
-        head.next = &tail;
-        tail.prev = &head;
-        tail.next = nullptr;
-        size = 0;
+        sentinel.next = &sentinel;
+        sentinel.prev = &sentinel;
     }
 
     Iterator begin()
     {
-        return Iterator(head.next);
+        return Iterator(sentinel.next);
     }
 
     Iterator end()
     {
-        return Iterator(&tail);
+        return Iterator(&sentinel);
     }
 
     void Push(Hookups* item)
     {
-        item->InsertBefore(&tail);
-        size++;
+        assert(item->Disconnected());
+        auto* last = sentinel.prev;
+        last->next = item;
+        item->prev = last;
+        item->next = &sentinel;
+        sentinel.prev = item;
     }
 
-    bool Pop(Ptr& out)
+    Ptr Pop()
     {
-        if (IsEmpty())
+        auto* first = sentinel.next;
+        if (first == &sentinel) [[unlikely]]
         {
-            return false;
+            return nullptr;
         }
 
-        out = head.next->Cast();
-        head.next->Pop();
-        size--;
-        return true;
+        auto* second = first->next;
+        sentinel.next = second;
+        second->prev = &sentinel;
+
+#ifndef NDEBUG
+        first->next = nullptr;
+        first->prev = nullptr;
+#endif
+
+        return first->Cast();
     }
 
     Ptr Peek()
     {
-        return head.next->Cast();
+        return sentinel.next->Cast();
     }
 
     size_t Size() const
     {
-        return size;
+        size_t n = 0;
+        auto* at = sentinel.next;
+        while (at != &sentinel)
+        {
+            at = at->next;
+            n++;
+        }
+        return n;
     }
 
     bool IsEmpty() const
     {
-        return head.next == &tail;
+        return sentinel.next == &sentinel;
     }
 
     void Remove(Hookups* h)
     {
         h->Pop();
-        size--;
     }
 
     void SanityCheck(Hookups* checkFor = nullptr)
     {
         bool found = false;
-        auto* at = head.next;
+        auto* at = sentinel.next;
         int n = 0;
-        while (at != &tail)
+        while (at != &sentinel)
         {
             if (at == checkFor)
             {
@@ -207,10 +221,9 @@ struct EmbeddedList
             n++;
         }
         assert(found || !checkFor);
-        assert(n == size);
 
-        at = tail.prev;
-        while (at != &head)
+        at = sentinel.prev;
+        while (at != &sentinel)
         {
             at = at->prev;
             if (0 > n--)
@@ -227,14 +240,13 @@ struct EmbeddedList
     template<typename Fn>
     void Visit(Fn const& fn)
     {
-        auto* at = head.next;
-        while (at != &tail)
+        auto* at = sentinel.next;
+        while (at != &sentinel)
         {
-            // Iterate forward now incase it gets removed and relinked somewhere else
-            //
+            auto* next = at->next;
+            __builtin_prefetch(next, 0, 0);
             auto* casted = at->Cast();
-            at = at->next;
-            
+            at = next;
             if (!fn(casted))
             {
                 return;
@@ -243,9 +255,7 @@ struct EmbeddedList
     }
 
   private:
-    Hookups head;
-    Hookups tail;
-    size_t size;
+    Hookups sentinel;
 };
 
 } // end namespace coop

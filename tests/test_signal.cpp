@@ -2,6 +2,7 @@
 
 #include "coop/cooperator.h"
 #include "coop/context.h"
+#include "coop/multi_coordinator.h"
 #include "coop/signal.h"
 #include "test_helpers.h"
 
@@ -117,5 +118,47 @@ TEST(SignalTest, WaitOnKillSignal)
         handle.Kill();
 
         EXPECT_TRUE(waited);
+    });
+}
+
+TEST(SignalTest, CoordinateWithKillRepeated)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Context::Handle handle;
+        bool completed = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::Coordinator coord;
+            coord.TryAcquire(child);
+
+            // Yield so the parent can kill us before we call CoordinateWithKill
+            //
+            child->Yield(true);
+            EXPECT_TRUE(child->IsKilled());
+
+            // First CoordinateWithKill — signal already fired, so TryAcquire succeeds on the
+            // signal's coordinator and re-arms m_heldBy.
+            //
+            auto r1 = coop::CoordinateWithKill(child, &coord);
+            EXPECT_TRUE(child->IsKilled());
+
+            // Second CoordinateWithKill — without proper cleanup, TryAcquire would fail on
+            // the re-armed coordinator and deadlock here.
+            //
+            auto r2 = coop::CoordinateWithKill(child, &coord);
+            EXPECT_TRUE(child->IsKilled());
+
+            coord.Release(child, false);
+            completed = true;
+        }, &handle);
+
+        // Kill the child, then yield to let it resume and run both CoordinateWithKill calls
+        //
+        handle.Kill();
+        ctx->Yield(true);
+
+        EXPECT_TRUE(completed);
     });
 }

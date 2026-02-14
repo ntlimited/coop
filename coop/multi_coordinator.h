@@ -230,8 +230,18 @@ detail::AmbiResult CoordinateWith(Args... args)
 template<typename... Args>
 detail::AmbiResult CoordinateWithKill(Context* ctx, Args... args)
 {
-    auto result = CoordinateWith(ctx, ctx->GetKilledSignal()->AsCoordinator(),
+    auto* signal = ctx->GetKilledSignal();
+    auto result = CoordinateWith(ctx, signal->AsCoordinator(),
         std::forward<Args>(args)...);
+
+    // If the kill signal won, reset its coordinator. MultiCoordinator's TryAcquire sets m_heldBy,
+    // which would re-arm the coordinator and deadlock future uses.
+    //
+    if (result.index == 0)
+    {
+        signal->ResetCoordinator();
+    }
+
     result.index -= 1;
     return result;
 }

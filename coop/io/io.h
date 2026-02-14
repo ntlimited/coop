@@ -3,6 +3,9 @@
 #include "accept.h"
 #include "close.h"
 #include "connect.h"
+#include "open.h"
+#include "read.h"
+#include "read_file.h"
 #include "recv.h"
 #include "send.h"
 

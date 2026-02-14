@@ -17,3 +17,13 @@ bool ::coop::IsKilled()
 {
     return ::coop::Self()->IsKilled();
 }
+
+::coop::io::Uring* ::coop::GetUring()
+{
+    return Cooperator::thread_cooperator->GetUring();
+}
+
+::coop::time::Ticker* ::coop::GetTicker()
+{
+    return Cooperator::thread_cooperator->GetTicker();
+}

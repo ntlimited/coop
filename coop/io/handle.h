@@ -15,6 +15,7 @@ namespace io
 {
 
 struct Descriptor;
+struct Uring;
 
 // Handle to an event being processed by io_uring. Because it needs to hook into the user data for
 // the SQE, note that it is responsible for completing the contract for the uring submission after
@@ -26,8 +27,9 @@ struct Handle : EmbeddedListHookups<Handle>
 
     Handle(Handle const&) = delete;
     Handle(Handle&&) = delete;
-  
+
     Handle(Context*, Descriptor&, Coordinator*);
+    Handle(Context*, Uring*, Coordinator*);
 
     // Either we have completed the operation and are done or we were cancelled.
     //
@@ -54,7 +56,8 @@ struct Handle : EmbeddedListHookups<Handle>
 
     // TODO visibility
     //
-    Descriptor&     m_descriptor;
+    Uring*          m_ring;
+    Descriptor*     m_descriptor;
     Coordinator*    m_coord;
     Context*        m_context;
 

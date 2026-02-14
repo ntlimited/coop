@@ -6,6 +6,9 @@ namespace coop
 
 struct Context;
 
+namespace io { struct Uring; }
+namespace time { struct Ticker; }
+
 // This lets code use thread locals to get the context that is running instead of passing it around.
 // I know, thread locals, right? Ultimately, the register for them exists whether we like it or not,
 // the state is being tracked already, and the thread local hookup is only done when the cooperator
@@ -16,5 +19,11 @@ Context* Self();
 bool Yield();
 
 bool IsKilled();
+
+// Convenience accessors that go straight through the thread-local cooperator, avoiding the
+// Self() -> Context -> Cooperator round-trip.
+//
+io::Uring* GetUring();
+time::Ticker* GetTicker();
 
 } // end namespace coop

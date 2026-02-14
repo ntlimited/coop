@@ -30,6 +30,11 @@ build/      - Build artifacts (git-ignored)
 - Patterns that stack allocate, or enable stack allocation, are preferred
 - RAII should be used wherever possible
 - Thread locals are explicitly disallowed outside of `::coop::Cooperator__thread_cooperator`
+- stdint types (`int64_t`, `uint8_t`) are encouraged over `int`, `unsigned char` where possible/
+  appropriate
+- All I/O calls should be implemented through the coop::io patterns. Syscalls likely should as well.
+- Use separate `build/release` and `build/debug` directories for release and debug mode builds
+  respectively
 
 ### Error Handling
 - Errors should bubble up using a checked-return pattern

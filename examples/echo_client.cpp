@@ -1,15 +1,9 @@
 #include <cstring>
-#include <stdio.h>
 #include <sys/socket.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 #include <spdlog/spdlog.h>
 
 #include "coop/cooperator.h"
-#include "coop/coordinator.h"
-#include "coop/embedded_list.h"
-#include "coop/multi_coordinator.h"
 #include "coop/thread.h"
 #include "coop/io/io.h"
 #include "coop/io/ssl/ssl.h"

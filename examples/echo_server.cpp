@@ -1,28 +1,15 @@
 #include <cstring>
-#include <fcntl.h>
-#include <functional>
-#include <vector>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
 #include <spdlog/spdlog.h>
 
-#include "coop/coordinator.h"
 #include "coop/cooperator.h"
-#include "coop/multi_coordinator.h"
-#include "coop/embedded_list.h"
 #include "coop/launchable.h"
 #include "coop/thread.h"
-#include "coop/network/epoll_router.h"
-#include "coop/network/poll_router.h"
-#include "coop/network/tcp_handler.h"
-#include "coop/network/tcp_server.h"
 #include "coop/time/sleep.h"
-#include "coop/tricks.h"
 #include "coop/io/io.h"
 #include "coop/io/ssl/ssl.h"
-
-#include "HTTPRequest.hpp"
 
 // Demo program that sets up two TCP echo servers:
 //

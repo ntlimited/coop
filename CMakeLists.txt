@@ -38,11 +38,11 @@ find_package(OpenSSL 3.0 REQUIRED)
 target_link_libraries(coop PUBLIC ${URING_LIB} OpenSSL::SSL OpenSSL::Crypto spdlog::spdlog)
 
 # Executables
-add_executable(server server.cpp)
-target_link_libraries(server PRIVATE coop)
+add_executable(echo_server examples/echo_server.cpp)
+target_link_libraries(echo_server PRIVATE coop)
 
-add_executable(client client.cpp)
-target_link_libraries(client PRIVATE coop)
+add_executable(echo_client examples/echo_client.cpp)
+target_link_libraries(echo_client PRIVATE coop)
 
 # Generate a self-signed TLS certificate for testing if one doesn't already exist
 add_custom_command(
@@ -57,7 +57,7 @@ add_custom_target(test-certs DEPENDS
     ${CMAKE_BINARY_DIR}/bin/cert.pem
     ${CMAKE_BINARY_DIR}/bin/key.pem
 )
-add_dependencies(server test-certs)
+add_dependencies(echo_server test-certs)
 
 # Google Test
 FetchContent_Declare(

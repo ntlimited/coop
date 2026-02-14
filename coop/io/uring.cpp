@@ -1,5 +1,7 @@
 #include "uring.h"
 
+#include <spdlog/spdlog.h>
+
 #include "handle.h"
 
 #include "coop/context.h"
@@ -29,6 +31,7 @@ void Uring::Launch()
             assert(false);
         }
         assert(ret == 0);
+        spdlog::trace("uring cqe result={}", cqe->res);
         Handle::Callback(cqe);
     }
 }
@@ -37,6 +40,7 @@ void Uring::Launch()
 //
 void Uring::Register(Descriptor* descriptor)
 {
+    spdlog::trace("uring register fd={} count={}", descriptor->m_fd, m_registeredCount + 1);
     m_descriptors.Push(descriptor);
     if (m_registeredCount == REGISTERED_SIZE)
     {
@@ -67,6 +71,7 @@ int Uring::RegisteredIndex(int* reg)
 
 void Uring::Unregister(Descriptor* descriptor)
 {
+    spdlog::trace("uring unregister fd={}", descriptor->m_fd);
     m_descriptors.Remove(descriptor);
     if (descriptor->m_registered)
     {

@@ -1,6 +1,7 @@
 #include "context.h"
 
 #include <cassert>
+#include <spdlog/spdlog.h>
 
 namespace coop
 {
@@ -16,6 +17,8 @@ Context::Context(Mode mode)
 , m_mode(mode)
 {
     assert(m_ctx);
+    spdlog::info("ssl context created mode={}",
+        mode == Mode::Server ? "server" : "client");
 }
 
 Context::~Context()
@@ -25,12 +28,30 @@ Context::~Context()
 
 bool Context::LoadCertificate(const char* path)
 {
-    return SSL_CTX_use_certificate_chain_file(m_ctx, path) == 1;
+    bool ok = SSL_CTX_use_certificate_chain_file(m_ctx, path) == 1;
+    if (ok)
+    {
+        spdlog::info("ssl loaded certificate path={}", path);
+    }
+    else
+    {
+        spdlog::error("ssl failed to load certificate path={}", path);
+    }
+    return ok;
 }
 
 bool Context::LoadPrivateKey(const char* path)
 {
-    return SSL_CTX_use_PrivateKey_file(m_ctx, path, SSL_FILETYPE_PEM) == 1;
+    bool ok = SSL_CTX_use_PrivateKey_file(m_ctx, path, SSL_FILETYPE_PEM) == 1;
+    if (ok)
+    {
+        spdlog::info("ssl loaded private key path={}", path);
+    }
+    else
+    {
+        spdlog::error("ssl failed to load private key path={}", path);
+    }
+    return ok;
 }
 
 } // end namespace coop::io::ssl

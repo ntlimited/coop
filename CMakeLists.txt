@@ -6,6 +6,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# spdlog — header-only structured logging
+include(FetchContent)
+FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG        v1.15.0
+)
+FetchContent_MakeAvailable(spdlog)
+
 # Collect library sources
 file(GLOB_RECURSE COOP_SOURCES
     coop/*.cpp
@@ -21,7 +30,7 @@ target_compile_options(coop PRIVATE -Wcpp)
 # External libraries
 find_library(URING_LIB uring REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
-target_link_libraries(coop PUBLIC ${URING_LIB} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(coop PUBLIC ${URING_LIB} OpenSSL::SSL OpenSSL::Crypto spdlog::spdlog)
 
 # Executables
 add_executable(server server.cpp)

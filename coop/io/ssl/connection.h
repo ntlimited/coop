@@ -64,8 +64,10 @@ struct Connection
     BIO* m_rbio;
     BIO* m_wbio;
 
+    // Heap-allocated to avoid blowing cooperative context stacks (default 16KB).
+    //
     static constexpr size_t BUFFER_SIZE = 16384;
-    char m_buffer[BUFFER_SIZE];
+    char* m_buffer;
 };
 
 } // end namespace coop::io::ssl

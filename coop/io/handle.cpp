@@ -1,4 +1,5 @@
 #include <liburing.h>
+#include <spdlog/spdlog.h>
 
 #include "handle.h"
 
@@ -26,15 +27,7 @@ Handle::Handle(
 
 void Handle::Submit(struct io_uring_sqe* sqe)
 {
-    #if 0
-    if (m_descriptor->m_registered)
-    {
-        sqe->flags |= IOSQE_FIXED_FILE;
-        auto old = sqe->fd;
-        sqe->fd = m_descriptor.m_ring->RegisteredIndex(m_descriptor.m_registered);
-        printf("Replaced fd %d with registered fd %d\n", old, sqe->fd);
-    }
-    #endif
+    spdlog::trace("handle submit fd={} ctx={}", m_descriptor.m_fd, m_context->GetName());
 
     m_coord->TryAcquire(m_context);
     m_descriptor.m_handles.Push(this);
@@ -52,6 +45,7 @@ Handle::operator int()
 void Handle::Complete(struct io_uring_cqe* cqe)
 {
     m_result = cqe->res;
+    spdlog::trace("handle complete fd={} result={}", m_descriptor.m_fd, m_result);
     io_uring_cqe_seen(&m_descriptor.m_ring->m_ring, cqe);
 
     // TODO is this useful even?

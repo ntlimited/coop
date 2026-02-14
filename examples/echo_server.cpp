@@ -1,4 +1,5 @@
 #include <cstring>
+#include <optional>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -16,116 +17,75 @@
 // - A plaintext echo server on port 8888
 // - A TLS echo server on port 8889
 //
-// Both use the same cooperative uring-based I/O. The TLS version demonstrates coop::io::ssl usage
-// — note how similar TLSClientHandler is to the plaintext ClientHandler.
+// Both use the same cooperative uring-based I/O. The echo loop itself is transport-agnostic — it
+// operates on a Stream&, so plaintext and TLS handlers share the same core logic.
 //
 
-struct ClientHandler : coop::Launchable
+void EchoLoop(coop::Context* ctx, coop::io::Stream& stream)
 {
-    ClientHandler(coop::Context* ctx, int fd)
+    char buffer[4096];
+
+    while (!ctx->IsKilled())
+    {
+        int ret = stream.Recv(&buffer[0], 4096);
+        if (ret <= 0)
+        {
+            break;
+        }
+
+        int sent = stream.SendAll(&buffer[0], ret);
+        if (sent <= 0)
+        {
+            break;
+        }
+    }
+}
+
+struct EchoHandler : coop::Launchable
+{
+    // Plaintext constructor
+    //
+    EchoHandler(coop::Context* ctx, int fd)
     : coop::Launchable(ctx)
     , m_fd(fd)
+    , m_plaintextStream(std::in_place, m_fd)
+    , m_stream(&*m_plaintextStream)
     {
         ctx->SetName("ConnectionHandler");
     }
 
-    virtual void Launch() final
-    {
-        char buffer[4096];
-
-        while (!GetContext()->IsKilled())
-        {
-            int ret = coop::io::Recv(m_fd, &buffer[0], 4096);
-            if (!ret)
-            {
-                // Short read, disconnected
-                //
-                break;
-            }
-
-            if (ret < 0)
-            {
-                assert(false);
-                break;
-            }
-
-            int at = 0;
-            while (ret)
-            {
-                int sent = coop::io::Send(m_fd, &buffer[at], ret);
-                if (sent == 0)
-                {
-                    m_fd.Close();
-                    return;
-                }
-
-                assert(sent > 0);
-                at += sent;
-                ret -= sent;
-            }
-        }
-        m_fd.Close();
-    }
-    
-    coop::io::Descriptor m_fd;
-};
-
-struct TLSClientHandler : coop::Launchable
-{
-    TLSClientHandler(coop::Context* ctx, int fd, coop::io::ssl::Context* sslCtx)
+    // TLS constructor
+    //
+    EchoHandler(coop::Context* ctx, int fd, coop::io::ssl::Context* sslCtx)
     : coop::Launchable(ctx)
     , m_fd(fd)
-    , m_conn(*sslCtx, m_fd, m_tlsBuffer, sizeof(m_tlsBuffer))
+    , m_conn(std::in_place, *sslCtx, m_fd, m_tlsBuffer, sizeof(m_tlsBuffer))
+    , m_secureStream(std::in_place, *m_conn)
+    , m_stream(&*m_secureStream)
     {
         ctx->SetName("TLSConnectionHandler");
     }
 
     virtual void Launch() final
     {
-        if (m_conn.Handshake() < 0)
+        if (m_conn)
         {
-            spdlog::warn("tls handshake failed fd={}", m_fd.m_fd);
-            m_fd.Close();
-            return;
+            if (m_conn->Handshake() < 0)
+            {
+                spdlog::warn("tls handshake failed fd={}", m_fd.m_fd);
+                return;
+            }
+            spdlog::info("tls handshake ok fd={}", m_fd.m_fd);
         }
-        spdlog::info("tls handshake ok fd={}", m_fd.m_fd);
-
-        char buffer[4096];
-
-        while (!GetContext()->IsKilled())
-        {
-            int ret = coop::io::ssl::Recv(m_conn, &buffer[0], 4096);
-            if (!ret)
-            {
-                break;
-            }
-
-            if (ret < 0)
-            {
-                break;
-            }
-
-            spdlog::debug("tls echo fd={} bytes={}", m_fd.m_fd, ret);
-            int at = 0;
-            while (ret)
-            {
-                int sent = coop::io::ssl::Send(m_conn, &buffer[at], ret);
-                if (sent <= 0)
-                {
-                    m_fd.Close();
-                    return;
-                }
-
-                at += sent;
-                ret -= sent;
-            }
-        }
-        m_fd.Close();
+        EchoLoop(GetContext(), *m_stream);
     }
 
-    coop::io::Descriptor       m_fd;
-    char                       m_tlsBuffer[coop::io::ssl::Connection::BUFFER_SIZE];
-    coop::io::ssl::Connection  m_conn;
+    coop::io::Descriptor                            m_fd;
+    char                                            m_tlsBuffer[coop::io::ssl::Connection::BUFFER_SIZE];
+    std::optional<coop::io::PlaintextStream>        m_plaintextStream;
+    std::optional<coop::io::ssl::Connection>        m_conn;
+    std::optional<coop::io::ssl::SecureStream>      m_secureStream;
+    coop::io::Stream*                               m_stream;
 };
 
 int bind_and_listen(int port)
@@ -190,7 +150,7 @@ void SpawningTask(coop::Context* ctx, void*)
             assert(fd >= 0);
 
             spdlog::info("plaintext accepted fd={}", fd);
-            co->Launch<ClientHandler>(fd);
+            co->Launch<EchoHandler>(fd);
             serverCtx->Yield();
         }
     }, &serverHandle);
@@ -209,7 +169,7 @@ void SpawningTask(coop::Context* ctx, void*)
             assert(fd >= 0);
 
             spdlog::info("tls accepted fd={}", fd);
-            co->Launch<TLSClientHandler>(fd, sslCtxPtr);
+            co->Launch<EchoHandler>(fd, sslCtxPtr);
             tlsCtx->Yield();
         }
     });

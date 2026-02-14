@@ -62,6 +62,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googletest)
 
+# Google Benchmark
+FetchContent_Declare(
+    googlebenchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG        v1.9.1
+)
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googlebenchmark)
+
 enable_testing()
 
 add_executable(coop_tests
@@ -72,3 +81,9 @@ add_executable(coop_tests
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 include(GoogleTest)
 gtest_discover_tests(coop_tests)
+
+# Benchmarks
+add_executable(coop_benchmarks
+    benchmarks/bench_embedded_list.cpp
+)
+target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)

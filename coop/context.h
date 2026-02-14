@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "coordinator.h"
+#include "signal.h"
 #include "channel.h"
 #include "embedded_list.h"
 #include "scheduler_state.h"
@@ -83,19 +84,18 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         return m_cooperator;
     }
 
-    // The Killed system for contexts (and presumably most things) functions using a coordinator
-    // that initially is held by the context itself, and then shutdown as a kill signal.
+    // The Killed system for contexts uses a Signal that starts armed and is notified on kill.
     //
     bool IsKilled() const
     {
-        return !m_killedCoordinator.IsHeld();
+        return m_killedSignal.IsSignaled();
     }
 
-    // The KilledSignal 
+    // Returns the kill signal for use with Wait or CoordinateWith patterns.
     //
-    Coordinator* GetKilledSignal()
+    Signal* GetKilledSignal()
     {
-        return &m_killedCoordinator;
+        return &m_killedSignal;
     }
 
     Context* Parent()
@@ -123,6 +123,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     friend struct Cooperator;
     friend struct Coordinator;
     friend struct CoordinatorExtension;
+    friend struct Signal;
 
     // Enter the block caused by the given coordinator
     //
@@ -148,7 +149,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     int m_priority;
     int m_currentPriority;
     Cooperator* m_cooperator;
-    Coordinator m_killedCoordinator;
+    Signal m_killedSignal;
     ContextChildrenList m_children;
     Coordinator m_lastChild;
     const char* m_name;
@@ -164,6 +165,11 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     // The jmp_buf operates as the 'bookmark' to jump back into when the context is active.
     //
     std::jmp_buf m_jmpBuf;
+
+    // Entry function to call when the context first starts executing. Set by Spawn/Launch before
+    // calling EnterContext, which uses it from the makecontext trampoline.
+    //
+    void (*m_entry)(Context*);
 
     // Must be last member
     //
@@ -189,7 +195,7 @@ struct Context::Handle
 
     void Kill();
 
-    Coordinator* GetKilledSignal();
+    Signal* GetKilledSignal();
 
     operator bool() const
     {

@@ -53,3 +53,22 @@ add_custom_target(test-certs DEPENDS
     ${CMAKE_BINARY_DIR}/bin/key.pem
 )
 add_dependencies(server test-certs)
+
+# Google Test
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG        v1.15.0
+)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+
+add_executable(coop_tests
+    tests/test_coordinator.cpp
+    tests/test_spawn.cpp
+    tests/test_signal.cpp
+)
+target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
+include(GoogleTest)
+gtest_discover_tests(coop_tests)

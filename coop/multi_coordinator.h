@@ -230,7 +230,8 @@ detail::AmbiResult CoordinateWith(Args... args)
 template<typename... Args>
 detail::AmbiResult CoordinateWithKill(Context* ctx, Args... args)
 {
-    auto result = CoordinateWith(ctx, ctx->GetKilledSignal(), std::forward<Args>(args)...);
+    auto result = CoordinateWith(ctx, ctx->GetKilledSignal()->AsCoordinator(),
+        std::forward<Args>(args)...);
     result.index -= 1;
     return result;
 }

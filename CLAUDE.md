@@ -23,6 +23,8 @@ build/      - Build artifacts (git-ignored)
 - Member variables are prefixed with `m_`
 - `NULL` should never be used, use `nullptr` instead
 - Comments should be used liberally to document wider intent and goals, but code should speak for itself
+- Multiline comments should be avoided. Comment blocks should have a trailing, empty `//` line to
+  improve visual separation
 
 ### Best Practices
 - Patterns that stack allocate, or enable stack allocation, are preferred

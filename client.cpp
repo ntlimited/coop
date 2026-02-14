@@ -48,7 +48,8 @@ void ClientTask(coop::Context* ctx, void* arg)
 
             if (useSsl)
             {
-                coop::io::ssl::Connection conn(*sslCtxPtr, remote);
+                char tlsBuffer[coop::io::ssl::Connection::BUFFER_SIZE];
+                coop::io::ssl::Connection conn(*sslCtxPtr, remote, tlsBuffer, sizeof(tlsBuffer));
                 if (conn.Handshake() < 0)
                 {
                     spdlog::warn("client tls handshake failed fd={}", fd);
@@ -87,7 +88,7 @@ void ClientTask(coop::Context* ctx, void* arg)
         });
     }
 
-    ctx->GetKilledSignal()->Acquire(ctx);
+    ctx->GetKilledSignal()->Wait(ctx);
 }
 
 int main(int argc, char* argv[])

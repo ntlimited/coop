@@ -34,7 +34,11 @@ struct Connection
     Connection(Connection const&) = delete;
     Connection(Connection&&) = delete;
 
-    Connection(Context& ctx, Descriptor& desc);
+    // Recommended minimum buffer size for the I/O staging buffer.
+    //
+    static constexpr size_t BUFFER_SIZE = 16384;
+
+    Connection(Context& ctx, Descriptor& desc, char* buffer, size_t bufferSize);
     ~Connection();
 
     // Perform the TLS handshake. Server-mode connections call SSL_accept semantics; client-mode
@@ -64,10 +68,8 @@ struct Connection
     BIO* m_rbio;
     BIO* m_wbio;
 
-    // Heap-allocated to avoid blowing cooperative context stacks (default 16KB).
-    //
-    static constexpr size_t BUFFER_SIZE = 16384;
     char* m_buffer;
+    size_t m_bufferSize;
 };
 
 } // end namespace coop::io::ssl

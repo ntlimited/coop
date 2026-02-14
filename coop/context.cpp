@@ -1,6 +1,5 @@
 #include "context.h"
 #include "cooperator.h"
-#include "coordinator_extension.h"
 
 namespace coop
 {
@@ -16,8 +15,8 @@ Context::Context(
 , m_priority(config.priority)
 , m_currentPriority(config.priority)
 , m_cooperator(cooperator)
+, m_killedSignal(this)
 {
-    m_killedCoordinator.Acquire(this);
     if (m_handle)
     {
         m_handle->m_context = this;
@@ -30,6 +29,7 @@ Context::Context(
         m_parent->m_lastChild.TryAcquire(this);
     }
     m_segment.m_size = config.stackSize;
+    m_entry = nullptr;
 
     m_statistics.ticks = 0;
     m_statistics.yields = 0;
@@ -46,7 +46,7 @@ Context::~Context()
 
     // Properly kill this if we were not already. Note that this propagates down to child contexts
     //
-    if (m_killedCoordinator.IsHeld())
+    if (!m_killedSignal.IsSignaled())
     {
         Kill(this);
     }
@@ -106,12 +106,8 @@ void Context::Unblock(Context* other, const bool schedule /* = true */)
 
 void Context::Kill(Context* other, const bool schedule /* = true */)
 {
-    CoordinatorExtension().Shutdown(&other->m_killedCoordinator, other);
+    other->m_killedSignal.Notify(other, schedule);
 
-    // TODO this is a pretty unsafe pattern and probably needs to not have the "schedule" mechanism.
-    // Maybe it would be possible to split up the way it does this to get some fascimile of the
-    // intended "actually let the thing fully die" way it was conceptually intended to.
-    //
     other->m_children.Visit([&](Context* child)
     {
         Kill(child, schedule);

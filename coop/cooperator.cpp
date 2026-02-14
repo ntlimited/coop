@@ -2,6 +2,7 @@
 #include <mutex>
 #include <new>
 #include <thread>
+#include <ucontext.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -299,6 +300,75 @@ void Cooperator::SanityCheck()
         return true;
     });
     assert(blocked == 0);
+}
+
+void Cooperator::ContextEntryPoint(int lo, int hi)
+{
+    auto* ctx = reinterpret_cast<Context*>(
+        (static_cast<uintptr_t>(static_cast<uint32_t>(hi)) << 32) |
+         static_cast<uintptr_t>(static_cast<uint32_t>(lo)));
+
+    ctx->m_entry(ctx);
+
+    // This deletion must be done while the context is still in its own stack, so that it can
+    // context switch to anyone waiting on the signal safely.
+    //
+    ctx->~Context();
+
+    LongJump(Cooperator::thread_cooperator->m_jmpBuf, SchedulerJumpResult::EXITED);
+}
+
+void Cooperator::EnterContext(Context* ctx)
+{
+    m_ticks += rdtsc() - m_lastRdtsc;
+
+    Context* lastCtx = m_scheduled;
+    auto& buf = (lastCtx ? lastCtx->m_jmpBuf : m_jmpBuf);
+    bool isSelf = !lastCtx;
+
+    if (lastCtx)
+    {
+        lastCtx->m_state = SchedulerState::YIELDED;
+        m_yielded.Push(lastCtx);
+        m_scheduled = nullptr;
+    }
+
+    auto jmpRet = setjmp(buf);
+    if (!jmpRet)
+    {
+        ctx->m_state = SchedulerState::RUNNING;
+        m_scheduled = ctx;
+
+        SanityCheck();
+
+        // Use ucontext to properly set up and switch to the new context's stack, replacing
+        // the previous inline asm approach.
+        //
+        ucontext_t uc;
+        getcontext(&uc);
+        uc.uc_stack.ss_sp = ctx->m_segment.Bottom();
+        uc.uc_stack.ss_size = ctx->m_segment.m_size;
+        uc.uc_link = nullptr;
+
+        auto val = reinterpret_cast<uintptr_t>(ctx);
+        makecontext(&uc, reinterpret_cast<void(*)()>(Cooperator::ContextEntryPoint), 2,
+            static_cast<int>(val & 0xFFFFFFFF),
+            static_cast<int>(val >> 32));
+
+        setcontext(&uc);
+        // Unreachable
+        //
+        assert(false);
+    }
+
+    if (isSelf)
+    {
+        HandleCooperatorResumption(static_cast<SchedulerJumpResult>(jmpRet));
+    }
+    else
+    {
+        assert(lastCtx == m_scheduled);
+    }
 }
 
 namespace

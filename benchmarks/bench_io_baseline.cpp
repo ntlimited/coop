@@ -176,7 +176,7 @@ static void BM_Blocking_PingPong_Scale(benchmark::State& state)
     }
 }
 BENCHMARK(BM_Blocking_PingPong_Scale)
-    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32);
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64)->Arg(128)->Arg(256);
 
 // ---------------------------------------------------------------------------
 // 2. Poll (single-threaded event loop)
@@ -309,7 +309,7 @@ static void BM_Poll_PingPong_Scale(benchmark::State& state)
     }
 }
 BENCHMARK(BM_Poll_PingPong_Scale)
-    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32);
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64)->Arg(128)->Arg(256);
 
 // ---------------------------------------------------------------------------
 // 3. Epoll (single-threaded event loop)
@@ -462,4 +462,4 @@ static void BM_Epoll_PingPong_Scale(benchmark::State& state)
     }
 }
 BENCHMARK(BM_Epoll_PingPong_Scale)
-    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32);
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64)->Arg(128)->Arg(256);

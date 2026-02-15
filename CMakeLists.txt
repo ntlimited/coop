@@ -96,5 +96,7 @@ gtest_discover_tests(coop_tests)
 # Benchmarks
 add_executable(coop_benchmarks
     benchmarks/bench_embedded_list.cpp
+    benchmarks/bench_coordinator.cpp
+    benchmarks/bench_pthread.cpp
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)

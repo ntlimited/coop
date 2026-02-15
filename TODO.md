@@ -1,5 +1,4 @@
 # Probably important things
-* More tests for io functionality
 * Context allocation pooling; given that the size of a context stack can be set at runtime, we
   would likely need to enforce only (a) pooling allocations of that size and (b) having a config
   as part of the Cooperator constructor regarding how many to pool at max

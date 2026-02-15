@@ -35,6 +35,8 @@ build/release/  - Release build artifacts (git-ignored)
 - All I/O calls should be implemented through the coop::io patterns. Syscalls likely should as well.
 - Use separate `build/release` and `build/debug` directories for release and debug mode builds
   respectively
+- Whenever context needs to be gathered at sufficient cost, suggest changes for CLAUDE.md directives
+  that will reduce future costs.
 
 ### Error Handling
 - Errors should bubble up using a checked-return pattern

@@ -37,6 +37,10 @@ struct Uring
 
     void Init();
 
+    // Process any available CQEs without blocking. Returns the number of CQEs dispatched.
+    //
+    int Poll();
+
     void Run(Context* ctx);
 
     // TODO lock down the guts

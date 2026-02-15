@@ -150,7 +150,7 @@ void Cooperator::Launch()
     Cooperator::thread_cooperator = this;
     m_lastRdtsc = rdtsc();
 
-    Spawn([this](Context* ctx) { m_uring.Run(ctx); }, &m_uringHandle);
+    m_uring.Init();
 
     bool shutdownKillDone = false;
 
@@ -178,6 +178,24 @@ void Cooperator::Launch()
 
         if (m_yielded.IsEmpty())
         {
+            // Poll the native uring — contexts may be waiting on IO completions that would
+            // move them from blocked to yielded.
+            //
+            m_uring.Poll();
+            if (!m_yielded.IsEmpty())
+            {
+                continue;
+            }
+
+            // If there are blocked contexts, they may be waiting on IO that hasn't completed
+            // yet. Keep spinning on uring completions (same behavior as the old dedicated uring
+            // context). Only block on submissions when there's truly nothing in flight.
+            //
+            if (!m_blocked.IsEmpty())
+            {
+                SpawnSubmitted(false);
+                continue;
+            }
             SpawnSubmitted(true /* wait */);
             continue;
         }
@@ -198,6 +216,7 @@ void Cooperator::Launch()
             auto* ctx = m_yielded.Pop();
 
             Resume(ctx);
+            m_uring.Poll();
 
             if (!m_submissions.IsEmpty())
             {
@@ -228,10 +247,6 @@ void Cooperator::Resume(Context* ctx)
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
 
-    auto now = rdtsc();
-    m_ticks += now - m_lastRdtsc;
-    ctx->m_lastRdtsc = now;
-
     auto ret = ContextSwitch(&m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
     HandleCooperatorResumption(static_cast<SchedulerJumpResult>(ret));
 }
@@ -259,9 +274,10 @@ void Cooperator::Block(Context* ctx)
 
 void Cooperator::Unblock(Context* ctx, const bool schedule)
 {
-    // Currently, never gets run from outside of an execution context
+    // When schedule is true, we need a currently running context to yield from. When false (e.g.
+    // CQE processing from the cooperator loop), we just move the context to the yielded list.
     //
-    assert(m_scheduled);
+    assert(!schedule || m_scheduled);
     assert(ctx->m_state == SchedulerState::BLOCKED);
 
     m_blocked.Remove(ctx);

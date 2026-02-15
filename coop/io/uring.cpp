@@ -45,6 +45,16 @@ void Uring::Init()
     params.flags = flags;
 
     int ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
+    if (ret == -EINVAL && (flags & IORING_SETUP_SINGLE_ISSUER))
+    {
+        // SINGLE_ISSUER requires kernel 6.0+. Retry without it but keep user-requested flags.
+        //
+        flags &= ~IORING_SETUP_SINGLE_ISSUER;
+        spdlog::warn("uring init: SINGLE_ISSUER not supported, retrying with flags {:#x}", flags);
+        memset(&params, 0, sizeof(params));
+        params.flags = flags;
+        ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
+    }
     if (ret == -EINVAL && flags != 0)
     {
         spdlog::warn("uring init with flags {:#x} failed, retrying without", flags);
@@ -65,31 +75,33 @@ void Uring::Init()
     }
 }
 
-// Work loop
+int Uring::Poll()
+{
+    int dispatched = 0;
+    struct io_uring_cqe* cqe;
+
+    while (io_uring_peek_cqe(&m_ring, &cqe) == 0)
+    {
+        spdlog::trace("uring cqe result={}", cqe->res);
+        Handle::Callback(cqe);
+        dispatched++;
+    }
+
+    return dispatched;
+}
+
+// Work loop for non-native urings that run as a dedicated context
 //
 void Uring::Run(Context* ctx)
 {
     ctx->SetName(m_config.taskName);
-    
+
     Init();
-    
+
     while (!ctx->IsKilled())
     {
         ctx->Yield();
-
-        struct io_uring_cqe* cqe;
-        int ret = io_uring_peek_cqe(&m_ring, &cqe);
-        if (ret == -EAGAIN || ret == -EINTR)
-        {
-            continue;
-        }
-        if (ret < 0)
-        {
-            assert(false);
-        }
-        assert(ret == 0);
-        spdlog::trace("uring cqe result={}", cqe->res);
-        Handle::Callback(cqe);
+        Poll();
     }
 }
 

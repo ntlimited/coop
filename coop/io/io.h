@@ -7,6 +7,7 @@
 #include "read.h"
 #include "read_file.h"
 #include "recv.h"
+#include "resolve.h"
 #include "send.h"
 #include "stream.h"
 

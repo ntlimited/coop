@@ -16,10 +16,10 @@ struct Handle;
 #define CONNECT_ARGS(F) F(const struct sockaddr*, addr, ) F(socklen_t, addrLen, )
 COOP_IO_DECLARATIONS(Connect, CONNECT_ARGS)
 
-// Note that this takes an IP address, not a DNS name to resolve. Async DNS resolution is
-// supremely unfun and someone else can chew that off...
+// Accepts either a dotted-quad IP address or a hostname. If the string isn't a numeric address,
+// DNS resolution is performed cooperatively via Resolve4 (UDP queries through io_uring).
 //
-int Connect(Descriptor& desc, const char* ipv4, int port);
+int Connect(Descriptor& desc, const char* hostname, int port);
 
 } // end namespace coop::io
 } // end namespace coop

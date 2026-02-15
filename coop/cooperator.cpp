@@ -67,6 +67,13 @@ void Cooperator::ShutdownAll()
     });
 }
 
+void Cooperator::ResetGlobalShutdown()
+{
+    std::lock_guard<std::mutex> lock(s_registryMutex);
+    assert(s_registry.IsEmpty());
+    s_registryShutdown.store(false, std::memory_order_relaxed);
+}
+
 bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
 {
     m_submissionAvailabilitySemaphore.acquire();

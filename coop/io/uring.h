@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "descriptor.h"
+#include "uring_configuration.h"
 
 #include "coop/coordinator.h"
 #include "coop/detail/embedded_list.h"
@@ -27,9 +28,9 @@ struct Uring
 {
     using DescriptorList = EmbeddedList<Descriptor>;
 
-    Uring(int entries, int registeredSlots = 64)
-    : m_entries(entries)
-    , m_registered(registeredSlots, -1)
+    Uring(UringConfiguration const& config = s_defaultUringConfiguration)
+    : m_config(config)
+    , m_registered(config.registeredSlots, -1)
     {
         memset(&m_ring, 0, sizeof(m_ring));
     }
@@ -57,7 +58,7 @@ struct Uring
     // slot index is stored in Descriptor::m_registeredIndex and operations use IOSQE_FIXED_FILE.
     //
     std::vector<int> m_registered;
-    int     m_entries;
+    UringConfiguration m_config;
 };
 
 } // end namespace io

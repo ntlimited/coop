@@ -1,18 +1,18 @@
 #pragma once
 
+#include "io/uring_configuration.h"
+
 namespace coop
 {
 
 struct CooperatorConfiguration
 {
-    int uringEntries;
-    int uringRegisteredSlots;
+    io::UringConfiguration uring;
     int tickerResolution;
 };
 
 static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
-    .uringEntries = 64,
-    .uringRegisteredSlots = 64,
+    .uring = io::s_defaultUringConfiguration,
     .tickerResolution = 3,
 };
 

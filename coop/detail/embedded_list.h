@@ -28,6 +28,11 @@ struct EmbeddedListHookups
     {
     }
 
+    EmbeddedListHookups(EmbeddedListHookups const&) = delete;
+    EmbeddedListHookups& operator=(EmbeddedListHookups const&) = delete;
+    EmbeddedListHookups(EmbeddedListHookups&&) = delete;
+    EmbeddedListHookups& operator=(EmbeddedListHookups&&) = delete;
+
     // These methods are only intended to be called by the list they're a member of, as otherwise
     // various guarantees may not be honored.
     //

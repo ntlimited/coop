@@ -6,6 +6,18 @@
 
 #include "coop/context.h"
 
+// Compat defines for kernels/liburing that don't expose these yet. These are stable kernel ABI.
+//
+#ifndef IORING_SETUP_SINGLE_ISSUER
+#define IORING_SETUP_SINGLE_ISSUER (1U << 12)
+#endif
+#ifndef IORING_SETUP_COOP_TASKRUN
+#define IORING_SETUP_COOP_TASKRUN (1U << 8)
+#endif
+#ifndef IORING_SETUP_TASKRUN_FLAG
+#define IORING_SETUP_TASKRUN_FLAG (1U << 9)
+#endif
+
 namespace coop
 {
 
@@ -14,7 +26,31 @@ namespace io
 
 void Uring::Init()
 {
-    int ret = io_uring_queue_init(m_entries, &m_ring, 0);
+    unsigned flags = IORING_SETUP_SINGLE_ISSUER;
+    if (m_config.sqpoll)
+    {
+        flags |= IORING_SETUP_SQPOLL;
+    }
+    if (m_config.iopoll)
+    {
+        flags |= IORING_SETUP_IOPOLL;
+    }
+    if (m_config.coopTaskrun)
+    {
+        flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
+    }
+
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+    params.flags = flags;
+
+    int ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
+    if (ret == -EINVAL && flags != 0)
+    {
+        spdlog::warn("uring init with flags {:#x} failed, retrying without", flags);
+        memset(&params, 0, sizeof(params));
+        ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
+    }
     assert(ret == 0);
     std::ignore = ret;
 

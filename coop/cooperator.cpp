@@ -12,20 +12,78 @@
 namespace coop
 {
 
+std::atomic<bool>        Cooperator::s_registryShutdown{false};
+std::mutex               Cooperator::s_registryMutex;
+Cooperator::RegistryList Cooperator::s_registry;
+
+Cooperator::Cooperator(CooperatorConfiguration const& config)
+: m_lastRdtsc(0)
+, m_ticks(0)
+, m_shutdown(false)
+, m_ticker(config.tickerResolution)
+, m_uring(config.uringEntries)
+, m_scheduled(nullptr)
+, m_submissionSemaphore(0)
+, m_submissionAvailabilitySemaphore(8)
+{
+}
+
+Cooperator::~Cooperator()
+{
+    std::lock_guard<std::mutex> lock(s_registryMutex);
+    if (!Disconnected())
+    {
+        s_registry.Remove(this);
+    }
+}
+
+void Cooperator::Shutdown()
+{
+    m_shutdown.store(true, std::memory_order_relaxed);
+
+    // Wake the cooperator if it is blocked waiting for submissions
+    //
+    m_submissionSemaphore.release();
+
+    // Wake anyone blocked in Submit. The released caller will see m_shutdown and chain-release
+    // so that all blocked callers eventually drain out.
+    //
+    m_submissionAvailabilitySemaphore.release();
+}
+
+void Cooperator::ShutdownAll()
+{
+    // Close the gate so no new cooperators can register, then take the lock. Any Launch() that
+    // beat us to the lock will have registered and be visible in the list; any Launch() that
+    // follows will see the flag under the lock and shut itself down.
+    //
+    s_registryShutdown.store(true, std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(s_registryMutex);
+    s_registry.Visit([](Cooperator* co) -> bool
+    {
+        co->Shutdown();
+        return true;
+    });
+}
+
 bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
 {
-    // Block on there being a slot available to submit to. This means the bool return is
-    // currently irrelevant, but this should get extended to support a timeout at least.
-    //
     m_submissionAvailabilitySemaphore.acquire();
+
+    if (m_shutdown.load(std::memory_order_relaxed))
+    {
+        // Chain-release so the next blocked caller also wakes up and drains out
+        //
+        m_submissionAvailabilitySemaphore.release();
+        return false;
+    }
 
     m_submissionLock.lock();
     auto ret =  m_submissions.Push(ExecutionSubmission{func, arg, config});
     m_submissionLock.unlock();
     if (ret)
     {
-        // Signal that there is work to be picked up.
-        //
         m_submissionSemaphore.release();
     }
     return ret;
@@ -69,14 +127,46 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
 
 void Cooperator::Launch()
 {
+    {
+        std::lock_guard<std::mutex> lock(s_registryMutex);
+        if (s_registryShutdown.load(std::memory_order_relaxed))
+        {
+            Shutdown();
+            return;
+        }
+        s_registry.Push(this);
+    }
+
     Cooperator::thread_cooperator = this;
     m_lastRdtsc = rdtsc();
 
     Spawn([this](Context* ctx) { m_ticker.Run(ctx); }, &m_tickerHandle);
     Spawn([this](Context* ctx) { m_uring.Run(ctx); }, &m_uringHandle);
 
-    while (!m_yielded.IsEmpty() || !m_shutdown)
+    bool shutdownKillDone = false;
+
+    while (!m_yielded.IsEmpty() || !m_shutdown.load(std::memory_order_relaxed))
     {
+        // When shutdown is requested, kill all live contexts from within the cooperator's
+        // thread so they can exit naturally. This only needs to happen once; killed contexts
+        // will check IsKilled() when resumed and return.
+        //
+        if (m_shutdown.load(std::memory_order_relaxed) && !shutdownKillDone)
+        {
+            shutdownKillDone = true;
+            Spawn([this](Context* killCtx)
+            {
+                m_contexts.Visit([&](Context* c) -> bool
+                {
+                    if (c != killCtx && !c->IsKilled())
+                    {
+                        killCtx->Kill(c, false /* schedule */);
+                    }
+                    return true;
+                });
+            });
+        }
+
         if (m_yielded.IsEmpty())
         {
             SpawnSubmitted(true /* wait */);
@@ -106,6 +196,11 @@ void Cooperator::Launch()
                 break;
             }
         }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_registryMutex);
+        s_registry.Remove(this);
     }
 }
 
@@ -231,10 +326,17 @@ bool Cooperator::SpawnSubmitted(bool wait /* = false */)
             return false;
         }
     }
+
     m_submissionLock.lock();
 
     ExecutionSubmission submitted;
-    m_submissions.Pop(submitted);
+    if (!m_submissions.Pop(submitted))
+    {
+        // Woken by Shutdown() releasing the semaphore, not by an actual submission
+        //
+        m_submissionLock.unlock();
+        return false;
+    }
 
     m_submissionLock.unlock();
     m_submissionAvailabilitySemaphore.release();
@@ -391,7 +493,12 @@ void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /*
         args.mutex.lock();
         args.handle = handle;
 
-        Submit(&BoundaryCrossingKill, &args);
+        if (!Submit(&BoundaryCrossingKill, &args))
+        {
+            // Cooperator is shutting down; the kill will be handled by the shutdown sweep
+            //
+            return;
+        }
 
         // This gets unlocked in the submitted func; technically we don't need to do this but
         // it preserves the same contract as when we kill from inside the boundary and don't

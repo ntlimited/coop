@@ -11,6 +11,7 @@
 #include "coop/time/sleep.h"
 #include "coop/io/io.h"
 #include "coop/io/ssl/ssl.h"
+#include "coop/shutdown.h"
 
 // Demo program that sets up two TCP echo servers:
 //
@@ -193,13 +194,18 @@ void SpawningTask(coop::Context* ctx, void*)
         }
     });
 
-    // Wait for either the router or us to get killed
+    // Yield until the shutdown handler shuts us down
     //
-    ctx->GetKilledSignal()->Wait(ctx);
+    while (!co->IsShuttingDown())
+    {
+        ctx->Yield(true);
+    }
+    spdlog::info("shutting down...");
 }
 
 int main()
 {
+    coop::InstallShutdownHandler();
     coop::Cooperator cooperator;
     coop::Thread mt(&cooperator);
 

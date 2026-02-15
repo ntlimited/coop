@@ -17,7 +17,10 @@ Signal* Context::Handle::GetKilledSignal()
 //
 void Context::Handle::Kill()
 {
-    m_context->GetCooperator()->BoundarySafeKill(this, false);
+    if (m_context)
+    {
+        m_context->GetCooperator()->BoundarySafeKill(this, false);
+    }
 }
 
 } // end namespace coop

@@ -7,6 +7,7 @@
 #include "coop/thread.h"
 #include "coop/io/io.h"
 #include "coop/io/ssl/ssl.h"
+#include "coop/shutdown.h"
 
 void ClientTask(coop::Context* ctx, void* arg)
 {
@@ -70,7 +71,13 @@ void ClientTask(coop::Context* ctx, void* arg)
         });
     }
 
-    ctx->GetKilledSignal()->Wait(ctx);
+    // Yield until the shutdown handler shuts us down
+    //
+    while (!co->IsShuttingDown())
+    {
+        ctx->Yield(true);
+    }
+    spdlog::info("shutting down...");
 }
 
 int main(int argc, char* argv[])
@@ -84,6 +91,7 @@ int main(int argc, char* argv[])
         }
     }
 
+    coop::InstallShutdownHandler();
     coop::Cooperator cooperator;
     coop::Thread mt(&cooperator);
 

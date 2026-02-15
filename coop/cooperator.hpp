@@ -34,7 +34,7 @@ bool Cooperator::Spawn(Fn const& fn, Context::Handle* handle /* = nullptr */)
 template<typename Fn>
 bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::Handle* handle /* = nullptr */)
 {
-    if (m_shutdown || (m_scheduled && m_scheduled->IsKilled()))
+    if (m_scheduled && m_scheduled->IsKilled())
     {
         return false;
     }
@@ -65,7 +65,7 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
 {
     static_assert(std::is_base_of<Launchable, T>::value);
 
-    if (m_shutdown || (m_scheduled && m_scheduled->IsKilled()))
+    if (m_scheduled && m_scheduled->IsKilled())
     {
         return nullptr;
     }

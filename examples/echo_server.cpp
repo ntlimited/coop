@@ -138,6 +138,13 @@ void SpawningTask(coop::Context* ctx, void*)
 
     coop::Context::Handle serverHandle;
 
+    // EchoHandler embeds a 16KB TLS buffer, so it needs a larger stack than the default
+    //
+    static constexpr coop::SpawnConfiguration handlerConfig = {
+        .priority = 0,
+        .stackSize = 65536,
+    };
+
     // Plaintext echo server on port 8888
     //
     co->Spawn([=](coop::Context* serverCtx)
@@ -151,7 +158,7 @@ void SpawningTask(coop::Context* ctx, void*)
             assert(fd >= 0);
 
             spdlog::info("plaintext accepted fd={}", fd);
-            co->Launch<EchoHandler>(fd);
+            co->Launch<EchoHandler>(handlerConfig, fd);
             serverCtx->Yield();
         }
     }, &serverHandle);
@@ -170,7 +177,7 @@ void SpawningTask(coop::Context* ctx, void*)
             assert(fd >= 0);
 
             spdlog::info("tls accepted fd={}", fd);
-            co->Launch<EchoHandler>(fd, sslCtxPtr);
+            co->Launch<EchoHandler>(handlerConfig, fd, sslCtxPtr);
             tlsCtx->Yield();
         }
     });
@@ -209,6 +216,6 @@ int main()
     coop::Cooperator cooperator;
     coop::Thread mt(&cooperator);
 
-    cooperator.Submit(&SpawningTask);
+    cooperator.Submit(&SpawningTask, nullptr, {.priority = 0, .stackSize = 65536});
     return 0;
 }

@@ -46,6 +46,17 @@ struct BaseChannel
     {
     }
 
+  protected:
+    // Required for virtual inheritance — the most-derived class initializes the virtual base
+    // directly, but intermediate classes still need a default constructor to exist syntactically.
+    //
+    BaseChannel()
+    : m_shutdown(false)
+    {
+    }
+
+  public:
+
     virtual ~BaseChannel()
     {
     }
@@ -103,6 +114,19 @@ struct TypedBaseChannel : public BaseChannel
         }
     }
 
+  protected:
+    // See BaseChannel default constructor comment
+    //
+    TypedBaseChannel()
+    : m_buffer(nullptr)
+    , m_head(0)
+    , m_tail(0)
+    , m_capacity(0)
+    {
+    }
+
+  public:
+
     virtual ~TypedBaseChannel()
     {
     }
@@ -118,7 +142,7 @@ struct TypedBaseChannel : public BaseChannel
         return next ==  m_head;
     }
 
-  private:
+  protected:
     T* m_buffer;
     size_t m_head;
     size_t m_tail;
@@ -139,7 +163,7 @@ struct RecvChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
-        RecvImpl(ctx, value);
+        RecvImpl(value);
 
         if (Base::IsEmpty())
         {
@@ -259,7 +283,7 @@ struct SendChannel : virtual TypedBaseChannel<T>
 
         // TODO should probably assert on this
         //
-        Base::SendImpl(value);
+        SendImpl(value);
         
         // If there is space, let go of the coordinator so that the preconditions still stand. This
         // in theory wouldn't happen today but if we change the unblock mechanics to not just
@@ -275,10 +299,12 @@ struct SendChannel : virtual TypedBaseChannel<T>
         {
             Base::m_recv.Release(ctx);
         }
+
+        return true;
     }
 
   protected:
-    bool SendImpl(Context* ctx, T value)
+    bool SendImpl(T value)
     {
         if (Base::IsFull())
         {

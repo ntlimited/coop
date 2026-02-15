@@ -44,6 +44,9 @@ target_link_libraries(echo_server PRIVATE coop)
 add_executable(echo_client examples/echo_client.cpp)
 target_link_libraries(echo_client PRIVATE coop)
 
+add_executable(chat_server examples/chat_server.cpp)
+target_link_libraries(chat_server PRIVATE coop)
+
 # Generate a self-signed TLS certificate for testing if one doesn't already exist
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/bin/cert.pem ${CMAKE_BINARY_DIR}/bin/key.pem

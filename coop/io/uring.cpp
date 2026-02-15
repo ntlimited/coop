@@ -69,7 +69,10 @@ void Uring::Init()
 //
 void Uring::Run(Context* ctx)
 {
+    ctx->SetName(m_config.taskName);
+    
     Init();
+    
     while (!ctx->IsKilled())
     {
         ctx->Yield();

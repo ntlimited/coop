@@ -9,6 +9,7 @@ struct UringConfiguration
 {
     int entries;
     int registeredSlots;
+    const char* taskName;
 
     // IORING_SETUP_SQPOLL: kernel thread polls the SQ for new entries, avoiding io_uring_enter()
     // for submission. May require CAP_SYS_ADMIN or appropriate cgroup permissions.
@@ -35,6 +36,7 @@ struct UringConfiguration
 static const UringConfiguration s_defaultUringConfiguration = {
     .entries = 64,
     .registeredSlots = 64,
+    .taskName = "Uring",
     .sqpoll = false,
     .iopoll = false,
     .coopTaskrun = false,

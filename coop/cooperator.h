@@ -171,6 +171,11 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         return m_blocked.Size();
     }
 
+    template<typename Fn>
+    void VisitContexts(Fn const& fn) { m_contexts.Visit(fn); }
+
+    int64_t GetTicks() const { return m_ticks; }
+
     void SanityCheck();
 
     // Ideally this would be better protected

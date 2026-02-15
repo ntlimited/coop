@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>coop status</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #1a1a2e; color: #e0e0e0;
+    font-family: 'Consolas', 'Monaco', monospace; font-size: 14px;
+    padding: 20px;
+}
+h1 { color: #7fdbca; margin-bottom: 16px; font-size: 18px; }
+.summary {
+    display: flex; gap: 24px; margin-bottom: 20px;
+    padding: 12px; background: #16213e; border-radius: 6px;
+}
+.stat { display: flex; flex-direction: column; }
+.stat-label { color: #888; font-size: 11px; text-transform: uppercase; }
+.stat-value { color: #7fdbca; font-size: 20px; font-weight: bold; }
+.chart-container {
+    background: #16213e; border-radius: 6px; padding: 12px;
+    margin-bottom: 20px;
+}
+.chart-title { color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 8px; }
+canvas { display: block; width: 100%; }
+.legend {
+    display: flex; flex-wrap: wrap; gap: 12px;
+    margin-top: 8px; font-size: 11px;
+}
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-swatch { width: 10px; height: 10px; border-radius: 2px; }
+.ctx {
+    margin-left: 20px; padding: 6px 10px;
+    border-left: 2px solid #333; margin-bottom: 4px;
+}
+.ctx-root { margin-left: 0; }
+.ctx-header { display: flex; align-items: center; gap: 8px; }
+.ctx-name { font-weight: bold; color: #c3cee3; }
+.badge {
+    font-size: 11px; padding: 1px 6px; border-radius: 3px;
+    font-weight: bold; text-transform: uppercase;
+}
+.badge-running  { background: #264f3d; color: #7fdbca; }
+.badge-yielded  { background: #3d3c1f; color: #e6db74; }
+.badge-blocked  { background: #4f2626; color: #f07178; }
+.badge-killed   { background: #4f2626; color: #ff5370; }
+.ctx-stats { color: #666; font-size: 12px; margin-top: 2px; }
+.error { color: #f07178; padding: 20px; }
+#updated { color: #555; font-size: 11px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<h1>coop status</h1>
+<div class="summary">
+    <div class="stat"><span class="stat-label">contexts</span><span class="stat-value" id="s-ctx">-</span></div>
+    <div class="stat"><span class="stat-label">yielded</span><span class="stat-value" id="s-yld">-</span></div>
+    <div class="stat"><span class="stat-label">blocked</span><span class="stat-value" id="s-blk">-</span></div>
+    <div class="stat"><span class="stat-label">ticks</span><span class="stat-value" id="s-tck">-</span></div>
+</div>
+<div class="chart-container">
+    <div class="chart-title">ticks per context (delta per update)</div>
+    <canvas id="chart" height="180"></canvas>
+    <div class="legend" id="legend"></div>
+</div>
+<div id="tree"></div>
+<div id="updated"></div>
+<script>
+var COLORS = [
+    '#7fdbca', '#c792ea', '#f78c6c', '#82aaff', '#c3e88d',
+    '#ff5370', '#e6db74', '#89ddff', '#f07178', '#ffcb6b'
+];
+var MAX_POINTS = 60;
+
+// { contextName: [delta0, delta1, ...] }
+var history = {};
+// { contextName: ticksLastSeen }
+var prevTicks = null;
+// Stable color assignment
+var colorMap = {};
+var nextColor = 0;
+
+function colorFor(name) {
+    if (!(name in colorMap)) {
+        colorMap[name] = COLORS[nextColor % COLORS.length];
+        nextColor++;
+    }
+    return colorMap[name];
+}
+
+// Walk the context tree and collect { name: totalTicks } for all leaf-ish contexts
+function flattenTicks(ctx, prefix, out) {
+    var name = prefix ? prefix + '/' + ctx.name : ctx.name;
+    out[name] = ctx.statistics.ticks;
+    if (ctx.children) {
+        for (var i = 0; i < ctx.children.length; i++) {
+            flattenTicks(ctx.children[i], name, out);
+        }
+    }
+}
+
+function recordDeltas(data) {
+    var current = {};
+    for (var i = 0; i < data.contexts.length; i++) {
+        flattenTicks(data.contexts[i], '', current);
+    }
+
+    // First fetch — seed prevTicks but don't record (no meaningful deltas yet)
+    if (prevTicks === null) {
+        prevTicks = current;
+        return;
+    }
+
+    // Compute deltas against previous snapshot
+    var deltas = {};
+    for (var name in current) {
+        var prev = prevTicks[name] || 0;
+        deltas[name] = current[name] - prev;
+    }
+    prevTicks = current;
+
+    // Push deltas into history, capping length
+    // Also prune contexts that have disappeared
+    var activeNames = {};
+    for (var name in deltas) {
+        activeNames[name] = true;
+        if (!history[name]) history[name] = [];
+        history[name].push(deltas[name]);
+        if (history[name].length > MAX_POINTS) {
+            history[name].shift();
+        }
+    }
+    for (var name in history) {
+        if (!activeNames[name]) {
+            delete history[name];
+        }
+    }
+}
+
+function drawChart() {
+    var canvas = document.getElementById('chart');
+    var dpr = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    var ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    var W = rect.width;
+    var H = rect.height;
+
+    ctx.clearRect(0, 0, W, H);
+
+    var names = Object.keys(history);
+    if (names.length === 0) return;
+
+    // Find the max number of data points and the global max delta
+    var maxLen = 0;
+    var maxVal = 1;
+    for (var i = 0; i < names.length; i++) {
+        var h = history[names[i]];
+        if (h.length > maxLen) maxLen = h.length;
+        for (var j = 0; j < h.length; j++) {
+            if (h[j] > maxVal) maxVal = h[j];
+        }
+    }
+
+    var padL = 48, padR = 8, padT = 8, padB = 20;
+    var plotW = W - padL - padR;
+    var plotH = H - padT - padB;
+
+    // Grid lines
+    ctx.strokeStyle = '#ffffff10';
+    ctx.lineWidth = 1;
+    var gridLines = 4;
+    for (var i = 0; i <= gridLines; i++) {
+        var y = padT + (plotH / gridLines) * i;
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(W - padR, y);
+        ctx.stroke();
+
+        ctx.fillStyle = '#555';
+        ctx.font = '10px Consolas, Monaco, monospace';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        var label = Math.round(maxVal * (1 - i / gridLines));
+        ctx.fillText(label, padL - 6, y);
+    }
+
+    // Draw stacked area chart
+    // First, build per-column stacked totals
+    var stacked = [];
+    for (var col = 0; col < maxLen; col++) {
+        stacked[col] = [];
+        var cumulative = 0;
+        for (var ni = 0; ni < names.length; ni++) {
+            var h = history[names[ni]];
+            var offset = maxLen - h.length;
+            var val = col >= offset ? h[col - offset] : 0;
+            cumulative += val;
+            stacked[col].push(cumulative);
+        }
+    }
+
+    // Adjust maxVal to stacked max
+    var stackedMax = 1;
+    for (var col = 0; col < maxLen; col++) {
+        var top = stacked[col][names.length - 1];
+        if (top > stackedMax) stackedMax = top;
+    }
+
+    function xFor(col) {
+        return padL + (plotW / Math.max(MAX_POINTS - 1, 1)) * col;
+    }
+    function yFor(val) {
+        return padT + plotH - (val / stackedMax) * plotH;
+    }
+
+    // Draw areas back to front (top series first so bottom paints over)
+    for (var ni = names.length - 1; ni >= 0; ni--) {
+        ctx.fillStyle = colorFor(names[ni]) + '40';
+        ctx.strokeStyle = colorFor(names[ni]);
+        ctx.lineWidth = 1.5;
+
+        ctx.beginPath();
+        ctx.moveTo(xFor(0), yFor(0));
+
+        for (var col = 0; col < maxLen; col++) {
+            ctx.lineTo(xFor(col), yFor(stacked[col][ni]));
+        }
+
+        // Close back along the bottom of this band
+        for (var col = maxLen - 1; col >= 0; col--) {
+            var bottom = ni > 0 ? stacked[col][ni - 1] : 0;
+            ctx.lineTo(xFor(col), yFor(bottom));
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        // Stroke the top edge
+        ctx.beginPath();
+        for (var col = 0; col < maxLen; col++) {
+            if (col === 0) ctx.moveTo(xFor(col), yFor(stacked[col][ni]));
+            else ctx.lineTo(xFor(col), yFor(stacked[col][ni]));
+        }
+        ctx.stroke();
+    }
+
+    // Update legend
+    var legend = document.getElementById('legend');
+    legend.innerHTML = '';
+    for (var i = 0; i < names.length; i++) {
+        var item = document.createElement('span');
+        item.className = 'legend-item';
+        var swatch = document.createElement('span');
+        swatch.className = 'legend-swatch';
+        swatch.style.backgroundColor = colorFor(names[i]);
+        item.appendChild(swatch);
+        // Show just the last segment of the path for brevity
+        var parts = names[i].split('/');
+        var label = parts[parts.length - 1];
+        item.appendChild(document.createTextNode(label));
+        legend.appendChild(item);
+    }
+}
+
+function renderCtx(c, root) {
+    var d = document.createElement('div');
+    d.className = 'ctx' + (root ? ' ctx-root' : '');
+    var h = document.createElement('div');
+    h.className = 'ctx-header';
+    var name = document.createElement('span');
+    name.className = 'ctx-name';
+    name.textContent = c.name;
+    h.appendChild(name);
+    var b = document.createElement('span');
+    b.className = 'badge badge-' + c.state;
+    b.textContent = c.state;
+    h.appendChild(b);
+    if (c.killed) {
+        var k = document.createElement('span');
+        k.className = 'badge badge-killed';
+        k.textContent = 'killed';
+        h.appendChild(k);
+    }
+    d.appendChild(h);
+    var s = document.createElement('div');
+    s.className = 'ctx-stats';
+    s.textContent = 'ticks=' + c.statistics.ticks +
+        ' yields=' + c.statistics.yields +
+        ' blocks=' + c.statistics.blocks +
+        ' priority=' + c.priority;
+    d.appendChild(s);
+    if (c.children) {
+        for (var i = 0; i < c.children.length; i++) {
+            d.appendChild(renderCtx(c.children[i], false));
+        }
+    }
+    return d;
+}
+
+function refresh() {
+    fetch('/api/status').then(function(r) { return r.json(); }).then(function(data) {
+        document.getElementById('s-ctx').textContent = data.contextsCount;
+        document.getElementById('s-yld').textContent = data.yieldedCount;
+        document.getElementById('s-blk').textContent = data.blockedCount;
+        document.getElementById('s-tck').textContent = data.ticks;
+
+        recordDeltas(data);
+        drawChart();
+
+        var tree = document.getElementById('tree');
+        tree.innerHTML = '';
+        for (var i = 0; i < data.contexts.length; i++) {
+            tree.appendChild(renderCtx(data.contexts[i], true));
+        }
+        document.getElementById('updated').textContent =
+            'updated ' + new Date().toLocaleTimeString();
+    }).catch(function(e) {
+        document.getElementById('tree').innerHTML =
+            '<div class="error">fetch failed: ' + e.message + '</div>';
+    });
+}
+
+refresh();
+setInterval(refresh, 2000);
+window.addEventListener('resize', drawChart);
+</script>
+</body>
+</html>

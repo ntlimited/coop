@@ -285,8 +285,8 @@ TEST(SleepTest, SleepCompletesNormally)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        bool ok = coop::time::Sleep(ctx, coop::time::Interval(100));
-        EXPECT_TRUE(ok);
+        auto result = coop::time::Sleep(ctx, std::chrono::milliseconds(100));
+        EXPECT_EQ(result, coop::time::SleepResult::Ok);
     });
 }
 
@@ -295,7 +295,7 @@ TEST(SleepTest, SleepReturnsFalseOnKill)
     test::RunInCooperator([](coop::Context* ctx)
     {
         coop::Context::Handle handle;
-        bool sleepResult = true;
+        coop::time::SleepResult sleepResult = coop::time::SleepResult::Ok;
         bool completed = false;
 
         ctx->GetCooperator()->Spawn([&](coop::Context* child)
@@ -308,11 +308,16 @@ TEST(SleepTest, SleepReturnsFalseOnKill)
         //
         handle.Kill();
 
-        // Yield to let the child wake up and finish
+        // Yield until the child finishes. The killed child's Sleeper destructor cancels the
+        // pending io_uring timeout, which requires the Uring context to process cancel CQEs
+        // before the child can complete.
         //
-        ctx->Yield(true);
+        while (!completed)
+        {
+            ctx->Yield(true);
+        }
 
-        EXPECT_FALSE(sleepResult);
+        EXPECT_EQ(sleepResult, coop::time::SleepResult::Killed);
         EXPECT_TRUE(completed);
     });
 }

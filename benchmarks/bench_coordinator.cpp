@@ -104,7 +104,7 @@ static void BM_CoordinateWith_Timeout_NoFire(benchmark::State& state)
         coop::Coordinator coord;
         for (auto _ : state)
         {
-            auto result = coop::CoordinateWith(ctx, &coord, coop::time::Interval(1000));
+            auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(1000));
             benchmark::DoNotOptimize(result.coordinator);
             coord.Release(ctx, false);
         }
@@ -259,7 +259,7 @@ static void BM_CoordinateWith_Timeout_Fires(benchmark::State& state)
         for (auto _ : state)
         {
             coop::Coordinator coord(ctx);
-            auto result = coop::CoordinateWith(ctx, &coord, coop::time::Interval(1));
+            auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(1));
             benchmark::DoNotOptimize(result.TimedOut());
             coord.Release(ctx, false);
         }

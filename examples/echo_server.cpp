@@ -198,10 +198,9 @@ void SpawningTask(coop::Context* ctx, void*)
         statusCtx->SetName("Status context");
         coop::time::Sleeper s(
             statusCtx,
-            statusCtx->GetCooperator()->GetTicker(),
             std::chrono::seconds(10));
 
-        while (s.Sleep())
+        while (s.Sleep() == coop::time::SleepResult::Ok)
         {
             spdlog::info("cooperator total={} yielded={} blocked={}",
                 statusCtx->GetCooperator()->ContextsCount(),

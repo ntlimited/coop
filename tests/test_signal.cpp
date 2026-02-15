@@ -220,7 +220,7 @@ TEST(SignalTest, CoordinateWithTimesOut)
         //
         coop::Coordinator coord(ctx);
 
-        auto result = coop::CoordinateWith(ctx, &coord, coop::time::Interval(50));
+        auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(50));
         EXPECT_TRUE(result.TimedOut());
         EXPECT_FALSE(result.Killed());
         EXPECT_EQ(result.coordinator, nullptr);
@@ -242,7 +242,7 @@ TEST(SignalTest, CoordinateWithCompletesBeforeTimeout)
             coord.Release(child, false);
         });
 
-        auto result = coop::CoordinateWith(ctx, &coord, coop::time::Interval(5000));
+        auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(5000));
         EXPECT_FALSE(result.TimedOut());
         EXPECT_FALSE(result.Killed());
         EXPECT_EQ(static_cast<size_t>(result), 0u);

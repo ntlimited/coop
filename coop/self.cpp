@@ -22,8 +22,3 @@ bool ::coop::IsKilled()
 {
     return Cooperator::thread_cooperator->GetUring();
 }
-
-::coop::time::Ticker* ::coop::GetTicker()
-{
-    return Cooperator::thread_cooperator->GetTicker();
-}

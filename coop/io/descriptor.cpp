@@ -6,7 +6,7 @@
 #include "uring.h"
 
 #include "coop/context.h"
-#include "coop/embedded_list.h"
+#include "coop/detail/embedded_list.h"
 #include "coop/self.h"
 
 namespace coop

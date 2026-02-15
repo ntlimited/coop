@@ -4,7 +4,7 @@
 #include <type_traits>
 
 #include "context.h"
-#include "scheduler_state.h"
+#include "detail/scheduler_state.h"
 #include "self.h"
 
 namespace coop

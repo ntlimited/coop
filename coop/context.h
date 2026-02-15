@@ -6,8 +6,8 @@
 #include "coordinator.h"
 #include "signal.h"
 #include "channel.h"
-#include "embedded_list.h"
-#include "scheduler_state.h"
+#include "detail/embedded_list.h"
+#include "detail/scheduler_state.h"
 #include "spawn_configuration.h"
 
 namespace coop

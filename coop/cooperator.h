@@ -135,6 +135,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     static void ShutdownAll();
 
+    // Reset the global shutdown state so that new cooperators can register again. All cooperators
+    // must have fully exited before this is called. This exists for test harnesses that need to
+    // exercise ShutdownAll() without poisoning the global state for subsequent tests.
+    //
+    static void ResetGlobalShutdown();
+
     bool IsShuttingDown() const
     {
         return m_shutdown.load(std::memory_order_relaxed);

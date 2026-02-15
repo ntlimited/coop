@@ -21,6 +21,7 @@ file(GLOB_RECURSE COOP_SOURCES
     coop/network/*.cpp
     coop/time/*.cpp
     coop/io/*.cpp
+    coop/http/*.cpp
 )
 
 add_library(coop STATIC ${COOP_SOURCES})
@@ -47,6 +48,9 @@ target_link_libraries(echo_client PRIVATE coop)
 add_executable(chat_server examples/chat_server.cpp)
 target_link_libraries(chat_server PRIVATE coop)
 
+add_executable(tcp_proxy examples/tcp_proxy.cpp)
+target_link_libraries(tcp_proxy PRIVATE coop)
+
 # Generate a self-signed TLS certificate for testing if one doesn't already exist
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/bin/cert.pem ${CMAKE_BINARY_DIR}/bin/key.pem
@@ -61,6 +65,17 @@ add_custom_target(test-certs DEPENDS
     ${CMAKE_BINARY_DIR}/bin/key.pem
 )
 add_dependencies(echo_server test-certs)
+
+# Copy static files to build output so they sit next to executables at runtime
+file(GLOB_RECURSE STATIC_FILES coop/http/static/*)
+add_custom_target(static-files ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin/static
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/coop/http/static
+        ${CMAKE_BINARY_DIR}/bin/static
+    DEPENDS ${STATIC_FILES}
+    COMMENT "Copying static files to build output"
+)
 
 # Google Test
 FetchContent_Declare(

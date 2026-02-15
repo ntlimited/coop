@@ -12,6 +12,7 @@
 #include "coop/io/io.h"
 #include "coop/io/ssl/ssl.h"
 #include "coop/shutdown.h"
+#include "coop/http/status.h"
 
 // Demo program that sets up two TCP echo servers:
 //
@@ -181,6 +182,16 @@ void SpawningTask(coop::Context* ctx, void*)
             tlsCtx->Yield();
         }
     });
+
+    // Search paths for static files — covers running from project root or from the bin directory
+    //
+    static const char* staticPaths[] = {
+        "static",
+        "build/debug/bin/static",
+        "build/release/bin/static",
+        nullptr,
+    };
+    coop::http::SpawnStatusServer(co, 8080, staticPaths);
 
     co->Spawn([=](coop::Context* statusCtx)
     {

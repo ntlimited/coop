@@ -99,5 +99,6 @@ add_executable(coop_benchmarks
     benchmarks/bench_coordinator.cpp
     benchmarks/bench_io.cpp
     benchmarks/bench_pthread.cpp
+    benchmarks/bench_io_baseline.cpp
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)

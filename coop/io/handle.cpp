@@ -72,7 +72,16 @@ void Handle::Submit(struct io_uring_sqe* sqe)
     io_uring_submit(&m_ring->m_ring);
 }
 
-void Handle::SubmitLinked(struct io_uring_sqe* sqe, struct __kernel_timespec* ts)
+void Handle::SubmitWithTimeout(struct io_uring_sqe* sqe, time::Interval timeout)
+{
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(timeout);
+    m_timeout.tv_sec = secs.count();
+    m_timeout.tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        timeout - secs).count();
+    SubmitLinked(sqe);
+}
+
+void Handle::SubmitLinked(struct io_uring_sqe* sqe)
 {
     spdlog::trace("handle submit_linked ctx={}", m_context->GetName());
 
@@ -93,7 +102,7 @@ void Handle::SubmitLinked(struct io_uring_sqe* sqe, struct __kernel_timespec* ts
     //
     auto* timeout_sqe = io_uring_get_sqe(&m_ring->m_ring);
     assert(timeout_sqe);
-    io_uring_prep_link_timeout(timeout_sqe, ts, 0);
+    io_uring_prep_link_timeout(timeout_sqe, &m_timeout, 0);
     io_uring_sqe_set_data(timeout_sqe, reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(this) | 1));
 

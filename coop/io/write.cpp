@@ -1,12 +1,12 @@
 #define COOP_IO_KEEP_ARGS
-#include "open.h"
+#include "write.h"
 
 #include <cerrno>
-#include <fcntl.h>
 
 #include "coop/coordinator.h"
 #include "coop/self.h"
 
+#include "descriptor.h"
 #include "handle.h"
 #include "uring.h"
 
@@ -16,7 +16,7 @@ namespace coop
 namespace io
 {
 
-COOP_IO_URING_IMPLEMENTATIONS(Open, io_uring_prep_openat, OPEN_ARGS)
+COOP_IO_IMPLEMENTATIONS(Write, io_uring_prep_write, WRITE_ARGS)
 
 } // end namespace coop::io
 } // end namespace coop

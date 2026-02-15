@@ -13,12 +13,12 @@ namespace io
 struct Descriptor;
 struct Handle;
 
-#define READ_ARGS(F) F(void*, buf, ) F(size_t, size, ) F(uint64_t, offset, = 0)
-COOP_IO_DECLARATIONS(Read, READ_ARGS)
+#define WRITE_ARGS(F) F(const void*, buf, ) F(size_t, size, ) F(uint64_t, offset, = 0)
+COOP_IO_DECLARATIONS(Write, WRITE_ARGS)
 
 } // end namespace coop::io
 } // end namespace coop
 
 #ifndef COOP_IO_KEEP_ARGS
-#undef READ_ARGS
+#undef WRITE_ARGS
 #endif

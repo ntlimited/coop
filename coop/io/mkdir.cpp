@@ -1,5 +1,5 @@
 #define COOP_IO_KEEP_ARGS
-#include "open.h"
+#include "mkdir.h"
 
 #include <cerrno>
 #include <fcntl.h>
@@ -16,7 +16,7 @@ namespace coop
 namespace io
 {
 
-COOP_IO_URING_IMPLEMENTATIONS(Open, io_uring_prep_openat, OPEN_ARGS)
+COOP_IO_URING_IMPLEMENTATIONS(Mkdir, io_uring_prep_mkdirat, MKDIR_ARGS)
 
 } // end namespace coop::io
 } // end namespace coop

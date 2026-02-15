@@ -1,8 +1,6 @@
 #pragma once
 
-#include <stddef.h>
-
-#include "coop/time/interval.h"
+#include "coop/io/detail/op_macros.h"
 
 namespace coop
 {
@@ -13,13 +11,12 @@ namespace io
 struct Descriptor;
 struct Handle;
 
-bool Recv(Handle& handle, void* buf, size_t size, int flags = 0);
-
-int Recv(Descriptor& desc, void* buf, size_t size, int flags = 0);
-
-// Recv with a linked timeout. Returns -ETIMEDOUT if the timeout fires before data arrives.
-//
-int Recv(Descriptor& desc, void* buf, size_t size, time::Interval timeout, int flags = 0);
+#define RECV_ARGS(F) F(void*, buf, ) F(size_t, size, ) F(int, flags, = 0)
+COOP_IO_DECLARATIONS(Recv, RECV_ARGS)
 
 } // end namespace coop::io
 } // end namespace coop
+
+#ifndef COOP_IO_KEEP_ARGS
+#undef RECV_ARGS
+#endif

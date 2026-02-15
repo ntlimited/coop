@@ -34,7 +34,7 @@ void Signal::Notify(Context* ctx, bool schedule /* = true */)
     //
     while (auto* ord = m_coord.m_blocking.Pop())
     {
-        ord->m_satisfied = true;
+        ord->Satisfy();
         ctx->Unblock(ord->GetContext(), schedule);
     }
 }

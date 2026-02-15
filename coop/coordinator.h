@@ -30,7 +30,8 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
     {
     }
 
-    // Fun classes of bugs around this
+    // Destroying a Coordinated while it is still on a Coordinator's wait list would corrupt
+    // the list.
     //
     ~Coordinated()
     {
@@ -103,7 +104,8 @@ struct Coordinator
 
     void Acquire(Context*);
 
-    // Dumb helper for acquire-and-release
+    // Barrier: blocks until the current holder releases, then immediately passes through. No-op
+    // if the coordinator is not held.
     //
     void Flash(Context*);
 
@@ -121,7 +123,7 @@ struct Coordinator
         return this == other;
     }
 
-  protected:
+  private:
     friend struct CoordinatorExtension;
     friend struct Signal;
 

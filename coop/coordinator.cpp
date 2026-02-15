@@ -14,7 +14,7 @@ Coordinator::Coordinator()
 
 bool Coordinator::IsHeld() const
 {
-    return !!m_heldBy;
+    return m_heldBy != nullptr;
 }
 
 bool Coordinator::TryAcquire(Context* ctx)

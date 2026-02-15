@@ -2,7 +2,7 @@
 #include "ticker.h"
 
 #include "coop/cooperator.h"
-#include "coop/multi_coordinator.h"
+#include "coop/coordinate_with.h"
 #include "coop/self.h"
 
 namespace coop

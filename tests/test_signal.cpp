@@ -2,7 +2,7 @@
 
 #include "coop/cooperator.h"
 #include "coop/context.h"
-#include "coop/multi_coordinator.h"
+#include "coop/coordinate_with.h"
 #include "coop/signal.h"
 #include "coop/time/interval.h"
 #include "test_helpers.h"

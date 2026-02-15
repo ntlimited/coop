@@ -6,10 +6,10 @@
 #include <mutex>
 #include <semaphore>
 
-#include "embedded_list.h"
+#include "detail/embedded_list.h"
 #include "context.h"
 #include "cooperator_configuration.h"
-#include "fixed_list.h"
+#include "detail/fixed_list.h"
 #include "spawn_configuration.h"
 #include "io/uring.h"
 #include "time/ticker.h"

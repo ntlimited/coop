@@ -1,6 +1,6 @@
 #pragma once
 
-#include "coop/embedded_list.h"
+#include "coop/detail/embedded_list.h"
 
 #include "coop/coordinator.h"
 

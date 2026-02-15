@@ -1,7 +1,7 @@
 #pragma once
 
-#include "coordinator.h"
-#include "context.h"
+#include "coop/coordinator.h"
+#include "coop/context.h"
 
 namespace coop
 {

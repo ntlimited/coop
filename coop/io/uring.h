@@ -8,7 +8,7 @@
 #include "descriptor.h"
 
 #include "coop/coordinator.h"
-#include "coop/embedded_list.h"
+#include "coop/detail/embedded_list.h"
 
 namespace coop
 {

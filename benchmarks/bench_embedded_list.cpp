@@ -5,8 +5,8 @@
 
 #include <benchmark/benchmark.h>
 
-#include "coop/embedded_list.h"
-#include "coop/tricks.h"
+#include "coop/detail/embedded_list.h"
+#include "coop/detail/tricks.h"
 
 // ---------------------------------------------------------------------------
 // Node types

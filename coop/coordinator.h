@@ -1,6 +1,6 @@
 #pragma once
 
-#include "embedded_list.h"
+#include "detail/embedded_list.h"
 
 namespace coop
 {
@@ -102,7 +102,7 @@ struct Coordinator
 
     // TryAcquire, Acquire, and Release all act in the manner that one would expect from a mutex
     // analogue. For multi-coordinator and timeout behaviors, see the CoordinateWith functionality
-    // in multi_coordinator.h.
+    // in coordinate_with.h.
     //
     bool TryAcquire(Context*);
 

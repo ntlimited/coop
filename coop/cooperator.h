@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <csetjmp>
 #include <mutex>
@@ -27,23 +28,17 @@ enum class SchedulerJumpResult
 
 struct Launchable;
 
+static constexpr int COOPERATOR_LIST_REGISTRY = 0;
+
 // A Cooperator manages multiple contexts
 //
-struct Cooperator
+struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTRY>
 {
+    using RegistryList = EmbeddedList<Cooperator, int, COOPERATOR_LIST_REGISTRY>;
     thread_local static Cooperator* thread_cooperator;
 
-    Cooperator(CooperatorConfiguration const& config = s_defaultCooperatorConfiguration)
-    : m_lastRdtsc(0)
-    , m_ticks(0)
-    , m_shutdown(false)
-    , m_ticker(config.tickerResolution)
-    , m_uring(config.uringEntries)
-    , m_scheduled(nullptr)
-    , m_submissionSemaphore(0)
-    , m_submissionAvailabilitySemaphore(8)
-    {
-    }
+    Cooperator(CooperatorConfiguration const& config = s_defaultCooperatorConfiguration);
+    ~Cooperator();
 
     Context* Scheduled()
     {
@@ -136,13 +131,13 @@ struct Cooperator
 
     bool SpawnSubmitted(bool wait = false);
 
-    // TODO do this properly and add more nuances around in vs out of cooperator-safe ooepratins.
-    //
-    void Shutdown()
+    void Shutdown();
+
+    static void ShutdownAll();
+
+    bool IsShuttingDown() const
     {
-        m_shutdown = true;
-        m_tickerHandle.Kill();
-        m_uringHandle.Kill();
+        return m_shutdown.load(std::memory_order_relaxed);
     }
 
     time::Ticker* GetTicker()
@@ -196,7 +191,7 @@ struct Cooperator
     int64_t m_lastRdtsc;
     int64_t m_ticks;
 
-    bool            m_shutdown;
+    std::atomic<bool> m_shutdown;
     Context*        m_scheduled;
 
     time::Ticker    m_ticker;
@@ -230,6 +225,10 @@ struct Cooperator
     Context::ContextStateList   m_yielded;
     Context::ContextStateList   m_blocked;
     Context::ContextStateList   m_zombie;
+
+    static std::atomic<bool> s_registryShutdown;
+    static std::mutex        s_registryMutex;
+    static RegistryList      s_registry;
 };
 
 void* AllocateContext(SpawnConfiguration const& config);

@@ -11,6 +11,7 @@
 #include "coop/thread.h"
 #include "coop/time/sleep.h"
 #include "coop/io/io.h"
+#include "coop/shutdown.h"
 
 // Chat server example
 //
@@ -47,7 +48,7 @@ struct ClientSlot
 {
     bool                        active;
     int32_t                     fd;
-    coop::Channel<Message>*     outbound;
+    coop::SendChannel<Message>* outbound;
     coop::Context::Handle       writerHandle;
 };
 
@@ -60,7 +61,7 @@ struct ClientRegistry
         memset(clients, 0, sizeof(clients));
     }
 
-    int32_t Register(int32_t fd, coop::Channel<Message>* outbound)
+    int32_t Register(int32_t fd, coop::SendChannel<Message>* outbound)
     {
         for (int32_t i = 0; i < MAX_CLIENTS; i++)
         {
@@ -87,7 +88,7 @@ struct ChatHandler : coop::Launchable
     ChatHandler(
         coop::Context* ctx,
         int fd,
-        coop::Channel<Message>* broadcast,
+        coop::SendChannel<Message>* broadcast,
         ClientRegistry* registry)
     : coop::Launchable(ctx)
     , m_fd(fd)
@@ -121,7 +122,7 @@ struct ChatHandler : coop::Launchable
         // Spawn the writer context as a child. It reads from our outbound channel and writes
         // to the socket.
         //
-        auto* outbound = &m_outbound;
+        coop::RecvChannel<Message>* outbound = &m_outbound;
         auto* stream = &m_stream;
         co->Spawn([outbound, stream, rawFd](coop::Context* writerCtx)
         {
@@ -174,7 +175,7 @@ struct ChatHandler : coop::Launchable
     }
 
     coop::io::Descriptor        m_fd;
-    coop::Channel<Message>*     m_broadcast;
+    coop::SendChannel<Message>* m_broadcast;
     ClientRegistry*             m_registry;
     Message                     m_outboundBuffer[OUTBOUND_BUFFER_SLOTS];
     coop::Channel<Message>      m_outbound;
@@ -240,12 +241,13 @@ void SpawningTask(coop::Context* ctx, void*)
 
     // Broadcaster: reads from the broadcast channel and fans out to all connected clients
     //
-    co->Spawn([&broadcast, &registry](coop::Context* bcastCtx)
+    coop::RecvChannel<Message>* bcastRecv = &broadcast;
+    co->Spawn([bcastRecv, &registry](coop::Context* bcastCtx)
     {
         bcastCtx->SetName("Broadcaster");
         Message msg;
 
-        while (broadcast.Recv(bcastCtx, msg))
+        while (bcastRecv->Recv(bcastCtx, msg))
         {
             for (int32_t i = 0; i < MAX_CLIENTS; i++)
             {
@@ -287,9 +289,13 @@ void SpawningTask(coop::Context* ctx, void*)
         }
     });
 
-    // Wait until we're killed
+    // Yield until the shutdown handler shuts us down
     //
-    ctx->GetKilledSignal()->Wait(ctx);
+    while (!co->IsShuttingDown())
+    {
+        ctx->Yield(true);
+    }
+    spdlog::info("shutting down...");
 
     // Shut down the broadcast channel so the broadcaster exits cleanly
     //
@@ -298,6 +304,7 @@ void SpawningTask(coop::Context* ctx, void*)
 
 int main()
 {
+    coop::InstallShutdownHandler();
     coop::Cooperator cooperator;
     coop::Thread mt(&cooperator);
 

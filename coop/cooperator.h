@@ -197,7 +197,6 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     Context*        m_scheduled;
 
     io::Uring       m_uring;
-    Context::Handle m_uringHandle;
 
     void*           m_sp{nullptr};
 

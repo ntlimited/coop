@@ -13,6 +13,7 @@
 
 #include "descriptor.h"
 #include "handle.h"
+#include "resolve.h"
 #include "uring.h"
 
 namespace coop
@@ -31,11 +32,18 @@ int Connect(Descriptor& desc, const char* hostname, int port)
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
 
-    int ret = inet_pton(AF_INET, hostname, &addr.sin_addr);
-    if (ret != 1)
+    // Try numeric IP first (fast path)
+    //
+    if (inet_pton(AF_INET, hostname, &addr.sin_addr) != 1)
     {
-        spdlog::warn("connect inet_pton failed host={} ret={}", hostname, ret);
-        return ret;
+        // DNS resolve
+        //
+        int ret = Resolve4(hostname, &addr.sin_addr);
+        if (ret < 0)
+        {
+            spdlog::warn("connect resolve failed host={} ret={}", hostname, ret);
+            return ret;
+        }
     }
 
     int result = Connect(desc, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));

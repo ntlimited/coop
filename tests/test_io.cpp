@@ -1,5 +1,7 @@
+#include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -8,9 +10,11 @@
 #include "coop/coordinator.h"
 #include "coop/self.h"
 
+#include "coop/io/connect.h"
 #include "coop/io/descriptor.h"
 #include "coop/io/handle.h"
 #include "coop/io/recv.h"
+#include "coop/io/resolve.h"
 #include "coop/io/send.h"
 
 #include "coop/time/interval.h"
@@ -155,5 +159,79 @@ TEST(IoTest, RAIICancelOnDestroy)
         // If we get here without crashing, the RAII cancel worked
         //
         SUCCEED();
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Resolve tests
+// -------------------------------------------------------------------------------------
+
+TEST(ResolveTest, Localhost)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        struct in_addr result;
+        int ret = coop::io::Resolve4("localhost", &result);
+        ASSERT_EQ(ret, 0);
+        EXPECT_EQ(result.s_addr, htonl(INADDR_LOOPBACK));
+    });
+}
+
+TEST(ResolveTest, NumericPassthrough)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        struct in_addr result;
+        int ret = coop::io::Resolve4("127.0.0.1", &result);
+        ASSERT_EQ(ret, 0);
+        EXPECT_EQ(result.s_addr, htonl(INADDR_LOOPBACK));
+    });
+}
+
+TEST(ResolveTest, PublicHostname)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        struct in_addr result;
+        int ret = coop::io::Resolve4("dns.google", &result,
+            std::chrono::seconds(10));
+        ASSERT_EQ(ret, 0);
+
+        // dns.google resolves to 8.8.8.8 or 8.8.4.4
+        //
+        struct in_addr expected1, expected2;
+        inet_pton(AF_INET, "8.8.8.8", &expected1);
+        inet_pton(AF_INET, "8.8.4.4", &expected2);
+        EXPECT_TRUE(result.s_addr == expected1.s_addr || result.s_addr == expected2.s_addr);
+    });
+}
+
+TEST(ResolveTest, NonExistent)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        struct in_addr result;
+        int ret = coop::io::Resolve4("this.does.not.exist.example.", &result,
+            std::chrono::seconds(10));
+        EXPECT_EQ(ret, -ENOENT);
+    });
+}
+
+TEST(ResolveTest, ConnectWithHostname)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        ASSERT_GE(fd, 0);
+
+        auto* ring = coop::GetUring();
+        coop::io::Descriptor desc(fd, ring);
+
+        // Connect to dns.google on port 443 — just verify the connect succeeds
+        //
+        int ret = coop::io::Connect(desc, "dns.google", 443);
+        EXPECT_GE(ret, 0);
+
+        desc.Close();
     });
 }

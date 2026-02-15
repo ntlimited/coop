@@ -1,8 +1,8 @@
 #include "sleep.h"
-#include "ticker.h"
 
 #include "coop/cooperator.h"
 #include "coop/coordinate_with.h"
+#include "coop/io/timeout.h"
 #include "coop/self.h"
 
 namespace coop
@@ -11,17 +11,18 @@ namespace coop
 namespace time
 {
 
-Sleeper::Sleeper(Context* ctx, Ticker* ticker, Interval interval)
-: m_coordinator(ctx)
+Sleeper::Sleeper(Context* ctx, Interval interval)
+: m_coordinator()
 , m_context(ctx)
-, m_handle(interval, &m_coordinator)
-, m_ticker(ticker)
+, m_handle(ctx, ctx->GetCooperator()->GetUring(), &m_coordinator)
+, m_interval(interval)
 {
 }
 
 Sleeper::~Sleeper()
 {
-    m_handle.Cancel();
+    // io::Handle destructor cancels the pending timeout if it hasn't fired yet
+    //
 }
 
 Coordinator* Sleeper::GetCoordinator()
@@ -29,9 +30,9 @@ Coordinator* Sleeper::GetCoordinator()
     return &m_coordinator;
 }
 
-void Sleeper::Submit()
+bool Sleeper::Submit()
 {
-    m_handle.Submit(m_ticker);
+    return io::Timeout(m_handle, m_interval);
 }
 
 bool Sleeper::Wait()
@@ -40,21 +41,21 @@ bool Sleeper::Wait()
     return !result.Killed();
 }
 
-bool Sleeper::Sleep()
+SleepResult Sleeper::Sleep()
 {
-    Submit();
-    return Wait();
+    if (!Submit())
+    {
+        return SleepResult::Error;
+    }
+    return Wait() ? SleepResult::Ok : SleepResult::Killed;
 }
 
-bool Sleep(Context* ctx, Interval interval)
+SleepResult Sleep(Context* ctx, Interval interval)
 {
-    auto* ticker = ctx->GetCooperator()->GetTicker();
-    assert(ticker);
-
-    return Sleeper(ctx, ticker, interval).Sleep();
+    return Sleeper(ctx, interval).Sleep();
 }
 
-bool Sleep(Interval interval)
+SleepResult Sleep(Interval interval)
 {
     return Sleep(Self(), interval);
 }

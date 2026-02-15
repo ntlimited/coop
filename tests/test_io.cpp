@@ -75,7 +75,7 @@ TEST(IoTest, RecvTimesOut)
         char buf[64] = {};
         int result = coop::io::Recv(
             reader, buf, sizeof(buf), 0,
-            coop::time::Interval(50));
+            std::chrono::milliseconds(50));
 
         EXPECT_EQ(result, -ETIMEDOUT);
     });
@@ -99,7 +99,7 @@ TEST(IoTest, RecvCompletesBeforeTimeout)
         char buf[64] = {};
         int result = coop::io::Recv(
             reader, buf, sizeof(buf), 0,
-            coop::time::Interval(5000));
+            std::chrono::milliseconds(5000));
 
         ASSERT_EQ(result, 5);
         EXPECT_EQ(memcmp(buf, "world", 5), 0);

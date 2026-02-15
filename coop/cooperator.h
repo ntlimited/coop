@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cassert>
-#include <csetjmp>
 #include <mutex>
 #include <semaphore>
 
@@ -12,7 +11,8 @@
 #include "detail/fixed_list.h"
 #include "spawn_configuration.h"
 #include "io/uring.h"
-#include "time/ticker.h"
+
+extern "C" void CoopContextEntry(coop::Context* ctx);
 
 namespace coop
 {
@@ -146,11 +146,6 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         return m_shutdown.load(std::memory_order_relaxed);
     }
 
-    time::Ticker* GetTicker()
-    {
-        return &m_ticker;
-    }
-
     io::Uring* GetUring()
     {
         return &m_uring;
@@ -186,14 +181,10 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
   private:
     // Shared logic for entering a newly created context. Handles saving the spawning context's
-    // state, setting up the new stack via ucontext, and switching to it. Used by both Spawn and
-    // Launch to eliminate duplication.
+    // state, setting up the new stack via ContextInit, and switching to it. Used by both Spawn
+    // and Launch to eliminate duplication.
     //
     void EnterContext(Context* ctx);
-
-    // Trampoline invoked by makecontext when a new context starts executing.
-    //
-    static void ContextEntryPoint(int lo, int hi);
 
     void HandleCooperatorResumption(const SchedulerJumpResult res);
 
@@ -205,12 +196,10 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     std::atomic<bool> m_shutdown;
     Context*        m_scheduled;
 
-    time::Ticker    m_ticker;
-    Context::Handle m_tickerHandle;
     io::Uring       m_uring;
     Context::Handle m_uringHandle;
 
-    std::jmp_buf    m_jmpBuf;
+    void*           m_sp{nullptr};
 
     struct ExecutionSubmission
     {
@@ -232,6 +221,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // super complex as it is right now.
     //
     friend struct Context;
+    friend void ::CoopContextEntry(::coop::Context*);
     Context::AllContextsList    m_contexts;
     Context::ContextStateList   m_yielded;
     Context::ContextStateList   m_blocked;
@@ -243,8 +233,6 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 };
 
 void* AllocateContext(SpawnConfiguration const& config);
-
-void LongJump(std::jmp_buf& buf, SchedulerJumpResult result);
 
 } // end namespace coop
 

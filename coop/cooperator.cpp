@@ -1,12 +1,11 @@
-#include <csetjmp>
 #include <mutex>
 #include <new>
 #include <thread>
-#include <ucontext.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "cooperator.h"
+#include "detail/context_switch.h"
 #include "launchable.h"
 
 namespace coop
@@ -20,7 +19,6 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 : m_lastRdtsc(0)
 , m_ticks(0)
 , m_shutdown(false)
-, m_ticker(config.tickerResolution)
 , m_uring(config.uring)
 , m_scheduled(nullptr)
 , m_submissionSemaphore(0)
@@ -98,7 +96,12 @@ bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& co
 
 void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
 {
-    m_lastRdtsc = rdtsc();
+    // Charge elapsed time to the context that was running, then mark the cooperator's timestamp
+    // for its own accounting. This single rdtsc serves both purposes.
+    //
+    auto now = rdtsc();
+    m_scheduled->m_statistics.ticks += now - m_scheduled->m_lastRdtsc;
+    m_lastRdtsc = now;
 
     switch (res)
     {
@@ -147,7 +150,6 @@ void Cooperator::Launch()
     Cooperator::thread_cooperator = this;
     m_lastRdtsc = rdtsc();
 
-    Spawn([this](Context* ctx) { m_ticker.Run(ctx); }, &m_tickerHandle);
     Spawn([this](Context* ctx) { m_uring.Run(ctx); }, &m_uringHandle);
 
     bool shutdownKillDone = false;
@@ -196,7 +198,6 @@ void Cooperator::Launch()
             auto* ctx = m_yielded.Pop();
 
             Resume(ctx);
-            m_lastRdtsc = rdtsc();
 
             if (!m_submissions.IsEmpty())
             {
@@ -213,15 +214,8 @@ void Cooperator::Launch()
 
 void Cooperator::YieldFrom(Context* ctx)
 {
-    // This is where all jmpBuf saving for contexts occurs presently
-    //
-    auto ret = setjmp(ctx->m_jmpBuf);
-    if (!ret)
-    {
-        LongJump(m_jmpBuf, SchedulerJumpResult::YIELDED);
-    }
+    auto ret = ContextSwitch(&ctx->m_sp, m_sp, static_cast<int>(SchedulerJumpResult::YIELDED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
-    return;
 }
 
 void Cooperator::Resume(Context* ctx)
@@ -230,20 +224,16 @@ void Cooperator::Resume(Context* ctx)
     //
     assert(!m_scheduled);
     assert(ctx->m_state == SchedulerState::YIELDED);
-   
+
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
 
-    auto ret = setjmp(m_jmpBuf);
-    if (!ret)
-    {
-        m_ticks += rdtsc() - m_lastRdtsc;
-        LongJump(ctx->m_jmpBuf, SchedulerJumpResult::RESUMED);
-    }
-    else
-    {
-        HandleCooperatorResumption((static_cast<SchedulerJumpResult>(ret)));
-    }
+    auto now = rdtsc();
+    m_ticks += now - m_lastRdtsc;
+    ctx->m_lastRdtsc = now;
+
+    auto ret = ContextSwitch(&m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
+    HandleCooperatorResumption(static_cast<SchedulerJumpResult>(ret));
 }
 
 void Cooperator::Block(Context* ctx)
@@ -263,19 +253,8 @@ void Cooperator::Block(Context* ctx)
     // The currently running context is placing itself into a blocked state
     //
 
-    auto ret = setjmp(ctx->m_jmpBuf);
-    if (!ret)
-    {
-        LongJump(m_jmpBuf, SchedulerJumpResult::BLOCKED);
-
-        // Unreachable
-        //
-        assert(false);
-        return;
-    }
-
+    auto ret = ContextSwitch(&ctx->m_sp, m_sp, static_cast<int>(SchedulerJumpResult::BLOCKED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
-    return;
 }
 
 void Cooperator::Unblock(Context* ctx, const bool schedule)
@@ -301,22 +280,19 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
     // to schedule it.
     //
 
-    auto ret = setjmp(m_scheduled->m_jmpBuf);
-    if (!ret)
-    {
-        m_scheduled->m_state = SchedulerState::YIELDED;
-        m_yielded.Push(m_scheduled);
+    auto* prev = m_scheduled;
 
-        ctx->m_state = SchedulerState::RUNNING;
-        m_scheduled = ctx;
-        
-        LongJump(ctx->m_jmpBuf, SchedulerJumpResult::RESUMED);
-        // unreachable
-        //
-        assert(false);
-        return;
-    }
+    auto now = rdtsc();
+    prev->m_statistics.ticks += now - prev->m_lastRdtsc;
 
+    prev->m_state = SchedulerState::YIELDED;
+    m_yielded.Push(prev);
+
+    ctx->m_state = SchedulerState::RUNNING;
+    m_scheduled = ctx;
+    ctx->m_lastRdtsc = now;
+
+    auto ret = ContextSwitch(&prev->m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
 }
 
@@ -395,68 +371,61 @@ void Cooperator::SanityCheck()
     assert(blocked == 0);
 }
 
-void Cooperator::ContextEntryPoint(int lo, int hi)
-{
-    auto* ctx = reinterpret_cast<Context*>(
-        (static_cast<uintptr_t>(static_cast<uint32_t>(hi)) << 32) |
-         static_cast<uintptr_t>(static_cast<uint32_t>(lo)));
+} // end namespace coop (resumed below after extern "C" trampoline)
 
+extern "C" void CoopContextEntry(coop::Context* ctx)
+{
     ctx->m_entry(ctx);
 
-    // This deletion must be done while the context is still in its own stack, so that it can
-    // context switch to anyone waiting on the signal safely.
+    // Destructor must run while we're still on this context's stack so that kill signals can
+    // context-switch to waiters safely.
     //
     ctx->~Context();
 
-    LongJump(Cooperator::thread_cooperator->m_jmpBuf, SchedulerJumpResult::EXITED);
+    void* dummy;
+    ContextSwitch(
+        &dummy,
+        coop::Cooperator::thread_cooperator->m_sp,
+        static_cast<int>(coop::SchedulerJumpResult::EXITED));
 }
+
+namespace coop
+{
 
 void Cooperator::EnterContext(Context* ctx)
 {
-    m_ticks += rdtsc() - m_lastRdtsc;
+    auto now = rdtsc();
 
     Context* lastCtx = m_scheduled;
-    auto& buf = (lastCtx ? lastCtx->m_jmpBuf : m_jmpBuf);
+    void** save_sp = lastCtx ? &lastCtx->m_sp : &m_sp;
     bool isSelf = !lastCtx;
 
     if (lastCtx)
     {
+        lastCtx->m_statistics.ticks += now - lastCtx->m_lastRdtsc;
         lastCtx->m_state = SchedulerState::YIELDED;
         m_yielded.Push(lastCtx);
         m_scheduled = nullptr;
     }
-
-    auto jmpRet = setjmp(buf);
-    if (!jmpRet)
+    else
     {
-        ctx->m_state = SchedulerState::RUNNING;
-        m_scheduled = ctx;
-
-        SanityCheck();
-
-        // Use ucontext to properly set up and switch to the new context's stack, replacing
-        // the previous inline asm approach.
-        //
-        ucontext_t uc;
-        getcontext(&uc);
-        uc.uc_stack.ss_sp = ctx->m_segment.Bottom();
-        uc.uc_stack.ss_size = ctx->m_segment.m_size;
-        uc.uc_link = nullptr;
-
-        auto val = reinterpret_cast<uintptr_t>(ctx);
-        makecontext(&uc, reinterpret_cast<void(*)()>(Cooperator::ContextEntryPoint), 2,
-            static_cast<int>(val & 0xFFFFFFFF),
-            static_cast<int>(val >> 32));
-
-        setcontext(&uc);
-        // Unreachable
-        //
-        assert(false);
+        m_ticks += now - m_lastRdtsc;
     }
+
+    ctx->m_state = SchedulerState::RUNNING;
+    m_scheduled = ctx;
+    ctx->m_lastRdtsc = now;
+
+    SanityCheck();
+
+    // Prepare the new context's stack for first entry via ContextSwitch
+    //
+    void* init_sp = ContextInit(ctx->m_segment.Top(), ctx);
+    auto ret = ContextSwitch(save_sp, init_sp, 0);
 
     if (isSelf)
     {
-        HandleCooperatorResumption(static_cast<SchedulerJumpResult>(jmpRet));
+        HandleCooperatorResumption(static_cast<SchedulerJumpResult>(ret));
     }
     else
     {
@@ -638,11 +607,6 @@ void* AllocateContext(SpawnConfiguration const& config)
     //
     assert((config.stackSize & 127) == 0);
     return malloc(sizeof(Context) + config.stackSize);
-}
-
-void LongJump(std::jmp_buf& buf, SchedulerJumpResult result)
-{
-    longjmp(buf, static_cast<int>(result));
 }
 
 thread_local Cooperator* Cooperator::thread_cooperator;

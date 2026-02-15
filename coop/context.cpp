@@ -34,7 +34,7 @@ Context::Context(
     m_statistics.ticks = 0;
     m_statistics.yields = 0;
     m_statistics.blocks = 0;
-    m_lastRdtsc = m_cooperator->rdtsc();
+    m_lastRdtsc = 0;
 }
 
 Context::~Context()
@@ -71,9 +71,7 @@ bool Context::Yield(const bool force /* = false */)
     ++m_statistics.yields;
     m_currentPriority = m_priority;
 
-    m_statistics.ticks += m_cooperator->rdtsc() - m_lastRdtsc;
     m_cooperator->YieldFrom(this);
-    m_lastRdtsc = m_cooperator->rdtsc();
     return true;
 }
 
@@ -91,9 +89,7 @@ void Context::Detach()
 void Context::Block()
 {
     ++m_statistics.blocks;
-    m_statistics.ticks += m_cooperator->rdtsc() - m_lastRdtsc;
     m_cooperator->Block(this);
-    m_lastRdtsc = m_cooperator->rdtsc();
 }
 
 void Context::Unblock(Context* other, const bool schedule /* = true */)

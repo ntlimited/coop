@@ -6,7 +6,9 @@
 
 #include "coop/multi_coordinator.h"
 #include "coop/self.h"
-#include "coop/time/handle.h"
+#include "coop/io/handle.h"
+#include "coop/io/timeout.h"
+#include "coop/time/interval.h"
 
 namespace coop
 {
@@ -48,7 +50,7 @@ namespace detail
 //
 // With a timeout:
 //
-//  auto result = CoordinateWith(&coord, time::Interval(1000));  // timeout is always last
+//  auto result = CoordinateWith(&coord, std::chrono::milliseconds(1000));  // timeout is always last
 //  if (result.TimedOut())
 //  {
 //      ...
@@ -106,19 +108,21 @@ AmbiResult CoordinateWithImpl(Context* ctx, Coords... coords)
 }
 
 // Implementation for the timeout path. Internal ordering is [kill, coords..., timeout] so user
-// coordinators take priority over the timeout in "leftmost wins" semantics. The timeout must be
-// non-zero.
+// coordinators take priority over the timeout in "leftmost wins" semantics. The timeout is
+// submitted as an IORING_OP_TIMEOUT via the cooperator's io_uring ring; the io::Handle destructor
+// cancels the pending timeout if it hasn't fired.
 //
 template<typename... Coords>
 AmbiResult CoordinateWithTimeoutImpl(Context* ctx, time::Interval timeout, Coords... coords)
 {
     auto* signal = ctx->GetKilledSignal();
-    auto* ticker = GetTicker();
-    assert(ticker);
 
-    Coordinator timeoutCoord(ctx);
-    time::Handle timeoutHandle(timeout, &timeoutCoord);
-    timeoutHandle.Submit(ticker);
+    Coordinator timeoutCoord;
+    io::Handle timeoutHandle(ctx, GetUring(), &timeoutCoord);
+    if (!io::Timeout(timeoutHandle, timeout))
+    {
+        return AmbiResult { static_cast<size_t>(-3), nullptr };
+    }
 
     // Order: [kill, user_coord1, ..., timeout]
     //
@@ -126,7 +130,7 @@ AmbiResult CoordinateWithTimeoutImpl(Context* ctx, time::Interval timeout, Coord
         signal->AsCoordinator(), std::forward<Coords>(coords)..., &timeoutCoord);
     auto result = mc.Acquire(ctx);
 
-    timeoutHandle.Cancel();
+    // io::Handle destructor cancels the pending timeout if it hasn't fired yet
 
     if (result.index == 0)
     {
@@ -165,7 +169,7 @@ detail::AmbiResult CoordinateWith(Context* ctx, Args... args)
     static_assert(sizeof...(Args) > 0,
         "CoordinateWith requires at least one argument.");
 
-    if constexpr (std::is_same_v<detail::LastType<Args...>, time::Interval>)
+    if constexpr (std::is_convertible_v<detail::LastType<Args...>, time::Interval>)
     {
         static_assert(sizeof...(Args) > 1,
             "CoordinateWith with timeout requires at least one Coordinator.");

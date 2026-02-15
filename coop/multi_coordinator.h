@@ -23,6 +23,8 @@ namespace detail
 
         bool TimedOut() const { return index == static_cast<size_t>(-2); }
 
+        bool Error() const { return index == static_cast<size_t>(-3); }
+
         operator size_t() const
         {
             return index;

@@ -10,8 +10,8 @@
 namespace coop
 {
 
-// Trampolines used by EnterContext's makecontext call. These are the typed entry points that know
-// how to invoke the lambda (Spawn) or Launchable (Launch) stored at the segment's bottom.
+// Typed entry points that know how to invoke the lambda (Spawn) or Launchable (Launch) stored
+// at the segment's bottom. Called from CoopContextEntry via ctx->m_entry.
 //
 template<typename Fn>
 void SpawnTrampoline(Context* ctx)

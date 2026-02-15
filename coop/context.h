@@ -1,6 +1,5 @@
 #pragma once
 
-#include <csetjmp>
 #include <cstdint>
 
 #include "coordinator.h"
@@ -162,9 +161,9 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     } m_statistics;
     int64_t m_lastRdtsc;
 
-    // The jmp_buf operates as the 'bookmark' to jump back into when the context is active.
+    // Saved stack pointer — the 'bookmark' to switch back to when the context is resumed.
     //
-    std::jmp_buf m_jmpBuf;
+    void* m_sp{nullptr};
 
     // Entry function to call when the context first starts executing. Set by Spawn/Launch before
     // calling EnterContext, which uses it from the makecontext trampoline.

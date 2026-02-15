@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(coop LANGUAGES CXX)
+project(coop LANGUAGES CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +18,7 @@ FetchContent_MakeAvailable(spdlog)
 # Collect library sources
 file(GLOB_RECURSE COOP_SOURCES
     coop/*.cpp
+    coop/*.S
     coop/network/*.cpp
     coop/time/*.cpp
     coop/io/*.cpp
@@ -27,11 +28,6 @@ file(GLOB_RECURSE COOP_SOURCES
 add_library(coop STATIC ${COOP_SOURCES})
 target_include_directories(coop PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_options(coop PRIVATE -Wcpp)
-
-# Cooperative threading uses longjmp across user-allocated stacks. glibc's _FORTIFY_SOURCE
-# replaces longjmp with __longjmp_chk which validates stack pointers against a single-stack
-# model, producing false positives. Disable it for the library.
-target_compile_definitions(coop PRIVATE _FORTIFY_SOURCE=0)
 
 # External libraries
 find_library(URING_LIB uring REQUIRED)
@@ -115,5 +111,6 @@ add_executable(coop_benchmarks
     benchmarks/bench_io.cpp
     benchmarks/bench_pthread.cpp
     benchmarks/bench_io_baseline.cpp
+    benchmarks/bench_scheduler.cpp
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)

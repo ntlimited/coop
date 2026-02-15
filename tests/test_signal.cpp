@@ -4,6 +4,7 @@
 #include "coop/context.h"
 #include "coop/multi_coordinator.h"
 #include "coop/signal.h"
+#include "coop/time/interval.h"
 #include "test_helpers.h"
 
 TEST(SignalTest, StartsUnsignaled)
@@ -121,7 +122,7 @@ TEST(SignalTest, WaitOnKillSignal)
     });
 }
 
-TEST(SignalTest, CoordinateWithKillReturnsKilled)
+TEST(SignalTest, CoordinateWithReturnsKilled)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
@@ -136,7 +137,7 @@ TEST(SignalTest, CoordinateWithKillReturnsKilled)
             //
             child->Yield(true);
 
-            auto result = coop::CoordinateWithKill(child, &coord);
+            auto result = coop::CoordinateWith(child, &coord);
             EXPECT_TRUE(result.Killed());
             EXPECT_EQ(result.coordinator, nullptr);
 
@@ -150,17 +151,17 @@ TEST(SignalTest, CoordinateWithKillReturnsKilled)
     });
 }
 
-TEST(SignalTest, CoordinateWithKillReturnsCoordinator)
+TEST(SignalTest, CoordinateWithReturnsCoordinator)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
         coop::Coordinator coord(ctx);
 
-        // Coordinator is held by ctx, release it so CoordinateWithKill can acquire it
+        // Coordinator is held by ctx, release it so CoordinateWith can acquire it
         //
         coord.Release(ctx, false);
 
-        auto result = coop::CoordinateWithKill(ctx, &coord);
+        auto result = coop::CoordinateWith(ctx, &coord);
         EXPECT_FALSE(result.Killed());
         EXPECT_EQ(static_cast<size_t>(result), 0u);
         EXPECT_TRUE(result.coordinator == &coord);
@@ -169,7 +170,7 @@ TEST(SignalTest, CoordinateWithKillReturnsCoordinator)
     });
 }
 
-TEST(SignalTest, CoordinateWithKillRepeated)
+TEST(SignalTest, CoordinateWithRepeated)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
@@ -181,32 +182,72 @@ TEST(SignalTest, CoordinateWithKillRepeated)
             coop::Coordinator coord;
             coord.TryAcquire(child);
 
-            // Yield so the parent can kill us before we call CoordinateWithKill
+            // Yield so the parent can kill us before we call CoordinateWith
             //
             child->Yield(true);
             EXPECT_TRUE(child->IsKilled());
 
-            // First CoordinateWithKill — signal already fired, so TryAcquire succeeds on the
+            // First CoordinateWith — signal already fired, so TryAcquire succeeds on the
             // signal's coordinator and re-arms m_heldBy.
             //
-            auto r1 = coop::CoordinateWithKill(child, &coord);
+            auto r1 = coop::CoordinateWith(child, &coord);
             EXPECT_TRUE(child->IsKilled());
 
-            // Second CoordinateWithKill — without proper cleanup, TryAcquire would fail on
+            // Second CoordinateWith — without proper cleanup, TryAcquire would fail on
             // the re-armed coordinator and deadlock here.
             //
-            auto r2 = coop::CoordinateWithKill(child, &coord);
+            auto r2 = coop::CoordinateWith(child, &coord);
             EXPECT_TRUE(child->IsKilled());
 
             coord.Release(child, false);
             completed = true;
         }, &handle);
 
-        // Kill the child, then yield to let it resume and run both CoordinateWithKill calls
+        // Kill the child, then yield to let it resume and run both CoordinateWith calls
         //
         handle.Kill();
         ctx->Yield(true);
 
         EXPECT_TRUE(completed);
+    });
+}
+
+TEST(SignalTest, CoordinateWithTimesOut)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        // Coordinator held by ctx — will never be released, so the timeout should fire
+        //
+        coop::Coordinator coord(ctx);
+
+        auto result = coop::CoordinateWith(ctx, &coord, coop::time::Interval(50));
+        EXPECT_TRUE(result.TimedOut());
+        EXPECT_FALSE(result.Killed());
+        EXPECT_EQ(result.coordinator, nullptr);
+
+        coord.Release(ctx, false);
+    });
+}
+
+TEST(SignalTest, CoordinateWithCompletesBeforeTimeout)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Coordinator coord(ctx);
+
+        // Spawn a child that releases the coordinator before the timeout fires
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coord.Release(child, false);
+        });
+
+        auto result = coop::CoordinateWith(ctx, &coord, coop::time::Interval(5000));
+        EXPECT_FALSE(result.TimedOut());
+        EXPECT_FALSE(result.Killed());
+        EXPECT_EQ(static_cast<size_t>(result), 0u);
+        EXPECT_TRUE(result.coordinator == &coord);
+
+        coord.Release(ctx, false);
     });
 }

@@ -87,6 +87,7 @@ add_executable(coop_tests
     tests/test_signal.cpp
     tests/test_channel.cpp
     tests/test_shutdown.cpp
+    tests/test_io.cpp
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 include(GoogleTest)

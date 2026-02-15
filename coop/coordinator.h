@@ -101,8 +101,8 @@ struct Coordinator
     bool IsHeld() const;
 
     // TryAcquire, Acquire, and Release all act in the manner that one would expect from a mutex
-    // analogue. For timeout based behaviors, see the coop::time package and the multi coordinator
-    // aka 'CoordinateWith' functionality.
+    // analogue. For multi-coordinator and timeout behaviors, see the CoordinateWith functionality
+    // in multi_coordinator.h.
     //
     bool TryAcquire(Context*);
 

@@ -68,6 +68,12 @@ void Handle::Submit(struct io_uring_sqe* sqe)
         m_descriptor->m_handles.Push(this);
     }
 
+    if (m_descriptor && m_descriptor->m_registeredIndex >= 0)
+    {
+        sqe->fd = m_descriptor->m_registeredIndex;
+        sqe->flags |= IOSQE_FIXED_FILE;
+    }
+
     io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(this));
     io_uring_submit(&m_ring->m_ring);
 }
@@ -91,6 +97,12 @@ void Handle::SubmitLinked(struct io_uring_sqe* sqe)
     if (m_descriptor)
     {
         m_descriptor->m_handles.Push(this);
+    }
+
+    if (m_descriptor && m_descriptor->m_registeredIndex >= 0)
+    {
+        sqe->fd = m_descriptor->m_registeredIndex;
+        sqe->flags |= IOSQE_FIXED_FILE;
     }
 
     // Mark the operation SQE as linked so the next SQE becomes a linked timeout

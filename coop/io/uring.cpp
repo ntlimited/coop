@@ -12,6 +12,23 @@ namespace coop
 namespace io
 {
 
+void Uring::Init()
+{
+    int ret = io_uring_queue_init(m_entries, &m_ring, 0);
+    assert(ret == 0);
+    std::ignore = ret;
+
+    if (!m_registered.empty())
+    {
+        ret = io_uring_register_files(&m_ring, m_registered.data(), m_registered.size());
+        if (ret < 0)
+        {
+            spdlog::warn("uring register_files failed ret={}", ret);
+            m_registered.clear();
+        }
+    }
+}
+
 // Work loop
 //
 void Uring::Run(Context* ctx)
@@ -37,49 +54,45 @@ void Uring::Run(Context* ctx)
     }
 }
 
-// TODO migrate this to an optional system and sidestep a lot of crap...
-//
 void Uring::Register(Descriptor* descriptor)
 {
-    spdlog::trace("uring register fd={} count={}", descriptor->m_fd, m_registeredCount + 1);
-    m_descriptors.Push(descriptor);
-    if (m_registeredCount == REGISTERED_SIZE)
-    {
-        // Nothing else to do, we're just gonna be on the slowpath
-        //
-        return;
-    }
-
-    int i = 0;
-    while (true)
+    int slots = static_cast<int>(m_registered.size());
+    for (int i = 0; i < slots; i++)
     {
         if (m_registered[i] == -1)
         {
             m_registered[i] = descriptor->m_fd;
-            descriptor->m_registered = &m_registered[i];
-            break;
+            int ret = io_uring_register_files_update(&m_ring, i, &descriptor->m_fd, 1);
+            if (ret < 0)
+            {
+                spdlog::warn("uring register_files_update failed fd={} ret={}",
+                    descriptor->m_fd, ret);
+                m_registered[i] = -1;
+                return;
+            }
+            descriptor->m_registeredIndex = i;
+            spdlog::trace("uring register fd={} slot={}", descriptor->m_fd, i);
+            return;
         }
-        ++i;
     }
-    descriptor->m_generation = ++m_dirtyGeneration;
-    ++m_registeredCount;
-}
-
-int Uring::RegisteredIndex(int* reg)
-{
-    return reg - &m_registered[0];
+    spdlog::debug("uring register fd={} no slot available", descriptor->m_fd);
 }
 
 void Uring::Unregister(Descriptor* descriptor)
 {
-    spdlog::trace("uring unregister fd={}", descriptor->m_fd);
-    m_descriptors.Remove(descriptor);
-    if (descriptor->m_registered)
+    int idx = descriptor->m_registeredIndex;
+    assert(idx >= 0 && idx < static_cast<int>(m_registered.size()));
+
+    int negOne = -1;
+    m_registered[idx] = -1;
+    int ret = io_uring_register_files_update(&m_ring, idx, &negOne, 1);
+    if (ret < 0)
     {
-        *descriptor->m_registered = -1;
-        ++m_dirtyGeneration;
-        --m_registeredCount;
+        spdlog::warn("uring unregister_files_update failed fd={} slot={} ret={}",
+            descriptor->m_fd, idx, ret);
     }
+    descriptor->m_registeredIndex = -1;
+    spdlog::trace("uring unregister fd={} slot={}", descriptor->m_fd, idx);
 }
 
 } // end namespace io

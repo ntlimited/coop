@@ -1,6 +1,5 @@
 #pragma once
 
-#include <limits>
 #include <utility>
 
 #include "coop/coordinator.h"
@@ -12,18 +11,6 @@ namespace coop
 
 namespace detail
 {
-    template<typename Arg, typename... Args>
-    struct CountArgs
-    {
-        static constexpr size_t C = 1 + CountArgs<Args...>::C;
-    };
-    
-    template<>
-    struct CountArgs<Coordinator*>
-    {
-        static constexpr size_t C = 1;
-    };
-
     // AmbiResult can be an index in the args (for switches) or a coordinator pointer for other
     // mechanics.
     //
@@ -34,6 +21,8 @@ namespace detail
     {
         size_t          index;
         Coordinator*    coordinator;
+
+        bool Killed() const { return index == static_cast<size_t>(-1); }
 
         operator size_t() const
         {
@@ -54,28 +43,32 @@ namespace detail
 } // end coop::detail
 
 // CoordinateWith is available in various flavors of syntactic sugar and is a fairly thin wrapper
-// ver the MultiCoordinator type which will probably get extended in the future. It (and the
+// over the MultiCoordinator type which will probably get extended in the future. It (and the
 // MultiCoordinator) is built for multiple highly sugared patterns, such as:
+//
+//  auto result = CoordinateWithKill(&coord);
+//  if (result.Killed())
+//  {
+//      // We were killed
+//  }
+//
+// Coordinator pointer comparison:
 //
 //  if (coord == CoordinateWithKill(&coord))
 //  {
 //      ...
-//  }
-//  else
-//  {
-//      // We were killed
 //  }
 //
 // and Golang-style switches based on indices in the argument order:
 //
 //  switch (CoordinateWithKill(&timeoutCond, &lockCond))
 //  {
-//      0:
+//      case 0:
 //          // Timeout cond triggered first
 //          //
 //          ...
 //          break;
-//      1:
+//      case 1:
 //          // We received lockCond prior to the timeout triggering
 //          //
 //          ...
@@ -86,7 +79,7 @@ namespace detail
 //  }
 //
 // The contract is, very specifically, that:
-//  
+//
 //      exactly one coordinator will have been taken ownership
 //      of when CoordinateWith returns
 //
@@ -102,7 +95,7 @@ namespace detail
 template<typename... Coordinators>
 struct MultiCoordinator : CoordinatorExtension
 {
-    static constexpr size_t C = detail::CountArgs<Coordinators...>::C;
+    static constexpr size_t C = sizeof...(Coordinators);
 
     MultiCoordinator(Coordinators... coordinators)
     {
@@ -122,12 +115,8 @@ struct MultiCoordinator : CoordinatorExtension
             {
                 break;
             }
-            CoordinatorExtension().SetContext(&
-                m_coordinateds[idx],
-                ctx);
-            CoordinatorExtension().AddAsBlocked(
-                m_underlying[idx],
-                &m_coordinateds[idx]);
+            SetContext(&m_coordinateds[idx], ctx);
+            AddAsBlocked(m_underlying[idx], &m_coordinateds[idx]);
         }
 
         // If we are going to early exit, undo the hookups we did make.
@@ -136,9 +125,7 @@ struct MultiCoordinator : CoordinatorExtension
         {
             for (size_t i = 0 ; i < idx ; i++)
             {
-                CoordinatorExtension().RemoveAsBlocked(
-                    m_underlying[i],
-                    &m_coordinateds[i]);
+                RemoveAsBlocked(m_underlying[i], &m_coordinateds[i]);
             }
 
             SanityCheck();
@@ -147,7 +134,7 @@ struct MultiCoordinator : CoordinatorExtension
 
         // We have hooked up all of the conditions to wait for any of them to wake us
         //
-        CoordinatorExtension().Block(ctx);
+        Block(ctx);
 
         // Find which one(s) fired for us (in the event that we were unblocked but not immediately
         // scheduled).
@@ -156,9 +143,7 @@ struct MultiCoordinator : CoordinatorExtension
         {
             if (!m_coordinateds[idx].Satisfied())
             {
-                CoordinatorExtension().RemoveAsBlocked(
-                    m_underlying[idx],
-                    &m_coordinateds[idx]);
+                RemoveAsBlocked(m_underlying[idx], &m_coordinateds[idx]);
                 continue;
             }
 
@@ -168,15 +153,13 @@ struct MultiCoordinator : CoordinatorExtension
             {
                 if (m_coordinateds[i].Satisfied())
                 {
-                    // Our Coordinated instances was unlinked already
+                    // Our Coordinated instance was unlinked already
                     //
-                    m_underlying[i]->Release(ctx);
+                    m_underlying[i]->Release(ctx, false);
                 }
                 else
                 {
-                    CoordinatorExtension().RemoveAsBlocked(
-                        m_underlying[i],
-                        &m_coordinateds[i]);
+                    RemoveAsBlocked(m_underlying[i], &m_coordinateds[i]);
                 }
             }
             SanityCheck();
@@ -190,10 +173,6 @@ struct MultiCoordinator : CoordinatorExtension
     template<typename... SetArgs>
     void Set(size_t idx, Coordinator* coord, SetArgs... args)
     {
-        if (idx == C)
-        {
-            return;  
-        }
         m_underlying[idx] = coord;
         Set(idx + 1, std::forward<SetArgs>(args)...);
     }
@@ -210,8 +189,8 @@ struct MultiCoordinator : CoordinatorExtension
         }
     }
 
-    mutable Coordinator* m_underlying[C];
-    mutable Coordinated m_coordinateds[C];
+    Coordinator* m_underlying[C];
+    Coordinated m_coordinateds[C];
 };
 
 template<typename... Args>
@@ -240,6 +219,7 @@ detail::AmbiResult CoordinateWithKill(Context* ctx, Args... args)
     if (result.index == 0)
     {
         signal->ResetCoordinator();
+        return detail::AmbiResult { static_cast<size_t>(-1), nullptr };
     }
 
     result.index -= 1;

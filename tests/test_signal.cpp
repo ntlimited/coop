@@ -121,6 +121,54 @@ TEST(SignalTest, WaitOnKillSignal)
     });
 }
 
+TEST(SignalTest, CoordinateWithKillReturnsKilled)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Context::Handle handle;
+        bool completed = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::Coordinator coord(child);
+
+            // Yield so the parent can kill us
+            //
+            child->Yield(true);
+
+            auto result = coop::CoordinateWithKill(child, &coord);
+            EXPECT_TRUE(result.Killed());
+            EXPECT_EQ(result.coordinator, nullptr);
+
+            coord.Release(child, false);
+            completed = true;
+        }, &handle);
+
+        handle.Kill();
+        ctx->Yield(true);
+        EXPECT_TRUE(completed);
+    });
+}
+
+TEST(SignalTest, CoordinateWithKillReturnsCoordinator)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Coordinator coord(ctx);
+
+        // Coordinator is held by ctx, release it so CoordinateWithKill can acquire it
+        //
+        coord.Release(ctx, false);
+
+        auto result = coop::CoordinateWithKill(ctx, &coord);
+        EXPECT_FALSE(result.Killed());
+        EXPECT_EQ(static_cast<size_t>(result), 0u);
+        EXPECT_TRUE(result.coordinator == &coord);
+
+        coord.Release(ctx, false);
+    });
+}
+
 TEST(SignalTest, CoordinateWithKillRepeated)
 {
     test::RunInCooperator([](coop::Context* ctx)

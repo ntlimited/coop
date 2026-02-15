@@ -2,6 +2,7 @@
 #include "ticker.h"
 
 #include "coop/cooperator.h"
+#include "coop/multi_coordinator.h"
 #include "coop/self.h"
 
 namespace coop
@@ -47,13 +48,13 @@ void Sleeper::Sleep()
 bool Sleep(Context* ctx, Interval interval)
 {
     auto* ticker = ctx->GetCooperator()->GetTicker();
-    if (!ticker)
-    {
-        return false;
-    }
+    assert(ticker);
 
-    Sleeper(ctx, ticker, interval).Sleep();
-    return true;
+    Sleeper sleeper(ctx, ticker, interval);
+    sleeper.Submit();
+
+    auto result = CoordinateWithKill(ctx, sleeper.GetCoordinator());
+    return !result.Killed();
 }
 
 bool Sleep(Interval interval)

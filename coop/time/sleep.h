@@ -20,9 +20,6 @@ struct Sleeper
 
     ~Sleeper();
 
-    // TDOO this would be better composed in a design philosophy consistency kind of manner.
-    // However, in practice wouldn't buy much anywhere this has been used so far.
-    //
     Coordinator* GetCoordinator();
 
     void Submit();
@@ -40,13 +37,8 @@ struct Sleeper
     Interval    m_interval;
 };
 
-// TODO these should be kill-aware, but where exactly the kill-awareness comes from is debateable.
-// It is probably fine to only do the kill awareness at a high level where the use of the API is
-// inherently "I'm not sensitive enough to have an opinion".
-//
-// Come to think of it, this is probably related to the above comment regarding BYOC patterns;
-// injecting the coordinator directly makes composing the top-level sleep pattern. "Signal using
-// coordinator at the top level" is more natural that way imo (or at least my opinion right now)
+// Kill-aware sleep. Returns true if the sleep completed normally, false if the context was killed
+// before the interval elapsed.
 //
 bool Sleep(Context* ctx, Interval interval);
 

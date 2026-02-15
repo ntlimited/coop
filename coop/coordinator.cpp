@@ -39,11 +39,9 @@ void Coordinator::Acquire(Context* ctx)
     Coordinated coord(ctx);
     AddAsBlocked(&coord);
 
-    // Block the context on the this coordinator
+    // Block the context on this coordinator
     //
     ctx->Block();
-
-    return;
 }
 
 void Coordinator::Flash(Context* ctx)

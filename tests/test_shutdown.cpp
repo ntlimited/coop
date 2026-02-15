@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -9,6 +10,8 @@
 #include "coop/coordinator.h"
 #include "coop/signal.h"
 #include "coop/thread.h"
+#include "coop/time/sleep.h"
+#include "coop/time/interval.h"
 #include "test_helpers.h"
 
 // Spawn several contexts that yield in loops. Call Shutdown() and verify that the cooperator
@@ -276,4 +279,40 @@ TEST(ShutdownTest, ShutdownAllThenReset)
     }
 
     EXPECT_TRUE(ran.load(std::memory_order_relaxed));
+}
+
+TEST(SleepTest, SleepCompletesNormally)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        bool ok = coop::time::Sleep(ctx, coop::time::Interval(100));
+        EXPECT_TRUE(ok);
+    });
+}
+
+TEST(SleepTest, SleepReturnsFalseOnKill)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Context::Handle handle;
+        bool sleepResult = true;
+        bool completed = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            sleepResult = coop::time::Sleep(child, std::chrono::seconds(60));
+            completed = true;
+        }, &handle);
+
+        // Child is now blocked in Sleep. Kill it.
+        //
+        handle.Kill();
+
+        // Yield to let the child wake up and finish
+        //
+        ctx->Yield(true);
+
+        EXPECT_FALSE(sleepResult);
+        EXPECT_TRUE(completed);
+    });
 }

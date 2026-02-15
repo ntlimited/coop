@@ -1,25 +1,39 @@
 #pragma once
 
+#include "coordinator.h"
+#include "context.h"
+
 namespace coop
 {
-
-struct Coordinated;
-struct Coordinator;
-struct Context;
 
 // CoordinatorExtension, per Coordinator docs, prevents casual misuse of Coordinator internals
 //
 struct CoordinatorExtension
 {
-    void Block(Context* c);
+    void Block(Context* c)
+    {
+        c->Block();
+    }
 
-    void AddAsBlocked(Coordinator* c, Coordinated* ord);
+    void AddAsBlocked(Coordinator* c, Coordinated* ord)
+    {
+        c->AddAsBlocked(ord);
+    }
 
-    void RemoveAsBlocked(Coordinator* c, Coordinated* ord);
+    void RemoveAsBlocked(Coordinator* c, Coordinated* ord)
+    {
+        c->RemoveAsBlocked(ord);
+    }
 
-    bool HeldBy(Coordinator* c, Context* ctx);
+    bool HeldBy(Coordinator* c, Context* ctx)
+    {
+        return c->HeldBy(ctx);
+    }
 
-    void SetContext(Coordinated* c, Context* ctx);
+    void SetContext(Coordinated* c, Context* ctx)
+    {
+        c->SetContext(ctx);
+    }
 };
 
 } // end namespace coop

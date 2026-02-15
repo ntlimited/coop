@@ -1,7 +1,5 @@
 #pragma once
 
-#include <stdint.h>
-
 #include "embedded_list.h"
 
 namespace coop
@@ -96,9 +94,8 @@ struct Coordinator
     // Start out held
     //
     Coordinator(Context* ctx)
-    : Coordinator()
+    : m_heldBy(ctx)
     {
-        m_heldBy = ctx;
     }
 
     bool IsHeld() const;
@@ -137,7 +134,7 @@ struct Coordinator
     void RemoveAsBlocked(Coordinated*);
     bool HeldBy(Context* ctx);
 
-//  private:
+  private:
     Context* m_heldBy;
     Coordinated::List m_blocking;
 };

@@ -145,7 +145,17 @@ size_t Ticker::Now() const
 
 int Ticker::BucketFor(size_t interval) const
 {
-    auto b = ((sizeof(interval)<<3) - __builtin_clzl(interval)) - m_resolution;
+    // clzl(0) is undefined, and intervals whose bit-width is <= the resolution produce an
+    // unsigned underflow that silently lands handles in the highest (least-checked) bucket.
+    // Treat anything that rounds to less than one resolution window as "fire ASAP."
+    //
+    int bits = (sizeof(interval) << 3) - __builtin_clzl(interval | 1);
+    if (bits <= m_resolution)
+    {
+        return 0;
+    }
+
+    int b = bits - m_resolution;
     if (b >= BUCKETS)
     {
         b = BUCKETS - 1;

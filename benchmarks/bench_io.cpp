@@ -26,9 +26,10 @@ struct BenchmarkArgs
 };
 
 static void RunBenchmark(benchmark::State& state,
-    std::function<void(coop::Context*, benchmark::State&)> fn)
+    std::function<void(coop::Context*, benchmark::State&)> fn,
+    coop::CooperatorConfiguration const& config = coop::s_defaultCooperatorConfiguration)
 {
-    coop::Cooperator cooperator;
+    coop::Cooperator cooperator(config);
     coop::Thread t(&cooperator);
 
     BenchmarkArgs args;
@@ -102,6 +103,51 @@ BENCHMARK(BM_IO_RoundTrip);
 
 static void BM_IO_RoundTrip_Registered(benchmark::State& s) { BM_IO_RoundTrip_Impl<true>(s); }
 BENCHMARK(BM_IO_RoundTrip_Registered);
+
+// SQPOLL variants: kernel thread polls the SQ, eliminating the io_uring_enter() syscall on
+// submission. Trades a dedicated kernel thread for lower per-op latency.
+//
+
+template<bool Reg>
+static void BM_IO_RoundTrip_SQPoll_Impl(benchmark::State& state)
+{
+    coop::CooperatorConfiguration config = {
+        .uring = {
+            .entries = 64,
+            .registeredSlots = 64,
+            .taskName = "Uring",
+            .sqpoll = true,
+            .iopoll = false,
+            .coopTaskrun = false,
+        },
+    };
+
+    RunBenchmark(state, [](coop::Context*, benchmark::State& state)
+    {
+        int fds[2];
+        MakeSocketPair(fds);
+
+        auto a = MakeDescriptor<Reg>(fds[0]);
+        auto b = MakeDescriptor<Reg>(fds[1]);
+
+        char msg[MSG_SIZE] = {};
+        char buf[MSG_SIZE] = {};
+
+        for (auto _ : state)
+        {
+            coop::io::Send(a, msg, MSG_SIZE);
+            coop::io::Recv(b, buf, MSG_SIZE);
+        }
+    }, config);
+}
+
+static void BM_IO_RoundTrip_SQPoll(benchmark::State& s)
+    { BM_IO_RoundTrip_SQPoll_Impl<false>(s); }
+BENCHMARK(BM_IO_RoundTrip_SQPoll);
+
+static void BM_IO_RoundTrip_SQPoll_Registered(benchmark::State& s)
+    { BM_IO_RoundTrip_SQPoll_Impl<true>(s); }
+BENCHMARK(BM_IO_RoundTrip_SQPoll_Registered);
 
 // ---------------------------------------------------------------------------
 // 2. Two-context ping-pong
@@ -246,11 +292,11 @@ static void BM_IO_PingPong_Scale(benchmark::State& s)
     BM_IO_PingPong_Scale_Impl<false>(s);
 }
 BENCHMARK(BM_IO_PingPong_Scale)
-    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32);
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64)->Arg(128)->Arg(256);
 
 static void BM_IO_PingPong_Scale_Registered(benchmark::State& s)
 {
     BM_IO_PingPong_Scale_Impl<true>(s);
 }
 BENCHMARK(BM_IO_PingPong_Scale_Registered)
-    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32);
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64)->Arg(128)->Arg(256);

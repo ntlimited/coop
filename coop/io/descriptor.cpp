@@ -7,7 +7,6 @@
 
 #include "coop/context.h"
 #include "coop/detail/embedded_list.h"
-#include "coop/self.h"
 
 namespace coop
 {
@@ -15,19 +14,33 @@ namespace coop
 namespace io
 {
 
-Descriptor::Descriptor(int fd, Uring* ring /* = nullptr */)
-: m_ring(ring ? ring : GetUring())
+Descriptor::Descriptor(int fd, Uring* ring /* = GetUring() */)
+: m_ring(ring)
 , m_fd(fd)
-, m_registered(nullptr)
-, m_generation(0)
+, m_registeredIndex(-1)
 {
     assert(m_ring);
     spdlog::debug("descriptor create fd={}", m_fd);
+    m_ring->m_descriptors.Push(this);
+}
+
+Descriptor::Descriptor(Registered, int fd, Uring* ring /* = GetUring() */)
+: m_ring(ring)
+, m_fd(fd)
+, m_registeredIndex(-1)
+{
+    assert(m_ring);
+    spdlog::debug("descriptor create registered fd={}", m_fd);
+    m_ring->m_descriptors.Push(this);
     m_ring->Register(this);
 }
 
 Descriptor::~Descriptor()
 {
+    if (m_registeredIndex >= 0)
+    {
+        m_ring->Unregister(this);
+    }
     if (m_fd >= 0)
     {
         int fd = m_fd;
@@ -37,7 +50,7 @@ Descriptor::~Descriptor()
             spdlog::warn("descriptor close in destructor failed fd={} result={}", fd, result);
         }
     }
-    m_ring->Unregister(this);
+    m_ring->m_descriptors.Remove(this);
 }
 
 int Descriptor::Close()

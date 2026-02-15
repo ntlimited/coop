@@ -20,6 +20,15 @@ without dynamic allocation (modulo of course the stacks themselves). The `coop::
 effectively the system as far as a lot of code goes, alongside its `coop::Coordinated` sibling.
 These are the hooks into the blocking/unblocking of tasks within the scheduler.
 
+### Coordinators, Kills, and Timeouts
+
+`Coordinator` instances are an extremely efficient and low level building block, but almost-as-low-
+level functionality exists to incorporate them into both kill state and timeout aware conditions.
+`CoordinateWith` allows composing blocking functionality that waits for any of a given set of
+`Coordinator`s to be taken, and automatically includes the current `Context`'s kill state as well
+as a condition to return. An optional `Interval` may be passed as the final argument to embed an
+additional timeout condition.
+
 ### Handles
 
 `Coordinator` instances are a very strong building block, but for higher level interfaces `Handle`
@@ -51,6 +60,27 @@ For obvious reasons, thread locals are shunned _other than_ the two requisite th
 `Cooperator` itself (the userspace scheduler). There is unfortunately not a strongly opinionated
 enough way of writing APIs that operate on "the current task" and probably we should just defer to
 always pulling it off the thread local (e.g. `coop::Self()`) but that's a problem for another day.
+
+## Important building blocks
+
+### io
+
+The `coop::io` package contains both an `io_uring` driven bridge to kernelspace operations, and
+the functionality for the IO operations that make up the bulk of its value. Because of the very
+fundamental need for this in all but the most trivial of applications, APIs strive to be close to
+the native nix-isms that developers are familiar with.
+
+#### ssl
+
+`coop::io::ssl` contains OpenSSL-integrated constructs for trivially using transport layer security
+in application powered by coop.
+
+### time
+
+The `coop::time` package includes functionality for doing things related to time in a manner which
+uses the `Cooperator` scheduler vs actual thread blocking. This can be useful directly in some
+circumstances - e.g. for `coop::time::Sleep` - but realistically should usually be used via
+`CoordinateWith` in composition with other functionality.
 
 ## Awful shitty TODOs
 

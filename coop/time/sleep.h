@@ -24,9 +24,13 @@ struct Sleeper
 
     void Submit();
 
-    void Wait();
+    // Returns true if the sleep completed normally, false if the context was killed.
+    //
+    bool Wait();
 
-    void Sleep();
+    // Submit and wait. Returns true if completed, false if killed.
+    //
+    bool Sleep();
 
   private:
     Coordinator m_coordinator;

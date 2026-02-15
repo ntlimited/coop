@@ -34,15 +34,16 @@ void Sleeper::Submit()
     m_handle.Submit(m_ticker);
 }
 
-void Sleeper::Wait()
+bool Sleeper::Wait()
 {
-    m_handle.Wait(m_context);
+    auto result = CoordinateWith(m_context, &m_coordinator);
+    return !result.Killed();
 }
 
-void Sleeper::Sleep()
+bool Sleeper::Sleep()
 {
     Submit();
-    Wait();
+    return Wait();
 }
 
 bool Sleep(Context* ctx, Interval interval)
@@ -50,11 +51,7 @@ bool Sleep(Context* ctx, Interval interval)
     auto* ticker = ctx->GetCooperator()->GetTicker();
     assert(ticker);
 
-    Sleeper sleeper(ctx, ticker, interval);
-    sleeper.Submit();
-
-    auto result = CoordinateWithKill(ctx, sleeper.GetCoordinator());
-    return !result.Killed();
+    return Sleeper(ctx, ticker, interval).Sleep();
 }
 
 bool Sleep(Interval interval)

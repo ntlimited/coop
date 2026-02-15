@@ -1,3 +1,6 @@
+#include <cassert>
+#include <cerrno>
+#include <cstdint>
 #include <liburing.h>
 #include <spdlog/spdlog.h>
 
@@ -23,6 +26,9 @@ Handle::Handle(
 , m_descriptor(&descriptor)
 , m_coord(coordinator)
 , m_context(context)
+, m_result(0)
+, m_pendingCqes(0)
+, m_timedOut(false)
 {
 }
 
@@ -34,13 +40,28 @@ Handle::Handle(
 , m_descriptor(nullptr)
 , m_coord(coordinator)
 , m_context(context)
+, m_result(0)
+, m_pendingCqes(0)
+, m_timedOut(false)
 {
+}
+
+Handle::~Handle()
+{
+    if (m_pendingCqes > 0)
+    {
+        Cancel();
+        m_coord->Flash(m_context);
+    }
+    assert(Disconnected());
 }
 
 void Handle::Submit(struct io_uring_sqe* sqe)
 {
     spdlog::trace("handle submit ctx={}", m_context->GetName());
 
+    m_timedOut = false;
+    m_pendingCqes = 1;
     m_coord->TryAcquire(m_context);
     if (m_descriptor)
     {
@@ -51,17 +72,66 @@ void Handle::Submit(struct io_uring_sqe* sqe)
     io_uring_submit(&m_ring->m_ring);
 }
 
+void Handle::SubmitLinked(struct io_uring_sqe* sqe, struct __kernel_timespec* ts)
+{
+    spdlog::trace("handle submit_linked ctx={}", m_context->GetName());
+
+    m_timedOut = false;
+    m_pendingCqes = 2;
+    m_coord->TryAcquire(m_context);
+    if (m_descriptor)
+    {
+        m_descriptor->m_handles.Push(this);
+    }
+
+    // Mark the operation SQE as linked so the next SQE becomes a linked timeout
+    //
+    sqe->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(this));
+
+    // Second SQE: linked timeout with tagged pointer (bit 0 set)
+    //
+    auto* timeout_sqe = io_uring_get_sqe(&m_ring->m_ring);
+    assert(timeout_sqe);
+    io_uring_prep_link_timeout(timeout_sqe, ts, 0);
+    io_uring_sqe_set_data(timeout_sqe, reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(this) | 1));
+
+    io_uring_submit(&m_ring->m_ring);
+}
+
+void Handle::Cancel()
+{
+    if (m_pendingCqes == 0)
+    {
+        return;
+    }
+
+    auto* sqe = io_uring_get_sqe(&m_ring->m_ring);
+    assert(sqe);
+
+    // Cancel targets the original SQE by its userdata (untagged `this`). The cancel SQE's own
+    // userdata is tagged so its completion routes to OnSecondaryComplete.
+    //
+    io_uring_prep_cancel(sqe, reinterpret_cast<void*>(this), 0);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(this) | 1));
+    io_uring_submit(&m_ring->m_ring);
+    m_pendingCqes++;
+}
+
 Handle::operator int()
 {
     m_coord->Flash(m_context);
     return m_result;
 }
 
-void Handle::Complete(struct io_uring_cqe* cqe)
+void Handle::Finalize()
 {
-    m_result = cqe->res;
-    spdlog::trace("handle complete result={}", m_result);
-    io_uring_cqe_seen(&m_ring->m_ring, cqe);
+    if (--m_pendingCqes > 0)
+    {
+        return;
+    }
 
     if (m_descriptor)
     {
@@ -70,9 +140,38 @@ void Handle::Complete(struct io_uring_cqe* cqe)
     m_coord->Release(m_context, false /* schedule */);
 }
 
+void Handle::Complete(struct io_uring_cqe* cqe)
+{
+    m_result = cqe->res;
+    spdlog::trace("handle complete result={}", m_result);
+    io_uring_cqe_seen(&m_ring->m_ring, cqe);
+    Finalize();
+}
+
+void Handle::OnSecondaryComplete(struct io_uring_cqe* cqe)
+{
+    spdlog::trace("handle secondary complete result={}", cqe->res);
+    if (cqe->res == -ETIME)
+    {
+        m_timedOut = true;
+    }
+    io_uring_cqe_seen(&m_ring->m_ring, cqe);
+    Finalize();
+}
+
 void Handle::Callback(struct io_uring_cqe* cqe)
 {
-    reinterpret_cast<Handle*>(io_uring_cqe_get_data(cqe))->Complete(cqe);
+    auto data = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
+    auto* handle = reinterpret_cast<Handle*>(data & ~uintptr_t(0x7));
+
+    if (data & 1)
+    {
+        handle->OnSecondaryComplete(cqe);
+    }
+    else
+    {
+        handle->Complete(cqe);
+    }
 }
 
 } // end namespace coop::io

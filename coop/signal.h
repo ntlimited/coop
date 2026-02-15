@@ -1,18 +1,28 @@
 #pragma once
 
 #include "coordinator.h"
+#include "time/interval.h"
 
 namespace coop
 {
 
 struct Context;
-namespace detail { struct AmbiResult; }
+namespace detail
+{
+    struct AmbiResult;
+
+    template<typename... Coords>
+    AmbiResult CoordinateWithImpl(Context*, Coords...);
+
+    template<typename... Coords>
+    AmbiResult CoordinateWithTimeoutImpl(Context*, time::Interval, Coords...);
+}
 
 // Signal is a one-shot broadcast notification primitive. It starts in the "armed" state, held by
 // an owning context. Other contexts can Wait on it, blocking until Notify is called. Once notified,
 // all waiting contexts are unblocked and future Wait calls return immediately.
 //
-// This is the mechanism behind context kill signals. CoordinateWithKill is the sole consumer of
+// This is the mechanism behind context kill signals. CoordinateWith is the sole consumer of
 // the internal coordinator — it handles cleanup to prevent re-arming after MultiCoordinator's
 // TryAcquire sets m_heldBy.
 //
@@ -36,11 +46,12 @@ struct Signal
     void Notify(Context* ctx, bool schedule = true);
 
   private:
-    template<typename... Args>
-    friend detail::AmbiResult CoordinateWithKill(Context*, Args...);
+    template<typename... Coords>
+    friend detail::AmbiResult detail::CoordinateWithImpl(Context*, Coords...);
 
-    template<typename... Args>
-    friend detail::AmbiResult CoordinateWithKill(Args...);
+    template<typename... Coords>
+    friend detail::AmbiResult detail::CoordinateWithTimeoutImpl(
+        Context*, time::Interval, Coords...);
 
     Coordinator* AsCoordinator() { return &m_coord; }
 

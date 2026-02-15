@@ -1,12 +1,13 @@
 #include <arpa/inet.h>
+#include <cerrno>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
 #include <spdlog/spdlog.h>
 
+#define COOP_IO_KEEP_ARGS
 #include "connect.h"
 
-#include "coop/context.h"
 #include "coop/coordinator.h"
 #include "coop/self.h"
 
@@ -20,31 +21,7 @@ namespace coop
 namespace io
 {
 
-bool Connect(Handle& handle, const struct sockaddr* addr, socklen_t addrLen)
-{
-    auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);
-    if (!sqe)
-    {
-        return false;
-    }
-
-    spdlog::trace("connect fd={}", handle.m_descriptor->m_fd);
-    io_uring_prep_connect(sqe, handle.m_descriptor->m_fd, addr, addrLen);
-    handle.Submit(sqe);
-    return true;
-}
-
-int Connect(Descriptor& desc, const struct sockaddr* addr, socklen_t addrLen)
-{
-    Coordinator coord;
-    Handle handle(Self(), desc, &coord);
-    if (!Connect(handle, addr, addrLen))
-    {
-        return -EAGAIN;
-    }
-
-    return handle;
-}
+COOP_IO_IMPLEMENTATIONS(Connect, io_uring_prep_connect, CONNECT_ARGS)
 
 int Connect(Descriptor& desc, const char* hostname, int port)
 {

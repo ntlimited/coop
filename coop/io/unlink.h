@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdint>
-
 #include "coop/io/detail/op_macros.h"
 
 namespace coop
@@ -10,15 +8,14 @@ namespace coop
 namespace io
 {
 
-struct Descriptor;
 struct Handle;
 
-#define READ_ARGS(F) F(void*, buf, ) F(size_t, size, ) F(uint64_t, offset, = 0)
-COOP_IO_DECLARATIONS(Read, READ_ARGS)
+#define UNLINK_ARGS(F) F(const char*, path, ) F(int, flags, = 0)
+COOP_IO_URING_DECLARATIONS(Unlink, UNLINK_ARGS)
 
 } // end namespace coop::io
 } // end namespace coop
 
 #ifndef COOP_IO_KEEP_ARGS
-#undef READ_ARGS
+#undef UNLINK_ARGS
 #endif

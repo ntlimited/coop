@@ -1,10 +1,12 @@
 #pragma once
 
+#include <linux/time_types.h>
+
 #include "coop/detail/embedded_list.h"
+#include "coop/time/interval.h"
 
 struct io_uring_cqe;
 struct io_uring_sqe;
-struct __kernel_timespec;
 
 namespace coop
 {
@@ -44,12 +46,11 @@ struct Handle : EmbeddedListHookups<Handle>
 
     void Submit(struct io_uring_sqe*);
 
-    // Submit with a linked timeout. The operation SQE gets IOSQE_IO_LINK, a second SQE is
-    // appended for the linked timeout, and m_pendingCqes is set to 2. The __kernel_timespec*
-    // must remain valid until both CQEs are consumed (guaranteed because the owning context
-    // blocks via Flash and its stack frame stays alive).
+    // Submit with a linked timeout. Converts the interval to a __kernel_timespec stored in
+    // m_timeout, marks the operation SQE with IOSQE_IO_LINK, appends a linked timeout SQE,
+    // and sets m_pendingCqes to 2.
     //
-    void SubmitLinked(struct io_uring_sqe*, struct __kernel_timespec*);
+    void SubmitWithTimeout(struct io_uring_sqe*, time::Interval timeout);
 
     // Cancel an in-flight operation. Submits an IORING_OP_ASYNC_CANCEL targeting our original
     // SQE's userdata. The cancel acknowledgment CQE is routed to OnSecondaryComplete. No-op if
@@ -83,7 +84,14 @@ struct Handle : EmbeddedListHookups<Handle>
     int     m_pendingCqes;
     bool    m_timedOut;
 
+    struct __kernel_timespec m_timeout;
+
 private:
+    // Submit with a linked timeout using a pre-populated m_timeout. Called by SubmitWithTimeout
+    // after converting the interval.
+    //
+    void SubmitLinked(struct io_uring_sqe*);
+
     // Shared finalization logic. Decrements m_pendingCqes and only releases the coordinator
     // when it hits zero.
     //

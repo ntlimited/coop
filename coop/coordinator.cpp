@@ -76,7 +76,7 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
     // Mark the coordinated instance as having been satisfied by gaining the lock now
     // that we've popped it from the list
     //
-    next->m_satisfied = true;
+    next->Satisfy();
     m_heldBy = next->GetContext();
 
     ctx->Unblock(m_heldBy, schedule);
@@ -84,7 +84,7 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 
 void Coordinator::AddAsBlocked(Coordinated* c)
 {
-    c->m_satisfied = false;
+    c->Reset();
     m_blocking.Push(c);
 }
 

@@ -10,12 +10,9 @@ struct Context;
 struct CoordinatorExtension;
 struct Signal;
 
-// Coordinated is an internal type used to maintain the necessary metadata for coordinated
-// operations. It is also usable with the CoordinatorExtension type that launders access to
-// its internal APIs in order to create higher-level coordination constructs.
-//
-// TODO any value to including the Coordinator in the struct? Probably not and would likely
-// lead to bad patterns.
+// Coordinated is the link between a blocked Context and the Coordinator it is waiting on. Each
+// instance sits on a Coordinator's wait list and tracks whether the coordination was satisfied
+// (i.e. the context was granted ownership).
 //
 struct Coordinated : EmbeddedListHookups<Coordinated>
 {
@@ -45,22 +42,20 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
         return m_satisfied;
     }
 
-    // The satisfied flag is set when the Coordinated instance is pulled off the blocked list and
-    // its context is passed control. This is almost isomorphic to the 'heldBy' tracking in the
-    // Coordinator instance itself, but there is a nuance with "reentrancy" in the case where we
-    // compose the Coordinate(...) functionality and we need to distinguish the fact that an
-    // instance was already held by the same context (and it is waiting on another to unlock it
-    // out of band, e.g. a kill signal...)
-    //
-    operator bool() const
-    {
-        return m_satisfied;
-    }
-
   private:
     friend struct Coordinator;
     friend struct CoordinatorExtension;
     friend struct Signal;
+
+    void Satisfy()
+    {
+        m_satisfied = true;
+    }
+
+    void Reset()
+    {
+        m_satisfied = false;
+    }
 
     void SetContext(Context* ctx)
     {

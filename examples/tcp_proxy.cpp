@@ -1,7 +1,9 @@
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <spdlog/spdlog.h>
 
@@ -13,12 +15,10 @@
 #include "coop/shutdown.h"
 
 // TCP proxy that accepts client connections and relays bytes bidirectionally to an upstream server.
-// Exercises the coop IO and connection lifecycle primitives under realistic conditions.
+// Uses splice for zero-copy relay — data moves between sockets entirely in-kernel.
 //
 // Usage: tcp_proxy <listen-port> <upstream-ip> <upstream-port>
 //
-
-static constexpr size_t BUFFER_SIZE = 8192;
 
 struct ProxyHandler : coop::Launchable
 {
@@ -28,6 +28,9 @@ struct ProxyHandler : coop::Launchable
     , m_upstreamIp(upstreamIp)
     , m_upstreamPort(upstreamPort)
     {
+        // Non-blocking required for splice + io::Poll cooperative waiting
+        //
+        fcntl(clientFd, F_SETFL, fcntl(clientFd, F_GETFL) | O_NONBLOCK);
         ctx->SetName("ProxyHandler");
     }
 
@@ -59,51 +62,38 @@ struct ProxyHandler : coop::Launchable
         auto* ctx = GetContext();
         coop::Context::Handle childHandle;
 
-        // Child context: relay client -> upstream
-        //
         auto* upstreamPtr = &upstream;
         auto* clientPtr = &m_client;
         auto* childDonePtr = &childDone;
 
+        // Child context: relay client -> upstream (zero-copy via splice)
+        //
         coop::Spawn([=](coop::Context* childCtx)
         {
             childCtx->SetName("ClientToUpstream");
-            char buf[BUFFER_SIZE];
+            int pipefd[2];
+            pipe2(pipefd, O_NONBLOCK);
 
             while (!childCtx->IsKilled())
             {
-                int n = coop::io::Recv(*clientPtr, buf, sizeof(buf));
-                if (n <= 0)
-                {
-                    break;
-                }
-
-                int sent = coop::io::SendAll(*upstreamPtr, buf, n);
-                if (sent <= 0)
-                {
-                    break;
-                }
+                int n = coop::io::Splice(*clientPtr, *upstreamPtr, pipefd, 65536);
+                if (n <= 0) break;
             }
 
+            close(pipefd[0]);
+            close(pipefd[1]);
             *childDonePtr = true;
         }, &childHandle);
 
-        // Parent context: relay upstream -> client
+        // Parent context: relay upstream -> client (zero-copy via splice)
         //
-        char buf[BUFFER_SIZE];
+        int pipefd[2];
+        pipe2(pipefd, O_NONBLOCK);
+
         while (!ctx->IsKilled())
         {
-            int n = coop::io::Recv(upstream, buf, sizeof(buf));
-            if (n <= 0)
-            {
-                break;
-            }
-
-            int sent = coop::io::SendAll(m_client, buf, n);
-            if (sent <= 0)
-            {
-                break;
-            }
+            int n = coop::io::Splice(upstream, m_client, pipefd, 65536);
+            if (n <= 0) break;
 
             // If the child exited (client closed its write side), propagate the half-close
             // to upstream so it knows no more data is coming, then keep draining.
@@ -114,6 +104,9 @@ struct ProxyHandler : coop::Launchable
                 childDone = false;
             }
         }
+
+        close(pipefd[0]);
+        close(pipefd[1]);
 
         // Parent is done — kill the child if it's still running. RAII closes both descriptors.
         //

@@ -4,6 +4,7 @@
 #include "connection.h"
 #include "recv.h"
 #include "send.h"
+#include "sendfile.h"
 #include "stream.h"
 
 // coop::io::ssl provides a TLS layer on top of coop's io module. Two modes are supported:

@@ -1,13 +1,15 @@
 #include "server.h"
 
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "coop/cooperator.h"
 #include "coop/launchable.h"
 #include "coop/io/io.h"
-#include "coop/io/read_file.h"
 
 namespace coop
 {
@@ -38,13 +40,13 @@ bool HasPathTraversal(const char* path)
     return strstr(path, "..") != nullptr;
 }
 
-// Build a complete HTTP/1.1 response from status code, content type, and body
+// Build HTTP/1.1 response headers (no body). Used with sendfile for zero-copy file serving.
 //
-std::string FormatResponse(int code, const char* status, const char* contentType,
-                           const std::string& body)
+std::string FormatHeaders(int code, const char* status, const char* contentType,
+                          size_t contentLength)
 {
     std::string resp;
-    resp.reserve(256 + body.size());
+    resp.reserve(256);
     resp += "HTTP/1.1 ";
     resp += std::to_string(code);
     resp += ' ';
@@ -52,8 +54,17 @@ std::string FormatResponse(int code, const char* status, const char* contentType
     resp += "\r\nContent-Type: ";
     resp += contentType;
     resp += "\r\nContent-Length: ";
-    resp += std::to_string(body.size());
+    resp += std::to_string(contentLength);
     resp += "\r\nConnection: close\r\n\r\n";
+    return resp;
+}
+
+// Build a complete HTTP/1.1 response with body inline.
+//
+std::string FormatResponse(int code, const char* status, const char* contentType,
+                           const std::string& body)
+{
+    auto resp = FormatHeaders(code, status, contentType, body.size());
     resp += body;
     return resp;
 }
@@ -71,6 +82,9 @@ struct HttpConnection : Launchable
     , m_routeCount(routeCount)
     , m_searchPaths(searchPaths)
     {
+        // Non-blocking required for sendfile + io::Poll cooperative waiting
+        //
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
         ctx->SetName("HttpConnection");
     }
 
@@ -127,7 +141,7 @@ struct HttpConnection : Launchable
             }
         }
 
-        // File serving fallback
+        // File serving fallback — zero-copy via sendfile
         //
         if (m_searchPaths && !HasPathTraversal(pathStart))
         {
@@ -138,7 +152,6 @@ struct HttpConnection : Launchable
             }
 
             char filePath[512];
-            char fileBuf[65536];
 
             for (const char* const* sp = m_searchPaths; *sp != nullptr; sp++)
             {
@@ -148,15 +161,27 @@ struct HttpConnection : Launchable
                     continue;
                 }
 
-                int bytes = io::ReadFile(filePath, fileBuf, sizeof(fileBuf));
-                if (bytes >= 0)
+                int fileFd = ::open(filePath, O_RDONLY);
+                if (fileFd < 0) continue;
+
+                struct stat st;
+                if (::fstat(fileFd, &st) != 0 || !S_ISREG(st.st_mode))
                 {
-                    const char* ct = ContentTypeForExtension(filePath);
-                    std::string body(fileBuf, static_cast<size_t>(bytes));
-                    auto resp = FormatResponse(200, "OK", ct, body);
-                    m_stream.SendAll(resp.data(), resp.size());
-                    return;
+                    ::close(fileFd);
+                    continue;
                 }
+
+                const char* ct = ContentTypeForExtension(filePath);
+                auto headers = FormatHeaders(200, "OK", ct, st.st_size);
+                m_stream.SendAll(headers.data(), headers.size());
+
+                if (st.st_size > 0)
+                {
+                    io::SendfileAll(m_fd, fileFd, 0, st.st_size);
+                }
+
+                ::close(fileFd);
+                return;
             }
         }
 
@@ -213,9 +238,7 @@ void RunServer(
             break;
         }
 
-        // HttpConnection stack-allocates a 64KB file read buffer, so it needs a larger stack
-        //
-        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 131072};
+        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 16384};
         co->Launch<HttpConnection>(config, fd, co, routes, routeCount, searchPaths);
         ctx->Yield();
     }

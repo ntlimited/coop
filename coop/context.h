@@ -189,6 +189,7 @@ struct Context::Handle
     Handle(Handle const&) = delete;
     Handle(Handle&&) = delete;
     Handle()
+    : m_context(nullptr)
     {
     }
 

@@ -11,19 +11,23 @@
 #include "coop/time/sleep.h"
 #include "coop/io/io.h"
 #include "coop/io/ssl/ssl.h"
+#include "coop/coordinate_with.h"
 #include "coop/shutdown.h"
 #include "coop/http/status.h"
+
+using namespace coop;
 
 // Demo program that sets up two TCP echo servers:
 //
 // - A plaintext echo server on port 8888
 // - A TLS echo server on port 8889
 //
-// Both use the same cooperative uring-based I/O. The echo loop itself is transport-agnostic — it
-// operates on a Stream&, so plaintext and TLS handlers share the same core logic.
+// A single acceptor context multiplexes both listening sockets using CoordinateWith to
+// demonstrate composing multiple async IO operations. The echo loop itself is transport-agnostic —
+// it operates on a Stream&, so plaintext and TLS handlers share the same core logic.
 //
 
-void EchoLoop(coop::Context* ctx, coop::io::Stream& stream)
+void EchoLoop(Context* ctx, io::Stream& stream)
 {
     char buffer[4096];
 
@@ -43,12 +47,12 @@ void EchoLoop(coop::Context* ctx, coop::io::Stream& stream)
     }
 }
 
-struct EchoHandler : coop::Launchable
+struct EchoHandler : Launchable
 {
     // Plaintext constructor
     //
-    EchoHandler(coop::Context* ctx, int fd)
-    : coop::Launchable(ctx)
+    EchoHandler(Context* ctx, int fd)
+    : Launchable(ctx)
     , m_fd(fd)
     , m_plaintextStream(std::in_place, m_fd)
     , m_stream(&*m_plaintextStream)
@@ -58,8 +62,8 @@ struct EchoHandler : coop::Launchable
 
     // TLS constructor
     //
-    EchoHandler(coop::Context* ctx, int fd, coop::io::ssl::Context* sslCtx)
-    : coop::Launchable(ctx)
+    EchoHandler(Context* ctx, int fd, io::ssl::Context* sslCtx)
+    : Launchable(ctx)
     , m_fd(fd)
     , m_conn(std::in_place, *sslCtx, m_fd, m_tlsBuffer, sizeof(m_tlsBuffer))
     , m_secureStream(std::in_place, *m_conn)
@@ -82,12 +86,12 @@ struct EchoHandler : coop::Launchable
         EchoLoop(GetContext(), *m_stream);
     }
 
-    coop::io::Descriptor                            m_fd;
-    char                                            m_tlsBuffer[coop::io::ssl::Connection::BUFFER_SIZE];
-    std::optional<coop::io::PlaintextStream>        m_plaintextStream;
-    std::optional<coop::io::ssl::Connection>        m_conn;
-    std::optional<coop::io::ssl::SecureStream>      m_secureStream;
-    coop::io::Stream*                               m_stream;
+    io::Descriptor                       m_fd;
+    char                                 m_tlsBuffer[io::ssl::Connection::BUFFER_SIZE];
+    std::optional<io::PlaintextStream>   m_plaintextStream;
+    std::optional<io::ssl::Connection>   m_conn;
+    std::optional<io::ssl::SecureStream> m_secureStream;
+    io::Stream*                          m_stream;
 };
 
 int bind_and_listen(int port)
@@ -113,117 +117,88 @@ int bind_and_listen(int port)
     return serverFd;
 }
 
-void SpawningTask(coop::Context* ctx, void*)
+void SpawningTask(Context* ctx, void*)
 {
-    ctx->SetName("SpawningTask");
     spdlog::info("server starting plaintext=8888 tls=8889");
+    
+    {
+        // Search paths for static files — covers running from project root or from the bin directory
+        //
+        static const char* staticPaths[] = {
+            "static",
+            "build/debug/bin/static",
+            "build/release/bin/static",
+            nullptr,
+        };
+        http::SpawnStatusServer(GetCooperator(), 8080, staticPaths);
+    }
 
     int serverFd = bind_and_listen(8888);
     int tlsServerFd = bind_and_listen(8889);
 
-    auto* co = ctx->GetCooperator();
-
     // TLS configuration — shared across all TLS connections
     //
-    coop::io::ssl::Context sslCtx(coop::io::ssl::Mode::Server);
+    io::ssl::Context sslCtx(io::ssl::Mode::Server);
 
     char certBuf[8192];
-    int certLen = coop::io::ReadFile("cert.pem", certBuf, sizeof(certBuf));
+    int certLen = io::ReadFile("cert.pem", certBuf, sizeof(certBuf));
     assert(certLen > 0);
     assert(sslCtx.LoadCertificate(certBuf, certLen));
 
     char keyBuf[8192];
-    int keyLen = coop::io::ReadFile("key.pem", keyBuf, sizeof(keyBuf));
+    int keyLen = io::ReadFile("key.pem", keyBuf, sizeof(keyBuf));
     assert(keyLen > 0);
     assert(sslCtx.LoadPrivateKey(keyBuf, keyLen));
 
-    coop::Context::Handle serverHandle;
-
     // EchoHandler embeds a 16KB TLS buffer, so it needs a larger stack than the default
     //
-    static constexpr coop::SpawnConfiguration handlerConfig = {
+    static constexpr SpawnConfiguration handlerConfig = {
         .priority = 0,
         .stackSize = 65536,
     };
 
-    // Plaintext echo server on port 8888
-    //
-    co->Spawn([=](coop::Context* serverCtx)
+    ctx->SetName("Acceptor");
+    io::Descriptor plaintextDesc(serverFd);
+    io::Descriptor tlsDesc(tlsServerFd);
+
+    Coordinator plaintextCoord, tlsCoord;
+    io::Handle plaintextHandle(ctx, plaintextDesc, &plaintextCoord);
+    io::Handle tlsHandle(ctx, tlsDesc, &tlsCoord);
+
+    io::Accept(plaintextHandle);
+    io::Accept(tlsHandle);
+
+    while (true)
     {
-        serverCtx->SetName("PlaintextAcceptor");
-        coop::io::Descriptor desc(serverFd);
+        auto result = CoordinateWith(ctx, &plaintextCoord, &tlsCoord);
+        if (result.Killed()) break;
 
-        while (!serverCtx->IsKilled())
+        if (result == plaintextCoord)
         {
-            int fd = coop::io::Accept(desc);
-            assert(fd >= 0);
-
+            int fd = plaintextHandle.m_result;
+            plaintextCoord.Release(ctx, false);
             spdlog::info("plaintext accepted fd={}", fd);
-            co->Launch<EchoHandler>(handlerConfig, fd);
-            serverCtx->Yield();
+            Launch<EchoHandler>(handlerConfig, fd);
+            io::Accept(plaintextHandle);
         }
-    }, &serverHandle);
-
-    // TLS echo server on port 8889
-    //
-    auto* sslCtxPtr = &sslCtx;
-    co->Spawn([=](coop::Context* tlsCtx)
-    {
-        tlsCtx->SetName("TLSAcceptor");
-        coop::io::Descriptor desc(tlsServerFd);
-
-        while (!tlsCtx->IsKilled())
+        else if (result == tlsCoord)
         {
-            int fd = coop::io::Accept(desc);
-            assert(fd >= 0);
-
+            int fd = tlsHandle.m_result;
+            tlsCoord.Release(ctx, false);
             spdlog::info("tls accepted fd={}", fd);
-            co->Launch<EchoHandler>(handlerConfig, fd, sslCtxPtr);
-            tlsCtx->Yield();
+            Launch<EchoHandler>(handlerConfig, fd, &sslCtx);
+            io::Accept(tlsHandle);
         }
-    });
-
-    // Search paths for static files — covers running from project root or from the bin directory
-    //
-    static const char* staticPaths[] = {
-        "static",
-        "build/debug/bin/static",
-        "build/release/bin/static",
-        nullptr,
-    };
-    coop::http::SpawnStatusServer(co, 8080, staticPaths);
-
-    co->Spawn([=](coop::Context* statusCtx)
-    {
-        statusCtx->SetName("Status context");
-        coop::time::Sleeper s(
-            statusCtx,
-            std::chrono::seconds(10));
-
-        while (s.Sleep() == coop::time::SleepResult::Ok)
-        {
-            spdlog::info("cooperator total={} yielded={} blocked={}",
-                statusCtx->GetCooperator()->ContextsCount(),
-                statusCtx->GetCooperator()->YieldedCount(),
-                statusCtx->GetCooperator()->BlockedCount());
-            statusCtx->GetCooperator()->PrintContextTree();
-        }
-    });
-
-    // Yield until the shutdown handler shuts us down
-    //
-    while (!co->IsShuttingDown())
-    {
-        ctx->Yield(true);
     }
+
     spdlog::info("shutting down...");
 }
 
 int main()
 {
-    coop::InstallShutdownHandler();
-    coop::Cooperator cooperator;
-    coop::Thread mt(&cooperator);
+    InstallShutdownHandler();
+    Cooperator cooperator;
+    Thread mt(&cooperator);
 
     cooperator.Submit(&SpawningTask, nullptr, {.priority = 0, .stackSize = 65536});
     return 0;

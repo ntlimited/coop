@@ -63,12 +63,32 @@ ctx->Detach();          // disassociate from parent
 ```
 Contexts form a parent-child tree. Killing a parent kills its children.
 
+### Free Functions (`coop/self.h`, `coop/cooperator.hpp`)
+Thread-local convenience functions that avoid explicit cooperator/context references:
+```cpp
+Context* Self();              // current context
+bool Yield();                 // cooperate
+bool IsKilled();              // check kill signal
+bool IsShuttingDown();        // check cooperator shutdown
+Cooperator* GetCooperator();  // thread-local cooperator
+io::Uring* GetUring();        // thread-local uring
+```
+
+`Spawn` and `Launch` are also available as free functions (template, in `cooperator.hpp`):
+```cpp
+Spawn([](Context* ctx) { ... });
+Spawn(config, [](Context* ctx) { ... }, &handle);
+Launch<MyHandler>(config, fd, ...);
+Launch<MyHandler>(args...);
+```
+
 ### Spawn vs Launch (`coop/cooperator.h`)
 Two ways to create contexts:
 - `bool Spawn(Fn const& fn)` — lambda copied to context stack, for simple one-off tasks
 - `T* Launch<T>(Args&&...)` — Launchable subclass, forwarded ctor args, for stateful handlers
 
 Both accept optional `SpawnConfiguration` and `Context::Handle*`.
+Both are available as free functions (prefer these) or as `Cooperator` methods.
 
 ### Launchable (`coop/launchable.h`)
 OOP alternative to lambda spawning. Subclass, implement `virtual void Launch() final`. Instance is
@@ -81,7 +101,7 @@ struct MyHandler : Launchable {
     virtual void Launch() final { /* runs on own context */ }
     io::Descriptor m_fd;
 };
-co->Launch<MyHandler>(fd, co, ...);
+Launch<MyHandler>(fd, ...);
 ```
 
 ### Coordinator (`coop/coordinator.h`)

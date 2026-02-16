@@ -44,16 +44,19 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
         return false;
     }
 
-    auto* alloc = AllocateContext(config);
+    SpawnConfiguration actual = config;
+    actual.stackSize = StackPool::RoundUpStackSize(config.stackSize);
+
+    auto* alloc = m_stackPool.Allocate(actual.stackSize);
     if (!alloc)
     {
         return false;
     }
 
-    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
+    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, handle, this);
     m_contexts.Push(spawnCtx);
 
-    assert(sizeof(Fn) <= config.stackSize);
+    assert(sizeof(Fn) <= actual.stackSize);
     new (spawnCtx->m_segment.Bottom()) Fn(fn);
 
     spawnCtx->m_entry = &SpawnTrampoline<Fn>;
@@ -72,16 +75,19 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
         return nullptr;
     }
 
-    auto* alloc = AllocateContext(config);
+    SpawnConfiguration actual = config;
+    actual.stackSize = StackPool::RoundUpStackSize(config.stackSize);
+
+    auto* alloc = m_stackPool.Allocate(actual.stackSize);
     if (!alloc)
     {
         return nullptr;
     }
 
-    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, config, handle, this);
+    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, handle, this);
     m_contexts.Push(spawnCtx);
 
-    assert(sizeof(T) <= config.stackSize);
+    assert(sizeof(T) <= actual.stackSize);
     auto* launchable = new (spawnCtx->m_segment.Bottom()) T(
         spawnCtx,
         std::forward<Args>(args)...

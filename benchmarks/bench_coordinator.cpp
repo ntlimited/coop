@@ -58,9 +58,7 @@ static void BM_AcquireRelease(benchmark::State& state)
 }
 BENCHMARK(BM_AcquireRelease);
 
-// CoordinateWith on one unheld coordinator. Measures the overhead of kill-signal integration
-// (MultiCoordinator try kill → fail/arm → try user coord → succeed → undo kill hookup) versus
-// raw acquire/release.
+// CoordinateWith on one unheld coordinator. Pure multi-coordinator path, no kill signal.
 //
 static void BM_CoordinateWith_1Coord(benchmark::State& state)
 {
@@ -77,7 +75,26 @@ static void BM_CoordinateWith_1Coord(benchmark::State& state)
 }
 BENCHMARK(BM_CoordinateWith_1Coord);
 
-// CoordinateWith with two unheld coordinators. Measures MultiCoordinator scaling.
+// CoordinateWithKill on one unheld coordinator. Measures the overhead of kill-signal integration
+// (MultiCoordinator try kill -> fail/arm -> try user coord -> succeed -> undo kill hookup) versus
+// raw CoordinateWith.
+//
+static void BM_CoordinateWithKill_1Coord(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        coop::Coordinator coord;
+        for (auto _ : state)
+        {
+            auto result = coop::CoordinateWithKill(ctx, &coord);
+            benchmark::DoNotOptimize(result.coordinator);
+            coord.Release(ctx, false);
+        }
+    });
+}
+BENCHMARK(BM_CoordinateWithKill_1Coord);
+
+// CoordinateWith with two unheld coordinators. Measures MultiCoordinator scaling, no kill signal.
 //
 static void BM_CoordinateWith_2Coords(benchmark::State& state)
 {
@@ -93,6 +110,23 @@ static void BM_CoordinateWith_2Coords(benchmark::State& state)
     });
 }
 BENCHMARK(BM_CoordinateWith_2Coords);
+
+// CoordinateWithKill with two unheld coordinators. Kill signal + two user coordinators.
+//
+static void BM_CoordinateWithKill_2Coords(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        coop::Coordinator c1, c2;
+        for (auto _ : state)
+        {
+            auto result = coop::CoordinateWithKill(ctx, &c1, &c2);
+            benchmark::DoNotOptimize(result.coordinator);
+            result.coordinator->Release(ctx, false);
+        }
+    });
+}
+BENCHMARK(BM_CoordinateWithKill_2Coords);
 
 // CoordinateWith with one unheld coordinator + a timeout that never fires. Measures timer
 // setup + cancel overhead on the fast path.
@@ -111,6 +145,24 @@ static void BM_CoordinateWith_Timeout_NoFire(benchmark::State& state)
     });
 }
 BENCHMARK(BM_CoordinateWith_Timeout_NoFire);
+
+// CoordinateWithKill with one unheld coordinator + a timeout that never fires.
+//
+static void BM_CoordinateWithKill_Timeout_NoFire(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        coop::Coordinator coord;
+        for (auto _ : state)
+        {
+            auto result = coop::CoordinateWithKill(
+                ctx, &coord, std::chrono::milliseconds(1000));
+            benchmark::DoNotOptimize(result.coordinator);
+            coord.Release(ctx, false);
+        }
+    });
+}
+BENCHMARK(BM_CoordinateWithKill_Timeout_NoFire);
 
 // ---------------------------------------------------------------------------
 // Contended: two contexts, ping-pong context switching
@@ -163,8 +215,7 @@ static void BM_PingPong_Raw(benchmark::State& state)
 }
 BENCHMARK(BM_PingPong_Raw);
 
-// Same ping-pong but child uses CoordinateWith instead of raw Acquire. Measures CoordinateWith
-// overhead in the blocking (slow) path.
+// Same ping-pong but child uses CoordinateWith (no kill signal) instead of raw Acquire.
 //
 static void BM_PingPong_CoordinateWith(benchmark::State& state)
 {
@@ -206,12 +257,55 @@ static void BM_PingPong_CoordinateWith(benchmark::State& state)
 }
 BENCHMARK(BM_PingPong_CoordinateWith);
 
+// Same ping-pong but child uses CoordinateWithKill (kill signal included). Measures the overhead
+// of kill-signal integration in the blocking (slow) path.
+//
+static void BM_PingPong_CoordinateWithKill(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        coop::Coordinator c1, c2;
+        c1.TryAcquire(ctx);
+        c2.TryAcquire(ctx);
+
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            while (!done)
+            {
+                auto r = coop::CoordinateWithKill(child, &c1);
+                c1.Release(child, false);
+                if (done) break;
+                r = coop::CoordinateWithKill(child, &c2);
+                c2.Release(child, false);
+            }
+        });
+
+        // Child is now blocked inside CoordinateWithKill on c1
+        //
+        for (auto _ : state)
+        {
+            c1.Release(ctx, true);
+            c1.TryAcquire(ctx);
+            c2.Release(ctx, true);
+            c2.TryAcquire(ctx);
+        }
+
+        // Let the child exit
+        //
+        done = true;
+        c1.Release(ctx, true);
+    });
+}
+BENCHMARK(BM_PingPong_CoordinateWithKill);
+
 // ---------------------------------------------------------------------------
 // Kill signal
 // ---------------------------------------------------------------------------
 
-// Spawn a child that blocks on a coordinator via CoordinateWith, immediately kill it, yield to
-// let cleanup run. Measures the full spawn + kill + cleanup cycle.
+// Spawn a child that blocks on a coordinator via CoordinateWithKill, immediately kill it, yield
+// to let cleanup run. Measures the full spawn + kill + cleanup cycle.
 //
 static void BM_SpawnAndKill(benchmark::State& state)
 {
@@ -224,11 +318,11 @@ static void BM_SpawnAndKill(benchmark::State& state)
 
             ctx->GetCooperator()->Spawn([&](coop::Context* child)
             {
-                auto result = coop::CoordinateWith(child, &coord);
+                auto result = coop::CoordinateWithKill(child, &coord);
                 benchmark::DoNotOptimize(result.Killed());
             }, &handle);
 
-            // Child is blocked inside CoordinateWith. Kill it.
+            // Child is blocked inside CoordinateWithKill. Kill it.
             //
             handle.Kill();
 
@@ -246,23 +340,21 @@ BENCHMARK(BM_SpawnAndKill);
 // Timeout fires
 // ---------------------------------------------------------------------------
 
-// CoordinateWith with a held coordinator + timeout that actually fires. Measures the real timeout
-// path including timer firing and wakeup. The interval must be large enough to resolve to a
-// non-zero tick count at the default ticker resolution (>>3, i.e. 8ms granularity); 50ms lands
-// in bucket 0 and fires on the next epoch change. Will naturally run fewer iterations due to
-// wall-clock cost.
+// CoordinateWithKill with a held coordinator + timeout that actually fires. Measures the real
+// timeout path including timer firing and wakeup.
 //
-static void BM_CoordinateWith_Timeout_Fires(benchmark::State& state)
+static void BM_CoordinateWithKill_Timeout_Fires(benchmark::State& state)
 {
     RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
     {
         for (auto _ : state)
         {
             coop::Coordinator coord(ctx);
-            auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(1));
+            auto result = coop::CoordinateWithKill(
+                ctx, &coord, std::chrono::milliseconds(1));
             benchmark::DoNotOptimize(result.TimedOut());
             coord.Release(ctx, false);
         }
     });
 }
-BENCHMARK(BM_CoordinateWith_Timeout_Fires);
+BENCHMARK(BM_CoordinateWithKill_Timeout_Fires);

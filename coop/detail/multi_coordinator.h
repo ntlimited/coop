@@ -28,38 +28,32 @@ struct MultiCoordinator : CoordinatorExtension
 
     CoordinationResult Acquire(Context* ctx)
     {
-        size_t idx;
-        for (idx = 0 ; idx < C ; idx++)
+        // Fast path: try all coordinators without hooking up to wait lists. Scheduling is
+        // cooperative so no coordinator state can change between TryAcquire calls — the
+        // separation into two passes is safe.
+        //
+        for (size_t idx = 0 ; idx < C ; idx++)
         {
             if (m_underlying[idx]->TryAcquire(ctx))
             {
-                break;
+                return CoordinationResult{ idx, m_underlying[idx] };
             }
+        }
+
+        // Slow path: all TryAcquires failed. Hook up all coordinators and block.
+        //
+        for (size_t idx = 0 ; idx < C ; idx++)
+        {
             SetContext(&m_coordinateds[idx], ctx);
             AddAsBlocked(m_underlying[idx], &m_coordinateds[idx]);
         }
 
-        // If we are going to early exit, undo the hookups we did make.
-        //
-        if (idx < C)
-        {
-            for (size_t i = 0 ; i < idx ; i++)
-            {
-                RemoveAsBlocked(m_underlying[i], &m_coordinateds[i]);
-            }
-
-            SanityCheck();
-            return CoordinationResult{ idx, m_underlying[idx] };
-        }
-
-        // We have hooked up all of the conditions to wait for any of them to wake us
-        //
         Block(ctx);
 
         // Find which one(s) fired for us (in the event that we were unblocked but not immediately
         // scheduled).
         //
-        for (idx = 0 ; idx < C ; idx++)
+        for (size_t idx = 0 ; idx < C ; idx++)
         {
             if (!m_coordinateds[idx].Satisfied())
             {

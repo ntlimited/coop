@@ -25,6 +25,12 @@ void LaunchTrampoline(Context* ctx)
     reinterpret_cast<T*>(ctx->m_segment.Bottom())->Launch();
 }
 
+template<typename T>
+void LaunchCleanup(Context* ctx)
+{
+    reinterpret_cast<T*>(ctx->m_segment.Bottom())->~T();
+}
+
 template<typename Fn>
 bool Cooperator::Spawn(Fn const& fn, Context::Handle* handle /* = nullptr */)
 {
@@ -56,6 +62,7 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
 #pragma GCC diagnostic pop
 
     spawnCtx->m_entry = &SpawnTrampoline<Fn>;
+    spawnCtx->m_cleanup = nullptr;
     EnterContext(spawnCtx);
     return true;
 }
@@ -86,6 +93,7 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
     );
 
     spawnCtx->m_entry = &LaunchTrampoline<T>;
+    spawnCtx->m_cleanup = &LaunchCleanup<T>;
     EnterContext(spawnCtx);
     return launchable;
 }

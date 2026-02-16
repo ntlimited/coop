@@ -155,7 +155,8 @@ void Cooperator::Launch()
     bool shutdownKillDone = false;
 
     while (!m_yielded.IsEmpty() || !m_shutdown.load(std::memory_order_relaxed)
-                                 || !shutdownKillDone)
+                                 || !shutdownKillDone
+                                 || m_uring.PendingOps() > 0)
     {
         // When shutdown is requested, kill all live contexts from within the cooperator's
         // thread so they can exit naturally. This only needs to happen once; killed contexts
@@ -394,8 +395,16 @@ extern "C" void CoopContextEntry(coop::Context* ctx)
 {
     ctx->m_entry(ctx);
 
-    // Destructor must run while we're still on this context's stack so that kill signals can
-    // context-switch to waiters safely.
+    // Run Launchable destructor (if any) while the context is still alive and schedulable,
+    // since destruction may do cooperative IO (e.g. Descriptor Close).
+    //
+    if (ctx->m_cleanup)
+    {
+        ctx->m_cleanup(ctx);
+    }
+
+    // Context destructor must run while we're still on this context's stack so that kill signals
+    // can context-switch to waiters safely.
     //
     ctx->~Context();
 

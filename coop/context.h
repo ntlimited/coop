@@ -170,6 +170,12 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     //
     void (*m_entry)(Context*);
 
+    // Optional cleanup function called after m_entry returns but before ~Context(). Set by Launch
+    // to a typed destructor trampoline so Launchable subclasses get proper C++ destruction. Null
+    // for Spawn (lambdas are memcpy'd, not constructed).
+    //
+    void (*m_cleanup)(Context*);
+
     // Must be last member
     //
     Segment m_segment;

@@ -442,7 +442,9 @@ void Cooperator::EnterContext(Context* ctx)
     m_scheduled = ctx;
     ctx->m_lastRdtsc = now;
 
+#ifndef NDEBUG
     SanityCheck();
+#endif
 
     // Prepare the new context's stack for first entry via ContextSwitch
     //

@@ -242,6 +242,30 @@ CoordinationResult CoordinateWith(Args... args)
 template<typename... Args>
 CoordinationResult CoordinateWithKill(Context* ctx, Args... args)
 {
+    // Fast path for the common case: single Coordinator*, not killed, uncontended.
+    // Bypasses MultiCoordinator construction entirely — avoids 2 Coordinated objects,
+    // 2 array stores, and the TryAcquire loop overhead. This is the IO hot path
+    // (Handle::Wait calls CoordinateWithKill with a single Coordinator*).
+    //
+    // Safety: scheduling is cooperative, so nothing can change between IsKilled() and
+    // TryAcquire(). If TryAcquire succeeds we never blocked, so the kill signal never
+    // had a chance to fire. If TryAcquire fails, we fall through to the full
+    // MultiCoordinator path which multiplexes the kill signal properly.
+    //
+    if constexpr (sizeof...(Args) == 1 && (std::is_same_v<Args, Coordinator*> && ...))
+    {
+        if (ctx->IsKilled())
+        {
+            return CoordinationResult { static_cast<size_t>(-1), nullptr };
+        }
+
+        Coordinator* coord = [](Coordinator* c) { return c; }(args...);
+        if (coord->TryAcquire(ctx))
+        {
+            return CoordinationResult{0, coord};
+        }
+    }
+
     auto result = CoordinateWith(ctx, ctx->GetKilledSignal(), std::forward<Args>(args)...);
 
     // Kill signal fired (index 0)

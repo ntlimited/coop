@@ -52,6 +52,13 @@ struct Context
     //
     bool LoadPrivateKey(const char* pem, size_t len);
 
+    // Enable kernel TLS offload. When active, OpenSSL installs cipher state into the kernel
+    // after handshake so that subsequent send/recv bypasses userspace crypto entirely. Requires
+    // a TCP socket (not AF_UNIX) and a socket BIO connection. Must be called before any
+    // connections are created from this context.
+    //
+    void EnableKTLS();
+
     SSL_CTX* m_ctx;
     Mode     m_mode;
 };

@@ -17,14 +17,15 @@
 
 using namespace coop;
 
-// Demo program that sets up two TCP echo servers:
+// Demo program that sets up three TCP echo servers:
 //
 // - A plaintext echo server on port 8888
-// - A TLS echo server on port 8889
+// - A TLS echo server on port 8889 (memory BIO)
+// - A kTLS echo server on port 8890 (socket BIO + kernel TLS offload)
 //
-// A single acceptor context multiplexes both listening sockets using CoordinateWith to
+// A single acceptor context multiplexes all listening sockets using CoordinateWith to
 // demonstrate composing multiple async IO operations. The echo loop itself is transport-agnostic —
-// it operates on a Stream&, so plaintext and TLS handlers share the same core logic.
+// it operates on a Stream&, so plaintext, TLS, and kTLS handlers share the same core logic.
 //
 
 void EchoLoop(Context* ctx, io::Stream& stream)
@@ -60,7 +61,7 @@ struct EchoHandler : Launchable
         ctx->SetName("ConnectionHandler");
     }
 
-    // TLS constructor
+    // TLS constructor (memory BIO)
     //
     EchoHandler(Context* ctx, int fd, io::ssl::Context* sslCtx)
     : Launchable(ctx)
@@ -70,6 +71,18 @@ struct EchoHandler : Launchable
     , m_stream(&*m_secureStream)
     {
         ctx->SetName("TLSConnectionHandler");
+    }
+
+    // kTLS constructor (socket BIO — no staging buffer needed)
+    //
+    EchoHandler(Context* ctx, int fd, io::ssl::Context* sslCtx, io::ssl::SocketBio)
+    : Launchable(ctx)
+    , m_fd(fd)
+    , m_conn(std::in_place, *sslCtx, m_fd, io::ssl::SocketBio{})
+    , m_secureStream(std::in_place, *m_conn)
+    , m_stream(&*m_secureStream)
+    {
+        ctx->SetName("kTLSConnectionHandler");
     }
 
     virtual void Launch() final
@@ -119,8 +132,8 @@ int bind_and_listen(int port)
 
 void SpawningTask(Context* ctx, void*)
 {
-    spdlog::info("server starting plaintext=8888 tls=8889");
-    
+    spdlog::info("server starting plaintext=8888 tls=8889 ktls=8890");
+
     {
         // Search paths for static files — covers running from project root or from the bin directory
         //
@@ -135,8 +148,9 @@ void SpawningTask(Context* ctx, void*)
 
     int serverFd = bind_and_listen(8888);
     int tlsServerFd = bind_and_listen(8889);
+    int ktlsServerFd = bind_and_listen(8890);
 
-    // TLS configuration — shared across all TLS connections
+    // TLS configuration — shared across memory BIO connections
     //
     io::ssl::Context sslCtx(io::ssl::Mode::Server);
 
@@ -150,27 +164,43 @@ void SpawningTask(Context* ctx, void*)
     assert(keyLen > 0);
     assert(sslCtx.LoadPrivateKey(keyBuf, keyLen));
 
-    // EchoHandler embeds a 16KB TLS buffer, so it needs a larger stack than the default
+    // kTLS configuration — separate context with kTLS enabled
+    //
+    io::ssl::Context ktlsCtx(io::ssl::Mode::Server);
+    assert(ktlsCtx.LoadCertificate(certBuf, certLen));
+    assert(ktlsCtx.LoadPrivateKey(keyBuf, keyLen));
+    ktlsCtx.EnableKTLS();
+
+    // EchoHandler with memory BIO embeds a 16KB TLS buffer, so it needs a larger stack.
+    // kTLS handlers don't need the buffer, so they can use a smaller stack.
     //
     static constexpr SpawnConfiguration handlerConfig = {
         .priority = 0,
         .stackSize = 65536,
     };
 
+    static constexpr SpawnConfiguration ktlsHandlerConfig = {
+        .priority = 0,
+        .stackSize = 16384,
+    };
+
     ctx->SetName("Acceptor");
     io::Descriptor plaintextDesc(serverFd);
     io::Descriptor tlsDesc(tlsServerFd);
+    io::Descriptor ktlsDesc(ktlsServerFd);
 
-    Coordinator plaintextCoord, tlsCoord;
+    Coordinator plaintextCoord, tlsCoord, ktlsCoord;
     io::Handle plaintextHandle(ctx, plaintextDesc, &plaintextCoord);
     io::Handle tlsHandle(ctx, tlsDesc, &tlsCoord);
+    io::Handle ktlsHandle(ctx, ktlsDesc, &ktlsCoord);
 
     io::Accept(plaintextHandle);
     io::Accept(tlsHandle);
+    io::Accept(ktlsHandle);
 
     while (true)
     {
-        auto result = CoordinateWithKill(ctx, &plaintextCoord, &tlsCoord);
+        auto result = CoordinateWithKill(ctx, &plaintextCoord, &tlsCoord, &ktlsCoord);
         if (result.Killed()) break;
 
         if (result == plaintextCoord)
@@ -188,6 +218,14 @@ void SpawningTask(Context* ctx, void*)
             spdlog::info("tls accepted fd={}", fd);
             Launch<EchoHandler>(handlerConfig, fd, &sslCtx);
             io::Accept(tlsHandle);
+        }
+        else if (result == ktlsCoord)
+        {
+            int fd = ktlsHandle.Result();
+            ktlsCoord.Release(ctx, false);
+            spdlog::info("ktls accepted fd={}", fd);
+            Launch<EchoHandler>(ktlsHandlerConfig, fd, &ktlsCtx, io::ssl::SocketBio{});
+            io::Accept(ktlsHandle);
         }
     }
 

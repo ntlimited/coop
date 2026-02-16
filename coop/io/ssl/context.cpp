@@ -129,6 +129,12 @@ bool Context::LoadPrivateKey(const char* pem, size_t len)
     return true;
 }
 
+void Context::EnableKTLS()
+{
+    SSL_CTX_set_options(m_ctx, SSL_OP_ENABLE_KTLS);
+    spdlog::info("ssl ktls enabled");
+}
+
 } // end namespace coop::io::ssl
 } // end namespace coop::io
 } // end namespace coop

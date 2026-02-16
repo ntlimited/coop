@@ -4,6 +4,7 @@
 #include "close.h"
 #include "connect.h"
 #include "open.h"
+#include "poll.h"
 #include "read.h"
 #include "read_file.h"
 #include "recv.h"

@@ -121,5 +121,10 @@ add_executable(coop_benchmarks
     benchmarks/bench_io_baseline.cpp
     benchmarks/bench_scheduler.cpp
     benchmarks/bench_uring_config.cpp
+    benchmarks/bench_ssl.cpp
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
+
+add_executable(diag_ktls benchmarks/diag_ktls.cpp)
+target_link_libraries(diag_ktls PRIVATE coop)
+add_dependencies(diag_ktls test-certs)

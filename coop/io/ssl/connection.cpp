@@ -1,11 +1,17 @@
 #include "connection.h"
 
 #include <cassert>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <openssl/bio.h>
 #include <openssl/err.h>
 #include <spdlog/spdlog.h>
 
 #include "context.h"
 #include "coop/io/descriptor.h"
+#include "coop/io/poll.h"
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
 
@@ -38,6 +44,44 @@ Connection::Connection(Context& ctx, Descriptor& desc, char* buffer, size_t buff
     // SSL_set_bio transfers ownership of both BIOs to the SSL object — SSL_free will free them.
     //
     SSL_set_bio(m_ssl, m_rbio, m_wbio);
+
+    if (ctx.m_mode == Mode::Server)
+    {
+        SSL_set_accept_state(m_ssl);
+    }
+    else
+    {
+        SSL_set_connect_state(m_ssl);
+    }
+}
+
+Connection::Connection(Context& ctx, Descriptor& desc, SocketBio)
+: m_desc(desc)
+, m_buffer(nullptr)
+, m_bufferSize(0)
+{
+    m_ssl = SSL_new(ctx.m_ctx);
+    assert(m_ssl);
+
+    // Attach OpenSSL directly to the real socket fd. This lets OpenSSL install kTLS state
+    // into the kernel after handshake. SSL_set_fd creates socket BIOs internally.
+    //
+    SSL_set_fd(m_ssl, desc.m_fd);
+    m_rbio = nullptr;
+    m_wbio = nullptr;
+
+    // The socket must be non-blocking for cooperative handshake via io::Poll.
+    //
+    int flags = fcntl(desc.m_fd, F_GETFL, 0);
+    fcntl(desc.m_fd, F_SETFL, flags | O_NONBLOCK);
+
+    // Disable Nagle's algorithm. kTLS frames each write() as a complete TLS record. With Nagle
+    // enabled, the TCP layer may delay sending the record, causing the receiver to stall waiting
+    // for data sitting in the sender's buffer. This creates catastrophic O(n) per-byte overhead
+    // on loopback — 500x slower than plaintext at 16KB messages.
+    //
+    int on = 1;
+    setsockopt(desc.m_fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
 
     if (ctx.m_mode == Mode::Server)
     {
@@ -105,16 +149,83 @@ int Connection::FeedRead()
     return written;
 }
 
-// Drive the TLS handshake to completion. Loops calling SSL_do_handshake(), shuttling ciphertext
-// between the memory BIOs and the descriptor via FlushWrite/FeedRead on each WANT_READ or
-// WANT_WRITE cycle.
+// Dispatch to the appropriate handshake implementation based on the BIO mode.
+//
+int Connection::Handshake()
+{
+    if (m_buffer == nullptr)
+    {
+        return HandshakeSocketBio();
+    }
+    return HandshakeMemoryBio();
+}
+
+// Drive the socket BIO handshake cooperatively using io::Poll. OpenSSL operates on the real fd,
+// so WANT_READ/WANT_WRITE mean "the socket isn't ready" — we wait for readability/writability
+// via io_uring poll, then retry.
+//
+// After successful handshake, probes for kTLS activation. If the kernel accepted the cipher
+// state, subsequent Send/Recv bypass OpenSSL entirely.
+//
+int Connection::HandshakeSocketBio()
+{
+    spdlog::debug("ssl socket-bio handshake start fd={}", m_desc.m_fd);
+    for (;;)
+    {
+        int ret = SSL_do_handshake(m_ssl);
+        if (ret == 1)
+        {
+            // Probe kTLS activation
+            //
+            m_ktlsTx = BIO_get_ktls_send(SSL_get_wbio(m_ssl)) != 0;
+            m_ktlsRx = BIO_get_ktls_recv(SSL_get_rbio(m_ssl)) != 0;
+            spdlog::debug("ssl socket-bio handshake complete fd={} ktls_tx={} ktls_rx={}",
+                m_desc.m_fd, m_ktlsTx, m_ktlsRx);
+            return 0;
+        }
+
+        int err = SSL_get_error(m_ssl, ret);
+        switch (err)
+        {
+        case SSL_ERROR_WANT_READ:
+        {
+            spdlog::trace("ssl socket-bio handshake fd={} WANT_READ", m_desc.m_fd);
+            int r = io::Poll(m_desc, POLLIN);
+            if (r < 0)
+            {
+                spdlog::warn("ssl socket-bio handshake fd={} poll failed={}", m_desc.m_fd, r);
+                return -1;
+            }
+            break;
+        }
+
+        case SSL_ERROR_WANT_WRITE:
+        {
+            spdlog::trace("ssl socket-bio handshake fd={} WANT_WRITE", m_desc.m_fd);
+            int r = io::Poll(m_desc, POLLOUT);
+            if (r < 0)
+            {
+                spdlog::warn("ssl socket-bio handshake fd={} poll failed={}", m_desc.m_fd, r);
+                return -1;
+            }
+            break;
+        }
+
+        default:
+            spdlog::error("ssl socket-bio handshake fd={} failed err={}", m_desc.m_fd, err);
+            return -1;
+        }
+    }
+}
+
+// Drive the memory BIO handshake to completion. Loops calling SSL_do_handshake(), shuttling
+// ciphertext between the memory BIOs and the descriptor via FlushWrite/FeedRead on each
+// WANT_READ or WANT_WRITE cycle.
 //
 // This is naturally cooperative because io::Send and io::Recv yield the Context while waiting
 // for uring completions, so other Contexts run during the handshake's network round-trips.
 //
-// Returns 0 on success, negative on error.
-//
-int Connection::Handshake()
+int Connection::HandshakeMemoryBio()
 {
     spdlog::debug("ssl handshake start fd={}", m_desc.m_fd);
     for (;;)

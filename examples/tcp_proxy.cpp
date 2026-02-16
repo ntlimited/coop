@@ -57,8 +57,6 @@ struct ProxyHandler : coop::Launchable
         bool childDone = false;
 
         auto* ctx = GetContext();
-        auto* co = ctx->GetCooperator();
-
         coop::Context::Handle childHandle;
 
         // Child context: relay client -> upstream
@@ -67,7 +65,7 @@ struct ProxyHandler : coop::Launchable
         auto* clientPtr = &m_client;
         auto* childDonePtr = &childDone;
 
-        co->Spawn([=](coop::Context* childCtx)
+        coop::Spawn([=](coop::Context* childCtx)
         {
             childCtx->SetName("ClientToUpstream");
             char buf[BUFFER_SIZE];
@@ -169,12 +167,11 @@ void SpawningTask(coop::Context* ctx, void* arg)
         config->listenPort, config->upstreamIp, config->upstreamPort);
 
     int serverFd = bind_and_listen(config->listenPort);
-    auto* co = ctx->GetCooperator();
 
     auto* upstreamIp = config->upstreamIp;
     auto upstreamPort = config->upstreamPort;
 
-    co->Spawn([=](coop::Context* acceptCtx)
+    coop::Spawn([=](coop::Context* acceptCtx)
     {
         acceptCtx->SetName("Acceptor");
         coop::io::Descriptor desc(serverFd);
@@ -188,12 +185,12 @@ void SpawningTask(coop::Context* ctx, void* arg)
             }
 
             spdlog::info("proxy: accepted fd={}", fd);
-            co->Launch<ProxyHandler>(fd, upstreamIp, upstreamPort);
-            acceptCtx->Yield();
+            coop::Launch<ProxyHandler>(fd, upstreamIp, upstreamPort);
+            coop::Yield();
         }
     });
 
-    while (!co->IsShuttingDown())
+    while (!coop::IsShuttingDown())
     {
         ctx->Yield(true);
     }

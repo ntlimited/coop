@@ -16,8 +16,6 @@ void ClientTask(coop::Context* ctx, void* arg)
     spdlog::info("client starting mode={} port={}",
         useSsl ? "ssl" : "plaintext", useSsl ? 8889 : 8888);
 
-    auto* co = ctx->GetCooperator();
-
     coop::io::ssl::Context sslCtx(coop::io::ssl::Mode::Client);
     auto* sslCtxPtr = &sslCtx;
 
@@ -25,7 +23,7 @@ void ClientTask(coop::Context* ctx, void* arg)
 
     for (int i = 0 ; i < 16 ; i++)
     {
-        co->Spawn([co, sslCtxPtr, port, useSsl](coop::Context* childCtx)
+        coop::Spawn([sslCtxPtr, port, useSsl](coop::Context* childCtx)
         {
             int fd = socket(AF_INET , SOCK_STREAM | SOCK_NONBLOCK, 0);
             coop::io::Descriptor remote(fd);
@@ -73,7 +71,7 @@ void ClientTask(coop::Context* ctx, void* arg)
 
     // Yield until the shutdown handler shuts us down
     //
-    while (!co->IsShuttingDown())
+    while (!coop::IsShuttingDown())
     {
         ctx->Yield(true);
     }

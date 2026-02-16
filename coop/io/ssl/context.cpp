@@ -3,6 +3,7 @@
 #include <cassert>
 
 #include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
 
@@ -17,8 +18,24 @@ namespace io
 namespace ssl
 {
 
+// Suppress OpenSSL's atexit handler. SSL objects are created on the cooperator thread, which joins
+// before process exit. OPENSSL_cleanup's atexit handler then accesses freed per-thread state and
+// crashes. Must be called before the first SSL_CTX_new (which internally calls OPENSSL_init_ssl
+// and would register the atexit handler). Idempotent.
+//
+static SSL_CTX* CreateCtx(Mode mode)
+{
+    static bool initialized = [] {
+        OPENSSL_init_ssl(OPENSSL_INIT_NO_ATEXIT, nullptr);
+        return true;
+    }();
+    (void)initialized;
+
+    return SSL_CTX_new(mode == Mode::Server ? TLS_server_method() : TLS_client_method());
+}
+
 Context::Context(Mode mode)
-: m_ctx(SSL_CTX_new(mode == Mode::Server ? TLS_server_method() : TLS_client_method()))
+: m_ctx(CreateCtx(mode))
 , m_mode(mode)
 {
     assert(m_ctx);

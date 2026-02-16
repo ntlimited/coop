@@ -12,6 +12,8 @@ The `coop` project is a low level library for cooperative multitasking in C++. I
 coop/           - Source files (.cpp)
 build/debug/    - Debug build artifacts (git-ignored)
 build/release/  - Release build artifacts (git-ignored)
+tests/          - GTest code used to validate library behavior
+benchmarks/     - Benchmark code to evaluate performance of the library and of alternative idioms
 ```
 
 ## Coding Standards
@@ -262,3 +264,15 @@ serving as a fallback when no route matches.
 
 `SpawnStatusServer(co, port, staticPath)` provides a JSON API at `/api/status` and serves the
 dashboard from static files.
+
+# Debugging guidelines
+
+- Tests should be run in debug mode; release tests are not unimportant but should never be run
+  before debug tests pass.
+- Targetted usage of the gtest filter for changes is encouraged to save time, but run all tests
+  when called for - making foundational changes
+
+## Debugging Strategy
+
+- Running tests with GDB attached can save time, both for diagnosing potentially hanging tests
+  and investigating crashes that would be lost/harder to investigate after the process is dead

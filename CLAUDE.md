@@ -100,6 +100,9 @@ All IO goes through io_uring. Each operation has 4 variants:
 Key operations: `Accept`, `Recv`, `Send`, `Read`, `ReadFile`, `Open`, `Close`, `Shutdown`,
 `Connect`
 
+`Accept` args default to `nullptr, nullptr, 0` (addr, addrLen, flags) so existing `Accept(desc)`
+call sites continue to work. Pass a `sockaddr*` and `socklen_t*` to retrieve peer addresses.
+
 Blocking variant pattern:
 ```cpp
 int Recv(Descriptor& desc, void* buf, size_t size) {
@@ -109,6 +112,19 @@ int Recv(Descriptor& desc, void* buf, size_t size) {
     return handle;  // blocks, returns result via operator int()
 }
 ```
+
+**Connect** accepts either a dotted-quad IP or a hostname. Hostnames are resolved cooperatively
+via `Resolve4` (DNS over UDP through io_uring).
+
+**Resolve4** (`coop/io/resolve.h`) performs cooperative DNS resolution. Checks `/etc/hosts` first,
+then queries nameservers from `/etc/resolv.conf` over UDP. IPv4 (A records) only.
+```cpp
+int Resolve4(const char* hostname, struct in_addr* result);
+int Resolve4(const char* hostname, struct in_addr* result, time::Interval timeout);
+```
+Returns 0 on success, negative errno on failure (-ENOENT for NXDOMAIN, -ETIMEDOUT, -EAGAIN).
+Numeric addresses are detected and parsed directly without DNS. Config files are parsed lazily
+on first call and cached in file-static globals.
 
 `PlaintextStream` wraps a `Descriptor` for socket IO (`Recv`, `Send`, `SendAll`).
 `ReadFile(path, buf, bufSize)` reads an entire file, returns bytes read or negative errno.

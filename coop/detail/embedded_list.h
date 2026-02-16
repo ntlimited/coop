@@ -189,6 +189,15 @@ struct EmbeddedList
         return sentinel.next->Cast();
     }
 
+    // Returns the element after h, or nullptr if h is the last element.
+    //
+    Ptr Next(Hookups* h)
+    {
+        auto* n = h->next;
+        if (n == &sentinel) return nullptr;
+        return n->Cast();
+    }
+
     size_t Size() const
     {
         size_t n = 0;

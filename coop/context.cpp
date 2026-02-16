@@ -102,16 +102,44 @@ void Context::Unblock(Context* other, const bool schedule /* = true */)
 
 void Context::Kill(Context* other, const bool schedule /* = true */)
 {
-    // Kill children before firing the signal. When schedule=true, Notify may cause `other`
-    // to run and exit (freeing its memory), making other->m_children inaccessible afterward.
-    // Visit captures `next` before each callback, so children that exit and Detach during
-    // the iteration don't corrupt the traversal.
+    using ChildHookups = EmbeddedListHookups<Context, int, CONTEXT_LIST_CHILDREN>;
+
+    // Iterative post-order traversal: fire signals bottom-up so children are killed before
+    // parents. This avoids recursion, which would overflow the 16KB context stacks on deep
+    // trees. All descendants use schedule=false (no context switches during traversal);
+    // only the target itself uses the caller's schedule flag.
     //
-    other->m_children.Visit([&](Context* child)
+
+    // Descend to the leftmost leaf
+    //
+    auto* ctx = other;
+    while (!ctx->m_children.IsEmpty())
     {
-        Kill(child, schedule);
-        return true;
-    });
+        ctx = ctx->m_children.Peek();
+    }
+
+    // Process all descendants bottom-up
+    //
+    while (ctx != other)
+    {
+        ctx->m_killedSignal.Notify(ctx, false);
+
+        // Move to next sibling, or ascend if this was the last child
+        //
+        auto* next = ctx->m_parent->m_children.Next(static_cast<ChildHookups*>(ctx));
+        if (next)
+        {
+            ctx = next;
+            while (!ctx->m_children.IsEmpty())
+            {
+                ctx = ctx->m_children.Peek();
+            }
+        }
+        else
+        {
+            ctx = ctx->m_parent;
+        }
+    }
 
     other->m_killedSignal.Notify(other, schedule);
 }

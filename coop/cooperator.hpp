@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstring>
 #include <type_traits>
 
 #include "context.h"
@@ -55,14 +54,10 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
     m_contexts.Push(spawnCtx);
 
     assert(sizeof(Fn) <= config.stackSize);
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
-    memcpy(spawnCtx->m_segment.Bottom(), &fn, sizeof(Fn));
-#pragma GCC diagnostic pop
+    new (spawnCtx->m_segment.Bottom()) Fn(fn);
 
     spawnCtx->m_entry = &SpawnTrampoline<Fn>;
-    spawnCtx->m_cleanup = nullptr;
+    spawnCtx->m_cleanup = &LaunchCleanup<Fn>;
     EnterContext(spawnCtx);
     return true;
 }

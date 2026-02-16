@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Code coverage instrumentation (use with build/coverage)
+option(COOP_COVERAGE "Build with gcov coverage instrumentation" OFF)
+if(COOP_COVERAGE)
+    add_compile_options(--coverage -fno-inline)
+    add_link_options(--coverage)
+endif()
+
 # spdlog — header-only structured logging
 include(FetchContent)
 FetchContent_Declare(

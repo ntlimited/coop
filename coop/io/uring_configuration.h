@@ -29,6 +29,14 @@ struct UringConfiguration
     //
     bool coopTaskrun;
 
+    // IORING_SETUP_DEFER_TASKRUN: stronger variant of coopTaskrun. Task_work is only processed
+    // when the application explicitly requests it (io_uring_get_events), giving full control
+    // over when completions are processed. Requires SINGLE_ISSUER (always forced) and kernel
+    // 6.1+. Supersedes coopTaskrun — when both are set, deferTaskrun takes priority and
+    // coopTaskrun is used as the fallback if the kernel rejects DEFER_TASKRUN.
+    //
+    bool deferTaskrun;
+
     // IORING_SETUP_SINGLE_ISSUER is always forced and is not configurable — the cooperative
     // model guarantees only the cooperator's thread submits to the ring.
 };
@@ -39,7 +47,8 @@ static const UringConfiguration s_defaultUringConfiguration = {
     .taskName = "Uring",
     .sqpoll = false,
     .iopoll = false,
-    .coopTaskrun = false,
+    .coopTaskrun = true,
+    .deferTaskrun = false,
 };
 
 } // end namespace io

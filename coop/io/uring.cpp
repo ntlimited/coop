@@ -17,6 +17,9 @@
 #ifndef IORING_SETUP_TASKRUN_FLAG
 #define IORING_SETUP_TASKRUN_FLAG (1U << 9)
 #endif
+#ifndef IORING_SETUP_DEFER_TASKRUN
+#define IORING_SETUP_DEFER_TASKRUN (1U << 13)
+#endif
 
 namespace coop
 {
@@ -35,7 +38,15 @@ void Uring::Init()
     {
         flags |= IORING_SETUP_IOPOLL;
     }
-    if (m_config.coopTaskrun)
+    if (m_config.deferTaskrun)
+    {
+        // DEFER_TASKRUN supersedes COOP_TASKRUN — completions are only processed when
+        // explicitly requested via io_uring_get_events(). Requires SINGLE_ISSUER (always
+        // forced) and kernel 6.1+.
+        //
+        flags |= IORING_SETUP_DEFER_TASKRUN;
+    }
+    else if (m_config.coopTaskrun)
     {
         flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
     }
@@ -45,6 +56,17 @@ void Uring::Init()
     params.flags = flags;
 
     int ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
+    if (ret == -EINVAL && (flags & IORING_SETUP_DEFER_TASKRUN))
+    {
+        // DEFER_TASKRUN requires kernel 6.1+. Fall back to COOP_TASKRUN.
+        //
+        flags &= ~IORING_SETUP_DEFER_TASKRUN;
+        flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
+        spdlog::warn("uring init: DEFER_TASKRUN not supported, falling back to COOP_TASKRUN");
+        memset(&params, 0, sizeof(params));
+        params.flags = flags;
+        ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
+    }
     if (ret == -EINVAL && (flags & IORING_SETUP_SINGLE_ISSUER))
     {
         // SINGLE_ISSUER requires kernel 6.0+. Retry without it but keep user-requested flags.
@@ -64,6 +86,8 @@ void Uring::Init()
     assert(ret == 0);
     std::ignore = ret;
 
+    spdlog::info("uring init flags={:#x}", m_ring.flags);
+
     if (!m_registered.empty())
     {
         ret = io_uring_register_files(&m_ring, m_registered.data(), m_registered.size());
@@ -77,6 +101,14 @@ void Uring::Init()
 
 int Uring::Poll()
 {
+    // DEFER_TASKRUN: kernel won't process task_work until explicitly asked. Flush any deferred
+    // completions into the CQ before peeking.
+    //
+    if (m_ring.flags & IORING_SETUP_DEFER_TASKRUN)
+    {
+        io_uring_get_events(&m_ring);
+    }
+
     int dispatched = 0;
     struct io_uring_cqe* cqe;
 

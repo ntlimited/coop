@@ -119,6 +119,7 @@ static void BM_IO_RoundTrip_SQPoll_Impl(benchmark::State& state)
             .sqpoll = true,
             .iopoll = false,
             .coopTaskrun = false,
+            .deferTaskrun = false,
         },
     };
 

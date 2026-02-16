@@ -8,6 +8,7 @@
 
 #include "coop/context.h"
 #include "coop/cooperator.h"
+#include "coop/coordinator.h"
 #include "coop/self.h"
 #include "coop/thread.h"
 
@@ -301,3 +302,133 @@ static void BM_IO_PingPong_Scale_Registered(benchmark::State& s)
 }
 BENCHMARK(BM_IO_PingPong_Scale_Registered)
     ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64)->Arg(128)->Arg(256);
+
+// ---------------------------------------------------------------------------
+// 4. Async burst send
+// ---------------------------------------------------------------------------
+//
+// One context submits N async sends across N socketpairs, then waits for all completions.
+// With deferred submission: all N SQEs are batched into a single io_uring_submit() call
+// (triggered by Poll() after the first Wait blocks). The remaining N-1 Waits find their
+// coordinators already released and return immediately via the TryAcquire fast path.
+//
+// This measures the per-op overhead when SQE submission is amortized. Compared to N
+// sequential blocking sends (N submit syscalls), the burst pattern eliminates (N-1) submit
+// calls — each worth ~200-500ns.
+//
+static void BM_IO_AsyncBurstSend(benchmark::State& state)
+{
+    const int N = state.range(0);
+
+    RunBenchmark(state, [N](coop::Context* ctx, benchmark::State& state)
+    {
+        std::deque<coop::io::Descriptor> writers;
+        std::vector<int> readerFds(N);
+
+        for (int i = 0; i < N; i++)
+        {
+            int fds[2];
+            MakeSocketPair(fds);
+            writers.emplace_back(fds[0]);
+            readerFds[i] = fds[1];
+        }
+
+        char msg[MSG_SIZE] = {};
+        char buf[MSG_SIZE] = {};
+
+        // Aligned storage for Handles (non-movable)
+        //
+        struct alignas(coop::io::Handle) HandleSlot
+        {
+            char data[sizeof(coop::io::Handle)];
+        };
+
+        std::vector<HandleSlot> handleSlots(N);
+
+        for (auto _ : state)
+        {
+            // Fresh coordinators each iteration
+            //
+            std::vector<coop::Coordinator> coords(N);
+
+            // Phase 1: submit N async sends (SQEs fill, no submit)
+            //
+            for (int i = 0; i < N; i++)
+            {
+                auto* h = new (&handleSlots[i]) coop::io::Handle(
+                    ctx, writers[i], &coords[i]);
+                coop::io::Send(*h, msg, MSG_SIZE);
+            }
+
+            // Phase 2: wait for all completions. First Wait blocks, Poll submits
+            // all N SQEs in one batch. Remaining Waits are non-blocking.
+            //
+            for (int i = 0; i < N; i++)
+            {
+                auto* h = reinterpret_cast<coop::io::Handle*>(&handleSlots[i]);
+                h->Wait();
+            }
+
+            // Phase 3: destroy handles (all complete, destructors are no-ops)
+            //
+            for (int i = N - 1; i >= 0; i--)
+            {
+                reinterpret_cast<coop::io::Handle*>(&handleSlots[i])->~Handle();
+            }
+
+            // Drain received data (raw recv — not measured)
+            //
+            for (int i = 0; i < N; i++)
+            {
+                recv(readerFds[i], buf, MSG_SIZE, MSG_DONTWAIT);
+            }
+        }
+    });
+}
+BENCHMARK(BM_IO_AsyncBurstSend)
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32);
+
+// ---------------------------------------------------------------------------
+// 5. Sequential blocking send (baseline for comparison with burst)
+// ---------------------------------------------------------------------------
+//
+// Same N socketpairs, but sends are sequential and blocking — each one fills an SQE,
+// blocks, Poll submits that single SQE, CQE arrives, context resumes. N total submit
+// syscalls. Compare per-op cost against AsyncBurstSend.
+//
+static void BM_IO_SequentialSend(benchmark::State& state)
+{
+    const int N = state.range(0);
+
+    RunBenchmark(state, [N](coop::Context* ctx, benchmark::State& state)
+    {
+        std::deque<coop::io::Descriptor> writers;
+        std::vector<int> readerFds(N);
+
+        for (int i = 0; i < N; i++)
+        {
+            int fds[2];
+            MakeSocketPair(fds);
+            writers.emplace_back(fds[0]);
+            readerFds[i] = fds[1];
+        }
+
+        char msg[MSG_SIZE] = {};
+        char buf[MSG_SIZE] = {};
+
+        for (auto _ : state)
+        {
+            for (int i = 0; i < N; i++)
+            {
+                coop::io::Send(writers[i], msg, MSG_SIZE);
+            }
+
+            for (int i = 0; i < N; i++)
+            {
+                recv(readerFds[i], buf, MSG_SIZE, MSG_DONTWAIT);
+            }
+        }
+    });
+}
+BENCHMARK(BM_IO_SequentialSend)
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32);

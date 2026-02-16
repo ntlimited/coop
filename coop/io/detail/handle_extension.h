@@ -22,7 +22,7 @@ struct HandleExtension
 {
     static struct io_uring_sqe* GetSqe(Handle& h)
     {
-        return io_uring_get_sqe(&h.m_ring->m_ring);
+        return h.m_ring->GetSqe();
     }
 
     static int Fd(Handle& h)

@@ -39,9 +39,21 @@ struct Uring
 
     void Init();
 
-    // Process any available CQEs without blocking. Returns the number of CQEs dispatched.
+    // Submit any pending SQEs to the kernel. Returns the number of SQEs submitted (from
+    // io_uring_submit), or 0 if nothing was pending.
+    //
+    int Submit();
+
+    // Process any available CQEs without blocking. Submits pending SQEs first (deferred
+    // submission), then processes completions. Returns the number of CQEs dispatched.
     //
     int Poll();
+
+    // Get an SQE from the submission ring. If the ring is full, flushes pending SQEs to the
+    // kernel and retries. Returns nullptr only if the ring is truly exhausted (shouldn't happen
+    // in normal operation).
+    //
+    struct io_uring_sqe* GetSqe();
 
     void Run(Context* ctx);
 
@@ -60,6 +72,7 @@ struct Uring
     struct  io_uring m_ring;
     DescriptorList m_descriptors;
     int m_pendingOps{0};
+    int m_pendingSqes{0};
 
     // io_uring fd registration table. Slots contain the real fd or -1 for empty. Registration is
     // opt-in via the Descriptor(Registered, ...) constructor. When a descriptor is registered, its

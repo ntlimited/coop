@@ -4,7 +4,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "coop/multi_coordinator.h"
+#include "coop/detail/multi_coordinator.h"
 #include "coop/self.h"
 #include "coop/io/handle.h"
 #include "coop/io/timeout.h"
@@ -56,20 +56,6 @@ namespace detail
 //      ...
 //  }
 //
-// Golang-style switch over indices in the argument order:
-//
-//  switch (CoordinateWith(&timeoutCond, &lockCond))
-//  {
-//      case 0:
-//          // timeoutCond triggered first
-//          break;
-//      case 1:
-//          // lockCond triggered first
-//          break;
-//      default:
-//          // Context has been killed
-//  }
-//
 // The contract is, very specifically, that:
 //
 //      exactly one coordinator will have been taken ownership
@@ -80,8 +66,6 @@ namespace detail
 // reacquired. The selection policy is "leftmost wins" among user-supplied coordinators; kill always
 // takes priority over everything, and user coordinators take priority over the timeout.
 //
-// For direct access to the multi-coordinator mechanism without built-in kill or timeout handling,
-// use MultiCoordinator::Acquire directly.
 //
 
 namespace detail
@@ -90,7 +74,7 @@ namespace detail
 // Implementation for the non-timeout path. Kill signal is prepended at highest priority.
 //
 template<typename... Coords>
-AmbiResult CoordinateWithImpl(Context* ctx, Coords... coords)
+CoordinationResult CoordinateWithImpl(Context* ctx, Coords... coords)
 {
     auto* signal = ctx->GetKilledSignal();
     MultiCoordinator<Coordinator*, Coords...> mc(
@@ -100,7 +84,7 @@ AmbiResult CoordinateWithImpl(Context* ctx, Coords... coords)
     if (result.index == 0)
     {
         signal->ResetCoordinator();
-        return AmbiResult { static_cast<size_t>(-1), nullptr };
+        return CoordinationResult { static_cast<size_t>(-1), nullptr };
     }
 
     result.index -= 1;
@@ -113,7 +97,7 @@ AmbiResult CoordinateWithImpl(Context* ctx, Coords... coords)
 // cancels the pending timeout if it hasn't fired.
 //
 template<typename... Coords>
-AmbiResult CoordinateWithTimeoutImpl(Context* ctx, time::Interval timeout, Coords... coords)
+CoordinationResult CoordinateWithTimeoutImpl(Context* ctx, time::Interval timeout, Coords... coords)
 {
     auto* signal = ctx->GetKilledSignal();
 
@@ -121,7 +105,7 @@ AmbiResult CoordinateWithTimeoutImpl(Context* ctx, time::Interval timeout, Coord
     io::Handle timeoutHandle(ctx, GetUring(), &timeoutCoord);
     if (!io::Timeout(timeoutHandle, timeout))
     {
-        return AmbiResult { static_cast<size_t>(-3), nullptr };
+        return CoordinationResult { static_cast<size_t>(-3), nullptr };
     }
 
     // Order: [kill, user_coord1, ..., timeout]
@@ -135,13 +119,13 @@ AmbiResult CoordinateWithTimeoutImpl(Context* ctx, time::Interval timeout, Coord
     if (result.index == 0)
     {
         signal->ResetCoordinator();
-        return AmbiResult { static_cast<size_t>(-1), nullptr };
+        return CoordinationResult { static_cast<size_t>(-1), nullptr };
     }
 
     constexpr size_t timeoutIdx = sizeof...(Coords) + 1;
     if (result.index == timeoutIdx)
     {
-        return AmbiResult { static_cast<size_t>(-2), nullptr };
+        return CoordinationResult { static_cast<size_t>(-2), nullptr };
     }
 
     result.index -= 1;
@@ -152,7 +136,7 @@ AmbiResult CoordinateWithTimeoutImpl(Context* ctx, time::Interval timeout, Coord
 // an index sequence to forward just the coordinator arguments.
 //
 template<size_t... Is, typename Tuple>
-AmbiResult CoordinateWithTimeoutUnpack(Context* ctx, std::index_sequence<Is...>, Tuple& t)
+CoordinationResult CoordinateWithTimeoutUnpack(Context* ctx, std::index_sequence<Is...>, Tuple& t)
 {
     return CoordinateWithTimeoutImpl(
         ctx, std::get<std::tuple_size_v<Tuple> - 1>(t), std::get<Is>(t)...);
@@ -164,7 +148,7 @@ AmbiResult CoordinateWithTimeoutUnpack(Context* ctx, std::index_sequence<Is...>,
 // as a timeout; all other arguments must be Coordinator pointers.
 //
 template<typename... Args>
-detail::AmbiResult CoordinateWith(Context* ctx, Args... args)
+CoordinationResult CoordinateWith(Context* ctx, Args... args)
 {
     static_assert(sizeof...(Args) > 0,
         "CoordinateWith requires at least one argument.");
@@ -189,7 +173,7 @@ detail::AmbiResult CoordinateWith(Context* ctx, Args... args)
 // Convenience: use Self() as the context
 //
 template<typename... Args>
-detail::AmbiResult CoordinateWith(Args... args)
+CoordinationResult CoordinateWith(Args... args)
 {
     return CoordinateWith(Self(), std::forward<Args>(args)...);
 }

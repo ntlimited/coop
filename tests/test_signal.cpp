@@ -163,8 +163,7 @@ TEST(SignalTest, CoordinateWithReturnsCoordinator)
 
         auto result = coop::CoordinateWith(ctx, &coord);
         EXPECT_FALSE(result.Killed());
-        EXPECT_EQ(static_cast<size_t>(result), 0u);
-        EXPECT_TRUE(result.coordinator == &coord);
+        EXPECT_TRUE(result == coord);
 
         coord.Release(ctx, false);
     });
@@ -245,8 +244,7 @@ TEST(SignalTest, CoordinateWithCompletesBeforeTimeout)
         auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(5000));
         EXPECT_FALSE(result.TimedOut());
         EXPECT_FALSE(result.Killed());
-        EXPECT_EQ(static_cast<size_t>(result), 0u);
-        EXPECT_TRUE(result.coordinator == &coord);
+        EXPECT_TRUE(result == coord);
 
         coord.Release(ctx, false);
     });

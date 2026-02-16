@@ -10,6 +10,7 @@
 #include "cooperator_configuration.h"
 #include "detail/fixed_list.h"
 #include "spawn_configuration.h"
+#include "stack_pool.h"
 #include "io/uring.h"
 
 extern "C" void CoopContextEntry(coop::Context* ctx);
@@ -197,6 +198,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     Context*        m_scheduled;
 
     io::Uring       m_uring;
+    StackPool       m_stackPool;
 
     void*           m_sp{nullptr};
 
@@ -230,9 +232,6 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     static std::mutex        s_registryMutex;
     static RegistryList      s_registry;
 };
-
-void* AllocateContext(SpawnConfiguration const& config);
-void FreeContext(void* ptr, size_t stackSize);
 
 } // end namespace coop
 

@@ -37,7 +37,7 @@ bool Sleeper::Submit()
 
 bool Sleeper::Wait()
 {
-    auto result = CoordinateWith(m_context, &m_coordinator);
+    auto result = CoordinateWithKill(m_context, &m_coordinator);
     return !result.Killed();
 }
 

@@ -170,7 +170,7 @@ void SpawningTask(Context* ctx, void*)
 
     while (true)
     {
-        auto result = CoordinateWith(ctx, &plaintextCoord, &tlsCoord);
+        auto result = CoordinateWithKill(ctx, &plaintextCoord, &tlsCoord);
         if (result.Killed()) break;
 
         if (result == plaintextCoord)

@@ -115,9 +115,36 @@ Mutex facsimile — one context holds, others block in a FIFO queue.
 - `Release(ctx)` — unblocks head of wait list
 - `Flash(ctx)` — barrier: wait, acquire, release (serialization point)
 
+### CoordinateWith / CoordinateWithKill (`coop/coordinate_with.h`)
+`CoordinateWith` blocks the calling context until one of the given coordinators or signals is
+released. Arguments may be `Coordinator*` or `Signal*` in any combination, with an optional
+trailing `time::Interval` timeout. Signal arguments are converted internally and cleaned up
+automatically. **CoordinateWith does NOT implicitly include the kill signal.**
+
+`CoordinateWithKill` is sugar that prepends the context's kill signal as the first argument,
+delegates to `CoordinateWith`, and translates index 0 (kill) to the `Killed()` sentinel.
+```cpp
+auto result = CoordinateWith(ctx, &coord);           // no kill awareness
+auto result = CoordinateWithKill(ctx, &coord);       // kill-aware
+auto result = CoordinateWith(ctx, &signal, &coord);  // explicit Signal*
+auto result = CoordinateWith(ctx, &coord, timeout);  // with timeout
+auto result = CoordinateWithKill(ctx, &coord, timeout); // kill + timeout
+```
+Both have `(Args...)` convenience overloads that use `Self()` as the context.
+
+**Single-arg fast path**: `CoordinateWithImpl` bypasses `MultiCoordinator` for a single argument,
+using `Acquire` directly. This generates much smaller code that the compiler inlines.
+
+**Two-pass TryAcquire**: `MultiCoordinator::Acquire` tries all coordinators without hooking up
+to wait lists first. Since scheduling is cooperative, no coordinator state can change between
+TryAcquire calls. Only if all fail does it hook up and block. This eliminates
+`AddAsBlocked`/`RemoveAsBlocked` on the uncontended fast path (~60% of cycles previously).
+
 ### CoordinationResult (`coop/coordination_result.h`)
-Return type of `CoordinateWith`. Wraps the acquired `Coordinator*` with sentinel detection:
-- `Killed()` / `TimedOut()` / `Error()` — check sentinel conditions
+Return type of `CoordinateWith` / `CoordinateWithKill`. Wraps the acquired `Coordinator*` with
+sentinel detection:
+- `Killed()` — only possible from `CoordinateWithKill`
+- `TimedOut()` / `Error()` — check sentinel conditions
 - `operator Coordinator*()` / `operator->()` — access the acquired coordinator
 - `operator==(Coordinator*)` / `operator==(const Coordinator&)` — pointer comparison
 
@@ -144,7 +171,7 @@ while (has yielded contexts OR not shutdown OR shutdown kill not done):
 **Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and wakes the submission semaphore.
 The loop spawns a temporary kill context that visits all live contexts and fires their kill
 signals (`schedule=false` → moved to yielded, not immediately switched to). All blocking IO is
-kill-aware (via `CoordinateWith` in `Wait()`), so contexts blocked in `Recv`, `Accept`,
+kill-aware (via `CoordinateWithKill` in `Wait()`), so contexts blocked in `Recv`, `Accept`,
 etc. wake up and return `-ECANCELED` when killed.
 
 **Important**: the loop condition includes `!shutdownKillDone` (guarantees the kill logic runs
@@ -155,8 +182,11 @@ poll io_uring for cancel CQEs while Handle destructors drain in-flight operation
 **Construction**: parent registers child in `m_children` list; first child `TryAcquire`s the
 parent's `m_lastChild` coordinator (holds it so the parent's destructor will block).
 
-**Kill propagation**: `Kill(other)` fires the target's `m_killedSignal` then recursively kills
-all children. Signal::Notify unblocks all waiters on the kill signal coordinator.
+**Kill propagation**: `Kill(other)` uses iterative post-order traversal (children before parents)
+to avoid stack overflow on deep trees. For each descendant: fires `m_killedSignal` with
+`schedule=false` (no context switches during traversal). For the target itself, fires with
+the caller's `schedule` flag. Contexts blocked on coordinators are woken via `CoordinateWithKill`'s
+kill signal multiplexing when they are next scheduled.
 
 **Destruction** (runs on the context's own stack, in `CoopContextEntry`):
 1. `Detach()` from parent — removes from children list; last child `Release`s `m_lastChild`
@@ -185,7 +215,7 @@ userdata): untagged → `Complete()`, tagged → `OnSecondaryComplete()`. Both c
 which decrements `m_pendingCqes`; when it hits 0, pops from descriptor list and calls
 `m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator).
 
-**Blocking pattern** (`Wait()`): calls `CoordinateWith(ctx, m_coord)` which multiplexes
+**Blocking pattern** (`Wait()`): calls `CoordinateWithKill(ctx, m_coord)` which multiplexes
 the Handle's coordinator with the context's kill signal. If the context is killed, returns
 `-ECANCELED` immediately; otherwise returns `m_result`. `Result()` provides non-blocking access
 to the cached result (asserts all CQEs are drained). This makes all blocking IO kill-aware.
@@ -203,11 +233,34 @@ polling io_uring during shutdown while cancel CQEs are still in flight.
 This means Handle destructors **cooperatively block** — the scheduler runs other contexts and
 polls io_uring during the Flash, which is how the cancel CQEs get processed.
 
-**Reuse after CoordinateWith**: when `CoordinateWith` returns, the winning coordinator was
-acquired by `MultiCoordinator`. Release it explicitly, then resubmit the async op (which calls
-`Submit` → `TryAcquire` again). The losing coordinator was never acquired by CoordinateWith
-(its ordinal was removed from the wait list), and the Handle's pending CQE will eventually
-fire and release it via `Finalize`.
+**Reuse after CoordinateWith(Kill)**: when `CoordinateWith` or `CoordinateWithKill` returns,
+the winning coordinator was acquired by `MultiCoordinator`. Release it explicitly, then resubmit
+the async op (which calls `Submit` → `TryAcquire` again). The losing coordinator was never
+acquired (its ordinal was removed from the wait list), and the Handle's pending CQE will
+eventually fire and release it via `Finalize`.
+
+### Uring Configuration (`coop/io/uring_configuration.h`, `coop/io/uring.cpp`)
+`UringConfiguration` controls io_uring setup flags. Key fields:
+- `coopTaskrun` (default **true**): `IORING_SETUP_COOP_TASKRUN` — defers kernel task_work to
+  the next `io_uring_enter()`. Natural fit: task_work runs during submission, so completions
+  are in the CQ by the time we peek. ~5% faster than bare at scale, lower variance.
+- `deferTaskrun`: `IORING_SETUP_DEFER_TASKRUN` — stronger variant, completions only appear
+  after explicit `io_uring_get_events()`. Gives full control but **adds ~20-30% overhead** in
+  coop's submit-then-wait pattern (extra kernel transition per Poll). Lower latency variance.
+  Use only when predictable completion timing matters more than throughput.
+- `SINGLE_ISSUER` is always forced (not configurable).
+
+**Benchmark finding**: `DEFER_TASKRUN` is consistently slower because coop's hot path is
+submit → block → wake-on-completion. With `COOP_TASKRUN`, task_work piggybacks on the submit
+`io_uring_enter()` for free. With `DEFER_TASKRUN`, `Poll()` must make a separate
+`io_uring_get_events()` syscall. See `bench_uring_config.cpp` for numbers.
+
+`Poll()` checks `m_ring.flags & IORING_SETUP_DEFER_TASKRUN` at runtime to decide whether to
+call `io_uring_get_events()` before peeking CQEs. This means the runtime behavior adapts to
+whatever the kernel actually accepted, independent of the requested config.
+
+`Init()` uses a progressive fallback chain: `DEFER_TASKRUN` → `COOP_TASKRUN` → `SINGLE_ISSUER`
+only → bare init. Each step logs a warning.
 
 ### IO (`coop/io/`)
 All IO goes through io_uring. Each operation has 4 variants:
@@ -228,7 +281,7 @@ int Recv(Descriptor& desc, void* buf, size_t size) {
     Coordinator coord;
     Handle handle(Self(), desc, &coord);
     if (!Recv(handle, buf, size)) return -EAGAIN;
-    return handle.Wait();  // blocks via CoordinateWith, returns result or -ECANCELED
+    return handle.Wait();  // blocks via CoordinateWithKill, returns result or -ECANCELED
 }
 ```
 
@@ -264,6 +317,36 @@ serving as a fallback when no route matches.
 
 `SpawnStatusServer(co, port, staticPath)` provides a JSON API at `/api/status` and serves the
 dashboard from static files.
+
+## Design Review
+
+These are red flags that should trigger pushback **before implementation**, even when the proposal
+is well-reasoned and the plan is detailed. A good idea with the wrong orientation is worse than no
+change — the cost of implementing and reverting far exceeds the cost of a harder conversation
+upfront.
+
+### Cleanup paths are sacred
+Destructor and RAII teardown paths must work unconditionally — including on killed contexts. Any
+change that requires an escape hatch (e.g. `AcquireAlways`) for cleanup to function is a design
+smell. If a proposed change breaks cleanup, the change is wrong, not the cleanup.
+
+### Opt-in vs opt-out orientation
+When a change inverts an opt-in pattern to opt-out (or vice versa), enumerate both sides before
+implementing: how many call sites benefit from the new default vs. how many need the escape hatch?
+If the escape hatch cases are harder to get right (destructors, error paths, less-tested code),
+the original orientation is probably correct. A small number of well-placed opt-in call sites is
+better than pervasive opt-out burden.
+
+### Escape hatches signal wrong direction
+If a "simplification" requires a new back-door API to preserve existing behavior for certain
+callers, that's strong evidence the simplification is pointed the wrong way. The need for an
+escape hatch means the change is adding complexity, not removing it — it's just moving the
+complexity to harder-to-audit places.
+
+### Complexity budget
+If a change touches more than ~5 files, introduces new friend declarations or extension classes,
+or discovers multiple crash bugs during implementation, stop and re-evaluate the premise. The
+implementation difficulty is signal about the design, not just about the implementation.
 
 # Debugging guidelines
 

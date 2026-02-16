@@ -122,7 +122,7 @@ TEST(SignalTest, WaitOnKillSignal)
     });
 }
 
-TEST(SignalTest, CoordinateWithReturnsKilled)
+TEST(SignalTest, CoordinateWithKillReturnsKilled)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
@@ -137,7 +137,7 @@ TEST(SignalTest, CoordinateWithReturnsKilled)
             //
             child->Yield(true);
 
-            auto result = coop::CoordinateWith(child, &coord);
+            auto result = coop::CoordinateWithKill(child, &coord);
             EXPECT_TRUE(result.Killed());
             EXPECT_EQ(result.coordinator, nullptr);
 
@@ -162,14 +162,14 @@ TEST(SignalTest, CoordinateWithReturnsCoordinator)
         coord.Release(ctx, false);
 
         auto result = coop::CoordinateWith(ctx, &coord);
-        EXPECT_FALSE(result.Killed());
+        EXPECT_EQ(result.index, 0u);
         EXPECT_TRUE(result == coord);
 
         coord.Release(ctx, false);
     });
 }
 
-TEST(SignalTest, CoordinateWithRepeated)
+TEST(SignalTest, CoordinateWithKillRepeated)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
@@ -181,28 +181,28 @@ TEST(SignalTest, CoordinateWithRepeated)
             coop::Coordinator coord;
             coord.TryAcquire(child);
 
-            // Yield so the parent can kill us before we call CoordinateWith
+            // Yield so the parent can kill us before we call CoordinateWithKill
             //
             child->Yield(true);
             EXPECT_TRUE(child->IsKilled());
 
-            // First CoordinateWith — signal already fired, so TryAcquire succeeds on the
+            // First CoordinateWithKill — signal already fired, so TryAcquire succeeds on the
             // signal's coordinator and re-arms m_heldBy.
             //
-            auto r1 = coop::CoordinateWith(child, &coord);
+            auto r1 = coop::CoordinateWithKill(child, &coord);
             EXPECT_TRUE(child->IsKilled());
 
-            // Second CoordinateWith — without proper cleanup, TryAcquire would fail on
+            // Second CoordinateWithKill — without proper cleanup, TryAcquire would fail on
             // the re-armed coordinator and deadlock here.
             //
-            auto r2 = coop::CoordinateWith(child, &coord);
+            auto r2 = coop::CoordinateWithKill(child, &coord);
             EXPECT_TRUE(child->IsKilled());
 
             coord.Release(child, false);
             completed = true;
         }, &handle);
 
-        // Kill the child, then yield to let it resume and run both CoordinateWith calls
+        // Kill the child, then yield to let it resume and run both CoordinateWithKill calls
         //
         handle.Kill();
         ctx->Yield(true);
@@ -221,7 +221,6 @@ TEST(SignalTest, CoordinateWithTimesOut)
 
         auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(50));
         EXPECT_TRUE(result.TimedOut());
-        EXPECT_FALSE(result.Killed());
         EXPECT_EQ(result.coordinator, nullptr);
 
         coord.Release(ctx, false);
@@ -243,7 +242,6 @@ TEST(SignalTest, CoordinateWithCompletesBeforeTimeout)
 
         auto result = coop::CoordinateWith(ctx, &coord, std::chrono::milliseconds(5000));
         EXPECT_FALSE(result.TimedOut());
-        EXPECT_FALSE(result.Killed());
         EXPECT_TRUE(result == coord);
 
         coord.Release(ctx, false);

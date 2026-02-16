@@ -146,7 +146,7 @@ void Handle::Cancel()
 
 int Handle::Wait()
 {
-    auto result = CoordinateWith(m_context, m_coord);
+    auto result = CoordinateWithKill(m_context, m_coord);
     if (result.Killed())
     {
         return -ECANCELED;

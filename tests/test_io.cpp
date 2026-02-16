@@ -129,7 +129,7 @@ TEST(IoTest, CancelPendingRecv)
         //
         handle.Cancel();
 
-        int result = handle;
+        int result = handle.Wait();
         EXPECT_EQ(result, -ECANCELED);
     });
 }

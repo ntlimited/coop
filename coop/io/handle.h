@@ -20,16 +20,62 @@ namespace io
 struct Descriptor;
 struct Uring;
 
-// Handle to an event being processed by io_uring. Because it needs to hook into the user data for
-// the SQE, note that it is responsible for completing the contract for the uring submission after
-// the initial io_uring_prep_... by the caller.
+namespace detail { struct HandleExtension; }
+
+// Handle to an event being processed by io_uring. Each Handle owns exactly one logical operation
+// and tracks all CQEs that operation will produce. The address of the Handle is passed to io_uring
+// as SQE userdata; CQE callbacks route back through it. This means the Handle MUST remain alive
+// and at a stable address until every CQE has been accounted for.
 //
-// Tagged pointer dispatch: Handle inherits EmbeddedListHookups<Handle> which contains two pointer
-// members (prev, next). This guarantees at least 8-byte alignment on all platforms, so the low 3
-// bits of any Handle* are always zero. We steal bit 0 to distinguish primary CQEs (the operation
-// itself) from secondary/tagged CQEs (cancel acknowledgments, linked timeout completions). This
-// lets io_uring operations that produce two CQEs (cancel, linked timeout) route each CQE to the
-// correct handler without additional bookkeeping structures.
+// Lifecycle
+// ---------
+//
+//   Submit(sqe)                               CQE arrives (uring Poll)
+//       │                                          │
+//       ▼                                          ▼
+//   ┌─────────┐   Complete/OnSecondary    ┌──────────────┐
+//   │SUBMITTED├──────────────────────────►│  Finalize()  │
+//   │ cqes=1  │   (each CQE decrements)  │  --cqes > 0? │
+//   └────┬────┘                           └──────┬───────┘
+//        │                                       │ cqes == 0
+//        │ Cancel()                              ▼
+//        │ (submits cancel SQE,           ┌────────────┐
+//        │  ++cqes)                       │  COMPLETE   │
+//        ▼                                │  Pop, Rel.  │
+//   ┌──────────┐   cancel + orig CQEs     │  --pending  │
+//   │CANCELLING├─────────────────────────►└────────────┘
+//   │ cqes=2+  │   (via Finalize)
+//   └──────────┘
+//
+// The coordinator is TryAcquire'd at Submit and Release'd at Finalize(cqes==0). External code
+// blocks on the coordinator (via Flash or CoordinateWith) to wait for completion.
+//
+// Blocking IO (Wait)
+//
+//   The blocking IO macros call `return handle.Wait()` which uses CoordinateWith to multiplex
+//   the Handle's coordinator with the context's kill signal. If the context is killed, Wait()
+//   returns -ECANCELED immediately. The Handle destructor then runs Cancel + Flash to drain
+//   any remaining CQEs before the stack unwinds.
+//
+// Destructor safety
+//
+//   If pendingCqes > 0 when the Handle is destroyed (typical during shutdown — the context was
+//   killed before the IO completed), the destructor submits a cancel and blocks via Flash:
+//
+//       ~Handle:  Cancel() ──► Flash() ──► [blocked] ──► CQEs arrive ──► [unblocked] ──► done
+//
+//   Flash blocks the context cooperatively, which preserves the stack frame and therefore the
+//   Handle's address. The cooperator loop keeps polling uring (guarded by PendingOps > 0) so
+//   the cancel CQE arrives promptly — typically on the very next Poll() cycle. Only after all
+//   CQEs have been processed and pendingCqes reaches zero does the destructor return and the
+//   stack frame unwind.
+//
+// Tagged pointer dispatch
+//
+//   Handle inherits EmbeddedListHookups<Handle> which contains two pointer members (prev, next).
+//   This guarantees at least 8-byte alignment, so the low 3 bits of any Handle* are always zero.
+//   Bit 0 is stolen to distinguish primary CQEs (the operation itself) from secondary CQEs
+//   (cancel acknowledgments, linked timeout completions).
 //
 struct Handle : EmbeddedListHookups<Handle>
 {
@@ -42,7 +88,17 @@ struct Handle : EmbeddedListHookups<Handle>
     Handle(Context*, Uring*, Coordinator*);
     ~Handle();
 
-    operator int();
+    // Block until the operation completes or the context is killed. Uses CoordinateWith to
+    // multiplex the Handle's coordinator with the context's kill signal.
+    //
+    int Wait();
+
+    // Return the cached result. Only valid after all CQEs have been accounted for (asserts
+    // m_pendingCqes == 0).
+    //
+    int Result() const;
+
+    bool TimedOut() const { return m_timedOut; }
 
     void Submit(struct io_uring_sqe*);
 
@@ -58,8 +114,6 @@ struct Handle : EmbeddedListHookups<Handle>
     //
     void Cancel();
 
-    bool TimedOut() const { return m_timedOut; }
-
     // Invoked when the primary completion queue event is received (untagged pointer).
     //
     void Complete(struct io_uring_cqe*);
@@ -73,8 +127,19 @@ struct Handle : EmbeddedListHookups<Handle>
     //
     static void Callback(struct io_uring_cqe* cqe);
 
-    // TODO visibility
+private:
+    friend struct detail::HandleExtension;
+
+    // Submit with a linked timeout using a pre-populated m_timeout. Called by SubmitWithTimeout
+    // after converting the interval.
     //
+    void SubmitLinked(struct io_uring_sqe*);
+
+    // Shared finalization logic. Decrements m_pendingCqes and only releases the coordinator
+    // when it hits zero.
+    //
+    void Finalize();
+
     Uring*          m_ring;
     Descriptor*     m_descriptor;
     Coordinator*    m_coord;
@@ -85,17 +150,6 @@ struct Handle : EmbeddedListHookups<Handle>
     bool    m_timedOut;
 
     struct __kernel_timespec m_timeout;
-
-private:
-    // Submit with a linked timeout using a pre-populated m_timeout. Called by SubmitWithTimeout
-    // after converting the interval.
-    //
-    void SubmitLinked(struct io_uring_sqe*);
-
-    // Shared finalization logic. Decrements m_pendingCqes and only releases the coordinator
-    // when it hits zero.
-    //
-    void Finalize();
 };
 
 } // end namespace coop::io

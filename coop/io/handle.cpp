@@ -10,6 +10,7 @@
 #include "uring.h"
 
 #include "coop/context.h"
+#include "coop/coordinate_with.h"
 #include "coop/coordinator.h"
 
 namespace coop
@@ -62,6 +63,7 @@ void Handle::Submit(struct io_uring_sqe* sqe)
 
     m_timedOut = false;
     m_pendingCqes = 1;
+    m_ring->m_pendingOps++;
     m_coord->TryAcquire(m_context);
     if (m_descriptor)
     {
@@ -93,6 +95,7 @@ void Handle::SubmitLinked(struct io_uring_sqe* sqe)
 
     m_timedOut = false;
     m_pendingCqes = 2;
+    m_ring->m_pendingOps++;
     m_coord->TryAcquire(m_context);
     if (m_descriptor)
     {
@@ -141,9 +144,19 @@ void Handle::Cancel()
     m_pendingCqes++;
 }
 
-Handle::operator int()
+int Handle::Wait()
 {
-    m_coord->Flash(m_context);
+    auto result = CoordinateWith(m_context, m_coord);
+    if (result.Killed())
+    {
+        return -ECANCELED;
+    }
+    return m_result;
+}
+
+int Handle::Result() const
+{
+    assert(m_pendingCqes == 0);
     return m_result;
 }
 
@@ -153,6 +166,8 @@ void Handle::Finalize()
     {
         return;
     }
+
+    m_ring->m_pendingOps--;
 
     if (m_descriptor)
     {

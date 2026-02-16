@@ -1,5 +1,6 @@
 #pragma once
 
+#include "coop/io/detail/handle_extension.h"
 #include "coop/time/interval.h"
 
 // Visitor projections for operation argument lists.
@@ -28,12 +29,12 @@
 #define COOP_IO_ASYNC_IMPL(name, prep_fn, ARGS)                                         \
     bool name(Handle& handle ARGS(COOP_IO_ARG_DEF))                                     \
     {                                                                                    \
-        auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);                           \
+        auto* sqe = detail::HandleExtension::GetSqe(handle);                           \
         if (!sqe)                                                                        \
         {                                                                                \
             return false;                                                                \
         }                                                                                \
-        prep_fn(sqe, handle.m_descriptor->m_fd ARGS(COOP_IO_ARG_FWD));                  \
+        prep_fn(sqe, detail::HandleExtension::Fd(handle) ARGS(COOP_IO_ARG_FWD));                  \
         handle.Submit(sqe);                                                              \
         return true;                                                                     \
     }
@@ -41,12 +42,12 @@
 #define COOP_IO_ASYNC_TIMEOUT_IMPL(name, prep_fn, ARGS)                                 \
     bool name(Handle& handle ARGS(COOP_IO_ARG_DEF), time::Interval timeout)             \
     {                                                                                    \
-        auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);                           \
+        auto* sqe = detail::HandleExtension::GetSqe(handle);                           \
         if (!sqe)                                                                        \
         {                                                                                \
             return false;                                                                \
         }                                                                                \
-        prep_fn(sqe, handle.m_descriptor->m_fd ARGS(COOP_IO_ARG_FWD));                  \
+        prep_fn(sqe, detail::HandleExtension::Fd(handle) ARGS(COOP_IO_ARG_FWD));                  \
         handle.SubmitWithTimeout(sqe, timeout);                                          \
         return true;                                                                     \
     }
@@ -60,7 +61,7 @@
         {                                                                                \
             return -EAGAIN;                                                              \
         }                                                                                \
-        return handle;                                                                   \
+        return handle.Wait();                                                                   \
     }
 
 #define COOP_IO_BLOCKING_TIMEOUT_IMPL(name, ARGS)                                       \
@@ -72,7 +73,7 @@
         {                                                                                \
             return -EAGAIN;                                                              \
         }                                                                                \
-        int result = handle;                                                             \
+        int result = handle.Wait();                                                             \
         if (handle.TimedOut())                                                           \
         {                                                                                \
             return -ETIMEDOUT;                                                           \
@@ -113,7 +114,7 @@
 #define COOP_IO_URING_ASYNC_IMPL(name, prep_fn, ARGS)                                    \
     bool name(Handle& handle ARGS(COOP_IO_ARG_DEF))                                      \
     {                                                                                     \
-        auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);                            \
+        auto* sqe = detail::HandleExtension::GetSqe(handle);                            \
         if (!sqe)                                                                         \
         {                                                                                 \
             return false;                                                                 \
@@ -126,7 +127,7 @@
 #define COOP_IO_URING_ASYNC_TIMEOUT_IMPL(name, prep_fn, ARGS)                            \
     bool name(Handle& handle ARGS(COOP_IO_ARG_DEF), time::Interval timeout)              \
     {                                                                                     \
-        auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);                            \
+        auto* sqe = detail::HandleExtension::GetSqe(handle);                            \
         if (!sqe)                                                                         \
         {                                                                                 \
             return false;                                                                 \
@@ -146,7 +147,7 @@
         {                                                                                 \
             return -EAGAIN;                                                               \
         }                                                                                 \
-        return handle;                                                                    \
+        return handle.Wait();                                                                    \
     }
 
 #define COOP_IO_URING_BLOCKING_TIMEOUT_IMPL(name, ARGS)                                   \
@@ -159,7 +160,7 @@
         {                                                                                 \
             return -EAGAIN;                                                               \
         }                                                                                 \
-        int result = handle;                                                              \
+        int result = handle.Wait();                                                              \
         if (handle.TimedOut())                                                            \
         {                                                                                 \
             return -ETIMEDOUT;                                                            \

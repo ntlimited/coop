@@ -19,7 +19,7 @@ namespace coop
 namespace io
 {
 
-bool Accept(Handle& handle, Descriptor& desc)
+bool Accept(Handle& handle, struct sockaddr* addr, socklen_t* addrLen)
 {
     auto* sqe = io_uring_get_sqe(&handle.m_ring->m_ring);
     if (!sqe)
@@ -27,22 +27,17 @@ bool Accept(Handle& handle, Descriptor& desc)
         return false;
     }
 
-    // In this flavor, throwing these away
-    //
-    static struct ::sockaddr_in addrIn;
-    static socklen_t addrLen;
-
-    spdlog::trace("accept fd={}", desc.m_fd);
-    io_uring_prep_accept(sqe, desc.m_fd, (struct sockaddr*)&addrIn, &addrLen, 0);
+    spdlog::trace("accept fd={}", handle.m_descriptor->m_fd);
+    io_uring_prep_accept(sqe, handle.m_descriptor->m_fd, addr, addrLen, 0);
     handle.Submit(sqe);
     return true;
 }
 
-int Accept(Descriptor& desc)
+int Accept(Descriptor& desc, struct sockaddr* addr, socklen_t* addrLen)
 {
     Coordinator coord;
     Handle handle(Self(), desc, &coord);
-    if (!Accept(handle, desc))
+    if (!Accept(handle, addr, addrLen))
     {
         return -EAGAIN;
     }

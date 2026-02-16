@@ -211,6 +211,23 @@ struct EmbeddedList
         h->Pop();
     }
 
+    // Move all items from `other` into this list. This list must be empty. After the call,
+    // `other` is empty and all items are linked through this list's sentinel.
+    //
+    void Steal(EmbeddedList& other)
+    {
+        assert(IsEmpty());
+        if (other.IsEmpty()) return;
+
+        sentinel.next = other.sentinel.next;
+        sentinel.prev = other.sentinel.prev;
+        sentinel.next->prev = &sentinel;
+        sentinel.prev->next = &sentinel;
+
+        other.sentinel.next = &other.sentinel;
+        other.sentinel.prev = &other.sentinel;
+    }
+
     void SanityCheck(Hookups* checkFor = nullptr)
     {
         bool found = false;

@@ -4,6 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef NDEBUG
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "cooperator.h"
 #include "detail/context_switch.h"
 #include "launchable.h"
@@ -116,7 +121,7 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         }
         case SchedulerJumpResult::EXITED:
         {
-            free(m_scheduled);
+            FreeContext(m_scheduled, m_scheduled->m_segment.Size());
             break;
         }
         case SchedulerJumpResult::YIELDED:
@@ -621,19 +626,57 @@ int64_t Cooperator::rdtsc() const
     return static_cast<int64_t>((uint64_t)hi << 32 | lo);
 }
 
-void DeleteContext(Context* ctx)
+#ifndef NDEBUG
+
+// Debug: mmap with guard pages on both sides to catch stack overflow (bottom) and buffer
+// overruns (top) with an immediate SIGSEGV instead of silent corruption.
+//
+void* AllocateContext(SpawnConfiguration const& config)
 {
-    memset(ctx, 0xD0, sizeof(Context));
-    free(ctx);
+    assert((config.stackSize & 127) == 0);
+
+    static const size_t kPageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+
+    size_t usable = sizeof(Context) + config.stackSize;
+    size_t usableAligned = (usable + kPageSize - 1) & ~(kPageSize - 1);
+    size_t total = kPageSize + usableAligned + kPageSize;
+
+    void* base = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) return nullptr;
+
+    mprotect(base, kPageSize, PROT_NONE);
+    mprotect(static_cast<uint8_t*>(base) + kPageSize + usableAligned, kPageSize, PROT_NONE);
+
+    return static_cast<uint8_t*>(base) + kPageSize;
 }
+
+// Takes stack size so we don't read from the destroyed Context. The segment size is read
+// before munmap in the caller; after ~Context() the bytes are still intact (no zeroing).
+//
+void FreeContext(void* ptr, size_t stackSize)
+{
+    static const size_t kPageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+
+    size_t usable = sizeof(Context) + stackSize;
+    size_t usableAligned = (usable + kPageSize - 1) & ~(kPageSize - 1);
+    size_t total = kPageSize + usableAligned + kPageSize;
+
+    void* base = static_cast<uint8_t*>(ptr) - kPageSize;
+    munmap(base, total);
+}
+
+#else
 
 void* AllocateContext(SpawnConfiguration const& config)
 {
-    // Enforce 128 byte alignment at both top and bottom
-    //
     assert((config.stackSize & 127) == 0);
     return malloc(sizeof(Context) + config.stackSize);
 }
+
+void FreeContext(void* ptr, size_t) { free(ptr); }
+
+#endif
 
 thread_local Cooperator* Cooperator::thread_cooperator;
 

@@ -232,6 +232,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 };
 
 void* AllocateContext(SpawnConfiguration const& config);
+void FreeContext(void* ptr, size_t stackSize);
 
 } // end namespace coop
 

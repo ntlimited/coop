@@ -99,11 +99,65 @@ void Uring::Init()
     }
 }
 
+int Uring::Submit()
+{
+    if (m_pendingSqes <= 0)
+    {
+        return 0;
+    }
+
+    int submitted = io_uring_submit(&m_ring);
+    m_pendingSqes = 0;
+    return submitted;
+}
+
+struct io_uring_sqe* Uring::GetSqe()
+{
+    auto* sqe = io_uring_get_sqe(&m_ring);
+    if (!sqe)
+    {
+        // SQ ring is full — flush pending SQEs and retry
+        //
+        io_uring_submit(&m_ring);
+        m_pendingSqes = 0;
+        sqe = io_uring_get_sqe(&m_ring);
+    }
+    if (sqe)
+    {
+        m_pendingSqes++;
+    }
+    return sqe;
+}
+
 int Uring::Poll()
 {
-    // DEFER_TASKRUN: kernel won't process task_work until explicitly asked. Flush any deferred
-    // completions into the CQ before peeking.
+    // Check whether io_uring_submit() is needed before calling it. Poll() is invoked after
+    // every context Resume() in the scheduler loop, and most resumes don't produce SQEs (pure
+    // yields, coordinator-only operations). Checking here avoids io_uring_submit()'s internal
+    // bookkeeping (__io_uring_flush_sq + sq_ring_needs_enter) on the nothing-to-do path —
+    // roughly 5-10ns per call, ~2-3% of the yield hot path.
     //
+    // Two conditions require a submit:
+    //   1. m_pendingSqes > 0: new SQEs from Handle::Submit/SubmitLinked/Cancel need flushing.
+    //      io_uring_enter() also runs task_work as a side effect, so this covers both.
+    //   2. IORING_SQ_TASKRUN flag set (COOP_TASKRUN mode only): the kernel completed an
+    //      operation and has pending task_work to deliver. Without flushing, CQEs won't appear
+    //      in the CQ ring and blocked contexts would never wake. The flag is a volatile read
+    //      from kernel-mapped memory (sq.kflags); SINGLE_ISSUER keeps it uncontended.
+    //
+    // Note: liburing also checks CQ overflow inside sq_ring_needs_enter(). We skip that here;
+    // CQ overflow is pathological (means CQEs aren't being drained fast enough) and the next
+    // real submit catches it. Not worth an extra branch on every Poll().
+    //
+    // For DEFER_TASKRUN: io_uring_submit() cannot flush deferred completions (it doesn't pass
+    // IORING_ENTER_GETEVENTS when submitted==0). io_uring_get_events() is required separately.
+    //
+    if (m_pendingSqes > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN))
+    {
+        io_uring_submit(&m_ring);
+        m_pendingSqes = 0;
+    }
+
     if (m_ring.flags & IORING_SETUP_DEFER_TASKRUN)
     {
         io_uring_get_events(&m_ring);
@@ -122,7 +176,9 @@ int Uring::Poll()
     return dispatched;
 }
 
-// Work loop for non-native urings that run as a dedicated context
+// Work loop for non-native urings that run as a dedicated context. Poll() handles both
+// submitting pending SQEs and processing CQEs, so the yield-poll loop naturally batches
+// SQEs filled by other contexts between scheduling rounds.
 //
 void Uring::Run(Context* ctx)
 {

@@ -77,7 +77,6 @@ void Handle::Submit(struct io_uring_sqe* sqe)
     }
 
     io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(this));
-    io_uring_submit(&m_ring->m_ring);
 }
 
 void Handle::SubmitWithTimeout(struct io_uring_sqe* sqe, time::Interval timeout)
@@ -115,13 +114,11 @@ void Handle::SubmitLinked(struct io_uring_sqe* sqe)
 
     // Second SQE: linked timeout with tagged pointer (bit 0 set)
     //
-    auto* timeout_sqe = io_uring_get_sqe(&m_ring->m_ring);
+    auto* timeout_sqe = m_ring->GetSqe();
     assert(timeout_sqe);
     io_uring_prep_link_timeout(timeout_sqe, &m_timeout, 0);
     io_uring_sqe_set_data(timeout_sqe, reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(this) | 1));
-
-    io_uring_submit(&m_ring->m_ring);
 }
 
 void Handle::Cancel()
@@ -131,7 +128,7 @@ void Handle::Cancel()
         return;
     }
 
-    auto* sqe = io_uring_get_sqe(&m_ring->m_ring);
+    auto* sqe = m_ring->GetSqe();
     assert(sqe);
 
     // Cancel targets the original SQE by its userdata (untagged `this`). The cancel SQE's own
@@ -140,7 +137,6 @@ void Handle::Cancel()
     io_uring_prep_cancel(sqe, reinterpret_cast<void*>(this), 0);
     io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(this) | 1));
-    io_uring_submit(&m_ring->m_ring);
     m_pendingCqes++;
 }
 

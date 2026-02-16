@@ -87,6 +87,22 @@ Launch<MyHandler>(config, fd, ...);
 Launch<MyHandler>(args...);
 ```
 
+### StackPool (`coop/stack_pool.h`)
+Size-class allocator for context stack segments, owned by `Cooperator`. Eliminates
+`mmap`/`munmap` (debug) or `malloc`/`free` (release) syscalls on the spawn/exit hot path.
+
+**Buckets**: 6 power-of-2 sizes from 4KB to 128KB. Requests are rounded up via
+`RoundUpStackSize()`. Allocations larger than 128KB bypass the pool. Each bucket caches up to
+32 freed segments via an intrusive `FreeNode*` overlay on dead memory.
+
+**Allocation path**: `Spawn`/`Launch` call `m_stackPool.Allocate(roundedSize)` — checks the
+free list first, falls back to `RawAllocate` (mmap+guard pages in debug, malloc in release).
+`HandleCooperatorResumption(EXITED)` calls `m_stackPool.Free(ptr, size)` — returns to the
+free list (evicting oldest on cap), or `RawFree` if the bucket is full.
+
+Stack sizes in `SpawnConfiguration` are transparently rounded up, so contexts may get slightly
+more stack than requested (strictly better).
+
 ### Spawn vs Launch (`coop/cooperator.h`)
 Two ways to create contexts:
 - `bool Spawn(Fn const& fn)` — lambda copied to context stack, for simple one-off tasks
@@ -139,6 +155,13 @@ using `Acquire` directly. This generates much smaller code that the compiler inl
 to wait lists first. Since scheduling is cooperative, no coordinator state can change between
 TryAcquire calls. Only if all fail does it hook up and block. This eliminates
 `AddAsBlocked`/`RemoveAsBlocked` on the uncontended fast path (~60% of cycles previously).
+
+**CoordinateWithKill fast path**: for the common case of a single `Coordinator*` argument
+(the IO hot path — `Handle::Wait`), `CoordinateWithKill` has a `constexpr if` specialization
+that checks `IsKilled()` then `TryAcquire()` before falling through to the full
+`CoordinateWith` path. This avoids constructing a 2-arg `MultiCoordinator` (kill signal +
+coordinator) on every uncontended IO wait. Safety: cooperative scheduling means nothing changes
+between the two checks; if TryAcquire fails, the full multiplexed path handles it correctly.
 
 ### CoordinationResult (`coop/coordination_result.h`)
 Return type of `CoordinateWith` / `CoordinateWithKill`. Wraps the acquired `Coordinator*` with
@@ -196,7 +219,8 @@ kill signal multiplexing when they are next scheduled.
 5. Remove from cooperator's `m_contexts` list
 
 After `~Context()`, `CoopContextEntry` does `ContextSwitch(EXITED)` back to the cooperator,
-which calls `free()` on the context's allocation.
+which returns the allocation to the `StackPool` for reuse (or frees it if the pool bucket is
+full).
 
 **Launchable note**: instances are placement-new'd onto the context's stack segment. Their C++
 destructors run via `m_cleanup` (a typed destructor trampoline set by `Launch<T>`) after
@@ -207,8 +231,11 @@ PlaintextStream, etc.) to use RAII normally — their destructors may do coopera
 An `io::Handle` ties an io_uring SQE to a `Coordinator` for synchronization.
 
 **Submission**: `Submit(sqe)` calls `m_coord->TryAcquire(m_context)` (holds the coordinator),
-sets `m_pendingCqes = 1`, pushes onto descriptor's handle list, and submits to io_uring.
-`SubmitLinked` (for timeouts) sets `m_pendingCqes = 2` and links a timeout SQE.
+sets `m_pendingCqes = 1`, and pushes onto descriptor's handle list. The SQE is **not** submitted
+to the kernel immediately — it remains in the SQ ring until `Uring::Poll()` calls
+`io_uring_submit()` (deferred submission). `SubmitLinked` (for timeouts) sets `m_pendingCqes = 2`
+and links a timeout SQE. All SQE acquisition goes through `Uring::GetSqe()` which self-corrects
+on SQ ring exhaustion by flushing pending SQEs.
 
 **Completion**: io_uring CQE arrives → `Callback` dispatches via tagged pointer (bit 0 of
 userdata): untagged → `Complete()`, tagged → `OnSecondaryComplete()`. Both call `Finalize()`
@@ -255,9 +282,23 @@ submit → block → wake-on-completion. With `COOP_TASKRUN`, task_work piggybac
 `io_uring_enter()` for free. With `DEFER_TASKRUN`, `Poll()` must make a separate
 `io_uring_get_events()` syscall. See `bench_uring_config.cpp` for numbers.
 
-`Poll()` checks `m_ring.flags & IORING_SETUP_DEFER_TASKRUN` at runtime to decide whether to
-call `io_uring_get_events()` before peeking CQEs. This means the runtime behavior adapts to
-whatever the kernel actually accepted, independent of the requested config.
+**Deferred submission**: SQEs are not submitted to the kernel at `Handle::Submit()` time.
+Instead, `Uring::Poll()` calls `io_uring_submit()` unconditionally before processing CQEs.
+This batches multiple SQEs from a single context resume (or across resumes if poll frequency
+is reduced) into one `io_uring_enter()` syscall. For `COOP_TASKRUN`, this also flushes pending task_work.
+For `DEFER_TASKRUN`, `io_uring_get_events()` is additionally called since `io_uring_submit()`
+alone cannot flush deferred completions. `Uring::GetSqe()` provides self-correcting SQE
+acquisition: if the SQ ring is full, it flushes pending SQEs and retries.
+
+`Poll()` checks `m_pendingSqes > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN)` before calling
+`io_uring_submit()`. The `IORING_SQ_TASKRUN` flag (a volatile read from kernel-mapped SQ ring
+memory) is set by the kernel when completions are pending under `COOP_TASKRUN` mode. When
+neither SQEs nor task_work are pending — the common case on pure-yield resumes — the submit
+is skipped entirely, saving ~9ns per Poll() (~3% of yield cost).
+
+**Non-native urings** (running as dedicated contexts via `Uring::Run()`) use the same deferred
+model — their `Poll()` submits + processes CQEs on each scheduling round. IO latency is bounded
+by the round-robin cycle time.
 
 `Init()` uses a progressive fallback chain: `DEFER_TASKRUN` → `COOP_TASKRUN` → `SINGLE_ISSUER`
 only → bare init. Each step logs a warning.

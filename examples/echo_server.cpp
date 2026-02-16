@@ -175,7 +175,7 @@ void SpawningTask(Context* ctx, void*)
 
         if (result == plaintextCoord)
         {
-            int fd = plaintextHandle.m_result;
+            int fd = plaintextHandle.Result();
             plaintextCoord.Release(ctx, false);
             spdlog::info("plaintext accepted fd={}", fd);
             Launch<EchoHandler>(handlerConfig, fd);
@@ -183,7 +183,7 @@ void SpawningTask(Context* ctx, void*)
         }
         else if (result == tlsCoord)
         {
-            int fd = tlsHandle.m_result;
+            int fd = tlsHandle.Result();
             tlsCoord.Release(ctx, false);
             spdlog::info("tls accepted fd={}", fd);
             Launch<EchoHandler>(handlerConfig, fd, &sslCtx);

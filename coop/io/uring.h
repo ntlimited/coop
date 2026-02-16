@@ -35,6 +35,8 @@ struct Uring
         memset(&m_ring, 0, sizeof(m_ring));
     }
 
+    int PendingOps() const { return m_pendingOps; }
+
     void Init();
 
     // Process any available CQEs without blocking. Returns the number of CQEs dispatched.
@@ -47,6 +49,7 @@ struct Uring
     //
 
     friend struct Descriptor;
+    friend struct Handle;
 
     // Register/Unregister handle kernel fd registration only. The descriptor list is managed
     // directly by Descriptor constructors/destructors.
@@ -56,6 +59,7 @@ struct Uring
 
     struct  io_uring m_ring;
     DescriptorList m_descriptors;
+    int m_pendingOps{0};
 
     // io_uring fd registration table. Slots contain the real fd or -1 for empty. Registration is
     // opt-in via the Descriptor(Registered, ...) constructor. When a descriptor is registered, its

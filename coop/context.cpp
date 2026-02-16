@@ -102,13 +102,18 @@ void Context::Unblock(Context* other, const bool schedule /* = true */)
 
 void Context::Kill(Context* other, const bool schedule /* = true */)
 {
-    other->m_killedSignal.Notify(other, schedule);
-
+    // Kill children before firing the signal. When schedule=true, Notify may cause `other`
+    // to run and exit (freeing its memory), making other->m_children inaccessible afterward.
+    // Visit captures `next` before each callback, so children that exit and Detach during
+    // the iteration don't corrupt the traversal.
+    //
     other->m_children.Visit([&](Context* child)
     {
         Kill(child, schedule);
         return true;
     });
+
+    other->m_killedSignal.Notify(other, schedule);
 }
 
 } // end namespace coop

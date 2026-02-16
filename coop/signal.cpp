@@ -30,9 +30,14 @@ void Signal::Notify(Context* ctx, bool schedule /* = true */)
     m_signaled = true;
     m_coord.m_heldBy = nullptr;
 
-    // Unblock everyone waiting on the signal
+    // Steal the blocking list into a local before unblocking anyone. When schedule=true,
+    // Unblock context-switches to the waiter immediately; if that waiter exits, the context
+    // owning this signal is freed and the coordinator's sentinel becomes inaccessible.
     //
-    while (auto* ord = m_coord.m_blocking.Pop())
+    Coordinated::List local;
+    local.Steal(m_coord.m_blocking);
+
+    while (auto* ord = local.Pop())
     {
         ord->Satisfy();
         ctx->Unblock(ord->GetContext(), schedule);

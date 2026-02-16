@@ -63,6 +63,9 @@ ctx->Detach();          // disassociate from parent
 ```
 Contexts form a parent-child tree. Killing a parent kills its children.
 
+**Naming note**: `Context::Handle` is a lifecycle handle to a spawned context (for kill/tracking).
+`io::Handle` is an io_uring operation handle (for async IO). They are unrelated.
+
 ### Free Functions (`coop/self.h`, `coop/cooperator.hpp`)
 Thread-local convenience functions that avoid explicit cooperator/context references:
 ```cpp
@@ -138,12 +141,13 @@ while (has yielded contexts OR not shutdown OR shutdown kill not done):
 
 **Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and wakes the submission semaphore.
 The loop spawns a temporary kill context that visits all live contexts and fires their kill
-signals (`schedule=false` → moved to yielded, not immediately switched to). Contexts blocked in
-kill-aware primitives (CoordinateWith, Signal::Wait) get unblocked; contexts in raw blocking IO
-(e.g. `Recv`) stay blocked until their CQE arrives.
+signals (`schedule=false` → moved to yielded, not immediately switched to). All blocking IO is
+kill-aware (via `CoordinateWith` in `Wait()`), so contexts blocked in `Recv`, `Accept`,
+etc. wake up and return `-ECANCELED` when killed.
 
-**Important**: the loop condition must include `!shutdownKillDone` to guarantee the kill logic
-runs even when all contexts are blocked (no yielded contexts at the time shutdown fires).
+**Important**: the loop condition includes `!shutdownKillDone` (guarantees the kill logic runs
+even when all contexts are blocked) and `m_uring.PendingOps() > 0` (keeps the loop alive to
+poll io_uring for cancel CQEs while Handle destructors drain in-flight operations).
 
 ### Context Lifecycle (`coop/context.cpp`)
 **Construction**: parent registers child in `m_children` list; first child `TryAcquire`s the
@@ -163,8 +167,9 @@ After `~Context()`, `CoopContextEntry` does `ContextSwitch(EXITED)` back to the 
 which calls `free()` on the context's allocation.
 
 **Launchable note**: instances are placement-new'd onto the context's stack segment. Their C++
-destructors are **never called** — the stack is freed wholesale. Any RAII cleanup in Launchable
-members does not run.
+destructors run via `m_cleanup` (a typed destructor trampoline set by `Launch<T>`) after
+`m_entry` returns but before `~Context()`. This allows Launchable members (Descriptor,
+PlaintextStream, etc.) to use RAII normally — their destructors may do cooperative IO.
 
 ### IO Handle Lifecycle (`coop/io/handle.cpp`)
 An `io::Handle` ties an io_uring SQE to a `Coordinator` for synchronization.
@@ -178,8 +183,18 @@ userdata): untagged → `Complete()`, tagged → `OnSecondaryComplete()`. Both c
 which decrements `m_pendingCqes`; when it hits 0, pops from descriptor list and calls
 `m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator).
 
-**Blocking pattern** (`operator int()`): calls `m_coord->Flash(ctx)` which does
-`Acquire` (blocks until CQE fires and releases) then `Release`.
+**Blocking pattern** (`Wait()`): calls `CoordinateWith(ctx, m_coord)` which multiplexes
+the Handle's coordinator with the context's kill signal. If the context is killed, returns
+`-ECANCELED` immediately; otherwise returns `m_result`. `Result()` provides non-blocking access
+to the cached result (asserts all CQEs are drained). This makes all blocking IO kill-aware.
+
+**Encapsulation**: Handle fields are private. Internal access from IO operation macros and
+implementation files goes through `detail::HandleExtension` (friend struct), which exposes
+`GetSqe`, `Fd`, and `Timeout` static methods.
+
+**PendingOps tracking**: `Submit`/`SubmitLinked` increment `m_ring->m_pendingOps`; `Finalize`
+decrements it when `m_pendingCqes` reaches 0. The cooperator loop uses this counter to keep
+polling io_uring during shutdown while cancel CQEs are still in flight.
 
 **Destruction**: if `m_pendingCqes > 0`, submits `IORING_OP_ASYNC_CANCEL` (increments
 `m_pendingCqes` for the cancel CQE), then `m_coord->Flash(ctx)` to block until all CQEs drain.
@@ -211,7 +226,7 @@ int Recv(Descriptor& desc, void* buf, size_t size) {
     Coordinator coord;
     Handle handle(Self(), desc, &coord);
     if (!Recv(handle, buf, size)) return -EAGAIN;
-    return handle;  // blocks, returns result via operator int()
+    return handle.Wait();  // blocks via CoordinateWith, returns result or -ECANCELED
 }
 ```
 

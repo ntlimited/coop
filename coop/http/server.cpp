@@ -65,11 +65,11 @@ struct HttpConnection : Launchable
                    const char* const* searchPaths)
     : Launchable(ctx)
     , m_fd(fd)
+    , m_stream(m_fd)
     , m_co(co)
     , m_routes(routes)
     , m_routeCount(routeCount)
     , m_searchPaths(searchPaths)
-    , m_stream(m_fd)
     {
         ctx->SetName("HttpConnection");
     }
@@ -165,11 +165,11 @@ struct HttpConnection : Launchable
     }
 
     io::Descriptor      m_fd;
+    io::PlaintextStream m_stream;
     Cooperator*         m_co;
     const Route*        m_routes;
     int                 m_routeCount;
     const char* const*  m_searchPaths;
-    io::PlaintextStream m_stream;
 };
 
 } // end anonymous namespace
@@ -213,7 +213,10 @@ void RunServer(
             break;
         }
 
-        co->Launch<HttpConnection>(fd, co, routes, routeCount, searchPaths);
+        // HttpConnection stack-allocates a 64KB file read buffer, so it needs a larger stack
+        //
+        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 131072};
+        co->Launch<HttpConnection>(config, fd, co, routes, routeCount, searchPaths);
         ctx->Yield();
     }
 }

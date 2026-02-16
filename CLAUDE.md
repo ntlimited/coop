@@ -118,6 +118,80 @@ Return type of `CoordinateWith`. Wraps the acquired `Coordinator*` with sentinel
 
 No `operator size_t()`. The `index` field is internal to `MultiCoordinator` / `CoordinateWith`.
 
+### Scheduler Internals (`coop/cooperator.cpp`)
+Contexts have three states: `YIELDED` (runnable), `RUNNING` (active on the cooperator's thread),
+and `BLOCKED` (waiting for a coordinator release, e.g. IO completion or lock acquisition).
+
+The cooperator loop in `Cooperator::Launch()`:
+```
+while (has yielded contexts OR not shutdown OR shutdown kill not done):
+    1. If shutdown requested and kill not done: spawn kill context (kills all others)
+    2. If yielded list empty:
+       a. Poll io_uring (may move blocked → yielded)
+       b. If still empty and blocked exist: try SpawnSubmitted(false), continue
+       c. If nothing at all: SpawnSubmitted(true) blocks waiting for external Submit()
+    3. Pop up to 16 yielded contexts, Resume each one:
+       - After each Resume returns (context yielded/blocked/exited): poll io_uring
+       - This interleaved polling is critical — CQE processing between context
+         resumes is what unblocks Handle::Flash barriers during destruction
+```
+
+**Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and wakes the submission semaphore.
+The loop spawns a temporary kill context that visits all live contexts and fires their kill
+signals (`schedule=false` → moved to yielded, not immediately switched to). Contexts blocked in
+kill-aware primitives (CoordinateWith, Signal::Wait) get unblocked; contexts in raw blocking IO
+(e.g. `Recv`) stay blocked until their CQE arrives.
+
+**Important**: the loop condition must include `!shutdownKillDone` to guarantee the kill logic
+runs even when all contexts are blocked (no yielded contexts at the time shutdown fires).
+
+### Context Lifecycle (`coop/context.cpp`)
+**Construction**: parent registers child in `m_children` list; first child `TryAcquire`s the
+parent's `m_lastChild` coordinator (holds it so the parent's destructor will block).
+
+**Kill propagation**: `Kill(other)` fires the target's `m_killedSignal` then recursively kills
+all children. Signal::Notify unblocks all waiters on the kill signal coordinator.
+
+**Destruction** (runs on the context's own stack, in `CoopContextEntry`):
+1. `Detach()` from parent — removes from children list; last child `Release`s `m_lastChild`
+2. `Kill(this)` if not already killed — propagates to any remaining children
+3. Clear `m_handle->m_context` pointer
+4. `m_lastChild.Acquire(this)` — blocks until all children have exited and detached
+5. Remove from cooperator's `m_contexts` list
+
+After `~Context()`, `CoopContextEntry` does `ContextSwitch(EXITED)` back to the cooperator,
+which calls `free()` on the context's allocation.
+
+**Launchable note**: instances are placement-new'd onto the context's stack segment. Their C++
+destructors are **never called** — the stack is freed wholesale. Any RAII cleanup in Launchable
+members does not run.
+
+### IO Handle Lifecycle (`coop/io/handle.cpp`)
+An `io::Handle` ties an io_uring SQE to a `Coordinator` for synchronization.
+
+**Submission**: `Submit(sqe)` calls `m_coord->TryAcquire(m_context)` (holds the coordinator),
+sets `m_pendingCqes = 1`, pushes onto descriptor's handle list, and submits to io_uring.
+`SubmitLinked` (for timeouts) sets `m_pendingCqes = 2` and links a timeout SQE.
+
+**Completion**: io_uring CQE arrives → `Callback` dispatches via tagged pointer (bit 0 of
+userdata): untagged → `Complete()`, tagged → `OnSecondaryComplete()`. Both call `Finalize()`
+which decrements `m_pendingCqes`; when it hits 0, pops from descriptor list and calls
+`m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator).
+
+**Blocking pattern** (`operator int()`): calls `m_coord->Flash(ctx)` which does
+`Acquire` (blocks until CQE fires and releases) then `Release`.
+
+**Destruction**: if `m_pendingCqes > 0`, submits `IORING_OP_ASYNC_CANCEL` (increments
+`m_pendingCqes` for the cancel CQE), then `m_coord->Flash(ctx)` to block until all CQEs drain.
+This means Handle destructors **cooperatively block** — the scheduler runs other contexts and
+polls io_uring during the Flash, which is how the cancel CQEs get processed.
+
+**Reuse after CoordinateWith**: when `CoordinateWith` returns, the winning coordinator was
+acquired by `MultiCoordinator`. Release it explicitly, then resubmit the async op (which calls
+`Submit` → `TryAcquire` again). The losing coordinator was never acquired by CoordinateWith
+(its ordinal was removed from the wait list), and the Handle's pending CQE will eventually
+fire and release it via `Finalize`.
+
 ### IO (`coop/io/`)
 All IO goes through io_uring. Each operation has 4 variants:
 1. `bool Op(Handle&, ...)` — async

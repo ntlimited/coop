@@ -10,6 +10,8 @@
 #include "recv.h"
 #include "resolve.h"
 #include "send.h"
+#include "sendfile.h"
+#include "splice.h"
 #include "stream.h"
 
 // coop::io offers a very direct abstraction for blocking i/o and its user facing unit is the

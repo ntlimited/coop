@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -16,6 +17,8 @@
 #include "coop/io/recv.h"
 #include "coop/io/resolve.h"
 #include "coop/io/send.h"
+#include "coop/io/sendfile.h"
+#include "coop/io/splice.h"
 
 #include "coop/time/interval.h"
 
@@ -159,6 +162,173 @@ TEST(IoTest, RAIICancelOnDestroy)
         // If we get here without crashing, the RAII cancel worked
         //
         SUCCEED();
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Sendfile tests
+// -------------------------------------------------------------------------------------
+
+TEST(IoTest, Sendfile)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        // Set sender non-blocking (required for sendfile + io::Poll)
+        //
+        fcntl(sp.fds[1], F_SETFL, fcntl(sp.fds[1], F_GETFL) | O_NONBLOCK);
+
+        coop::io::Descriptor reader(sp.fds[0], uring);
+        coop::io::Descriptor writer(sp.fds[1], uring);
+
+        // Create a temp file with known content
+        //
+        char tmpPath[] = "/tmp/coop_sendfile_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+        unlink(tmpPath);
+
+        const char* fileData = "sendfile test data — hello from the kernel!";
+        size_t fileLen = strlen(fileData);
+        [[maybe_unused]] ssize_t w = ::write(fileFd, fileData, fileLen);
+        assert(w == (ssize_t)fileLen);
+
+        // Sendfile the entire file
+        //
+        int sent = coop::io::SendfileAll(writer, fileFd, 0, fileLen);
+        ASSERT_EQ(sent, (int)fileLen);
+
+        ::close(fileFd);
+
+        // Read it back and verify
+        //
+        char buf[128] = {};
+        int received = coop::io::Recv(reader, buf, sizeof(buf));
+        ASSERT_EQ(received, (int)fileLen);
+        EXPECT_EQ(memcmp(buf, fileData, fileLen), 0);
+    });
+}
+
+TEST(IoTest, SendfilePartialOffset)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        fcntl(sp.fds[1], F_SETFL, fcntl(sp.fds[1], F_GETFL) | O_NONBLOCK);
+
+        coop::io::Descriptor reader(sp.fds[0], uring);
+        coop::io::Descriptor writer(sp.fds[1], uring);
+
+        // Create a file with known content
+        //
+        char tmpPath[] = "/tmp/coop_sendfile_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+        unlink(tmpPath);
+
+        const char* fileData = "ABCDEFGHIJ";
+        [[maybe_unused]] ssize_t w = ::write(fileFd, fileData, 10);
+        assert(w == 10);
+
+        // Send only bytes 3-7 ("DEFGH")
+        //
+        int sent = coop::io::SendfileAll(writer, fileFd, 3, 5);
+        ASSERT_EQ(sent, 5);
+
+        ::close(fileFd);
+
+        char buf[64] = {};
+        int received = coop::io::Recv(reader, buf, sizeof(buf));
+        ASSERT_EQ(received, 5);
+        EXPECT_EQ(memcmp(buf, "DEFGH", 5), 0);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Splice tests
+// -------------------------------------------------------------------------------------
+
+TEST(IoTest, Splice)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        // Two socketpairs: inject data into sp[1], splice sp[0]→sp2[1], read from sp2[0]
+        //
+        SocketPair sp, sp2;
+        auto* uring = coop::GetUring();
+
+        fcntl(sp.fds[0], F_SETFL, fcntl(sp.fds[0], F_GETFL) | O_NONBLOCK);
+        fcntl(sp2.fds[1], F_SETFL, fcntl(sp2.fds[1], F_GETFL) | O_NONBLOCK);
+
+        coop::io::Descriptor in(sp.fds[0], uring);
+        coop::io::Descriptor out(sp2.fds[1], uring);
+
+        // Write test data into the input socket
+        //
+        const char* msg = "hello splice!";
+        size_t msgLen = strlen(msg);
+        [[maybe_unused]] ssize_t w = ::write(sp.fds[1], msg, msgLen);
+        assert(w == (ssize_t)msgLen);
+
+        // Create pipe for splice
+        //
+        int pipefd[2];
+        ASSERT_EQ(pipe2(pipefd, O_NONBLOCK), 0);
+
+        int transferred = coop::io::Splice(in, out, pipefd, 65536);
+        ASSERT_EQ(transferred, (int)msgLen);
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        // Read from output and verify
+        //
+        char buf[64] = {};
+        ssize_t r = ::read(sp2.fds[0], buf, sizeof(buf));
+        ASSERT_EQ(r, (ssize_t)msgLen);
+        EXPECT_EQ(memcmp(buf, msg, msgLen), 0);
+    });
+}
+
+TEST(IoTest, SpliceEOF)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp, sp2;
+        auto* uring = coop::GetUring();
+
+        fcntl(sp.fds[0], F_SETFL, fcntl(sp.fds[0], F_GETFL) | O_NONBLOCK);
+        fcntl(sp2.fds[1], F_SETFL, fcntl(sp2.fds[1], F_GETFL) | O_NONBLOCK);
+
+        coop::io::Descriptor in(sp.fds[0], uring);
+        coop::io::Descriptor out(sp2.fds[1], uring);
+
+        // Write data then close the write end to produce EOF
+        //
+        [[maybe_unused]] ssize_t w = ::write(sp.fds[1], "data", 4);
+        assert(w == 4);
+        close(sp.fds[1]);
+        sp.fds[1] = -1;
+
+        int pipefd[2];
+        ASSERT_EQ(pipe2(pipefd, O_NONBLOCK), 0);
+
+        // First splice should transfer the data
+        //
+        int transferred = coop::io::Splice(in, out, pipefd, 65536);
+        ASSERT_EQ(transferred, 4);
+
+        // Second splice should return 0 (EOF)
+        //
+        int eof = coop::io::Splice(in, out, pipefd, 65536);
+        EXPECT_EQ(eof, 0);
+
+        close(pipefd[0]);
+        close(pipefd[1]);
     });
 }
 

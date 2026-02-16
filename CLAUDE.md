@@ -270,7 +270,7 @@ All IO goes through io_uring. Each operation has 4 variants:
 4. `int Op(Descriptor&, ..., time::Interval)` — blocking + timeout
 
 Key operations: `Accept`, `Recv`, `Send`, `Read`, `ReadFile`, `Open`, `Close`, `Shutdown`,
-`Connect`
+`Connect`, `Sendfile`, `Splice`
 
 `Accept` args default to `nullptr, nullptr, 0` (addr, addrLen, flags) so existing `Accept(desc)`
 call sites continue to work. Pass a `sockaddr*` and `socklen_t*` to retrieve peer addresses.
@@ -300,6 +300,28 @@ on first call and cached in file-static globals.
 
 `PlaintextStream` wraps a `Descriptor` for socket IO (`Recv`, `Send`, `SendAll`).
 `ReadFile(path, buf, bufSize)` reads an entire file, returns bytes read or negative errno.
+
+**Sendfile** (`coop/io/sendfile.h`) sends file data directly to a socket via the `sendfile()`
+syscall — zero userspace copies. Uses `io::Poll` fallback on EAGAIN (socket must be non-blocking).
+```cpp
+int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count);
+int SendfileAll(Descriptor& desc, int in_fd, off_t offset, size_t count);
+```
+The SSL layer provides `ssl::Sendfile` / `ssl::SendfileAll` which dispatch to `io::Sendfile` for
+kTLS connections (kernel encrypts file data in-flight, zero copies) and fall back to pread+Send for
+non-kTLS connections. The HTTP server uses `io::SendfileAll` for static file serving, eliminating
+the previous 65KB staging buffer and multiple string copies.
+
+**Splice** (`coop/io/splice.h`) moves data between two sockets via a kernel pipe — zero userspace
+copies. Uses `io::Poll` for cooperative waiting on both sides. The caller manages the pipe (create
+with `pipe2(pipefd, O_NONBLOCK)`, reuse across calls). Both sockets must be non-blocking.
+```cpp
+int pipefd[2];
+pipe2(pipefd, O_NONBLOCK);
+int n = io::Splice(in, out, pipefd, 65536);  // up to 65KB per call
+```
+The TCP proxy uses this for bidirectional relay — data moves between client and upstream sockets
+entirely in-kernel without entering userspace.
 
 ### SSL/TLS (`coop/io/ssl/`)
 

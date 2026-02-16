@@ -1,7 +1,12 @@
+#include <atomic>
+#include <thread>
+
 #include <gtest/gtest.h>
 
 #include "coop/cooperator.h"
 #include "coop/context.h"
+#include "coop/coordinate_with.h"
+#include "coop/coordinator.h"
 #include "coop/launchable.h"
 #include "coop/self.h"
 #include "test_helpers.h"
@@ -236,6 +241,67 @@ TEST(SpawnTest, SpawnFromKilledContextFails)
 
         EXPECT_FALSE(spawnResult);
     });
+}
+
+TEST(SpawnTest, BoundaryCrossingKill)
+{
+    // Kill a context from outside the cooperator's thread. This exercises the BoundarySafeKill
+    // boundary-crossing path: Submit carries the kill into the cooperator thread, which then
+    // validates the handle and performs the actual kill.
+    //
+    struct SharedState
+    {
+        std::atomic<bool>       childBlocked{false};
+        std::atomic<bool>       childKilled{false};
+        coop::Context::Handle   handle;
+    } state;
+
+    coop::Cooperator cooperator;
+    coop::Thread t(&cooperator);
+
+    cooperator.Submit([](coop::Context* ctx, void* arg)
+    {
+        auto* state = static_cast<SharedState*>(arg);
+        coop::Coordinator coord;
+        coord.TryAcquire(ctx);
+
+        ctx->GetCooperator()->Spawn([&coord, state](coop::Context* child)
+        {
+            // Block kill-aware so the cross-thread kill can wake us
+            //
+            state->childBlocked.store(true, std::memory_order_release);
+            auto result = coop::CoordinateWithKill(child, &coord);
+
+            state->childKilled.store(result.Killed(), std::memory_order_release);
+        }, &state->handle);
+
+        // Yield until killed
+        //
+        while (!ctx->IsKilled())
+        {
+            ctx->Yield(true);
+        }
+    }, &state);
+
+    // Wait for the child to be blocked, then kill it from this (non-cooperator) thread
+    //
+    while (!state.childBlocked.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    state.handle.Kill();
+
+    // Give the cooperator time to process the kill
+    //
+    for (int i = 0; i < 100 && !state.childKilled.load(std::memory_order_acquire); i++)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    EXPECT_TRUE(state.childKilled.load(std::memory_order_acquire));
+
+    cooperator.Shutdown();
 }
 
 TEST(SpawnTest, KillParentKillsChildren)

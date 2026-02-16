@@ -103,7 +103,6 @@ struct ChatHandler : coop::Launchable
     virtual void Launch() final
     {
         auto* ctx = GetContext();
-        auto* co = ctx->GetCooperator();
         int32_t rawFd = m_fd.m_fd;
 
         // Register with the client registry so the broadcaster can find us
@@ -124,7 +123,7 @@ struct ChatHandler : coop::Launchable
         //
         coop::RecvChannel<Message>* outbound = &m_outbound;
         auto* stream = &m_stream;
-        co->Spawn([outbound, stream, rawFd](coop::Context* writerCtx)
+        coop::Spawn([outbound, stream, rawFd](coop::Context* writerCtx)
         {
             writerCtx->SetName("ChatWriter");
             Message msg;
@@ -211,7 +210,6 @@ void SpawningTask(coop::Context* ctx, void*)
     spdlog::info("chat server starting on port 9000");
 
     int serverFd = BindAndListen(9000);
-    auto* co = ctx->GetCooperator();
 
     // Broadcast channel and client registry live on this context's stack
     //
@@ -221,7 +219,7 @@ void SpawningTask(coop::Context* ctx, void*)
 
     // Acceptor: binds and listens, launches a ChatHandler per connection
     //
-    co->Spawn([co, serverFd, &broadcast, &registry](coop::Context* acceptCtx)
+    coop::Spawn([serverFd, &broadcast, &registry](coop::Context* acceptCtx)
     {
         acceptCtx->SetName("Acceptor");
         coop::io::Descriptor desc(serverFd);
@@ -234,15 +232,15 @@ void SpawningTask(coop::Context* ctx, void*)
                 break;
             }
 
-            co->Launch<ChatHandler>(fd, &broadcast, &registry);
-            acceptCtx->Yield();
+            coop::Launch<ChatHandler>(fd, &broadcast, &registry);
+            coop::Yield();
         }
     });
 
     // Broadcaster: reads from the broadcast channel and fans out to all connected clients
     //
     coop::RecvChannel<Message>* bcastRecv = &broadcast;
-    co->Spawn([bcastRecv, &registry](coop::Context* bcastCtx)
+    coop::Spawn([bcastRecv, &registry](coop::Context* bcastCtx)
     {
         bcastCtx->SetName("Broadcaster");
         Message msg;
@@ -270,7 +268,7 @@ void SpawningTask(coop::Context* ctx, void*)
 
     // Status: periodic stats, same pattern as echo_server
     //
-    co->Spawn([](coop::Context* statusCtx)
+    coop::Spawn([](coop::Context* statusCtx)
     {
         statusCtx->SetName("Status");
         coop::time::Sleeper s(
@@ -279,17 +277,18 @@ void SpawningTask(coop::Context* ctx, void*)
 
         while (s.Sleep() == coop::time::SleepResult::Ok)
         {
+            auto* co = coop::GetCooperator();
             spdlog::info("cooperator total={} yielded={} blocked={}",
-                statusCtx->GetCooperator()->ContextsCount(),
-                statusCtx->GetCooperator()->YieldedCount(),
-                statusCtx->GetCooperator()->BlockedCount());
-            statusCtx->GetCooperator()->PrintContextTree();
+                co->ContextsCount(),
+                co->YieldedCount(),
+                co->BlockedCount());
+            co->PrintContextTree();
         }
     });
 
     // Yield until the shutdown handler shuts us down
     //
-    while (!co->IsShuttingDown())
+    while (!coop::IsShuttingDown())
     {
         ctx->Yield(true);
     }

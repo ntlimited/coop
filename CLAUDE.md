@@ -90,6 +90,14 @@ Mutex facsimile — one context holds, others block in a FIFO queue.
 - `Release(ctx)` — unblocks head of wait list
 - `Flash(ctx)` — barrier: wait, acquire, release (serialization point)
 
+### CoordinationResult (`coop/coordination_result.h`)
+Return type of `CoordinateWith`. Wraps the acquired `Coordinator*` with sentinel detection:
+- `Killed()` / `TimedOut()` / `Error()` — check sentinel conditions
+- `operator Coordinator*()` / `operator->()` — access the acquired coordinator
+- `operator==(Coordinator*)` / `operator==(const Coordinator&)` — pointer comparison
+
+No `operator size_t()`. The `index` field is internal to `MultiCoordinator` / `CoordinateWith`.
+
 ### IO (`coop/io/`)
 All IO goes through io_uring. Each operation has 4 variants:
 1. `bool Op(Handle&, ...)` — async

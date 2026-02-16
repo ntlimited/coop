@@ -1,47 +1,13 @@
 #pragma once
 
+#include "coop/coordination_result.h"
 #include "coop/coordinator.h"
 #include "coop/detail/coordinator_extension.h"
 
 namespace coop
 {
-
 namespace detail
 {
-    // AmbiResult can be an index in the args (for switches) or a coordinator pointer for other
-    // mechanics.
-    //
-    // No one is expected to ever store or use this type directly, instead it is expected to
-    // immediately decay to one of its types.
-    //
-    struct AmbiResult
-    {
-        size_t          index;
-        Coordinator*    coordinator;
-
-        bool Killed() const { return index == static_cast<size_t>(-1); }
-
-        bool TimedOut() const { return index == static_cast<size_t>(-2); }
-
-        bool Error() const { return index == static_cast<size_t>(-3); }
-
-        operator size_t() const
-        {
-            return index;
-        }
-
-        operator Coordinator*()
-        {
-            return coordinator;
-        }
-
-        Coordinator* operator->()
-        {
-            return coordinator;
-        }
-    };
-
-} // end coop::detail
 
 // The MultiCoordinator wraps at least two coordinators and allows blocking until at least one
 // has been given and exposes which one.
@@ -60,7 +26,7 @@ struct MultiCoordinator : CoordinatorExtension
     {
     }
 
-    detail::AmbiResult Acquire(Context* ctx)
+    CoordinationResult Acquire(Context* ctx)
     {
         size_t idx;
         for (idx = 0 ; idx < C ; idx++)
@@ -83,7 +49,7 @@ struct MultiCoordinator : CoordinatorExtension
             }
 
             SanityCheck();
-            return detail::AmbiResult{ idx, m_underlying[idx] };
+            return CoordinationResult{ idx, m_underlying[idx] };
         }
 
         // We have hooked up all of the conditions to wait for any of them to wake us
@@ -117,10 +83,10 @@ struct MultiCoordinator : CoordinatorExtension
                 }
             }
             SanityCheck();
-            return detail::AmbiResult { idx, m_underlying[idx] };
+            return CoordinationResult { idx, m_underlying[idx] };
         }
         assert(false);
-        return detail::AmbiResult { C , nullptr };
+        return CoordinationResult { C , nullptr };
     }
 
   private:
@@ -147,4 +113,5 @@ struct MultiCoordinator : CoordinatorExtension
     Coordinated m_coordinateds[C];
 };
 
+} // end namespace detail
 } // end namespace coop

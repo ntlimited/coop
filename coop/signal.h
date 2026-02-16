@@ -7,15 +7,15 @@ namespace coop
 {
 
 struct Context;
+struct CoordinationResult;
+
 namespace detail
 {
-    struct AmbiResult;
+    template<typename... Coords>
+    CoordinationResult CoordinateWithImpl(Context*, Coords...);
 
     template<typename... Coords>
-    AmbiResult CoordinateWithImpl(Context*, Coords...);
-
-    template<typename... Coords>
-    AmbiResult CoordinateWithTimeoutImpl(Context*, time::Interval, Coords...);
+    CoordinationResult CoordinateWithTimeoutImpl(Context*, time::Interval, Coords...);
 }
 
 // Signal is a one-shot broadcast notification primitive. It starts in the "armed" state, held by
@@ -47,10 +47,10 @@ struct Signal
 
   private:
     template<typename... Coords>
-    friend detail::AmbiResult detail::CoordinateWithImpl(Context*, Coords...);
+    friend CoordinationResult detail::CoordinateWithImpl(Context*, Coords...);
 
     template<typename... Coords>
-    friend detail::AmbiResult detail::CoordinateWithTimeoutImpl(
+    friend CoordinationResult detail::CoordinateWithTimeoutImpl(
         Context*, time::Interval, Coords...);
 
     Coordinator* AsCoordinator() { return &m_coord; }

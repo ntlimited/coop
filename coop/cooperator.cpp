@@ -154,7 +154,8 @@ void Cooperator::Launch()
 
     bool shutdownKillDone = false;
 
-    while (!m_yielded.IsEmpty() || !m_shutdown.load(std::memory_order_relaxed))
+    while (!m_yielded.IsEmpty() || !m_shutdown.load(std::memory_order_relaxed)
+                                 || !shutdownKillDone)
     {
         // When shutdown is requested, kill all live contexts from within the cooperator's
         // thread so they can exit naturally. This only needs to happen once; killed contexts

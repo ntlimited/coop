@@ -90,4 +90,42 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
     return launchable;
 }
 
+// Free-function convenience wrappers that forward to the thread-local cooperator.
+//
+template<typename Fn>
+bool Spawn(Fn const& fn, Context::Handle* handle = nullptr)
+{
+    return Cooperator::thread_cooperator->Spawn(fn, handle);
+}
+
+template<typename Fn>
+bool Spawn(SpawnConfiguration const& config, Fn const& fn, Context::Handle* handle = nullptr)
+{
+    return Cooperator::thread_cooperator->Spawn(config, fn, handle);
+}
+
+template<typename T, typename... Args>
+T* Launch(SpawnConfiguration const& config, Context::Handle* handle, Args&&... args)
+{
+    return Cooperator::thread_cooperator->Launch<T>(config, handle, std::forward<Args>(args)...);
+}
+
+template<typename T, typename... Args>
+T* Launch(SpawnConfiguration const& config, Args&&... args)
+{
+    return Cooperator::thread_cooperator->Launch<T>(config, std::forward<Args>(args)...);
+}
+
+template<typename T, typename... Args>
+T* Launch(Context::Handle* handle, Args&&... args)
+{
+    return Cooperator::thread_cooperator->Launch<T>(handle, std::forward<Args>(args)...);
+}
+
+template<typename T, typename... Args>
+T* Launch(Args&&... args)
+{
+    return Cooperator::thread_cooperator->Launch<T>(std::forward<Args>(args)...);
+}
+
 } // end namespace coop

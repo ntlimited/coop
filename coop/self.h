@@ -5,6 +5,7 @@ namespace coop
 {
 
 struct Context;
+struct Cooperator;
 
 namespace io { struct Uring; }
 
@@ -19,9 +20,13 @@ bool Yield();
 
 bool IsKilled();
 
-// Convenience accessor that goes straight through the thread-local cooperator, avoiding the
+bool IsShuttingDown();
+
+// Convenience accessors that go straight through the thread-local cooperator, avoiding the
 // Self() -> Context -> Cooperator round-trip.
 //
+Cooperator* GetCooperator();
+
 io::Uring* GetUring();
 
 } // end namespace coop

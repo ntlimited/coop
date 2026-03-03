@@ -88,20 +88,9 @@ Launch<MyHandler>(args...);
 ```
 
 ### StackPool (`coop/stack_pool.h`)
-Size-class allocator for context stack segments, owned by `Cooperator`. Eliminates
-`mmap`/`munmap` (debug) or `malloc`/`free` (release) syscalls on the spawn/exit hot path.
-
-**Buckets**: 6 power-of-2 sizes from 4KB to 128KB. Requests are rounded up via
-`RoundUpStackSize()`. Allocations larger than 128KB bypass the pool. Each bucket caches up to
-32 freed segments via an intrusive `FreeNode*` overlay on dead memory.
-
-**Allocation path**: `Spawn`/`Launch` call `m_stackPool.Allocate(roundedSize)` — checks the
-free list first, falls back to `RawAllocate` (mmap+guard pages in debug, malloc in release).
-`HandleCooperatorResumption(EXITED)` calls `m_stackPool.Free(ptr, size)` — returns to the
-free list (evicting oldest on cap), or `RawFree` if the bucket is full.
-
-Stack sizes in `SpawnConfiguration` are transparently rounded up, so contexts may get slightly
-more stack than requested (strictly better).
+Size-class allocator for context stack segments, owned by `Cooperator`. 6 power-of-2 buckets
+(4KB-128KB), eliminates mmap/malloc syscalls on the spawn/exit hot path. Stack sizes in
+`SpawnConfiguration` are transparently rounded up. See `coop/CLAUDE.md` for internals.
 
 ### Spawn vs Launch (`coop/cooperator.h`)
 Two ways to create contexts:
@@ -148,20 +137,8 @@ auto result = CoordinateWithKill(ctx, &coord, timeout); // kill + timeout
 ```
 Both have `(Args...)` convenience overloads that use `Self()` as the context.
 
-**Single-arg fast path**: `CoordinateWithImpl` bypasses `MultiCoordinator` for a single argument,
-using `Acquire` directly. This generates much smaller code that the compiler inlines.
-
-**Two-pass TryAcquire**: `MultiCoordinator::Acquire` tries all coordinators without hooking up
-to wait lists first. Since scheduling is cooperative, no coordinator state can change between
-TryAcquire calls. Only if all fail does it hook up and block. This eliminates
-`AddAsBlocked`/`RemoveAsBlocked` on the uncontended fast path (~60% of cycles previously).
-
-**CoordinateWithKill fast path**: for the common case of a single `Coordinator*` argument
-(the IO hot path — `Handle::Wait`), `CoordinateWithKill` has a `constexpr if` specialization
-that checks `IsKilled()` then `TryAcquire()` before falling through to the full
-`CoordinateWith` path. This avoids constructing a 2-arg `MultiCoordinator` (kill signal +
-coordinator) on every uncontended IO wait. Safety: cooperative scheduling means nothing changes
-between the two checks; if TryAcquire fails, the full multiplexed path handles it correctly.
+See `coop/CLAUDE.md` for fast path details (single-arg, two-pass TryAcquire, CoordinateWithKill
+specialization).
 
 ### CoordinationResult (`coop/coordination_result.h`)
 Return type of `CoordinateWith` / `CoordinateWithKill`. Wraps the acquired `Coordinator*` with
@@ -174,137 +151,23 @@ sentinel detection:
 No `operator size_t()`. The `index` field is internal to `MultiCoordinator` / `CoordinateWith`.
 
 ### Scheduler Internals (`coop/cooperator.cpp`)
-Contexts have three states: `YIELDED` (runnable), `RUNNING` (active on the cooperator's thread),
-and `BLOCKED` (waiting for a coordinator release, e.g. IO completion or lock acquisition).
-
-The cooperator loop in `Cooperator::Launch()`:
-```
-while (has yielded contexts OR not shutdown OR shutdown kill not done):
-    1. If shutdown requested and kill not done: spawn kill context (kills all others)
-    2. If yielded list empty:
-       a. Poll io_uring (may move blocked → yielded)
-       b. If still empty and blocked exist: try SpawnSubmitted(false), continue
-       c. If nothing at all: SpawnSubmitted(true) blocks waiting for external Submit()
-    3. Pop up to 16 yielded contexts, Resume each one:
-       - After each Resume returns (context yielded/blocked/exited): poll io_uring
-       - This interleaved polling is critical — CQE processing between context
-         resumes is what unblocks Handle::Flash barriers during destruction
-```
-
-**Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and wakes the submission semaphore.
-The loop spawns a temporary kill context that visits all live contexts and fires their kill
-signals (`schedule=false` → moved to yielded, not immediately switched to). All blocking IO is
-kill-aware (via `CoordinateWithKill` in `Wait()`), so contexts blocked in `Recv`, `Accept`,
-etc. wake up and return `-ECANCELED` when killed.
-
-**Important**: the loop condition includes `!shutdownKillDone` (guarantees the kill logic runs
-even when all contexts are blocked) and `m_uring.PendingOps() > 0` (keeps the loop alive to
-poll io_uring for cancel CQEs while Handle destructors drain in-flight operations).
+Contexts have three states: `YIELDED` (runnable), `RUNNING` (active), `BLOCKED` (waiting on a
+coordinator). The cooperator loop pops yielded contexts, resumes them, and polls io_uring after
+each resume. Shutdown spawns a kill context that fires all kill signals; all blocking IO is
+kill-aware via `CoordinateWithKill`. See `coop/CLAUDE.md` for the full loop, shutdown sequence,
+and loop condition details.
 
 ### Context Lifecycle (`coop/context.cpp`)
-**Construction**: parent registers child in `m_children` list; first child `TryAcquire`s the
-parent's `m_lastChild` coordinator (holds it so the parent's destructor will block).
-
-**Kill propagation**: `Kill(other)` uses iterative post-order traversal (children before parents)
-to avoid stack overflow on deep trees. For each descendant: fires `m_killedSignal` with
-`schedule=false` (no context switches during traversal). For the target itself, fires with
-the caller's `schedule` flag. Contexts blocked on coordinators are woken via `CoordinateWithKill`'s
-kill signal multiplexing when they are next scheduled.
-
-**Destruction** (runs on the context's own stack, in `CoopContextEntry`):
-1. `Detach()` from parent — removes from children list; last child `Release`s `m_lastChild`
-2. `Kill(this)` if not already killed — propagates to any remaining children
-3. Clear `m_handle->m_context` pointer
-4. `m_lastChild.Acquire(this)` — blocks until all children have exited and detached
-5. Remove from cooperator's `m_contexts` list
-
-After `~Context()`, `CoopContextEntry` does `ContextSwitch(EXITED)` back to the cooperator,
-which returns the allocation to the `StackPool` for reuse (or frees it if the pool bucket is
-full).
-
-**Launchable note**: instances are placement-new'd onto the context's stack segment. Their C++
-destructors run via `m_cleanup` (a typed destructor trampoline set by `Launch<T>`) after
-`m_entry` returns but before `~Context()`. This allows Launchable members (Descriptor,
-PlaintextStream, etc.) to use RAII normally — their destructors may do cooperative IO.
-
-### IO Handle Lifecycle (`coop/io/handle.cpp`)
-An `io::Handle` ties an io_uring SQE to a `Coordinator` for synchronization.
-
-**Submission**: `Submit(sqe)` calls `m_coord->TryAcquire(m_context)` (holds the coordinator),
-sets `m_pendingCqes = 1`, and pushes onto descriptor's handle list. The SQE is **not** submitted
-to the kernel immediately — it remains in the SQ ring until `Uring::Poll()` calls
-`io_uring_submit()` (deferred submission). `SubmitLinked` (for timeouts) sets `m_pendingCqes = 2`
-and links a timeout SQE. All SQE acquisition goes through `Uring::GetSqe()` which self-corrects
-on SQ ring exhaustion by flushing pending SQEs.
-
-**Completion**: io_uring CQE arrives → `Callback` dispatches via tagged pointer (bit 0 of
-userdata): untagged → `Complete()`, tagged → `OnSecondaryComplete()`. Both call `Finalize()`
-which decrements `m_pendingCqes`; when it hits 0, pops from descriptor list and calls
-`m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator).
-
-**Blocking pattern** (`Wait()`): calls `CoordinateWithKill(ctx, m_coord)` which multiplexes
-the Handle's coordinator with the context's kill signal. If the context is killed, returns
-`-ECANCELED` immediately; otherwise returns `m_result`. `Result()` provides non-blocking access
-to the cached result (asserts all CQEs are drained). This makes all blocking IO kill-aware.
-
-**Encapsulation**: Handle fields are private. Internal access from IO operation macros and
-implementation files goes through `detail::HandleExtension` (friend struct), which exposes
-`GetSqe`, `Fd`, and `Timeout` static methods.
-
-**PendingOps tracking**: `Submit`/`SubmitLinked` increment `m_ring->m_pendingOps`; `Finalize`
-decrements it when `m_pendingCqes` reaches 0. The cooperator loop uses this counter to keep
-polling io_uring during shutdown while cancel CQEs are still in flight.
-
-**Destruction**: if `m_pendingCqes > 0`, submits `IORING_OP_ASYNC_CANCEL` (increments
-`m_pendingCqes` for the cancel CQE), then `m_coord->Flash(ctx)` to block until all CQEs drain.
-This means Handle destructors **cooperatively block** — the scheduler runs other contexts and
-polls io_uring during the Flash, which is how the cancel CQEs get processed.
-
-**Reuse after CoordinateWith(Kill)**: when `CoordinateWith` or `CoordinateWithKill` returns,
-the winning coordinator was acquired by `MultiCoordinator`. Release it explicitly, then resubmit
-the async op (which calls `Submit` → `TryAcquire` again). The losing coordinator was never
-acquired (its ordinal was removed from the wait list), and the Handle's pending CQE will
-eventually fire and release it via `Finalize`.
-
-### Uring Configuration (`coop/io/uring_configuration.h`, `coop/io/uring.cpp`)
-`UringConfiguration` controls io_uring setup flags. Key fields:
-- `coopTaskrun` (default **true**): `IORING_SETUP_COOP_TASKRUN` — defers kernel task_work to
-  the next `io_uring_enter()`. Natural fit: task_work runs during submission, so completions
-  are in the CQ by the time we peek. ~5% faster than bare at scale, lower variance.
-- `deferTaskrun`: `IORING_SETUP_DEFER_TASKRUN` — stronger variant, completions only appear
-  after explicit `io_uring_get_events()`. Gives full control but **adds ~20-30% overhead** in
-  coop's submit-then-wait pattern (extra kernel transition per Poll). Lower latency variance.
-  Use only when predictable completion timing matters more than throughput.
-- `SINGLE_ISSUER` is always forced (not configurable).
-
-**Benchmark finding**: `DEFER_TASKRUN` is consistently slower because coop's hot path is
-submit → block → wake-on-completion. With `COOP_TASKRUN`, task_work piggybacks on the submit
-`io_uring_enter()` for free. With `DEFER_TASKRUN`, `Poll()` must make a separate
-`io_uring_get_events()` syscall. See `bench_uring_config.cpp` for numbers.
-
-**Deferred submission**: SQEs are not submitted to the kernel at `Handle::Submit()` time.
-Instead, `Uring::Poll()` calls `io_uring_submit()` unconditionally before processing CQEs.
-This batches multiple SQEs from a single context resume (or across resumes if poll frequency
-is reduced) into one `io_uring_enter()` syscall. For `COOP_TASKRUN`, this also flushes pending task_work.
-For `DEFER_TASKRUN`, `io_uring_get_events()` is additionally called since `io_uring_submit()`
-alone cannot flush deferred completions. `Uring::GetSqe()` provides self-correcting SQE
-acquisition: if the SQ ring is full, it flushes pending SQEs and retries.
-
-`Poll()` checks `m_pendingSqes > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN)` before calling
-`io_uring_submit()`. The `IORING_SQ_TASKRUN` flag (a volatile read from kernel-mapped SQ ring
-memory) is set by the kernel when completions are pending under `COOP_TASKRUN` mode. When
-neither SQEs nor task_work are pending — the common case on pure-yield resumes — the submit
-is skipped entirely, saving ~9ns per Poll() (~3% of yield cost).
-
-**Non-native urings** (running as dedicated contexts via `Uring::Run()`) use the same deferred
-model — their `Poll()` submits + processes CQEs on each scheduling round. IO latency is bounded
-by the round-robin cycle time.
-
-`Init()` uses a progressive fallback chain: `DEFER_TASKRUN` → `COOP_TASKRUN` → `SINGLE_ISSUER`
-only → bare init. Each step logs a warning.
+Contexts form a parent-child tree. Construction registers in parent's `m_children` list.
+Kill propagation uses iterative post-order traversal. Destruction: detach, kill children, wait
+for children to exit via `m_lastChild` coordinator, then `ContextSwitch(EXITED)` back to the
+cooperator. See `coop/CLAUDE.md` for the full lifecycle and Launchable destruction details.
 
 ### IO (`coop/io/`)
-All IO goes through io_uring. Each operation has 4 variants:
+All IO goes through io_uring. See `coop/io/CLAUDE.md` for Handle lifecycle
+(submit/complete/wait/destruction), uring configuration, and zero-copy operation internals.
+
+Each operation has 4 variants:
 1. `bool Op(Handle&, ...)` — async
 2. `bool Op(Handle&, ..., time::Interval)` — async + timeout
 3. `int Op(Descriptor&, ...)` — blocking (creates Coordinator internally)
@@ -327,85 +190,16 @@ int Recv(Descriptor& desc, void* buf, size_t size) {
 ```
 
 **Connect** accepts either a dotted-quad IP or a hostname. Hostnames are resolved cooperatively
-via `Resolve4` (DNS over UDP through io_uring).
+via `Resolve4` (DNS over UDP through io_uring). `PlaintextStream` wraps a `Descriptor` for
+socket IO (`Recv`, `Send`, `SendAll`). `ReadFile(path, buf, bufSize)` reads an entire file.
 
-**Resolve4** (`coop/io/resolve.h`) performs cooperative DNS resolution. Checks `/etc/hosts` first,
-then queries nameservers from `/etc/resolv.conf` over UDP. IPv4 (A records) only.
-```cpp
-int Resolve4(const char* hostname, struct in_addr* result);
-int Resolve4(const char* hostname, struct in_addr* result, time::Interval timeout);
-```
-Returns 0 on success, negative errno on failure (-ENOENT for NXDOMAIN, -ETIMEDOUT, -EAGAIN).
-Numeric addresses are detected and parsed directly without DNS. Config files are parsed lazily
-on first call and cached in file-static globals.
-
-`PlaintextStream` wraps a `Descriptor` for socket IO (`Recv`, `Send`, `SendAll`).
-`ReadFile(path, buf, bufSize)` reads an entire file, returns bytes read or negative errno.
-
-**Sendfile** (`coop/io/sendfile.h`) sends file data directly to a socket via the `sendfile()`
-syscall — zero userspace copies. Uses `io::Poll` fallback on EAGAIN (socket must be non-blocking).
-```cpp
-int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count);
-int SendfileAll(Descriptor& desc, int in_fd, off_t offset, size_t count);
-```
-The SSL layer provides `ssl::Sendfile` / `ssl::SendfileAll` which dispatch to `io::Sendfile` for
-kTLS connections (kernel encrypts file data in-flight, zero copies) and fall back to pread+Send for
-non-kTLS connections. The HTTP server uses `io::SendfileAll` for static file serving, eliminating
-the previous 65KB staging buffer and multiple string copies.
-
-**Splice** (`coop/io/splice.h`) moves data between two sockets via a kernel pipe — zero userspace
-copies. Uses `io::Poll` for cooperative waiting on both sides. The caller manages the pipe (create
-with `pipe2(pipefd, O_NONBLOCK)`, reuse across calls). Both sockets must be non-blocking.
-```cpp
-int pipefd[2];
-pipe2(pipefd, O_NONBLOCK);
-int n = io::Splice(in, out, pipefd, 65536);  // up to 65KB per call
-```
-The TCP proxy uses this for bidirectional relay — data moves between client and upstream sockets
-entirely in-kernel without entering userspace.
+**Sendfile** / **Splice** provide zero-copy data transfer (file-to-socket and socket-to-socket
+respectively). See `coop/io/CLAUDE.md` for details.
 
 ### SSL/TLS (`coop/io/ssl/`)
-
-Two BIO modes for TLS connections:
-
-**Memory BIO** (default): OpenSSL uses memory BIOs decoupled from the socket. All I/O goes
-through staging buffers: `SSL_write → wbio → FlushWrite → io::Send`. Works with any socket
-type (TCP, AF_UNIX). Requires a caller-provided staging buffer (16KB recommended).
-```cpp
-ssl::Connection conn(sslCtx, desc, buffer, sizeof(buffer));
-```
-
-**Socket BIO** (`ssl::SocketBio` tag): OpenSSL operates on the real socket fd via `SSL_set_fd`.
-The handshake uses `io::Poll` for cooperative waiting on WANT_READ/WANT_WRITE. After handshake,
-if kTLS activates, `ssl::Send`/`ssl::Recv` bypass OpenSSL entirely — `io::Send`/`io::Recv` go
-straight to the kernel which handles crypto transparently. No staging buffer needed.
-```cpp
-sslCtx.EnableKTLS();  // must be called before creating connections
-ssl::Connection conn(sslCtx, desc, ssl::SocketBio{});
-conn.Handshake();     // probes kTLS activation (sets m_ktlsTx, m_ktlsRx)
-```
-
-**kTLS activation requirements**: TCP socket (not AF_UNIX), `EnableKTLS()` on the ssl::Context,
-kernel `tls` module loaded, and a cipher suite the kernel supports. TLS 1.3 typically gets TX
-only; TLS 1.2 can get both TX+RX. Falls back gracefully — socket BIO without kTLS still works,
-just uses `SSL_write`/`SSL_read` + `io::Poll` instead of the memory BIO staging path.
-
-**TCP_NODELAY** is set automatically in the socket BIO constructor. This is critical: kTLS
-frames each `write()` as a complete TLS record, and Nagle's algorithm delays sending small TCP
-segments. The interaction is catastrophic — without `TCP_NODELAY`, kTLS is 500x slower than
-plaintext on loopback at 16KB messages. With `TCP_NODELAY`, kTLS performs within ~10% of
-memory BIO at 16KB (187us vs 169us in benchmarks).
-
-**Data path dispatch** (in `ssl::Send` and `ssl::Recv`):
-1. `m_ktlsTx`/`m_ktlsRx` true → `write()`/`read()` directly + `io::Poll` on EAGAIN
-   (zero OpenSSL involvement; synchronous when socket buffer available)
-2. `m_buffer == nullptr` (socket BIO, no kTLS) → `SSL_write`/`SSL_read` + `io::Poll`
-3. `m_buffer != nullptr` (memory BIO) → existing `FlushWrite`/`FeedRead` path
-
-Both kTLS and socket BIO paths use direct syscalls with `io::Poll` fallback, avoiding uring
-for the common case where the syscall succeeds immediately. This is critical for throughput —
-routing every send through `io::Send` (uring SQE/CQE) adds ~20us per-op overhead that
-dominates the crypto savings kTLS provides.
+Two BIO modes: **Memory BIO** (default, staging buffer) and **Socket BIO** (real fd, enables
+kTLS). See `coop/io/ssl/CLAUDE.md` for BIO modes, kTLS activation, TCP_NODELAY rationale, and
+data path dispatch.
 
 ### HTTP Server (`coop/http/`)
 Route table maps paths to handlers:

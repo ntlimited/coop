@@ -153,9 +153,9 @@ No `operator size_t()`. The `index` field is internal to `MultiCoordinator` / `C
 ### Scheduler Internals (`coop/cooperator.cpp`)
 Contexts have three states: `YIELDED` (runnable), `RUNNING` (active), `BLOCKED` (waiting on a
 coordinator). The cooperator loop pops yielded contexts, resumes them, and polls io_uring after
-each resume. Shutdown spawns a kill context that fires all kill signals; all blocking IO is
-kill-aware via `CoordinateWithKill`. See `coop/CLAUDE.md` for the full loop, shutdown sequence,
-and loop condition details.
+each resume. Shutdown spawns a kill context that fires all kill signals. Handlers must check
+`IsKilled()` or use `CoordinateWithKill` explicitly for kill-aware IO. See `coop/CLAUDE.md`
+for the full loop, shutdown sequence, and loop condition details.
 
 ### Context Lifecycle (`coop/context.cpp`)
 Contexts form a parent-child tree. Construction registers in parent's `m_children` list.
@@ -185,7 +185,7 @@ int Recv(Descriptor& desc, void* buf, size_t size) {
     Coordinator coord;
     Handle handle(Self(), desc, &coord);
     if (!Recv(handle, buf, size)) return -EAGAIN;
-    return handle.Wait();  // blocks via CoordinateWithKill, returns result or -ECANCELED
+    return handle.Wait();  // blocks via CoordinateWith until IO completes
 }
 ```
 
@@ -247,6 +247,8 @@ complexity to harder-to-audit places.
 If a change touches more than ~5 files, introduces new friend declarations or extension classes,
 or discovers multiple crash bugs during implementation, stop and re-evaluate the premise. The
 implementation difficulty is signal about the design, not just about the implementation.
+
+See `DESIGN_IDIOMS.md` for patterns and idioms that should guide new API design.
 
 # Debugging guidelines
 

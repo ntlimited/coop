@@ -52,10 +52,12 @@ namespace detail { struct HandleExtension; }
 //
 // Blocking IO (Wait)
 //
-//   The blocking IO macros call `return handle.Wait()` which uses CoordinateWith to multiplex
-//   the Handle's coordinator with the context's kill signal. If the context is killed, Wait()
-//   returns -ECANCELED immediately. The Handle destructor then runs Cancel + Flash to drain
-//   any remaining CQEs before the stack unwinds.
+//   The blocking IO macros call `return handle.Wait()` which blocks via CoordinateWith on
+//   the Handle's coordinator. Wait is NOT kill-aware — it blocks until the IO completes
+//   regardless of kill state. This allows post-kill cleanup IO (flushing, goodbye messages).
+//   Callers that want kill-aware IO use CoordinateWithKill explicitly with async handles.
+//   The Handle destructor runs Cancel + Flash to drain any remaining CQEs before the stack
+//   unwinds.
 //
 // Destructor safety
 //
@@ -88,8 +90,8 @@ struct Handle : EmbeddedListHookups<Handle>
     Handle(Context*, Uring*, Coordinator*);
     ~Handle();
 
-    // Block until the operation completes or the context is killed. Uses CoordinateWith to
-    // multiplex the Handle's coordinator with the context's kill signal.
+    // Block until the operation completes. Uses CoordinateWith on the Handle's coordinator.
+    // Not kill-aware — callers that need kill sensitivity use CoordinateWithKill explicitly.
     //
     int Wait();
 

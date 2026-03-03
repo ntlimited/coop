@@ -58,9 +58,10 @@ while (has yielded contexts OR not shutdown OR shutdown kill not done):
 
 **Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and wakes the submission semaphore.
 The loop spawns a temporary kill context that visits all live contexts and fires their kill
-signals (`schedule=false` -> moved to yielded, not immediately switched to). All blocking IO is
-kill-aware (via `CoordinateWithKill` in `Wait()`), so contexts blocked in `Recv`, `Accept`,
-etc. wake up and return `-ECANCELED` when killed.
+signals (`schedule=false` -> moved to yielded, not immediately switched to). Handlers that
+loop (accept loops, read loops) check `IsKilled()` and break. Handlers that want kill-aware
+IO use `CoordinateWithKill` explicitly. Handle destructors run Cancel + Flash during stack
+unwind, draining in-flight IO.
 
 **Important**: the loop condition includes `!shutdownKillDone` (guarantees the kill logic runs
 even when all contexts are blocked) and `m_uring.PendingOps() > 0` (keeps the loop alive to

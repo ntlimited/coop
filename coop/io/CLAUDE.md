@@ -19,10 +19,11 @@ userdata): untagged -> `Complete()`, tagged -> `OnSecondaryComplete()`. Both cal
 which decrements `m_pendingCqes`; when it hits 0, pops from descriptor list and calls
 `m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator).
 
-**Blocking pattern** (`Wait()`): calls `CoordinateWithKill(ctx, m_coord)` which multiplexes
-the Handle's coordinator with the context's kill signal. If the context is killed, returns
-`-ECANCELED` immediately; otherwise returns `m_result`. `Result()` provides non-blocking access
-to the cached result (asserts all CQEs are drained). This makes all blocking IO kill-aware.
+**Blocking pattern** (`Wait()`): calls `CoordinateWith(ctx, m_coord)` which blocks until the
+Handle's coordinator is released (IO completes). Returns `m_result`. Not kill-aware — blocking
+IO continues to completion regardless of kill state, allowing post-kill cleanup IO. Callers
+that want kill-aware IO use `CoordinateWithKill` explicitly with async handles. `Result()`
+provides non-blocking access to the cached result (asserts all CQEs are drained).
 
 **Encapsulation**: Handle fields are private. Internal access from IO operation macros and
 implementation files goes through `detail::HandleExtension` (friend struct), which exposes

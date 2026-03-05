@@ -355,12 +355,10 @@ Chunk* Connection::ReadArgValue()
         m_chunk.complete = false;
 
         m_parsePos = m_bufLen;
-        Compact();
         RecvMore();
         return &m_chunk;
     }
 
-    Compact();
     if (RecvMore() <= 0)
     {
         m_valueConsumed = true;
@@ -624,12 +622,10 @@ Chunk* Connection::ReadHeaderValue()
         m_chunk.complete = false;
 
         m_parsePos = m_bufLen;
-        Compact();
         RecvMore();
         return &m_chunk;
     }
 
-    Compact();
     if (RecvMore() <= 0)
     {
         m_pendingContentLength = false;

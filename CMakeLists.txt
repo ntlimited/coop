@@ -40,7 +40,7 @@ target_compile_options(coop PRIVATE -Wcpp)
 # level checks in the IO hot path (spdlog::trace calls on every Submit/Complete/Poll).
 #
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    target_compile_definitions(coop PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO)
+    target_compile_definitions(coop PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_WARN)
 endif()
 
 # External libraries

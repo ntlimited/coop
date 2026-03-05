@@ -43,9 +43,14 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     target_compile_definitions(coop PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_WARN)
 endif()
 
-# Performance counter mode: 0=disabled (default), 1=always-on, 2=dynamic (NOP/JMP patching)
+# Performance counter mode: 0=disabled, 1=always-on, 2=dynamic (NOP/JMP patching)
+# Default: always-on in debug (useful diagnostics, negligible cost), disabled in release.
 #
-set(COOP_PERF_MODE "0" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(COOP_PERF_MODE "1" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")
+else()
+    set(COOP_PERF_MODE "0" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")
+endif()
 target_compile_definitions(coop PUBLIC COOP_PERF_MODE=${COOP_PERF_MODE})
 
 # External libraries
@@ -137,6 +142,7 @@ add_executable(coop_benchmarks
     benchmarks/bench_uring_config.cpp
     benchmarks/bench_ssl.cpp
     benchmarks/bench_http.cpp
+    benchmarks/bench_perf.cpp
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
 

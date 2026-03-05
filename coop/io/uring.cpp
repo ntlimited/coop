@@ -21,6 +21,20 @@
 #define IORING_SETUP_DEFER_TASKRUN (1U << 13)
 #endif
 
+#ifndef IORING_SQ_TASKRUN
+#define IORING_SQ_TASKRUN (1U << 0)
+// liburing < 2.3 lacks io_uring_get_events(). Polyfill via raw syscall: zero-submit enter
+// with IORING_ENTER_GETEVENTS to flush deferred completions.
+//
+#include <sys/syscall.h>
+#include <unistd.h>
+static inline int io_uring_get_events(struct io_uring* ring)
+{
+    return syscall(__NR_io_uring_enter, ring->ring_fd, 0, 0,
+        IORING_ENTER_GETEVENTS, nullptr, _NSIG / 8);
+}
+#endif
+
 namespace coop
 {
 
@@ -168,7 +182,7 @@ int Uring::Poll()
 
     while (io_uring_peek_cqe(&m_ring, &cqe) == 0)
     {
-        spdlog::trace("uring cqe result={}", cqe->res);
+        SPDLOG_TRACE("uring cqe result={}", cqe->res);
         Handle::Callback(cqe);
         dispatched++;
     }
@@ -210,11 +224,11 @@ void Uring::Register(Descriptor* descriptor)
                 return;
             }
             descriptor->m_registeredIndex = i;
-            spdlog::trace("uring register fd={} slot={}", descriptor->m_fd, i);
+            SPDLOG_TRACE("uring register fd={} slot={}", descriptor->m_fd, i);
             return;
         }
     }
-    spdlog::debug("uring register fd={} no slot available", descriptor->m_fd);
+    SPDLOG_DEBUG("uring register fd={} no slot available", descriptor->m_fd);
 }
 
 void Uring::Unregister(Descriptor* descriptor)
@@ -231,7 +245,7 @@ void Uring::Unregister(Descriptor* descriptor)
             descriptor->m_fd, idx, ret);
     }
     descriptor->m_registeredIndex = -1;
-    spdlog::trace("uring unregister fd={} slot={}", descriptor->m_fd, idx);
+    SPDLOG_TRACE("uring unregister fd={} slot={}", descriptor->m_fd, idx);
 }
 
 } // end namespace io

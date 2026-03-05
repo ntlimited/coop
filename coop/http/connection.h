@@ -128,11 +128,6 @@ struct Connection
     //
     void SkipToHeaders();
 
-    // Capture Content-Length / Transfer-Encoding from a header line in the buffer
-    //
-    void DetectSpecialHeader(size_t nameStart, size_t nameEnd,
-                             size_t valueStart, size_t valueEnd);
-
     // Status text for HTTP response codes
     //
     static const char* StatusText(int code);

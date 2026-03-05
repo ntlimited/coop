@@ -407,47 +407,6 @@ void Connection::SkipArgs()
 }
 
 // -------------------------------------------------------------------------------------
-// Special header detection
-// -------------------------------------------------------------------------------------
-
-void Connection::DetectSpecialHeader(size_t nameStart, size_t nameEnd,
-                                     size_t valueStart, size_t valueEnd)
-{
-    size_t nameLen = nameEnd - nameStart;
-
-    if (nameLen == 14 && strncasecmp(m_buf + nameStart, "content-length", 14) == 0)
-    {
-        m_contentLength = 0;
-        for (size_t i = valueStart; i < valueEnd; i++)
-        {
-            char c = m_buf[i];
-            if (c >= '0' && c <= '9')
-            {
-                m_contentLength = m_contentLength * 10 + (c - '0');
-            }
-        }
-    }
-
-    if (nameLen == 17 && strncasecmp(m_buf + nameStart, "transfer-encoding", 17) == 0)
-    {
-        size_t valLen = valueEnd - valueStart;
-        if (valLen >= 7 && strncasecmp(m_buf + valueStart, "chunked", 7) == 0)
-        {
-            m_chunkedBody = true;
-        }
-    }
-
-    if (nameLen == 10 && strncasecmp(m_buf + nameStart, "connection", 10) == 0)
-    {
-        size_t valLen = valueEnd - valueStart;
-        if (valLen >= 5 && strncasecmp(m_buf + valueStart, "close", 5) == 0)
-        {
-            m_clientClose = true;
-        }
-    }
-}
-
-// -------------------------------------------------------------------------------------
 // Phase 3: Headers
 //
 // parsePos is at the start of the first header line (or the empty \r\n).
@@ -687,82 +646,9 @@ void Connection::SkipHeaders()
     }
     if (m_phase != HEADERS) return;
 
-    // Skip any unconsumed value from previous header
-    //
-    if (!m_valueConsumed)
+    while (NextHeaderName() != nullptr)
     {
         SkipHeaderValue();
-    }
-
-    // Scan through header lines, detecting Content-Length and Transfer-Encoding as we go
-    //
-    while (true)
-    {
-        // Ensure at least 2 bytes
-        //
-        while (m_bufLen - m_parsePos < 2)
-        {
-            Compact();
-            if (RecvMore() <= 0)
-            {
-                m_phase = DONE;
-                return;
-            }
-        }
-
-        // Empty line = end of headers
-        //
-        if (m_buf[m_parsePos] == '\r' && m_buf[m_parsePos + 1] == '\n')
-        {
-            m_parsePos += 2;
-            m_phase = BODY;
-            return;
-        }
-
-        // Scan this header line: find colon (name end) and \r\n (line end)
-        //
-        size_t lineStart = m_parsePos;
-        size_t colonPos = 0;
-        bool foundColon = false;
-
-        while (true)
-        {
-            for (size_t i = m_parsePos; i + 1 < m_bufLen; i++)
-            {
-                if (!foundColon && m_buf[i] == ':')
-                {
-                    colonPos = i;
-                    foundColon = true;
-                }
-                if (m_buf[i] == '\r' && m_buf[i + 1] == '\n')
-                {
-                    // Detect special headers
-                    //
-                    if (foundColon)
-                    {
-                        size_t valueStart = colonPos + 1;
-                        while (valueStart < i && m_buf[valueStart] == ' ') valueStart++;
-                        DetectSpecialHeader(lineStart, colonPos, valueStart, i);
-                    }
-
-                    m_parsePos = i + 2;
-                    goto next_header;
-                }
-            }
-
-            // Line spans buffer boundary
-            //
-            Compact();
-            lineStart = m_parsePos;
-            foundColon = false;
-            if (RecvMore() <= 0)
-            {
-                m_phase = DONE;
-                return;
-            }
-        }
-
-        next_header:;
     }
 }
 

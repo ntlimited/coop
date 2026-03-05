@@ -239,12 +239,13 @@ the Interface → CRTP → Final pattern (see `DESIGN_IDIOMS.md`):
 - `ConnectionBase` — pure-virtual interface. Handlers take `ConnectionBase&`. Virtual dispatch
   happens once per handler call.
 - `ConnectionImpl<Derived>` — CRTP template with all parser state and methods. Accesses the
-  recv buffer via `static_cast<Derived*>(this)->m_buf` — compile-time offset, zero indirection.
-  Accesses transport via CRTP dispatch (fully inlined). Explicit template instantiation in
-  `connection.cpp` for `PlaintextTransport` and `TlsTransport`.
-- `Connection<Transport>` — final concrete type. Owns the transport, buffer size, and trailing
-  `char m_buf[0]`. Allocated via `ctx->Allocate<Connection<T>>(bufSize, ...)` from the bump
-  heap — one contiguous allocation for the object + its recv buffer.
+  recv buffer via `RecvBuf()` and send buffer via `SendBuf()` — compile-time offset, zero
+  indirection. Accesses transport via CRTP dispatch (fully inlined). Explicit template
+  instantiation in `connection.cpp` for `PlaintextTransport` and `TlsTransport`.
+- `Connection<Transport>` — final concrete type. Owns the transport, dual buffer sizes, and
+  trailing `char m_buf[0]` (layout: `[recv ... recvBufSize] [send ... sendBufSize]`).
+  Allocated via `ctx->Allocate<Connection<T>>(recvBufSize + sendBufSize, ...)` from the bump
+  heap — one contiguous allocation for the object + both buffers.
 
 Parsing is strictly sequential (request line -> args -> headers -> body), lazy, and memoized.
 Each phase implicitly skips the previous phase if not consumed. All string_views and data
@@ -261,8 +262,8 @@ Flyweight instances are Connection members, no heap allocation.
 **Pull API**:
 ```cpp
 PlaintextTransport transport(desc);
-auto conn = ctx->Allocate<Connection<PlaintextTransport>>(bufSize,
-    transport, ctx, co, bufSize);
+auto conn = ctx->Allocate<Connection<PlaintextTransport>>(bufSize + sendBufSize,
+    transport, ctx, co, bufSize, sendBufSize);
 auto* req = conn->GetRequestLine();      // RequestLine* (method, path)
 while (auto* name = conn->NextArgName()) // query string args
     auto* val = conn->ReadArgValue();    // Chunk* (zero-copy)

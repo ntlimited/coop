@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <sys/uio.h>
 
 #include "coop/io/descriptor.h"
 #include "coop/time/interval.h"
@@ -44,6 +43,7 @@ struct Chunk
 struct ConnectionBase
 {
     static constexpr size_t DEFAULT_BUFFER_SIZE = 2048;
+    static constexpr size_t DEFAULT_SEND_BUFFER_SIZE = 512;
 
     virtual ~ConnectionBase() = default;
 
@@ -134,8 +134,11 @@ struct ConnectionImpl : ConnectionBase
   private:
     // Buffer access via CRTP — resolved to compile-time offset, no pointer indirection
     //
-    char* Buf() { return static_cast<Derived*>(this)->m_buf; }
-    size_t BufSize() const { return static_cast<const Derived*>(this)->m_bufSize; }
+    char* RecvBuf() { return static_cast<Derived*>(this)->m_buf; }
+    size_t RecvBufSize() const { return static_cast<const Derived*>(this)->m_recvBufSize; }
+    char* SendBuf() { return static_cast<Derived*>(this)->m_buf +
+                             static_cast<const Derived*>(this)->m_recvBufSize; }
+    size_t SendBufSize() const { return static_cast<const Derived*>(this)->m_sendBufSize; }
 
     // Transport dispatch via CRTP — fully inlined, no virtual call
     //
@@ -149,15 +152,20 @@ struct ConnectionImpl : ConnectionBase
         return static_cast<Derived*>(this)->DoSendAll(buf, size);
     }
 
-    int TransportWritevAll(struct iovec* iov, int iovcnt)
-    {
-        return static_cast<Derived*>(this)->DoWritevAll(iov, iovcnt);
-    }
-
     int TransportSendfileAll(int in_fd, off_t offset, size_t count)
     {
         return static_cast<Derived*>(this)->DoSendfileAll(in_fd, offset, count);
     }
+
+    // Write buffer management
+    //
+    bool Append(const void* data, size_t size);
+    bool Flush();
+    bool AppendUInt(size_t val);
+    bool AppendHex(size_t val);
+    template<size_t N>
+    bool AppendLiteral(const char (&s)[N]);
+    bool AppendConnectionTrailer();
 
     enum Phase
     {
@@ -179,10 +187,7 @@ struct ConnectionImpl : ConnectionBase
     bool AdvanceToPhase(Phase target);
     Chunk* ReadChunkedBody();
     void SkipToHeaders();
-    static const char* StatusText(int code);
-    const char* ConnectionHeaderValue() const;
     bool SendRaw(const void* data, size_t size);
-    bool SendWritev(struct iovec* iov, int iovcnt);
 
     io::Descriptor& m_desc;
     Context*        m_ctx;
@@ -191,6 +196,7 @@ struct ConnectionImpl : ConnectionBase
 
     size_t          m_bufLen;
     size_t          m_parsePos;
+    size_t          m_sendLen;
 
     Phase           m_phase;
     int64_t         m_contentLength;
@@ -227,12 +233,23 @@ struct ConnectionImpl : ConnectionBase
 template<typename Transport>
 struct Connection final : ConnectionImpl<Connection<Transport>>
 {
+    // Trailing bytes needed for Allocate: recv buffer + send buffer.
+    //
+    static constexpr size_t ExtraBytes(
+        size_t recvBufSize = ConnectionBase::DEFAULT_BUFFER_SIZE,
+        size_t sendBufSize = ConnectionBase::DEFAULT_SEND_BUFFER_SIZE)
+    {
+        return recvBufSize + sendBufSize;
+    }
+
     Connection(Transport transport, Context* ctx, Cooperator* co,
-               size_t bufSize,
+               size_t recvBufSize = ConnectionBase::DEFAULT_BUFFER_SIZE,
+               size_t sendBufSize = ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
                time::Interval timeout = std::chrono::seconds(30))
     : ConnectionImpl<Connection<Transport>>(transport.Descriptor(), ctx, co, timeout)
     , m_transport(transport)
-    , m_bufSize(bufSize)
+    , m_recvBufSize(recvBufSize)
+    , m_sendBufSize(sendBufSize)
     {}
 
     // CRTP transport dispatch — called by ConnectionImpl, fully inlined
@@ -247,19 +264,15 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
         return m_transport.SendAll(buf, size);
     }
 
-    int DoWritevAll(struct iovec* iov, int iovcnt)
-    {
-        return m_transport.WritevAll(iov, iovcnt);
-    }
-
     int DoSendfileAll(int in_fd, off_t offset, size_t count)
     {
         return m_transport.SendfileAll(in_fd, offset, count);
     }
 
     Transport       m_transport;
-    size_t          m_bufSize;
-    char            m_buf[0];   // trailing — MUST BE LAST
+    size_t          m_recvBufSize;
+    size_t          m_sendBufSize;
+    char            m_buf[0];   // trailing: [recv ... recvBufSize] [send ... sendBufSize]
 };
 
 } // end namespace coop::http

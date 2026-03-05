@@ -14,9 +14,9 @@
 #include "coop/http/connection.h"
 #include "coop/http/transport.h"
 
-static constexpr size_t HTTP_BUF = coop::http::ConnectionBase::DEFAULT_BUFFER_SIZE;
-
 using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
+
+static constexpr size_t HTTP_EXTRA = HttpConn::ExtraBytes();
 
 #include "test_helpers.h"
 
@@ -87,8 +87,8 @@ TEST(HttpTest, GetRequestLine)
         SendString(client, "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         auto* req = conn->GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->method, "GET");
@@ -108,8 +108,8 @@ TEST(HttpTest, PostRequestLine)
         SendString(client, "POST /submit HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         auto* req = conn->GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->method, "POST");
@@ -133,8 +133,8 @@ TEST(HttpTest, GetArgs)
         SendString(client, "GET /search?q=hello&lang=en HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         auto* req = conn->GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->path, "/search");
@@ -188,8 +188,8 @@ TEST(HttpTest, Headers)
             "\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         conn->GetRequestLine();
 
         // First header: Host
@@ -243,8 +243,8 @@ TEST(HttpTest, PostWithBody)
             "Hello, World!");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         auto* req = conn->GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->method, "POST");
@@ -288,8 +288,8 @@ TEST(HttpTest, ChunkedBody)
             "\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         auto* req = conn->GetRequestLine();
         ASSERT_NE(req, nullptr);
 
@@ -331,8 +331,8 @@ TEST(HttpTest, SkipArgsToHeaders)
             "\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         conn->GetRequestLine();
 
         // Skip args, go straight to headers
@@ -364,8 +364,8 @@ TEST(HttpTest, SkipHeadersToBody)
             "test");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         conn->GetRequestLine();
         conn->SkipHeaders();
 
@@ -397,8 +397,8 @@ TEST(HttpTest, SendResponse)
         SendString(client, "GET / HTTP/1.1\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         conn->GetRequestLine();
         conn->Send(200, "text/plain", "OK!\n");
 
@@ -431,8 +431,8 @@ TEST(HttpTest, ChunkedResponse)
         SendString(client, "GET / HTTP/1.1\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         conn->GetRequestLine();
 
         conn->BeginChunked(200, "text/plain");
@@ -468,8 +468,8 @@ TEST(HttpTest, MalformedRequest)
         SendString(client, "GARBAGE\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-            transport, ctx, ctx->GetCooperator(), HTTP_BUF);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
         auto* req = conn->GetRequestLine();
         EXPECT_EQ(req, nullptr);
     });
@@ -491,9 +491,10 @@ TEST(HttpTest, RecvTimeout)
         // Don't send anything — Connection should time out
         //
         coop::http::PlaintextTransport transport(server);
-        auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
             transport, ctx, ctx->GetCooperator(),
-            HTTP_BUF, std::chrono::milliseconds(50));
+            HttpConn::DEFAULT_BUFFER_SIZE, HttpConn::DEFAULT_SEND_BUFFER_SIZE,
+            std::chrono::milliseconds(50));
 
         auto* req = conn->GetRequestLine();
         EXPECT_EQ(req, nullptr);

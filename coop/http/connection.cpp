@@ -1,4 +1,5 @@
 #include "connection.h"
+#include "response_constants.h"
 #include "transport.h"
 #include "tls_transport.h"
 
@@ -25,6 +26,7 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_timeout(timeout)
 , m_bufLen(0)
 , m_parsePos(0)
+, m_sendLen(0)
 , m_phase(REQUEST_LINE)
 , m_contentLength(-1)
 , m_chunkedBody(false)
@@ -52,6 +54,7 @@ void ConnectionImpl<Derived>::Reset()
     Compact();
 
     m_parsePos          = 0;
+    m_sendLen           = 0;
     m_phase             = REQUEST_LINE;
     m_contentLength     = -1;
     m_chunkedBody       = false;
@@ -80,13 +83,13 @@ int ConnectionImpl<Derived>::RecvMore()
 {
     if (m_ctx->IsKilled()) return -1;
 
-    if (m_bufLen >= BufSize())
+    if (m_bufLen >= RecvBufSize())
     {
         Compact();
-        if (m_bufLen >= BufSize()) return 0;
+        if (m_bufLen >= RecvBufSize()) return 0;
     }
 
-    int n = TransportRecv(Buf() + m_bufLen, BufSize() - m_bufLen, 0, m_timeout);
+    int n = TransportRecv(RecvBuf() +m_bufLen, RecvBufSize() - m_bufLen, 0, m_timeout);
 
     if (m_ctx->IsKilled()) return -1;
     if (n <= 0) return -1;
@@ -103,7 +106,7 @@ void ConnectionImpl<Derived>::Compact()
     size_t remaining = m_bufLen - m_parsePos;
     if (remaining > 0)
     {
-        memmove(Buf(), Buf() + m_parsePos, remaining);
+        memmove(RecvBuf(), RecvBuf() +m_parsePos, remaining);
     }
     m_bufLen = remaining;
     m_parsePos = 0;
@@ -126,7 +129,7 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
     {
         for (size_t i = m_parsePos; i + 1 < m_bufLen; i++)
         {
-            if (Buf()[i] == '\r' && Buf()[i + 1] == '\n')
+            if (RecvBuf()[i] == '\r' && RecvBuf()[i + 1] == '\n')
             {
                 if (!ParseRequestLine()) return nullptr;
                 m_phase = ARGS;
@@ -145,20 +148,20 @@ bool ConnectionImpl<Derived>::ParseRequestLine()
     size_t start = m_parsePos;
 
     size_t i = start;
-    while (i < m_bufLen && Buf()[i] != ' ') i++;
+    while (i < m_bufLen && RecvBuf()[i] != ' ') i++;
     if (i >= m_bufLen) return false;
 
-    m_requestLine.method = std::string_view(Buf() + start, i - start);
+    m_requestLine.method = std::string_view(RecvBuf() +start, i - start);
 
     i++;
     size_t pathStart = i;
 
-    while (i < m_bufLen && Buf()[i] != '?' && Buf()[i] != ' ' && Buf()[i] != '\r') i++;
+    while (i < m_bufLen && RecvBuf()[i] != '?' && RecvBuf()[i] != ' ' && RecvBuf()[i] != '\r') i++;
     if (i >= m_bufLen) return false;
 
-    m_requestLine.path = std::string_view(Buf() + pathStart, i - pathStart);
+    m_requestLine.path = std::string_view(RecvBuf() +pathStart, i - pathStart);
 
-    if (Buf()[i] == '?')
+    if (RecvBuf()[i] == '?')
     {
         m_parsePos = i + 1;
     }
@@ -211,7 +214,7 @@ void ConnectionImpl<Derived>::SkipToHeaders()
     {
         for (size_t i = m_parsePos; i < m_bufLen; i++)
         {
-            if (Buf()[i] == '\n')
+            if (RecvBuf()[i] == '\n')
             {
                 m_parsePos = i + 1;
                 m_phase = HEADERS;
@@ -247,7 +250,7 @@ const char* ConnectionImpl<Derived>::NextArgName()
         SkipArgValue();
     }
 
-    if (m_parsePos >= m_bufLen || Buf()[m_parsePos] == ' ' || Buf()[m_parsePos] == '\r')
+    if (m_parsePos >= m_bufLen || RecvBuf()[m_parsePos] == ' ' || RecvBuf()[m_parsePos] == '\r')
     {
         SkipToHeaders();
         return nullptr;
@@ -259,11 +262,11 @@ const char* ConnectionImpl<Derived>::NextArgName()
     {
         for (size_t i = (nameStart == m_parsePos ? m_parsePos : m_parsePos); i < m_bufLen; i++)
         {
-            char c = Buf()[i];
+            char c = RecvBuf()[i];
             if (c == '=' || c == '&' || c == ' ' || c == '\r')
             {
-                Buf()[i] = '\0';
-                const char* name = Buf() + nameStart;
+                RecvBuf()[i] = '\0';
+                const char* name = RecvBuf() +nameStart;
                 m_parsePos = i;
 
                 if (c == '=')
@@ -296,10 +299,10 @@ Chunk* ConnectionImpl<Derived>::ReadArgValue()
 
     for (size_t i = m_parsePos; i < m_bufLen; i++)
     {
-        char c = Buf()[i];
+        char c = RecvBuf()[i];
         if (c == '&' || c == ' ' || c == '\r')
         {
-            m_chunk.data = Buf() + valueStart;
+            m_chunk.data = RecvBuf() +valueStart;
             m_chunk.size = i - valueStart;
             m_chunk.complete = true;
 
@@ -313,7 +316,7 @@ Chunk* ConnectionImpl<Derived>::ReadArgValue()
     size_t available = m_bufLen - valueStart;
     if (available > 0)
     {
-        m_chunk.data = Buf() + valueStart;
+        m_chunk.data = RecvBuf() +valueStart;
         m_chunk.size = available;
         m_chunk.complete = false;
 
@@ -340,7 +343,7 @@ void ConnectionImpl<Derived>::SkipArgValue()
     {
         for (size_t i = m_parsePos; i < m_bufLen; i++)
         {
-            char c = Buf()[i];
+            char c = RecvBuf()[i];
             if (c == '&' || c == ' ' || c == '\r')
             {
                 m_parsePos = i;
@@ -397,7 +400,7 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
             if (RecvMore() <= 0) return nullptr;
         }
 
-        if (Buf()[m_parsePos] == '\r' && Buf()[m_parsePos + 1] == '\n')
+        if (RecvBuf()[m_parsePos] == '\r' && RecvBuf()[m_parsePos + 1] == '\n')
         {
             m_parsePos += 2;
             m_phase = BODY;
@@ -410,14 +413,14 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
         {
             for (size_t i = m_parsePos; i < m_bufLen; i++)
             {
-                if (Buf()[i] == ':')
+                if (RecvBuf()[i] == ':')
                 {
                     size_t nameEnd = i;
-                    Buf()[i] = '\0';
-                    const char* name = Buf() + nameStart;
+                    RecvBuf()[i] = '\0';
+                    const char* name = RecvBuf() +nameStart;
                     m_parsePos = i + 1;
 
-                    while (m_parsePos < m_bufLen && Buf()[m_parsePos] == ' ')
+                    while (m_parsePos < m_bufLen && RecvBuf()[m_parsePos] == ' ')
                     {
                         m_parsePos++;
                     }
@@ -443,7 +446,7 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
                     return name;
                 }
 
-                if (Buf()[i] == '\r')
+                if (RecvBuf()[i] == '\r')
                 {
                     m_phase = DONE;
                     return nullptr;
@@ -466,9 +469,9 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
 
     for (size_t i = m_parsePos; i < m_bufLen; i++)
     {
-        if (Buf()[i] == '\r')
+        if (RecvBuf()[i] == '\r')
         {
-            m_chunk.data = Buf() + valueStart;
+            m_chunk.data = RecvBuf() +valueStart;
             m_chunk.size = i - valueStart;
             m_chunk.complete = true;
 
@@ -505,7 +508,7 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
             }
 
             m_parsePos = i;
-            if (m_parsePos + 1 < m_bufLen && Buf()[m_parsePos + 1] == '\n')
+            if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
             {
                 m_parsePos += 2;
             }
@@ -517,7 +520,7 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
     size_t available = m_bufLen - valueStart;
     if (available > 0)
     {
-        m_chunk.data = Buf() + valueStart;
+        m_chunk.data = RecvBuf() +valueStart;
         m_chunk.size = available;
         m_chunk.complete = false;
 
@@ -557,10 +560,10 @@ void ConnectionImpl<Derived>::SkipHeaderValue()
     {
         for (size_t i = m_parsePos; i < m_bufLen; i++)
         {
-            if (Buf()[i] == '\r')
+            if (RecvBuf()[i] == '\r')
             {
                 m_parsePos = i;
-                if (m_parsePos + 1 < m_bufLen && Buf()[m_parsePos + 1] == '\n')
+                if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
                 {
                     m_parsePos += 2;
                 }
@@ -655,7 +658,7 @@ Chunk* ConnectionImpl<Derived>::ReadBody()
     }
 
     size_t toDeliver = std::min(available, m_bodyRemaining);
-    m_chunk.data = Buf() + m_parsePos;
+    m_chunk.data = RecvBuf() +m_parsePos;
     m_chunk.size = toDeliver;
     m_bodyRemaining -= toDeliver;
     m_chunk.complete = (m_bodyRemaining == 0);
@@ -701,7 +704,7 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
         }
 
         size_t toDeliver = std::min(available, m_bodyRemaining);
-        m_chunk.data = Buf() + m_parsePos;
+        m_chunk.data = RecvBuf() +m_parsePos;
         m_chunk.size = toDeliver;
         m_bodyRemaining -= toDeliver;
         m_parsePos += toDeliver;
@@ -730,12 +733,12 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
     {
         for (size_t i = m_parsePos; i + 1 < m_bufLen; i++)
         {
-            if (Buf()[i] == '\r' && Buf()[i + 1] == '\n')
+            if (RecvBuf()[i] == '\r' && RecvBuf()[i + 1] == '\n')
             {
                 size_t chunkSize = 0;
                 for (size_t j = m_parsePos; j < i; j++)
                 {
-                    char c = Buf()[j];
+                    char c = RecvBuf()[j];
                     if (c == ';') break;
 
                     chunkSize <<= 4;
@@ -764,39 +767,112 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
 }
 
 // -------------------------------------------------------------------------------------
-// Response
+// Write buffer
 // -------------------------------------------------------------------------------------
 
 template<typename Derived>
-const char* ConnectionImpl<Derived>::StatusText(int code)
+bool ConnectionImpl<Derived>::Append(const void* data, size_t size)
 {
-    switch (code)
+    if (m_sendError) return false;
+
+    // Data larger than the entire send buffer: flush what we have, then send directly
+    //
+    if (size > SendBufSize())
     {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 408: return "Request Timeout";
-        case 413: return "Payload Too Large";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        default:  return "Unknown";
+        if (!Flush()) return false;
+        return SendRaw(data, size);
     }
+
+    // Would overflow: flush first, then copy
+    //
+    if (m_sendLen + size > SendBufSize())
+    {
+        if (!Flush()) return false;
+    }
+
+    memcpy(SendBuf() + m_sendLen, data, size);
+    m_sendLen += size;
+    return true;
 }
 
 template<typename Derived>
-const char* ConnectionImpl<Derived>::ConnectionHeaderValue() const
+bool ConnectionImpl<Derived>::Flush()
 {
-    return (m_keepAlive && !m_clientClose) ? "keep-alive" : "close";
+    if (m_sendError) return false;
+    if (m_sendLen == 0) return true;
+
+    bool ok = SendRaw(SendBuf(), m_sendLen);
+    m_sendLen = 0;
+    return ok;
 }
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::AppendUInt(size_t val)
+{
+    // Hand-rolled itoa: max 20 digits for uint64_t. Write backwards then memcpy forward.
+    //
+    char tmp[20];
+    int pos = sizeof(tmp);
+
+    if (val == 0)
+    {
+        tmp[--pos] = '0';
+    }
+    else
+    {
+        while (val > 0)
+        {
+            tmp[--pos] = '0' + (val % 10);
+            val /= 10;
+        }
+    }
+
+    return Append(tmp + pos, sizeof(tmp) - pos);
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::AppendHex(size_t val)
+{
+    static constexpr char HEX[] = "0123456789abcdef";
+    char tmp[16];
+    int pos = sizeof(tmp);
+
+    if (val == 0)
+    {
+        tmp[--pos] = '0';
+    }
+    else
+    {
+        while (val > 0)
+        {
+            tmp[--pos] = HEX[val & 0xf];
+            val >>= 4;
+        }
+    }
+
+    return Append(tmp + pos, sizeof(tmp) - pos);
+}
+
+template<typename Derived>
+template<size_t N>
+bool ConnectionImpl<Derived>::AppendLiteral(const char (&s)[N])
+{
+    return Append(s, N - 1);
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::AppendConnectionTrailer()
+{
+    if (m_keepAlive && !m_clientClose)
+    {
+        return AppendLiteral(response::CONN_KEEP_ALIVE);
+    }
+    return AppendLiteral(response::CONN_CLOSE);
+}
+
+// -------------------------------------------------------------------------------------
+// Response
+// -------------------------------------------------------------------------------------
 
 template<typename Derived>
 bool ConnectionImpl<Derived>::SendRaw(const void* data, size_t size)
@@ -812,43 +888,23 @@ bool ConnectionImpl<Derived>::SendRaw(const void* data, size_t size)
     return true;
 }
 
-template<typename Derived>
-bool ConnectionImpl<Derived>::SendWritev(struct iovec* iov, int iovcnt)
-{
-    assert(!m_sendError);
-
-    size_t total = 0;
-    for (int i = 0; i < iovcnt; i++)
-    {
-        total += iov[i].iov_len;
-    }
-
-    int result = TransportWritevAll(iov, iovcnt);
-    if (result <= 0 || static_cast<size_t>(result) != total)
-    {
-        m_sendError = true;
-        return false;
-    }
-    return true;
-}
-
+// Append the common header block: status line, Content-Type, Content-Length, Connection.
+//
 template<typename Derived>
 bool ConnectionImpl<Derived>::SendHeaders(int status, const char* contentType,
                                            size_t contentLength)
 {
     assert(!m_sendError);
 
-    char hdr[512];
-    int len = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        status, StatusText(status), contentType, contentLength, ConnectionHeaderValue());
-    assert(len > 0 && static_cast<size_t>(len) < sizeof(hdr));
-
-    return SendRaw(hdr, len);
+    auto sl = response::StatusLine(status);
+    if (!Append(sl.data, sl.size)) return false;
+    if (!AppendLiteral(response::CONTENT_TYPE)) return false;
+    if (!Append(contentType, strlen(contentType))) return false;
+    if (!AppendLiteral(response::CONTENT_LENGTH)) return false;
+    if (!AppendUInt(contentLength)) return false;
+    if (!AppendLiteral(response::CRLF)) return false;
+    if (!AppendConnectionTrailer()) return false;
+    return Flush();
 }
 
 template<typename Derived>
@@ -857,26 +913,32 @@ bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
 {
     assert(!m_sendError);
 
-    char hdr[512];
-    int len = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: %s\r\n"
-        "\r\n",
-        status, StatusText(status), contentType, size, ConnectionHeaderValue());
-    assert(len > 0 && static_cast<size_t>(len) < sizeof(hdr));
+    auto sl = response::StatusLine(status);
+    if (!Append(sl.data, sl.size)) return false;
+    if (!AppendLiteral(response::CONTENT_TYPE)) return false;
+    if (!Append(contentType, strlen(contentType))) return false;
+    if (!AppendLiteral(response::CONTENT_LENGTH)) return false;
+    if (!AppendUInt(size)) return false;
+    if (!AppendLiteral(response::CRLF)) return false;
+    if (!AppendConnectionTrailer()) return false;
 
     if (size == 0)
     {
-        return SendRaw(hdr, len);
+        return Flush();
     }
 
-    struct iovec iov[2] = {
-        { hdr, static_cast<size_t>(len) },
-        { const_cast<void*>(body), size },
-    };
-    return SendWritev(iov, 2);
+    // Small body: coalesce headers + body into one send
+    //
+    if (m_sendLen + size <= SendBufSize())
+    {
+        if (!Append(body, size)) return false;
+        return Flush();
+    }
+
+    // Large body: flush headers, then send body directly
+    //
+    if (!Flush()) return false;
+    return SendRaw(body, size);
 }
 
 template<typename Derived>
@@ -897,45 +959,32 @@ bool ConnectionImpl<Derived>::BeginChunked(int status, const char* contentType)
     return true;
 }
 
+// Append chunked response headers into the write buffer (deferred until first chunk).
+//
 template<typename Derived>
 bool ConnectionImpl<Derived>::SendChunk(const void* data, size_t size)
 {
     assert(!m_sendError);
     if (size == 0) return false;
 
-    char sizeHdr[32];
-    int sizeLen = snprintf(sizeHdr, sizeof(sizeHdr), "%zx\r\n", size);
-
     if (m_chunkedHeadersPending)
     {
         m_chunkedHeadersPending = false;
 
-        char hdr[512];
-        int hdrLen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 %d %s\r\n"
-            "Content-Type: %s\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Connection: %s\r\n"
-            "\r\n",
-            m_chunkedStatus, StatusText(m_chunkedStatus), m_chunkedContentType,
-            ConnectionHeaderValue());
-        assert(hdrLen > 0 && static_cast<size_t>(hdrLen) < sizeof(hdr));
-
-        struct iovec iov[4] = {
-            { hdr, static_cast<size_t>(hdrLen) },
-            { sizeHdr, static_cast<size_t>(sizeLen) },
-            { const_cast<void*>(data), size },
-            { const_cast<char*>("\r\n"), 2 },
-        };
-        return SendWritev(iov, 4);
+        auto sl = response::StatusLine(m_chunkedStatus);
+        if (!Append(sl.data, sl.size)) return false;
+        if (!AppendLiteral(response::CONTENT_TYPE)) return false;
+        if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
+        if (!AppendLiteral(response::CRLF)) return false;
+        if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
+        if (!AppendConnectionTrailer()) return false;
     }
 
-    struct iovec iov[3] = {
-        { sizeHdr, static_cast<size_t>(sizeLen) },
-        { const_cast<void*>(data), size },
-        { const_cast<char*>("\r\n"), 2 },
-    };
-    return SendWritev(iov, 3);
+    if (!AppendHex(size)) return false;
+    if (!AppendLiteral(response::CRLF)) return false;
+    if (!Append(data, size)) return false;
+    if (!AppendLiteral(response::CRLF)) return false;
+    return Flush();
 }
 
 template<typename Derived>
@@ -947,25 +996,17 @@ bool ConnectionImpl<Derived>::EndChunked()
     {
         m_chunkedHeadersPending = false;
 
-        char hdr[512];
-        int hdrLen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 %d %s\r\n"
-            "Content-Type: %s\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Connection: %s\r\n"
-            "\r\n",
-            m_chunkedStatus, StatusText(m_chunkedStatus), m_chunkedContentType,
-            ConnectionHeaderValue());
-        assert(hdrLen > 0 && static_cast<size_t>(hdrLen) < sizeof(hdr));
-
-        struct iovec iov[2] = {
-            { hdr, static_cast<size_t>(hdrLen) },
-            { const_cast<char*>("0\r\n\r\n"), 5 },
-        };
-        return SendWritev(iov, 2);
+        auto sl = response::StatusLine(m_chunkedStatus);
+        if (!Append(sl.data, sl.size)) return false;
+        if (!AppendLiteral(response::CONTENT_TYPE)) return false;
+        if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
+        if (!AppendLiteral(response::CRLF)) return false;
+        if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
+        if (!AppendConnectionTrailer()) return false;
     }
 
-    return SendRaw("0\r\n\r\n", 5);
+    if (!AppendLiteral(response::CHUNKED_TERMINATOR)) return false;
+    return Flush();
 }
 
 template<typename Derived>
@@ -974,47 +1015,35 @@ bool ConnectionImpl<Derived>::EndChunked(const void* lastChunkData, size_t lastC
     assert(!m_sendError);
     if (lastChunkSize == 0) return EndChunked();
 
-    char sizeHdr[32];
-    int sizeLen = snprintf(sizeHdr, sizeof(sizeHdr), "%zx\r\n", lastChunkSize);
-
     if (m_chunkedHeadersPending)
     {
         m_chunkedHeadersPending = false;
 
-        char hdr[512];
-        int hdrLen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 %d %s\r\n"
-            "Content-Type: %s\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Connection: %s\r\n"
-            "\r\n",
-            m_chunkedStatus, StatusText(m_chunkedStatus), m_chunkedContentType,
-            ConnectionHeaderValue());
-        assert(hdrLen > 0 && static_cast<size_t>(hdrLen) < sizeof(hdr));
-
-        struct iovec iov[5] = {
-            { hdr, static_cast<size_t>(hdrLen) },
-            { sizeHdr, static_cast<size_t>(sizeLen) },
-            { const_cast<void*>(lastChunkData), lastChunkSize },
-            { const_cast<char*>("\r\n"), 2 },
-            { const_cast<char*>("0\r\n\r\n"), 5 },
-        };
-        return SendWritev(iov, 5);
+        auto sl = response::StatusLine(m_chunkedStatus);
+        if (!Append(sl.data, sl.size)) return false;
+        if (!AppendLiteral(response::CONTENT_TYPE)) return false;
+        if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
+        if (!AppendLiteral(response::CRLF)) return false;
+        if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
+        if (!AppendConnectionTrailer()) return false;
     }
 
-    struct iovec iov[4] = {
-        { sizeHdr, static_cast<size_t>(sizeLen) },
-        { const_cast<void*>(lastChunkData), lastChunkSize },
-        { const_cast<char*>("\r\n"), 2 },
-        { const_cast<char*>("0\r\n\r\n"), 5 },
-    };
-    return SendWritev(iov, 4);
+    if (!AppendHex(lastChunkSize)) return false;
+    if (!AppendLiteral(response::CRLF)) return false;
+    if (!Append(lastChunkData, lastChunkSize)) return false;
+    if (!AppendLiteral(response::CRLF)) return false;
+    if (!AppendLiteral(response::CHUNKED_TERMINATOR)) return false;
+    return Flush();
 }
 
 template<typename Derived>
 bool ConnectionImpl<Derived>::Sendfile(int fileFd, off_t offset, size_t count)
 {
     assert(!m_sendError);
+
+    // Flush any buffered headers before sendfile
+    //
+    if (!Flush()) return false;
 
     int result = TransportSendfileAll(fileFd, offset, count);
     if (result <= 0 || static_cast<size_t>(result) != count)

@@ -4,7 +4,6 @@
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
 #include "coop/io/sendfile.h"
-#include "coop/io/writev.h"
 #include "coop/time/interval.h"
 
 namespace coop
@@ -33,11 +32,6 @@ struct PlaintextTransport
     int SendAll(const void* buf, size_t size)
     {
         return io::SendAll(m_desc, buf, size);
-    }
-
-    int WritevAll(struct iovec* iov, int iovcnt)
-    {
-        return io::WritevAll(m_desc, iov, iovcnt);
     }
 
     int SendfileAll(int in_fd, off_t offset, size_t count)

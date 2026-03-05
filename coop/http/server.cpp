@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -156,11 +157,12 @@ struct HttpConnection : Launchable
 
     virtual void Launch() final
     {
+        using Conn = Connection<PlaintextTransport>;
         PlaintextTransport transport(m_fd);
-        auto conn = GetContext()->Allocate<Connection<PlaintextTransport>>(
-            ConnectionBase::DEFAULT_BUFFER_SIZE,
-            transport, GetContext(), m_co,
-            ConnectionBase::DEFAULT_BUFFER_SIZE, m_timeout);
+        auto conn = GetContext()->Allocate<Conn>(
+            Conn::ExtraBytes(), transport, GetContext(), m_co,
+            ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
+            m_timeout);
 
         while (!GetContext()->IsKilled())
         {
@@ -202,19 +204,30 @@ struct HttpTlsConnection : Launchable
     , m_timeout(timeout)
     {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+
+        // Disable Nagle's algorithm. TLS encrypts each SSL_write as a separate record, so the
+        // HTTP response becomes multiple TCP segments. Nagle holds the second segment until
+        // the first is ACKed; combined with the client's delayed ACK (~40ms), this creates a
+        // catastrophic latency floor per request.
+        //
+        int on = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+
         ctx->SetName("HttpTlsConnection");
     }
 
     virtual void Launch() final
     {
-        io::ssl::Connection sslConn(m_sslCtx, m_fd, io::ssl::SocketBio{});
+        char sslBuf[io::ssl::Connection::BUFFER_SIZE];
+        io::ssl::Connection sslConn(m_sslCtx, m_fd, sslBuf, sizeof(sslBuf));
         if (sslConn.Handshake() != 0) return;
 
+        using Conn = Connection<TlsTransport>;
         TlsTransport transport(sslConn, m_fd);
-        auto conn = GetContext()->Allocate<Connection<TlsTransport>>(
-            ConnectionBase::DEFAULT_BUFFER_SIZE,
-            transport, GetContext(), m_co,
-            ConnectionBase::DEFAULT_BUFFER_SIZE, m_timeout);
+        auto conn = GetContext()->Allocate<Conn>(
+            Conn::ExtraBytes(), transport, GetContext(), m_co,
+            ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
+            m_timeout);
 
         while (!GetContext()->IsKilled())
         {

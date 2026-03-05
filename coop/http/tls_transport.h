@@ -1,7 +1,5 @@
 #pragma once
 
-#include <sys/uio.h>
-
 #include "coop/io/descriptor.h"
 #include "coop/io/ssl/connection.h"
 #include "coop/io/ssl/recv.h"
@@ -14,8 +12,7 @@ namespace coop
 namespace http
 {
 
-// TlsTransport dispatches HTTP I/O through the ssl:: layer. Writev is flattened to sequential
-// SendAll calls (TLS can't scatter-gather through encryption). Sendfile dispatches through
+// TlsTransport dispatches HTTP I/O through the ssl:: layer. Sendfile dispatches through
 // ssl::SendfileAll which uses sendfile() directly for kTLS or falls back to pread+send.
 //
 struct TlsTransport
@@ -37,19 +34,6 @@ struct TlsTransport
     int SendAll(const void* buf, size_t size)
     {
         return io::ssl::SendAll(m_conn, buf, size);
-    }
-
-    int WritevAll(struct iovec* iov, int iovcnt)
-    {
-        size_t total = 0;
-        for (int i = 0; i < iovcnt; i++)
-        {
-            if (iov[i].iov_len == 0) continue;
-            int ret = io::ssl::SendAll(m_conn, iov[i].iov_base, iov[i].iov_len);
-            if (ret <= 0) return (total > 0) ? static_cast<int>(total) : ret;
-            total += ret;
-        }
-        return static_cast<int>(total);
     }
 
     int SendfileAll(int in_fd, off_t offset, size_t count)

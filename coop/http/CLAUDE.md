@@ -6,18 +6,23 @@ characteristics.
 
 ## Connection Buffer Management (`connection.cpp`)
 
-`Connection<Transport>` is a contiguous bump allocation: the object and its recv buffer are one
-allocation with `char m_buf[0]` as a trailing flexible member. Buffer size is configurable at
-construction (default 2KB). The parser accesses `m_buf` via CRTP — `ConnectionImpl<Derived>`
-calls `Buf()` which resolves to `static_cast<Derived*>(this)->m_buf`, a compile-time offset
-from `this` with zero pointer indirection.
+`Connection<Transport>` is a contiguous bump allocation with dual trailing buffers:
+`[Connection<T> fields] [recv buffer ... recvBufSize] [send buffer ... sendBufSize]`.
+Both are part of one `char m_buf[0]` trailing flexible member. Default recv: 2KB, send: 512B.
 
-Parsing advances `m_parsePos` through the buffer; `Compact()` memmoves remaining data to the
-front when more recv space is needed.
+The parser accesses the recv buffer via CRTP — `ConnectionImpl<Derived>` calls `RecvBuf()`
+which resolves to `static_cast<Derived*>(this)->m_buf`, a compile-time offset. The send buffer
+is accessed via `SendBuf()` = `m_buf + m_recvBufSize`.
 
-**Compact()**: `memmove(Buf(), Buf() + m_parsePos, remaining)` then resets `m_parsePos = 0`.
-Guarded by `if (m_parsePos == 0) return` to skip no-op calls. Called before `RecvMore()` in
-scan loops when data spans the buffer boundary.
+Allocation: `ctx->Allocate<Connection<T>>(recvBufSize + sendBufSize, transport, ctx, co,
+recvBufSize, sendBufSize)`.
+
+Parsing advances `m_parsePos` through the recv buffer; `Compact()` memmoves remaining data to
+the front when more recv space is needed.
+
+**Compact()**: `memmove(RecvBuf(), RecvBuf() + m_parsePos, remaining)` then resets
+`m_parsePos = 0`. Guarded by `if (m_parsePos == 0) return` to skip no-op calls. Called before
+`RecvMore()` in scan loops when data spans the buffer boundary.
 
 **Design note**: `Compact()` calls should only appear in "need more data" branches — the
 boundary-spanning case. For typical HTTP requests (200-500 bytes), the entire request fits
@@ -41,9 +46,20 @@ handler doesn't read them. `SkipHeaders()` scans all header lines and calls
 
 ## Response Formatting
 
-`Send()`, `BeginChunked()`, `SendChunk()`, `EndChunked()` use `snprintf` to format HTTP
-response headers into a stack buffer. This shows up in perf profiles as `__vfprintf_internal`
-(~0.5% under load) — it's legitimate hot-path work, not logging.
+Response methods use a write buffer (`m_sendLen` tracks fill level in the send buffer) with
+pre-compiled constants (`response_constants.h`). Status lines, header names, and connection
+trailers are pre-built `Fragment`s — memcpy'd via `Append`/`AppendLiteral`. Numeric values
+(Content-Length, chunk sizes) use hand-rolled `AppendUInt`/`AppendHex` (no snprintf). The
+write buffer flushes automatically on overflow or explicitly via `Flush()`.
+
+For small responses (headers + body fit in 512B), the entire response coalesces in the send
+buffer and goes out in one `SendAll` syscall. Large bodies flush headers first, then send the
+body directly via `SendRaw`. Chunked encoding accumulates hex size + data + CRLF in the buffer,
+coalescing multiple small chunks before flush.
+
+The `WritevAll` / iovec pattern is eliminated — both `PlaintextTransport` and `TlsTransport`
+no longer provide `WritevAll`. TLS benefits especially: the buffer replaces the deferred-send
+coalescing that `WritevAll` previously handled.
 
 ## Keep-Alive
 
@@ -55,7 +71,6 @@ parser state. `SkipBody()` must be called before `Reset()` to drain unconsumed b
 
 Under wrk load, the HTTP server is **overwhelmingly kernel-bound**. Top userspace symbols:
 - `Cooperator::DrainSubmissions` ~2% (per-connection context spawning)
-- `snprintf` ~0.5% (response header formatting)
 - `Uring::Poll` ~0.3%
 - `Connection::SkipHeaders` ~0.1%
 - `ContextSwitch` ~0.1%

@@ -24,10 +24,10 @@
 #include "coop/http/transport.h"
 #include "coop/http/tls_transport.h"
 
-static constexpr size_t HTTP_BUF = coop::http::ConnectionBase::DEFAULT_BUFFER_SIZE;
-
 using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
 using HttpTlsConn = coop::http::Connection<coop::http::TlsTransport>;
+
+static constexpr size_t HTTP_EXTRA = HttpConn::ExtraBytes();
 
 // ---------------------------------------------------------------------------
 // Helper: run a benchmark body inside a cooperator
@@ -225,8 +225,8 @@ static void BM_Http_Unix_MinimalGet(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 auto* req = conn->GetRequestLine();
                 assert(req);
                 conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
@@ -258,8 +258,8 @@ static void BM_Http_Unix_SendResponse(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 conn->GetRequestLine();
                 conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
@@ -294,8 +294,8 @@ static void BM_Http_Tcp_MinimalGet(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 auto* req = conn->GetRequestLine();
                 assert(req);
                 conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
@@ -327,8 +327,8 @@ static void BM_Http_Tcp_SendResponse(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 conn->GetRequestLine();
                 conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
@@ -361,8 +361,8 @@ static void BM_Http_Tcp_ChunkedResponse(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 conn->GetRequestLine();
                 conn->BeginChunked(200, "text/plain");
                 conn->SendChunk("Hello", 5);
@@ -399,9 +399,10 @@ static void BM_Http_Tcp_MinimalGet_NoTimeout(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
                     transport, ctx, co,
-                    HTTP_BUF, std::chrono::seconds(0));
+                    HttpConn::DEFAULT_BUFFER_SIZE, HttpConn::DEFAULT_SEND_BUFFER_SIZE,
+                    std::chrono::seconds(0));
                 auto* req = conn->GetRequestLine();
                 assert(req);
                 conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
@@ -440,8 +441,8 @@ static void BM_Http_Tcp_RealisticGet(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 auto* req = conn->GetRequestLine();
                 assert(req);
 
@@ -502,8 +503,8 @@ static void BM_Http_Tcp_RealisticPost(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 auto* req = conn->GetRequestLine();
                 assert(req);
 
@@ -562,8 +563,8 @@ static void BM_Http_Tcp_Response1K(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 conn->GetRequestLine();
                 conn->Send(200, "application/json", RESP_1K, sizeof(RESP_1K) - 1);
             }
@@ -594,8 +595,8 @@ static void BM_Http_Tcp_Response4K(benchmark::State& state)
 
             {
                 coop::http::PlaintextTransport transport(server);
-                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
-                    transport, ctx, co, HTTP_BUF);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+                    transport, ctx, co);
                 conn->GetRequestLine();
                 conn->Send(200, "application/json", RESP_4K, sizeof(RESP_4K) - 1);
             }
@@ -803,8 +804,10 @@ static void BM_Http_Tls_MinimalGet(benchmark::State& state)
         for (auto _ : state)
         {
             coop::http::TlsTransport transport(serverConn, serverDesc);
-            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
-                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto conn = ctx->Allocate<HttpTlsConn>(HttpTlsConn::ExtraBytes(),
+                transport, ctx, co,
+                HttpTlsConn::DEFAULT_BUFFER_SIZE, HttpTlsConn::DEFAULT_SEND_BUFFER_SIZE,
+                std::chrono::seconds(0));
             auto* req = conn->GetRequestLine();
             assert(req);
             conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
@@ -841,8 +844,10 @@ static void BM_Http_Tls_RealisticGet(benchmark::State& state)
         for (auto _ : state)
         {
             coop::http::TlsTransport transport(serverConn, serverDesc);
-            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
-                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto conn = ctx->Allocate<HttpTlsConn>(HttpTlsConn::ExtraBytes(),
+                transport, ctx, co,
+                HttpTlsConn::DEFAULT_BUFFER_SIZE, HttpTlsConn::DEFAULT_SEND_BUFFER_SIZE,
+                std::chrono::seconds(0));
             auto* req = conn->GetRequestLine();
             assert(req);
 
@@ -901,8 +906,10 @@ static void BM_Http_Tls_RealisticPost(benchmark::State& state)
         for (auto _ : state)
         {
             coop::http::TlsTransport transport(serverConn, serverDesc);
-            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
-                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto conn = ctx->Allocate<HttpTlsConn>(HttpTlsConn::ExtraBytes(),
+                transport, ctx, co,
+                HttpTlsConn::DEFAULT_BUFFER_SIZE, HttpTlsConn::DEFAULT_SEND_BUFFER_SIZE,
+                std::chrono::seconds(0));
             auto* req = conn->GetRequestLine();
             assert(req);
 
@@ -959,8 +966,10 @@ static void BM_Http_Tls_Response1K(benchmark::State& state)
         for (auto _ : state)
         {
             coop::http::TlsTransport transport(serverConn, serverDesc);
-            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
-                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto conn = ctx->Allocate<HttpTlsConn>(HttpTlsConn::ExtraBytes(),
+                transport, ctx, co,
+                HttpTlsConn::DEFAULT_BUFFER_SIZE, HttpTlsConn::DEFAULT_SEND_BUFFER_SIZE,
+                std::chrono::seconds(0));
             conn->GetRequestLine();
             conn->Send(200, "application/json", RESP_1K, sizeof(RESP_1K) - 1);
         }
@@ -993,8 +1002,10 @@ static void BM_Http_Tls_Response4K(benchmark::State& state)
         for (auto _ : state)
         {
             coop::http::TlsTransport transport(serverConn, serverDesc);
-            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
-                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto conn = ctx->Allocate<HttpTlsConn>(HttpTlsConn::ExtraBytes(),
+                transport, ctx, co,
+                HttpTlsConn::DEFAULT_BUFFER_SIZE, HttpTlsConn::DEFAULT_SEND_BUFFER_SIZE,
+                std::chrono::seconds(0));
             conn->GetRequestLine();
             conn->Send(200, "application/json", RESP_4K, sizeof(RESP_4K) - 1);
         }

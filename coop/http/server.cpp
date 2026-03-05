@@ -1,4 +1,5 @@
 #include "server.h"
+#include "connection.h"
 
 #include <cstring>
 #include <fcntl.h>
@@ -40,161 +41,134 @@ bool HasPathTraversal(const char* path)
     return strstr(path, "..") != nullptr;
 }
 
-// Build HTTP/1.1 response headers (no body). Used with sendfile for zero-copy file serving.
+// Try to serve a static file matching the requested path from the search paths.
+// Returns true if a file was found and served.
 //
-std::string FormatHeaders(int code, const char* status, const char* contentType,
-                          size_t contentLength)
+bool ServeFile(Connection& conn, std::string_view reqPath,
+               const char* const* searchPaths)
 {
-    std::string resp;
-    resp.reserve(256);
-    resp += "HTTP/1.1 ";
-    resp += std::to_string(code);
-    resp += ' ';
-    resp += status;
-    resp += "\r\nContent-Type: ";
-    resp += contentType;
-    resp += "\r\nContent-Length: ";
-    resp += std::to_string(contentLength);
-    resp += "\r\nConnection: close\r\n\r\n";
-    return resp;
-}
+    // Path traversal check — reqPath is a string_view, need null-terminated copy
+    //
+    char pathBuf[512];
+    if (reqPath.size() >= sizeof(pathBuf)) return false;
+    memcpy(pathBuf, reqPath.data(), reqPath.size());
+    pathBuf[reqPath.size()] = '\0';
 
-// Build a complete HTTP/1.1 response with body inline.
-//
-std::string FormatResponse(int code, const char* status, const char* contentType,
-                           const std::string& body)
-{
-    auto resp = FormatHeaders(code, status, contentType, body.size());
-    resp += body;
-    return resp;
+    if (HasPathTraversal(pathBuf)) return false;
+
+    const char* uriPath = pathBuf;
+    if (reqPath == "/")
+    {
+        uriPath = "/index.html";
+    }
+
+    char filePath[512];
+
+    for (const char* const* sp = searchPaths; *sp != nullptr; sp++)
+    {
+        int len = snprintf(filePath, sizeof(filePath), "%s%s", *sp, uriPath);
+        if (len < 0 || static_cast<size_t>(len) >= sizeof(filePath))
+        {
+            continue;
+        }
+
+        int fileFd = ::open(filePath, O_RDONLY);
+        if (fileFd < 0) continue;
+
+        struct stat st;
+        if (::fstat(fileFd, &st) != 0 || !S_ISREG(st.st_mode))
+        {
+            ::close(fileFd);
+            continue;
+        }
+
+        const char* ct = ContentTypeForExtension(filePath);
+        conn.SendHeaders(200, ct, st.st_size);
+
+        if (st.st_size > 0)
+        {
+            conn.Sendfile(fileFd, 0, st.st_size);
+        }
+
+        ::close(fileFd);
+        return true;
+    }
+
+    return false;
 }
 
 struct HttpConnection : Launchable
 {
     HttpConnection(Context* ctx, int fd, Cooperator* co,
                    const Route* routes, int routeCount,
-                   const char* const* searchPaths)
+                   const char* const* searchPaths,
+                   time::Interval timeout)
     : Launchable(ctx)
     , m_fd(fd)
-    , m_stream(m_fd)
     , m_co(co)
     , m_routes(routes)
     , m_routeCount(routeCount)
     , m_searchPaths(searchPaths)
+    , m_timeout(timeout)
     {
-        // Non-blocking required for sendfile + io::Poll cooperative waiting
-        //
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
         ctx->SetName("HttpConnection");
     }
 
     virtual void Launch() final
     {
-        char buf[4096];
-        int n = m_stream.Recv(buf, sizeof(buf) - 1);
-        if (n <= 0)
-        {
-            return;
-        }
-        buf[n] = '\0';
+        Connection conn(m_fd, GetContext(), m_co, m_timeout);
 
-        // Find end of request line
-        //
-        char* lineEnd = strstr(buf, "\r\n");
-        if (!lineEnd)
+        while (!GetContext()->IsKilled())
         {
-            auto resp = FormatResponse(400, "Bad Request", "text/plain", "Bad Request\n");
-            m_stream.SendAll(resp.data(), resp.size());
-            return;
-        }
-        *lineEnd = '\0';
-
-        // Verify GET method
-        //
-        if (strncmp(buf, "GET ", 4) != 0)
-        {
-            auto resp = FormatResponse(405, "Method Not Allowed", "text/plain",
-                                       "Method Not Allowed\n");
-            m_stream.SendAll(resp.data(), resp.size());
-            return;
-        }
-
-        // Extract path (between "GET " and next space)
-        //
-        char* pathStart = buf + 4;
-        char* pathEnd = strchr(pathStart, ' ');
-        if (pathEnd)
-        {
-            *pathEnd = '\0';
-        }
-
-        // Linear scan route match
-        //
-        for (int i = 0; i < m_routeCount; i++)
-        {
-            if (strcmp(pathStart, m_routes[i].path) == 0)
+            auto* req = conn.GetRequestLine();
+            if (!req)
             {
-                std::string body = m_routes[i].handler(m_co);
-                auto resp = FormatResponse(200, "OK", m_routes[i].contentType, body);
-                m_stream.SendAll(resp.data(), resp.size());
+                if (!conn.SendError())
+                {
+                    conn.Send(400, "text/plain", "Bad Request\n");
+                }
                 return;
             }
-        }
 
-        // File serving fallback — zero-copy via sendfile
-        //
-        if (m_searchPaths && !HasPathTraversal(pathStart))
-        {
-            const char* uriPath = pathStart;
-            if (strcmp(uriPath, "/") == 0)
+            bool handled = false;
+            for (int i = 0; i < m_routeCount; i++)
             {
-                uriPath = "/index.html";
+                if (req->path == m_routes[i].path)
+                {
+                    m_routes[i].handler(conn);
+                    handled = true;
+                    break;
+                }
             }
 
-            char filePath[512];
-
-            for (const char* const* sp = m_searchPaths; *sp != nullptr; sp++)
+            if (!handled)
             {
-                int len = snprintf(filePath, sizeof(filePath), "%s%s", *sp, uriPath);
-                if (len < 0 || static_cast<size_t>(len) >= sizeof(filePath))
+                if (m_searchPaths && ServeFile(conn, req->path, m_searchPaths))
                 {
-                    continue;
+                    handled = true;
                 }
-
-                int fileFd = ::open(filePath, O_RDONLY);
-                if (fileFd < 0) continue;
-
-                struct stat st;
-                if (::fstat(fileFd, &st) != 0 || !S_ISREG(st.st_mode))
+                else
                 {
-                    ::close(fileFd);
-                    continue;
+                    conn.Send(404, "text/plain", "Not Found\n");
                 }
-
-                const char* ct = ContentTypeForExtension(filePath);
-                auto headers = FormatHeaders(200, "OK", ct, st.st_size);
-                m_stream.SendAll(headers.data(), headers.size());
-
-                if (st.st_size > 0)
-                {
-                    io::SendfileAll(m_fd, fileFd, 0, st.st_size);
-                }
-
-                ::close(fileFd);
-                return;
             }
-        }
 
-        auto resp = FormatResponse(404, "Not Found", "text/plain", "Not Found\n");
-        m_stream.SendAll(resp.data(), resp.size());
+            if (conn.SendError() || !conn.KeepAlive()) return;
+
+            // Drain any unconsumed body before resetting for the next request
+            //
+            conn.SkipBody();
+            conn.Reset();
+        }
     }
 
     io::Descriptor      m_fd;
-    io::PlaintextStream m_stream;
     Cooperator*         m_co;
     const Route*        m_routes;
     int                 m_routeCount;
     const char* const*  m_searchPaths;
+    time::Interval      m_timeout;
 };
 
 } // end anonymous namespace
@@ -205,7 +179,8 @@ void RunServer(
     const Route* routes,
     int routeCount,
     const char* name /* = "HttpServer" */,
-    const char* const* searchPaths /* = nullptr */)
+    const char* const* searchPaths /* = nullptr */,
+    time::Interval timeout /* = std::chrono::seconds(30) */)
 {
     ctx->SetName(name);
 
@@ -238,8 +213,8 @@ void RunServer(
             break;
         }
 
-        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 16384};
-        co->Launch<HttpConnection>(config, fd, co, routes, routeCount, searchPaths);
+        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 32768};
+        co->Launch<HttpConnection>(config, fd, co, routes, routeCount, searchPaths, timeout);
         ctx->Yield();
     }
 }

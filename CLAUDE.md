@@ -202,18 +202,55 @@ kTLS). See `coop/io/ssl/CLAUDE.md` for BIO modes, kTLS activation, TCP_NODELAY r
 data path dispatch.
 
 ### HTTP Server (`coop/http/`)
-Route table maps paths to handlers:
+Route table maps paths to handler functions that receive a `Connection&`:
 ```cpp
 struct Route {
     const char* path;
-    const char* contentType;
-    std::string (*handler)(Cooperator*);
+    void (*handler)(Connection&);
 };
 ```
 
-`RunServer` accepts connections in a loop, launches an `HttpConnection` (Launchable) per client.
-GET-only, HTTP/1.0-style (Connection: close). Optional `searchPaths` parameter enables static file
-serving as a fallback when no route matches.
+`Connection` (`coop/http/connection.h`) is the request parser and response writer. Constructed
+stack-local per client, owns a 2KB sliding-window recv buffer. Parsing is strictly sequential
+(request line -> args -> headers -> body), lazy, and memoized. Each phase implicitly skips the
+previous phase if not consumed. All string_views and data pointers are zero-copy into the recv
+buffer.
+
+**Bounded vs unbounded**: HTTP elements split into bounded (method, path, arg names, header
+names — safe to access directly via string_view/const char*) and unbounded (arg values, header
+values, body — delivered via `Chunk*` with zero-copy and completion flag).
+
+**Flyweight pattern**: `GetRequestLine()` returns `RequestLine*` (null = failure).
+`ReadArgValue()`, `ReadHeaderValue()`, `ReadBody()` return `Chunk*` (null = end/error).
+Flyweight instances are Connection members, no heap allocation.
+
+**Pull API**:
+```cpp
+Connection conn(desc, ctx, co, timeout);
+auto* req = conn.GetRequestLine();      // RequestLine* (method, path)
+while (auto* name = conn.NextArgName()) // query string args
+    auto* val = conn.ReadArgValue();    // Chunk* (zero-copy)
+while (auto* name = conn.NextHeaderName())
+    auto* val = conn.ReadHeaderValue();
+while (auto* chunk = conn.ReadBody())   // handles chunked TE internally
+    process(chunk->data, chunk->size);
+conn.Send(200, "text/plain", body);
+```
+
+**Response methods**: `Send` (status + body), `SendHeaders` (headers only), `BeginChunked` /
+`SendChunk` / `EndChunked` (chunked response), `Sendfile` (zero-copy file serving).
+
+`RunServer` accepts connections in a loop, launches an `HttpConnection` (Launchable, 32KB stack)
+per client. No method filtering in framework — handlers decide.
+
+**Keep-alive**: HTTP/1.1 keep-alive is enabled by default. `HttpConnection::Launch` loops over
+requests on the same connection. `Connection::Reset()` reinitializes parser state between
+requests, preserving leftover buffer data for pipelining. The loop exits on send error, kill,
+or when the client sends `Connection: close`. The `Connection` header detection piggybacks on
+the existing special-header mechanism (alongside Content-Length / Transfer-Encoding).
+`KeepAlive()` returns the current keep-alive state. `SkipBody()` drains unconsumed body bytes
+before `Reset()` to keep the parser positioned correctly.
+Optional `searchPaths` for static file fallback, optional `timeout` (default 30s).
 
 `SpawnStatusServer(co, port, staticPath)` provides a JSON API at `/api/status` and serves the
 dashboard from static files.
@@ -249,6 +286,17 @@ or discovers multiple crash bugs during implementation, stop and re-evaluate the
 implementation difficulty is signal about the design, not just about the implementation.
 
 See `DESIGN_IDIOMS.md` for patterns and idioms that should guide new API design.
+
+## Building
+
+The project requires liburing >= 2.3 (Ubuntu 24.04+). A Docker-based build environment is
+provided for hosts with older liburing:
+
+- `./docker-build.sh` — debug build (or `./docker-build.sh release`)
+- `./docker-test.sh` — run tests (or `./docker-test.sh debug --gtest_filter=IO.*`)
+
+The host kernel's io_uring feature level doesn't matter for compilation — `uring.cpp` has compat
+defines. Runtime fallbacks in `Uring::Init()` handle missing kernel features gracefully.
 
 # Debugging guidelines
 

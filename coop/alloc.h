@@ -50,12 +50,10 @@ struct Alloc
         static_assert(std::has_virtual_destructor_v<T>,
             "Interface type must have a virtual destructor for From<Concrete> to work");
 
-        Alloc a;
-        a.m_ctx = ctx;
         void* mem = detail::BumpAlloc(ctx, sizeof(Concrete) + extra, alignof(Concrete));
         new (mem) Concrete(std::forward<Args>(args)...);
-        a.m_ptr = static_cast<T*>(static_cast<Concrete*>(mem));
-        return a;
+        T* ptr = static_cast<T*>(static_cast<Concrete*>(mem));
+        return Alloc(ctx, ptr);
     }
 
     ~Alloc()
@@ -80,6 +78,8 @@ struct Alloc
     const T* get() const { return m_ptr; }
 
   private:
+    Alloc(Context* ctx, T* ptr) : m_ptr(ptr), m_ctx(ctx) {}
+
     T*        m_ptr;
     Context*  m_ctx;
 };

@@ -67,3 +67,14 @@ not be buffered. If the caller skips the body, the body should not be read from 
 This is not lazy evaluation for its own sake. It is the principle that in a cooperative system, the
 cost of an operation should be borne by the context that benefits from it, and the framework should
 not preemptively consume resources (CPU, memory, IO bandwidth) on speculation.
+
+## IKWIAD (in release mode)
+
+"I Know What I am Doing" is a core principal for us. We're a micro-stack, green threading library:
+"Danger" is our user's middle name. We can offer safety checks but they should:
+
+- Offer zero-cost disabling mechanics
+- Disable by default in release builds (but we may allow developers to leave them enabled)
+
+Start with clean idioms and strong documentation, then give the user guns to point in any direction
+they want (feet included).

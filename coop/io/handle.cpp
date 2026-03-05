@@ -59,7 +59,7 @@ Handle::~Handle()
 
 void Handle::Submit(struct io_uring_sqe* sqe)
 {
-    spdlog::trace("handle submit ctx={}", m_context->GetName());
+    SPDLOG_TRACE("handle submit ctx={}", m_context->GetName());
 
     m_timedOut = false;
     m_pendingCqes = 1;
@@ -90,7 +90,7 @@ void Handle::SubmitWithTimeout(struct io_uring_sqe* sqe, time::Interval timeout)
 
 void Handle::SubmitLinked(struct io_uring_sqe* sqe)
 {
-    spdlog::trace("handle submit_linked ctx={}", m_context->GetName());
+    SPDLOG_TRACE("handle submit_linked ctx={}", m_context->GetName());
 
     m_timedOut = false;
     m_pendingCqes = 2;
@@ -142,6 +142,27 @@ void Handle::Cancel()
 
 int Handle::Wait()
 {
+    // Fast path: submit pending SQEs and check for immediate completion. With COOP_TASKRUN
+    // (or bare mode), task_work runs during io_uring_submit(), so synchronously completed
+    // operations have CQEs ready immediately. This avoids two context switches (block +
+    // resume) for the common case where the kernel completes the operation inline — e.g.
+    // sends to sockets with available buffer space, recvs from sockets with data already
+    // queued.
+    //
+    // Safety: Poll() may process CQEs for other handles, moving their blocked contexts to
+    // the yielded list. This is safe — cooperative scheduling means no context switch occurs
+    // until we explicitly block or yield.
+    //
+    m_ring->Poll();
+    if (m_pendingCqes == 0)
+    {
+        return m_result;
+    }
+
+    // Slow path: operation not yet complete, block until CQE arrives. The coordinator is
+    // still held (from Submit's TryAcquire), so Acquire will block. When the CQE eventually
+    // completes, Finalize releases the coordinator and unblocks us.
+    //
     CoordinateWith(m_context, m_coord);
     return m_result;
 }
@@ -171,14 +192,14 @@ void Handle::Finalize()
 void Handle::Complete(struct io_uring_cqe* cqe)
 {
     m_result = cqe->res;
-    spdlog::trace("handle complete result={}", m_result);
+    SPDLOG_TRACE("handle complete result={}", m_result);
     io_uring_cqe_seen(&m_ring->m_ring, cqe);
     Finalize();
 }
 
 void Handle::OnSecondaryComplete(struct io_uring_cqe* cqe)
 {
-    spdlog::trace("handle secondary complete result={}", cqe->res);
+    SPDLOG_TRACE("handle secondary complete result={}", cqe->res);
     if (cqe->res == -ETIME)
     {
         m_timedOut = true;

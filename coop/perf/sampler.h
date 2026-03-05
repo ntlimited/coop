@@ -57,6 +57,10 @@ int SamplingHz();
 //
 size_t ReadSamples(Sample* out, size_t maxSamples);
 
+// Reset the ring buffer and total count. Call before StartSampling to get a clean window.
+//
+void ResetSamples();
+
 // Total number of samples captured since sampling was last started.
 //
 size_t TotalSamples();

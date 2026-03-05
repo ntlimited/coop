@@ -143,6 +143,12 @@ size_t ReadSamples(Sample* out, size_t maxSamples)
     return count;
 }
 
+void ResetSamples()
+{
+    g_head.store(0, std::memory_order_relaxed);
+    g_total.store(0, std::memory_order_relaxed);
+}
+
 size_t TotalSamples()
 {
     return g_total.load(std::memory_order_relaxed);

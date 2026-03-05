@@ -71,6 +71,27 @@ is coherent with the dcache (syncs on next taken branch).
 - Mode 2 tests: `ProbeCount()` triggers `InitSites()` and should return > 0 when the binary
   has instrumented code. Counters are zero until `Enable()` is called.
 
+## CPU Sampler (`sampler.h`, `sampler.cpp`)
+
+SIGPROF-based CPU profiler, independent of perf counters. Uses `ITIMER_PROF` to fire at a
+configurable Hz, captures RIP + current context from the signal handler into a lock-free ring
+buffer (8192 entries). Per-context `m_statistics.samples` is also incremented in the handler
+(safe: same thread).
+
+**API**: `StartSampling(hz)`, `StopSampling()`, `IsSampling()`, `SamplingHz()`,
+`ReadSamples(out, max)`, `ResetSamples()`, `TotalSamples()`, `SampleCapacity()`.
+
+`ResetSamples()` clears the ring buffer head and total count — call before `StartSampling()`
+to get a clean sample window. The `/api/sampler/start` endpoint does this automatically.
+
+**Dashboard integration**: The status server exposes `/api/sampler/*` endpoints plus
+`/api/sampler/symbolize` (POST, comma-separated hex PCs) which uses `dladdr()` +
+`__cxa_demangle()` for server-side symbol resolution. The frontend runs periodic 1-second
+burst sampling cycles and renders a 2-level flame graph (contexts → functions).
+
+Executables that want useful symbol resolution need `-rdynamic` link flag (exports symbols to
+the dynamic symbol table for `dladdr()`).
+
 ## Adding New Probes
 
 1. Add the counter to the `Counter` enum in `counters.h` (before `COUNT`)

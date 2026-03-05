@@ -152,6 +152,36 @@ canvas { display: block; width: 100%; }
 .flame-tooltip .ft-state { font-size: 11px; margin-left: 6px; }
 .flame-tooltip .ft-detail { color: #888; margin-top: 2px; }
 .flame-empty { color: #555; padding: 40px; text-align: center; font-size: 13px; }
+
+/* Sampler tab */
+.sampler-controls {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+    padding: 12px; background: #16213e; border-radius: 6px;
+}
+.sampler-controls label { color: #888; font-size: 12px; }
+.sampler-controls input {
+    width: 60px; padding: 4px 8px; background: #0f3460; border: 1px solid #ffffff20;
+    color: #e0e0e0; font-family: inherit; font-size: 12px; border-radius: 3px;
+    text-align: center;
+}
+.sampler-status { color: #888; font-size: 12px; margin-left: auto; }
+.sampler-status .ss-active { color: #7fdbca; }
+.sampler-status .ss-idle { color: #555; }
+.sampler-flame {
+    position: relative; background: #16213e; border-radius: 6px; padding: 12px;
+}
+.sampler-flame canvas { display: block; width: 100%; cursor: pointer; }
+.sampler-tooltip {
+    display: none; position: absolute; background: #0f3460ee; color: #e0e0e0;
+    padding: 8px 12px; border-radius: 4px; font-size: 12px; pointer-events: none;
+    white-space: nowrap; z-index: 10; border: 1px solid #7fdbca44;
+}
+.sampler-tooltip .st-name { color: #c3cee3; font-weight: bold; }
+.sampler-tooltip .st-detail { color: #888; margin-top: 2px; }
+.sampler-info {
+    display: flex; gap: 16px; margin-bottom: 12px; font-size: 12px; color: #888;
+}
+.sampler-info .si-val { color: #7fdbca; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -161,6 +191,7 @@ canvas { display: block; width: 100%; }
     <button class="tab active" onclick="switchTab('status')">Status</button>
     <button class="tab" onclick="switchTab('flame')">Flame</button>
     <button class="tab" onclick="switchTab('perf')">Perf</button>
+    <button class="tab" onclick="switchTab('sampler')">Sampler</button>
 </div>
 
 <!-- STATUS TAB -->
@@ -214,6 +245,26 @@ canvas { display: block; width: 100%; }
     <thead><tr><th>Counter</th><th>Value</th><th>Rate /s</th></tr></thead>
     <tbody id="perf-table-body"></tbody>
 </table>
+</div>
+
+<!-- SAMPLER TAB -->
+<div id="tab-sampler" class="tab-content">
+<div class="sampler-controls">
+    <button class="toggle-btn" id="sampler-toggle" onclick="toggleSampler()">Start Sampling</button>
+    <label>Hz:</label>
+    <input type="number" id="sampler-hz" value="997" min="1" max="9999">
+    <span class="sampler-status" id="sampler-status"><span class="ss-idle">idle</span></span>
+</div>
+<div class="sampler-info" id="sampler-info">
+    <span>samples: <span class="si-val" id="si-samples">0</span></span>
+    <span>contexts: <span class="si-val" id="si-contexts">0</span></span>
+    <span>symbols cached: <span class="si-val" id="si-symbols">0</span></span>
+</div>
+<div class="sampler-flame">
+    <canvas id="sampler-canvas" height="300"></canvas>
+    <div class="sampler-tooltip" id="sampler-tooltip"></div>
+    <div class="flame-empty" id="sampler-empty">Click "Start Sampling" to begin CPU profiling</div>
+</div>
 </div>
 
 <div id="updated"></div>
@@ -939,6 +990,324 @@ function refreshFlame(data) {
     }
 }
 
+// ---- Sampler ----
+var samplerActive = false;
+var samplerCycleRunning = false;
+var samplerSymbolCache = {};  // pc string -> symbol name
+var samplerFlameData = null;  // {contexts: [{name, samples, functions: [{name, count}]}]}
+var samplerRects = [];
+var SAMPLER_BAR_H = 22;
+
+function toggleSampler() {
+    samplerActive = !samplerActive;
+    var btn = document.getElementById('sampler-toggle');
+    btn.textContent = samplerActive ? 'Stop Sampling' : 'Start Sampling';
+    btn.className = 'toggle-btn' + (samplerActive ? ' enabled' : '');
+    if (samplerActive) {
+        runSamplerCycle();
+    }
+}
+
+function runSamplerCycle() {
+    if (!samplerActive || samplerCycleRunning) return;
+    samplerCycleRunning = true;
+
+    var hz = parseInt(document.getElementById('sampler-hz').value) || 997;
+    var statusEl = document.getElementById('sampler-status');
+    statusEl.innerHTML = '<span class="ss-active">sampling at ' + hz + ' Hz...</span>';
+
+    fetch('/api/sampler/start?hz=' + hz, {method: 'POST'})
+        .then(function() {
+            // Wait 1 second for samples to accumulate
+            //
+            return new Promise(function(resolve) { setTimeout(resolve, 1000); });
+        })
+        .then(function() {
+            return fetch('/api/sampler/stop', {method: 'POST'});
+        })
+        .then(function() {
+            statusEl.innerHTML = '<span class="ss-active">reading samples...</span>';
+            return fetch('/api/sampler/samples').then(function(r) { return r.json(); });
+        })
+        .then(function(data) {
+            // Find PCs we haven't symbolized yet
+            //
+            var unknownPCs = [];
+            for (var i = 0; i < data.samples.length; i++) {
+                var pc = data.samples[i].pc;
+                if (!samplerSymbolCache[pc]) unknownPCs.push(pc);
+            }
+
+            if (unknownPCs.length > 0) {
+                statusEl.innerHTML = '<span class="ss-active">resolving ' +
+                    unknownPCs.length + ' symbols...</span>';
+                // Deduplicate
+                //
+                var unique = {};
+                for (var i = 0; i < unknownPCs.length; i++) unique[unknownPCs[i]] = true;
+                var body = Object.keys(unique).join(',');
+                return fetch('/api/sampler/symbolize', {
+                    method: 'POST',
+                    body: body
+                }).then(function(r) { return r.json(); }).then(function(syms) {
+                    for (var pc in syms.symbols) {
+                        samplerSymbolCache[pc] = syms.symbols[pc];
+                    }
+                    return data;
+                });
+            }
+            return data;
+        })
+        .then(function(data) {
+            buildSamplerFlame(data);
+            if (document.getElementById('tab-sampler').classList.contains('active')) {
+                drawSamplerFlame();
+            }
+
+            statusEl.innerHTML = '<span class="ss-idle">idle — ' +
+                data.count + ' samples</span>';
+            samplerCycleRunning = false;
+
+            // Auto-repeat if still active
+            //
+            if (samplerActive) {
+                setTimeout(runSamplerCycle, 500);
+            }
+        })
+        .catch(function(e) {
+            statusEl.innerHTML = '<span style="color:#f07178">error: ' +
+                e.message + '</span>';
+            samplerCycleRunning = false;
+            samplerActive = false;
+            var btn = document.getElementById('sampler-toggle');
+            btn.textContent = 'Start Sampling';
+            btn.className = 'toggle-btn';
+        });
+}
+
+function buildSamplerFlame(data) {
+    // Group samples by context, then by symbol within each context
+    //
+    var ctxMap = {};  // contextName -> {funcMap: {symbol -> count}, total: N}
+    var totalSamples = 0;
+
+    for (var i = 0; i < data.samples.length; i++) {
+        var s = data.samples[i];
+        var ctxName = s.context || '(cooperator)';
+        var symbol = samplerSymbolCache[s.pc] || s.pc;
+
+        // Shorten symbol: strip parameters for readability
+        //
+        var shortSym = shortenSymbol(symbol);
+
+        if (!ctxMap[ctxName]) ctxMap[ctxName] = {funcMap: {}, total: 0};
+        ctxMap[ctxName].funcMap[shortSym] = (ctxMap[ctxName].funcMap[shortSym] || 0) + 1;
+        ctxMap[ctxName].total++;
+        totalSamples++;
+    }
+
+    // Convert to sorted array
+    //
+    var contexts = [];
+    for (var name in ctxMap) {
+        var functions = [];
+        for (var fn in ctxMap[name].funcMap) {
+            functions.push({name: fn, count: ctxMap[name].funcMap[fn]});
+        }
+        functions.sort(function(a, b) { return b.count - a.count; });
+        contexts.push({name: name, samples: ctxMap[name].total, functions: functions});
+    }
+    contexts.sort(function(a, b) { return b.samples - a.samples; });
+
+    samplerFlameData = {contexts: contexts, total: totalSamples};
+
+    // Update info
+    //
+    document.getElementById('si-samples').textContent = totalSamples;
+    document.getElementById('si-contexts').textContent = contexts.length;
+    document.getElementById('si-symbols').textContent = Object.keys(samplerSymbolCache).length;
+}
+
+function shortenSymbol(sym) {
+    // Strip template parameters and function arguments for display
+    // Keep the first template level but strip nested ones
+    //
+    if (sym === '???') return sym;
+    // Strip everything after first '(' for C++ mangled names
+    //
+    var parenIdx = sym.indexOf('(');
+    if (parenIdx > 0) sym = sym.substring(0, parenIdx);
+    // Strip long template args: keep first <...> but truncate deeply nested ones
+    //
+    var depth = 0;
+    var result = '';
+    for (var i = 0; i < sym.length; i++) {
+        if (sym[i] === '<') {
+            depth++;
+            if (depth > 1) continue;
+        } else if (sym[i] === '>') {
+            depth--;
+            if (depth > 0) continue;
+        } else if (depth > 1) {
+            continue;
+        }
+        result += sym[i];
+    }
+    return result;
+}
+
+function drawSamplerFlame() {
+    var canvas = document.getElementById('sampler-canvas');
+    var emptyDiv = document.getElementById('sampler-empty');
+
+    if (!samplerFlameData || samplerFlameData.total === 0) {
+        canvas.style.display = 'none';
+        emptyDiv.style.display = 'block';
+        return;
+    }
+
+    canvas.style.display = 'block';
+    emptyDiv.style.display = 'none';
+
+    var dpr = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    var W = rect.width;
+
+    // Build rectangles: top row = contexts, bottom rows = functions per context
+    //
+    samplerRects = [];
+    var total = samplerFlameData.total;
+    var x = 0;
+
+    for (var ci = 0; ci < samplerFlameData.contexts.length; ci++) {
+        var ctx = samplerFlameData.contexts[ci];
+        var ctxW = (ctx.samples / total) * W;
+        if (ctxW < 2) ctxW = 2;
+
+        // Context bar (depth 0)
+        //
+        samplerRects.push({
+            x: x, w: ctxW, depth: 0,
+            name: ctx.name, count: ctx.samples,
+            pct: (ctx.samples / total * 100).toFixed(1),
+            isContext: true
+        });
+
+        // Function bars (depth 1+)
+        //
+        var fx = x;
+        for (var fi = 0; fi < ctx.functions.length; fi++) {
+            var fn = ctx.functions[fi];
+            var fnW = (fn.count / total) * W;
+            if (fnW < 1) fnW = 1;
+
+            samplerRects.push({
+                x: fx, w: fnW, depth: 1,
+                name: fn.name, count: fn.count,
+                pct: (fn.count / total * 100).toFixed(1),
+                contextName: ctx.name,
+                isContext: false
+            });
+            fx += fnW;
+        }
+        x += ctxW;
+    }
+
+    var maxDepth = 1;
+    var H = (maxDepth + 1) * (SAMPLER_BAR_H + 1) + 8;
+    canvas.height = H * dpr;
+    canvas.style.height = H + 'px';
+    canvas.width = W * dpr;
+
+    var c = canvas.getContext('2d');
+    c.scale(dpr, dpr);
+    c.clearRect(0, 0, W, H);
+
+    var ctxColors = [
+        '#7fdbca', '#c792ea', '#f78c6c', '#82aaff', '#c3e88d',
+        '#ff5370', '#e6db74', '#89ddff', '#f07178', '#ffcb6b'
+    ];
+    var ctxColorMap = {};
+    var ctxColorIdx = 0;
+
+    for (var i = 0; i < samplerRects.length; i++) {
+        var r = samplerRects[i];
+        var y = r.depth * (SAMPLER_BAR_H + 1) + 1;
+
+        var color;
+        if (r.isContext) {
+            color = ctxColors[ctxColorIdx % ctxColors.length];
+            ctxColorMap[r.name] = color;
+            ctxColorIdx++;
+        } else {
+            // Function bar: slightly dimmer version of context color
+            //
+            color = (ctxColorMap[r.contextName] || '#888') + 'cc';
+        }
+
+        c.fillStyle = color;
+        c.fillRect(r.x, y, Math.max(r.w - 1, 1), SAMPLER_BAR_H);
+
+        if (r.w > 50) {
+            c.fillStyle = '#000';
+            c.font = '11px Consolas, Monaco, monospace';
+            c.textBaseline = 'middle';
+            var label = r.name + ' (' + r.pct + '%)';
+            var maxTextW = r.w - 6;
+            if (c.measureText(label).width > maxTextW) {
+                label = r.name;
+                while (label.length > 1 && c.measureText(label + '…').width > maxTextW) {
+                    label = label.slice(0, -1);
+                }
+                label += '…';
+            }
+            c.fillText(label, r.x + 3, y + SAMPLER_BAR_H / 2);
+        }
+    }
+}
+
+// Sampler canvas mouse handlers
+//
+(function() {
+    var canvas = document.getElementById('sampler-canvas');
+    var tooltip = document.getElementById('sampler-tooltip');
+
+    canvas.addEventListener('mousemove', function(e) {
+        var rect = canvas.getBoundingClientRect();
+        var mx = e.clientX - rect.left;
+        var my = e.clientY - rect.top;
+
+        var hit = null;
+        for (var i = samplerRects.length - 1; i >= 0; i--) {
+            var r = samplerRects[i];
+            var y = r.depth * (SAMPLER_BAR_H + 1) + 1;
+            if (mx >= r.x && mx <= r.x + r.w && my >= y && my <= y + SAMPLER_BAR_H) {
+                hit = r; break;
+            }
+        }
+
+        if (hit) {
+            tooltip.innerHTML =
+                '<div><span class="st-name">' + hit.name + '</span></div>' +
+                '<div class="st-detail">' + hit.count + ' samples (' + hit.pct + '%)</div>';
+            tooltip.style.display = 'block';
+            var tx = e.clientX - canvas.parentElement.getBoundingClientRect().left + 12;
+            var ty = e.clientY - canvas.parentElement.getBoundingClientRect().top + 12;
+            if (tx + tooltip.offsetWidth > canvas.parentElement.offsetWidth - 8) {
+                tx = tx - tooltip.offsetWidth - 24;
+            }
+            tooltip.style.left = tx + 'px';
+            tooltip.style.top = ty + 'px';
+        } else {
+            tooltip.style.display = 'none';
+        }
+    });
+
+    canvas.addEventListener('mouseleave', function() {
+        tooltip.style.display = 'none';
+    });
+})();
+
 // ---- Main refresh loop ----
 function refresh() {
     Promise.all([
@@ -963,6 +1332,7 @@ window.addEventListener('resize', function() {
     drawStackedChart('chart', 'legend', statusHistory, statusColorFor);
     drawPerfChart();
     drawFlame();
+    drawSamplerFlame();
 });
 </script>
 </body>

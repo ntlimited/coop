@@ -56,11 +56,12 @@ target_compile_definitions(coop PUBLIC COOP_PERF_MODE=${COOP_PERF_MODE})
 # External libraries
 find_library(URING_LIB uring REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
-target_link_libraries(coop PUBLIC ${URING_LIB} OpenSSL::SSL OpenSSL::Crypto spdlog::spdlog)
+target_link_libraries(coop PUBLIC ${URING_LIB} OpenSSL::SSL OpenSSL::Crypto spdlog::spdlog dl)
 
 # Executables
 add_executable(echo_server examples/echo_server.cpp)
 target_link_libraries(echo_server PRIVATE coop)
+target_link_options(echo_server PRIVATE -rdynamic)
 
 add_executable(echo_client examples/echo_client.cpp)
 target_link_libraries(echo_client PRIVATE coop)
@@ -148,6 +149,7 @@ target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
 
 add_executable(bench_server benchmarks/bench_server.cpp)
 target_link_libraries(bench_server PRIVATE coop)
+target_link_options(bench_server PRIVATE -rdynamic)
 
 add_executable(diag_ktls benchmarks/diag_ktls.cpp)
 target_link_libraries(diag_ktls PRIVATE coop)

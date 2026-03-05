@@ -3,6 +3,8 @@
 #include "connection.h"
 
 #include <cstdint>
+#include <cxxabi.h>
+#include <dlfcn.h>
 #include <string>
 
 #include "coop/cooperator.h"
@@ -323,6 +325,7 @@ void HandleSamplerStart(ConnectionBase& conn)
             }
         }
     }
+    perf::ResetSamples();
     bool ok = perf::StartSampling(hz);
     conn.Send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
@@ -335,10 +338,11 @@ void HandleSamplerStop(ConnectionBase& conn)
 
 void HandleSamplerSamples(ConnectionBase& conn)
 {
-    // Read up to 1024 recent samples
+    // Read up to full ring capacity. Heap-allocated because 8192 * sizeof(Sample) = ~192KB
+    // which exceeds the 32KB HTTP connection stack.
     //
-    static constexpr size_t MAX_READ = 1024;
-    perf::Sample samples[MAX_READ];
+    static constexpr size_t MAX_READ = 8192;
+    auto* samples = new perf::Sample[MAX_READ];
     size_t count = perf::ReadSamples(samples, MAX_READ);
 
     std::string out;
@@ -372,6 +376,72 @@ void HandleSamplerSamples(ConnectionBase& conn)
     }
     w.EndArray();
     w.EndObject();
+    delete[] samples;
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
+void HandleSymbolize(ConnectionBase& conn)
+{
+    // Read POST body: comma-separated hex PCs like "0x1234,0x5678,..."
+    //
+    std::string body;
+    body.reserve(4096);
+    while (auto* chunk = conn.ReadBody())
+    {
+        body.append(static_cast<const char*>(chunk->data), chunk->size);
+        if (chunk->complete) break;
+        if (body.size() > 65536) break; // safety limit
+    }
+
+    std::string out;
+    out.reserve(body.size() * 4);
+    JsonWriter w(out);
+    w.BeginObject();
+    w.Key("symbols");
+    w.BeginObject();
+
+    // Parse comma-separated hex addresses
+    //
+    const char* p = body.c_str();
+    while (*p)
+    {
+        // Skip whitespace and commas
+        //
+        while (*p == ',' || *p == ' ' || *p == '\n' || *p == '\r') p++;
+        if (!*p) break;
+
+        // Parse hex address
+        //
+        char* end;
+        uintptr_t pc = strtoull(p, &end, 16);
+        if (end == p) break;
+        p = end;
+
+        // Look up symbol via dladdr
+        //
+        char pcKey[20];
+        snprintf(pcKey, sizeof(pcKey), "0x%lx", pc);
+
+        Dl_info info;
+        if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_sname)
+        {
+            // Try to demangle C++ names
+            //
+            int status;
+            char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+            w.Key(pcKey);
+            w.String(status == 0 ? demangled : info.dli_sname);
+            free(demangled);
+        }
+        else
+        {
+            w.Key(pcKey);
+            w.String("???");
+        }
+    }
+
+    w.EndObject();
+    w.EndObject();
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
@@ -384,6 +454,7 @@ Route s_statusRoutes[] = {
     {"/api/sampler/start",  HandleSamplerStart},
     {"/api/sampler/stop",   HandleSamplerStop},
     {"/api/sampler/samples", HandleSamplerSamples},
+    {"/api/sampler/symbolize", HandleSymbolize},
 };
 
 static constexpr int STATUS_ROUTE_COUNT = sizeof(s_statusRoutes) / sizeof(s_statusRoutes[0]);

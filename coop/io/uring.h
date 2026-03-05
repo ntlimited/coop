@@ -49,6 +49,12 @@ struct Uring
     //
     int Poll();
 
+    // Block until at least one CQE is available. Submits pending SQEs first. Used by the
+    // cooperator when all contexts are blocked on IO — replaces a tight spin with an efficient
+    // kernel wait. Returns number of CQEs dispatched.
+    //
+    int WaitAndPoll();
+
     // Get an SQE from the submission ring. If the ring is full, flushes pending SQEs to the
     // kernel and retries. Returns nullptr only if the ring is truly exhausted (shouldn't happen
     // in normal operation).

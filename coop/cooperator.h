@@ -219,7 +219,6 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     void PushSubmission(SubmissionEntry* entry);
     void WakeCooperator();
     void DrainSubmissions();
-    void WaitForSubmission();
     void SpawnFromSubmission(SubmissionEntry* entry);
     void DrainRemainingSubmissions();
 

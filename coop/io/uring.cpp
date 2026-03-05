@@ -1,5 +1,6 @@
 #include "uring.h"
 
+#include <unistd.h>
 #include <spdlog/spdlog.h>
 
 #include "handle.h"
@@ -192,6 +193,7 @@ int Uring::Poll()
     while (io_uring_peek_cqe(&m_ring, &cqe) == 0)
     {
         SPDLOG_TRACE("uring cqe result={}", cqe->res);
+
         COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollCqe);
         Handle::Callback(cqe);
         dispatched++;
@@ -199,6 +201,32 @@ int Uring::Poll()
 
     return dispatched;
 }
+
+int Uring::WaitAndPoll()
+{
+    // Flush any pending SQEs before blocking — they may produce the CQE we're about to wait for.
+    //
+    if (m_pendingSqes > 0)
+    {
+        io_uring_submit(&m_ring);
+        m_pendingSqes = 0;
+    }
+
+    // Block until at least one CQE is available. With COOP_TASKRUN, this also processes any
+    // pending task_work (deferred completions).
+    //
+    struct io_uring_cqe* cqe;
+    int ret = io_uring_wait_cqe(&m_ring, &cqe);
+    if (ret < 0)
+    {
+        return 0;
+    }
+
+    // Process all available CQEs (the wait may have delivered multiple).
+    //
+    return Poll();
+}
+
 
 // Work loop for non-native urings that run as a dedicated context. Poll() handles both
 // submitting pending SQEs and processing CQEs, so the yield-poll loop naturally batches

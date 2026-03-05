@@ -1,6 +1,5 @@
 #include <mutex>
 #include <new>
-#include <poll.h>
 #include <sys/eventfd.h>
 #include <thread>
 #include <unistd.h>
@@ -10,6 +9,8 @@
 
 #include "cooperator.h"
 #include "detail/context_switch.h"
+#include "io/descriptor.h"
+#include "io/read.h"
 #include "launchable.h"
 #include "perf/patch.h"
 #include "perf/probe.h"
@@ -130,21 +131,6 @@ void Cooperator::DrainSubmissions()
     }
 }
 
-void Cooperator::WaitForSubmission()
-{
-    // Drain the eventfd counter (non-blocking) before blocking, to avoid stale wakes
-    //
-    uint64_t val;
-    while (read(m_submitFd, &val, sizeof(val)) > 0) {}
-
-    // Block until the eventfd is readable (a Submit writes to it) or a signal interrupts
-    //
-    struct pollfd pfd;
-    pfd.fd = m_submitFd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-    while (poll(&pfd, 1, -1) < 0 && errno == EINTR) {}
-}
 
 void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
 {
@@ -239,6 +225,29 @@ void Cooperator::Launch()
 
     m_uring.Init();
 
+    // Spawn a detached context that reads the eventfd and drains cross-thread submissions.
+    // The eventfd is just another fd with a normal io_uring read — no special-case CQE handling
+    // in Poll(). The context owns the fd via io::Descriptor.
+    //
+    Spawn([this](Context* ctx)
+    {
+        ctx->SetName("SubmissionDrainer");
+
+        io::Descriptor desc(m_submitFd);
+
+        while (!ctx->IsKilled())
+        {
+            uint64_t val;
+            io::Read(desc, &val, sizeof(val));
+            if (ctx->IsKilled()) break;
+            DrainSubmissions();
+        }
+
+        // Prevent double-close — the cooperator destructor owns the fd.
+        //
+        desc.m_fd = -1;
+    });
+
     // Check COOP_PERF=1 env var to enable dynamic perf probes at startup (mode 2 only).
     // Static local ensures this runs once even with multiple cooperators.
     //
@@ -281,24 +290,23 @@ void Cooperator::Launch()
                     return true;
                 });
             });
+
+            // Wake the eventfd so the submission drainer's io::Read completes. The drainer
+            // uses non-kill-aware IO; it checks IsKilled() after each read returns.
+            //
+            WakeCooperator();
         }
 
         if (m_yielded.IsEmpty())
         {
-            // Poll the native uring — contexts may be waiting on IO completions that would
-            // move them from blocked to yielded.
-            //
             m_uring.Poll();
-            DrainSubmissions();
 
             if (!m_yielded.IsEmpty())
             {
                 continue;
             }
 
-            // If there are blocked contexts or pending IO, they may be waiting on completions.
-            // Keep spinning on uring completions. Only block on submissions when there's truly
-            // nothing in flight and we're not shutting down.
+            // Blocked contexts or pending IO — keep spinning for completions.
             //
             if (!m_blocked.IsEmpty() || m_uring.PendingOps() > 0)
             {
@@ -310,12 +318,12 @@ void Cooperator::Launch()
                 continue;
             }
 
-            WaitForSubmission();
-            DrainSubmissions();
+            // Truly idle — block until a CQE arrives. The submission drainer's pending
+            // io::Read on the eventfd will wake this when a cross-thread Submit arrives.
+            //
+            m_uring.WaitAndPoll();
             continue;
         }
-
-        DrainSubmissions();
 
         int remainingIterations = 16;
         while (remainingIterations && !m_yielded.IsEmpty())
@@ -323,17 +331,9 @@ void Cooperator::Launch()
             COOP_PERF_INC(m_perf, perf::Counter::SchedulerLoop);
             remainingIterations--;
 
-            // Pop off a context and resume it
-            //
             auto* ctx = m_yielded.Pop();
-
             Resume(ctx);
             m_uring.Poll();
-
-            if (m_hasSubmissions.load(std::memory_order_relaxed))
-            {
-                break;
-            }
         }
     }
 

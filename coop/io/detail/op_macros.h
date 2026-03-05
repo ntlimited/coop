@@ -81,6 +81,50 @@
         return result;                                                                   \
     }
 
+// Blocking variants with a nonblocking fast path. Before constructing a Handle and going
+// through io_uring, try the operation directly with a nonblocking syscall. If it succeeds
+// (or fails with a hard error), return immediately — avoiding Coordinator/Handle/SQE/CQE
+// ceremony entirely. Falls through to the normal io_uring path on EAGAIN/EWOULDBLOCK.
+//
+// try_fn signature: int try_fn(int fd, ...args...) — standard syscall convention.
+//
+#define COOP_IO_BLOCKING_FASTPATH_IMPL(name, try_fn, ARGS)                               \
+    int name(Descriptor& desc ARGS(COOP_IO_ARG_DEF))                                    \
+    {                                                                                    \
+        int ret = try_fn(desc.m_fd ARGS(COOP_IO_ARG_FWD));                              \
+        if (ret >= 0) return ret;                                                        \
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -errno;                      \
+                                                                                         \
+        Coordinator coord;                                                               \
+        Handle handle(Self(), desc, &coord);                                             \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD)))                                        \
+        {                                                                                \
+            return -EAGAIN;                                                              \
+        }                                                                                \
+        return handle.Wait();                                                            \
+    }
+
+#define COOP_IO_BLOCKING_TIMEOUT_FASTPATH_IMPL(name, try_fn, ARGS)                       \
+    int name(Descriptor& desc ARGS(COOP_IO_ARG_DEF), time::Interval timeout)            \
+    {                                                                                    \
+        int ret = try_fn(desc.m_fd ARGS(COOP_IO_ARG_FWD));                              \
+        if (ret >= 0) return ret;                                                        \
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -errno;                      \
+                                                                                         \
+        Coordinator coord;                                                               \
+        Handle handle(Self(), desc, &coord);                                             \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD), timeout))                               \
+        {                                                                                \
+            return -EAGAIN;                                                              \
+        }                                                                                \
+        int result = handle.Wait();                                                      \
+        if (handle.TimedOut())                                                           \
+        {                                                                                \
+            return -ETIMEDOUT;                                                           \
+        }                                                                                \
+        return result;                                                                   \
+    }
+
 // Generate all 4 implementations for a standard IO operation.
 //
 #define COOP_IO_IMPLEMENTATIONS(name, prep_fn, ARGS)                                     \
@@ -88,6 +132,14 @@
     COOP_IO_ASYNC_TIMEOUT_IMPL(name, prep_fn, ARGS)                                      \
     COOP_IO_BLOCKING_IMPL(name, ARGS)                                                    \
     COOP_IO_BLOCKING_TIMEOUT_IMPL(name, ARGS)
+
+// Generate all 4 implementations with nonblocking fast path on blocking variants.
+//
+#define COOP_IO_IMPLEMENTATIONS_FASTPATH(name, prep_fn, try_fn, ARGS)                    \
+    COOP_IO_ASYNC_IMPL(name, prep_fn, ARGS)                                              \
+    COOP_IO_ASYNC_TIMEOUT_IMPL(name, prep_fn, ARGS)                                      \
+    COOP_IO_BLOCKING_FASTPATH_IMPL(name, try_fn, ARGS)                                   \
+    COOP_IO_BLOCKING_TIMEOUT_FASTPATH_IMPL(name, try_fn, ARGS)
 
 // -------------------------------------------------------------------------------------
 // Uring-level operations (AT_FDCWD pattern)

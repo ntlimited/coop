@@ -68,6 +68,10 @@ void Uring::Init()
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
     params.flags = flags;
+    if (m_config.sqpoll && m_config.sqpollIdleMs > 0)
+    {
+        params.sq_thread_idle = m_config.sqpollIdleMs;
+    }
 
     int ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
     if (ret == -EINVAL && (flags & IORING_SETUP_DEFER_TASKRUN))

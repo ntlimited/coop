@@ -2,6 +2,7 @@
 #include "send.h"
 
 #include <cerrno>
+#include <sys/socket.h>
 
 #include "coop/coordinator.h"
 #include "coop/self.h"
@@ -16,7 +17,12 @@ namespace coop
 namespace io
 {
 
-COOP_IO_IMPLEMENTATIONS(Send, io_uring_prep_send, SEND_ARGS)
+static inline int TrySend(int fd, const void* buf, size_t size, int flags)
+{
+    return ::send(fd, buf, size, flags | MSG_DONTWAIT);
+}
+
+COOP_IO_IMPLEMENTATIONS_FASTPATH(Send, io_uring_prep_send, TrySend, SEND_ARGS)
 
 int SendAll(Descriptor& desc, const void* buf, size_t size, int flags /* = 0 */)
 {

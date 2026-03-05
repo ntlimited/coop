@@ -1,7 +1,9 @@
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 
 #include "coop/cooperator.h"
+#include "coop/cooperator_configuration.h"
 #include "coop/thread.h"
 #include "coop/http/server.h"
 #include "coop/http/connection.h"
@@ -28,9 +30,23 @@ int main(int argc, char* argv[])
     signal(SIGPIPE, SIG_IGN);
 
     int port = 8080;
-    if (argc > 1) port = atoi(argv[1]);
+    bool sqpoll = false;
 
-    Cooperator cooperator;
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--sqpoll") == 0) sqpoll = true;
+        else port = atoi(argv[i]);
+    }
+
+    CooperatorConfiguration config = s_defaultCooperatorConfiguration;
+    if (sqpoll)
+    {
+        config.uring.sqpoll = true;
+        config.uring.coopTaskrun = false;
+        config.uring.entries = 1024;
+    }
+
+    Cooperator cooperator(config);
     Thread t(&cooperator);
 
     cooperator.Submit([](Context* ctx, void* arg) {

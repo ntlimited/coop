@@ -12,9 +12,17 @@ struct UringConfiguration
     const char* taskName;
 
     // IORING_SETUP_SQPOLL: kernel thread polls the SQ for new entries, avoiding io_uring_enter()
-    // for submission. May require CAP_SYS_ADMIN or appropriate cgroup permissions.
+    // for submission. May require CAP_SYS_ADMIN or appropriate cgroup permissions. Incompatible
+    // with coopTaskrun/deferTaskrun — disable those when enabling SQPOLL.
     //
     bool sqpoll;
+
+    // How long (ms) the SQPOLL kernel thread busy-polls before going idle. Only meaningful when
+    // sqpoll is true. When the thread goes idle, the next submission requires an io_uring_enter()
+    // with IORING_ENTER_SQ_WAKEUP to wake it. Higher values keep the thread hot between bursts
+    // at the cost of CPU. 0 uses the kernel default (typically 1000ms).
+    //
+    unsigned sqpollIdleMs;
 
     // IORING_SETUP_IOPOLL: kernel busy-polls for I/O completions instead of using interrupts.
     // Only works with O_DIRECT / pollable operations. NOTE: the current Uring::Run() loop uses
@@ -46,6 +54,7 @@ static const UringConfiguration s_defaultUringConfiguration = {
     .registeredSlots = 64,
     .taskName = "Uring",
     .sqpoll = false,
+    .sqpollIdleMs = 0,
     .iopoll = false,
     .coopTaskrun = true,
     .deferTaskrun = false,

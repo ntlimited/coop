@@ -1,7 +1,8 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
+
+#include "coop/time/interval.h"
 
 namespace coop
 {
@@ -12,16 +13,16 @@ struct Context;
 namespace http
 {
 
+struct Connection;
+
 struct Route
 {
     const char* path;
-    const char* contentType;
-    std::string (*handler)(Cooperator*);
+    void (*handler)(Connection&);
 };
 
 // Run an HTTP server on the given port with the provided route table. Binds, listens, and accepts
-// connections in a loop, launching a handler context per client. GET-only, HTTP/1.0-style (close
-// after response).
+// connections in a loop, launching a handler context per client. Connection: close after response.
 //
 void RunServer(
     Context* ctx,
@@ -29,7 +30,8 @@ void RunServer(
     const Route* routes,
     int routeCount,
     const char* name = "HttpServer",
-    const char* const* searchPaths = nullptr);
+    const char* const* searchPaths = nullptr,
+    time::Interval timeout = std::chrono::seconds(30));
 
 } // end namespace coop::http
 } // end namespace coop

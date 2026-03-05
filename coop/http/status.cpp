@@ -1,5 +1,6 @@
 #include "status.h"
 #include "server.h"
+#include "connection.h"
 
 #include <cstdint>
 #include <string>
@@ -171,7 +172,7 @@ void SerializeContext(JsonWriter& w, Context* ctx)
     w.EndObject();
 }
 
-std::string HandleStatus(Cooperator* co)
+std::string GenerateStatusJson(Cooperator* co)
 {
     std::string out;
     out.reserve(4096);
@@ -207,8 +208,14 @@ std::string HandleStatus(Cooperator* co)
     return out;
 }
 
+void HandleStatus(Connection& conn)
+{
+    std::string body = GenerateStatusJson(conn.GetCooperator());
+    conn.Send(200, "application/json", body);
+}
+
 Route s_statusRoutes[] = {
-    {"/api/status",  "application/json",  HandleStatus},
+    {"/api/status", HandleStatus},
 };
 
 static constexpr int STATUS_ROUTE_COUNT = sizeof(s_statusRoutes) / sizeof(s_statusRoutes[0]);

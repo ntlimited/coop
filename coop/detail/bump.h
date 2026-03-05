@@ -25,11 +25,11 @@ inline void* BumpAlloc(Context* ctx, size_t size, size_t align = 16)
     void* result = reinterpret_cast<void*>(top);
     ctx->m_heapTop = reinterpret_cast<void*>(top + size);
 
-    // Sanity: heap must not collide with the stack. The stack pointer isn't tracked precisely
-    // here, but we can check against the segment top as a conservative bound.
+    // Sanity: heap must not collide with the stack. BumpAlloc is always called from the context
+    // whose segment we're allocating from, so the current frame pointer is on that stack.
     //
     assert(reinterpret_cast<uintptr_t>(ctx->m_heapTop) <
-           reinterpret_cast<uintptr_t>(ctx->m_segment.Top()));
+           reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
 
     return result;
 }

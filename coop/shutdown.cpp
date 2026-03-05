@@ -34,6 +34,7 @@ void InstallShutdownHandler()
 
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
+    signal(SIGPIPE, SIG_IGN);
 
     std::thread watcher(ShutdownWatcher);
     watcher.detach();

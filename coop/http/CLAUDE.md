@@ -6,11 +6,16 @@ characteristics.
 
 ## Connection Buffer Management (`connection.cpp`)
 
-`Connection` owns a 2KB stack-allocated sliding-window recv buffer (`char m_buf[BUFFER_SIZE]`).
+`Connection<Transport>` is a contiguous bump allocation: the object and its recv buffer are one
+allocation with `char m_buf[0]` as a trailing flexible member. Buffer size is configurable at
+construction (default 2KB). The parser accesses `m_buf` via CRTP — `ConnectionImpl<Derived>`
+calls `Buf()` which resolves to `static_cast<Derived*>(this)->m_buf`, a compile-time offset
+from `this` with zero pointer indirection.
+
 Parsing advances `m_parsePos` through the buffer; `Compact()` memmoves remaining data to the
 front when more recv space is needed.
 
-**Compact()**: `memmove(m_buf, m_buf + m_parsePos, remaining)` then resets `m_parsePos = 0`.
+**Compact()**: `memmove(Buf(), Buf() + m_parsePos, remaining)` then resets `m_parsePos = 0`.
 Guarded by `if (m_parsePos == 0) return` to skip no-op calls. Called before `RecvMore()` in
 scan loops when data spans the buffer boundary.
 
@@ -19,11 +24,6 @@ boundary-spanning case. For typical HTTP requests (200-500 bytes), the entire re
 in one recv and Compact never fires during parsing. Avoid adding Compact calls in paths where
 `m_parsePos == m_bufLen` (the memmove would be zero-length); `RecvMore()` handles compaction
 internally when the buffer is full.
-
-**Circular buffer not warranted**: The 2KB buffer is stack-allocated (zero setup cost). An mmap
-double-mapping circular buffer would require page-aligned sizes (4KB minimum = 8KB with alias),
-2 syscalls to set up per Connection, and fights the stack-first idiom. Only worthwhile for
-long-lived streaming connections with 16KB+ buffers under sustained throughput.
 
 ## Parser Phases
 

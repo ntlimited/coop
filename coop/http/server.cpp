@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "coop/alloc.h"
 #include "coop/cooperator.h"
 #include "coop/launchable.h"
 #include "coop/io/io.h"
@@ -156,16 +157,19 @@ struct HttpConnection : Launchable
     virtual void Launch() final
     {
         PlaintextTransport transport(m_fd);
-        Connection<PlaintextTransport> conn(transport, GetContext(), m_co, m_timeout);
+        auto conn = GetContext()->Allocate<Connection<PlaintextTransport>>(
+            ConnectionBase::DEFAULT_BUFFER_SIZE,
+            transport, GetContext(), m_co,
+            ConnectionBase::DEFAULT_BUFFER_SIZE, m_timeout);
 
         while (!GetContext()->IsKilled())
         {
-            HandleRequest(conn, m_routes, m_routeCount, m_searchPaths);
+            HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths);
 
-            if (conn.SendError() || !conn.KeepAlive()) return;
+            if (conn->SendError() || !conn->KeepAlive()) return;
 
-            conn.SkipBody();
-            conn.Reset();
+            conn->SkipBody();
+            conn->Reset();
         }
     }
 
@@ -207,16 +211,19 @@ struct HttpTlsConnection : Launchable
         if (sslConn.Handshake() != 0) return;
 
         TlsTransport transport(sslConn, m_fd);
-        Connection<TlsTransport> conn(transport, GetContext(), m_co, m_timeout);
+        auto conn = GetContext()->Allocate<Connection<TlsTransport>>(
+            ConnectionBase::DEFAULT_BUFFER_SIZE,
+            transport, GetContext(), m_co,
+            ConnectionBase::DEFAULT_BUFFER_SIZE, m_timeout);
 
         while (!GetContext()->IsKilled())
         {
-            HandleRequest(conn, m_routes, m_routeCount, m_searchPaths);
+            HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths);
 
-            if (conn.SendError() || !conn.KeepAlive()) return;
+            if (conn->SendError() || !conn->KeepAlive()) return;
 
-            conn.SkipBody();
-            conn.Reset();
+            conn->SkipBody();
+            conn->Reset();
         }
     }
 

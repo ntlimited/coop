@@ -1,4 +1,6 @@
 #include "connection.h"
+#include "transport.h"
+#include "tls_transport.h"
 
 #include <algorithm>
 #include <cassert>
@@ -14,8 +16,9 @@ namespace coop
 namespace http
 {
 
-ConnectionBase::ConnectionBase(io::Descriptor& desc, Context* ctx, Cooperator* co,
-                               time::Interval timeout)
+template<typename Derived>
+ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Cooperator* co,
+                                        time::Interval timeout)
 : m_desc(desc)
 , m_ctx(ctx)
 , m_co(co)
@@ -43,7 +46,8 @@ ConnectionBase::ConnectionBase(io::Descriptor& desc, Context* ctx, Cooperator* c
 {
 }
 
-void ConnectionBase::Reset()
+template<typename Derived>
+void ConnectionImpl<Derived>::Reset()
 {
     Compact();
 
@@ -71,17 +75,18 @@ void ConnectionBase::Reset()
 // Buffer management
 // -------------------------------------------------------------------------------------
 
-int ConnectionBase::RecvMore()
+template<typename Derived>
+int ConnectionImpl<Derived>::RecvMore()
 {
     if (m_ctx->IsKilled()) return -1;
 
-    if (m_bufLen >= BUFFER_SIZE)
+    if (m_bufLen >= BufSize())
     {
         Compact();
-        if (m_bufLen >= BUFFER_SIZE) return 0;
+        if (m_bufLen >= BufSize()) return 0;
     }
 
-    int n = TransportRecv(m_buf + m_bufLen, BUFFER_SIZE - m_bufLen, 0, m_timeout);
+    int n = TransportRecv(Buf() + m_bufLen, BufSize() - m_bufLen, 0, m_timeout);
 
     if (m_ctx->IsKilled()) return -1;
     if (n <= 0) return -1;
@@ -90,14 +95,15 @@ int ConnectionBase::RecvMore()
     return n;
 }
 
-void ConnectionBase::Compact()
+template<typename Derived>
+void ConnectionImpl<Derived>::Compact()
 {
     if (m_parsePos == 0) return;
 
     size_t remaining = m_bufLen - m_parsePos;
     if (remaining > 0)
     {
-        memmove(m_buf, m_buf + m_parsePos, remaining);
+        memmove(Buf(), Buf() + m_parsePos, remaining);
     }
     m_bufLen = remaining;
     m_parsePos = 0;
@@ -105,13 +111,10 @@ void ConnectionBase::Compact()
 
 // -------------------------------------------------------------------------------------
 // Phase 1: Request line
-//
-// After parsing:  parsePos points to the first arg byte (after '?') if query string exists,
-//                 or to the ' ' before "HTTP/1.x" if no query string.
-// Phase = ARGS.
 // -------------------------------------------------------------------------------------
 
-RequestLine* ConnectionBase::GetRequestLine()
+template<typename Derived>
+RequestLine* ConnectionImpl<Derived>::GetRequestLine()
 {
     if (m_requestLineParsed)
     {
@@ -119,16 +122,12 @@ RequestLine* ConnectionBase::GetRequestLine()
     }
     m_requestLineParsed = true;
 
-    // Recv until we have a complete request line (\r\n)
-    //
     while (true)
     {
         for (size_t i = m_parsePos; i + 1 < m_bufLen; i++)
         {
-            if (m_buf[i] == '\r' && m_buf[i + 1] == '\n')
+            if (Buf()[i] == '\r' && Buf()[i + 1] == '\n')
             {
-                // Full request line is in buffer. Parse it.
-                //
                 if (!ParseRequestLine()) return nullptr;
                 m_phase = ARGS;
                 return &m_requestLine;
@@ -140,42 +139,31 @@ RequestLine* ConnectionBase::GetRequestLine()
     }
 }
 
-bool ConnectionBase::ParseRequestLine()
+template<typename Derived>
+bool ConnectionImpl<Derived>::ParseRequestLine()
 {
-    // Request line format: METHOD PATH[?QUERY] HTTP/1.x\r\n
-    //
     size_t start = m_parsePos;
 
-    // Find method end (first space)
-    //
     size_t i = start;
-    while (i < m_bufLen && m_buf[i] != ' ') i++;
+    while (i < m_bufLen && Buf()[i] != ' ') i++;
     if (i >= m_bufLen) return false;
 
-    m_requestLine.method = std::string_view(m_buf + start, i - start);
+    m_requestLine.method = std::string_view(Buf() + start, i - start);
 
-    // Skip space, find path
-    //
     i++;
     size_t pathStart = i;
 
-    // Find end of path: '?' (query string), ' ' (HTTP version), or '\r'
-    //
-    while (i < m_bufLen && m_buf[i] != '?' && m_buf[i] != ' ' && m_buf[i] != '\r') i++;
+    while (i < m_bufLen && Buf()[i] != '?' && Buf()[i] != ' ' && Buf()[i] != '\r') i++;
     if (i >= m_bufLen) return false;
 
-    m_requestLine.path = std::string_view(m_buf + pathStart, i - pathStart);
+    m_requestLine.path = std::string_view(Buf() + pathStart, i - pathStart);
 
-    if (m_buf[i] == '?')
+    if (Buf()[i] == '?')
     {
-        // Query string exists — parsePos goes to first arg byte
-        //
         m_parsePos = i + 1;
     }
     else
     {
-        // No query string — parsePos at ' ' before HTTP version (or \r)
-        //
         m_parsePos = i;
     }
 
@@ -186,7 +174,8 @@ bool ConnectionBase::ParseRequestLine()
 // Phase advancement
 // -------------------------------------------------------------------------------------
 
-bool ConnectionBase::AdvanceToPhase(Phase target)
+template<typename Derived>
+bool ConnectionImpl<Derived>::AdvanceToPhase(Phase target)
 {
     while (m_phase < target)
     {
@@ -215,15 +204,14 @@ bool ConnectionBase::AdvanceToPhase(Phase target)
     return true;
 }
 
-// Skip parsePos forward through " HTTP/1.x\r\n" to reach the start of headers
-//
-void ConnectionBase::SkipToHeaders()
+template<typename Derived>
+void ConnectionImpl<Derived>::SkipToHeaders()
 {
     while (true)
     {
         for (size_t i = m_parsePos; i < m_bufLen; i++)
         {
-            if (m_buf[i] == '\n')
+            if (Buf()[i] == '\n')
             {
                 m_parsePos = i + 1;
                 m_phase = HEADERS;
@@ -243,12 +231,10 @@ void ConnectionBase::SkipToHeaders()
 
 // -------------------------------------------------------------------------------------
 // Phase 2: GET args (query string)
-//
-// parsePos is positioned within the query string. Args are delimited by '&', values by '='.
-// The query string ends at ' ' (before HTTP version) or '\r'.
 // -------------------------------------------------------------------------------------
 
-const char* ConnectionBase::NextArgName()
+template<typename Derived>
+const char* ConnectionImpl<Derived>::NextArgName()
 {
     if (m_phase < ARGS)
     {
@@ -256,36 +242,28 @@ const char* ConnectionBase::NextArgName()
     }
     if (m_phase > ARGS) return nullptr;
 
-    // Skip any unconsumed value from previous arg
-    //
     if (!m_valueConsumed)
     {
         SkipArgValue();
     }
 
-    // Check for end of query string
-    //
-    if (m_parsePos >= m_bufLen || m_buf[m_parsePos] == ' ' || m_buf[m_parsePos] == '\r')
+    if (m_parsePos >= m_bufLen || Buf()[m_parsePos] == ' ' || Buf()[m_parsePos] == '\r')
     {
         SkipToHeaders();
         return nullptr;
     }
 
-    // Parse arg name until '=' or '&' or ' ' or '\r'
-    //
     size_t nameStart = m_parsePos;
 
     while (true)
     {
         for (size_t i = (nameStart == m_parsePos ? m_parsePos : m_parsePos); i < m_bufLen; i++)
         {
-            char c = m_buf[i];
+            char c = Buf()[i];
             if (c == '=' || c == '&' || c == ' ' || c == '\r')
             {
-                // Null-terminate the name in place
-                //
-                m_buf[i] = '\0';
-                const char* name = m_buf + nameStart;
+                Buf()[i] = '\0';
+                const char* name = Buf() + nameStart;
                 m_parsePos = i;
 
                 if (c == '=')
@@ -303,15 +281,14 @@ const char* ConnectionBase::NextArgName()
             }
         }
 
-        // Name spans buffer boundary — compact and recv more
-        //
         Compact();
         nameStart = m_parsePos;
         if (RecvMore() <= 0) return nullptr;
     }
 }
 
-Chunk* ConnectionBase::ReadArgValue()
+template<typename Derived>
+Chunk* ConnectionImpl<Derived>::ReadArgValue()
 {
     if (m_valueConsumed) return nullptr;
 
@@ -319,10 +296,10 @@ Chunk* ConnectionBase::ReadArgValue()
 
     for (size_t i = m_parsePos; i < m_bufLen; i++)
     {
-        char c = m_buf[i];
+        char c = Buf()[i];
         if (c == '&' || c == ' ' || c == '\r')
         {
-            m_chunk.data = m_buf + valueStart;
+            m_chunk.data = Buf() + valueStart;
             m_chunk.size = i - valueStart;
             m_chunk.complete = true;
 
@@ -333,12 +310,10 @@ Chunk* ConnectionBase::ReadArgValue()
         }
     }
 
-    // Value spans buffer boundary — return what we have
-    //
     size_t available = m_bufLen - valueStart;
     if (available > 0)
     {
-        m_chunk.data = m_buf + valueStart;
+        m_chunk.data = Buf() + valueStart;
         m_chunk.size = available;
         m_chunk.complete = false;
 
@@ -356,7 +331,8 @@ Chunk* ConnectionBase::ReadArgValue()
     return ReadArgValue();
 }
 
-void ConnectionBase::SkipArgValue()
+template<typename Derived>
+void ConnectionImpl<Derived>::SkipArgValue()
 {
     if (m_valueConsumed) return;
 
@@ -364,7 +340,7 @@ void ConnectionBase::SkipArgValue()
     {
         for (size_t i = m_parsePos; i < m_bufLen; i++)
         {
-            char c = m_buf[i];
+            char c = Buf()[i];
             if (c == '&' || c == ' ' || c == '\r')
             {
                 m_parsePos = i;
@@ -383,7 +359,8 @@ void ConnectionBase::SkipArgValue()
     }
 }
 
-void ConnectionBase::SkipArgs()
+template<typename Derived>
+void ConnectionImpl<Derived>::SkipArgs()
 {
     if (m_phase < ARGS)
     {
@@ -396,11 +373,10 @@ void ConnectionBase::SkipArgs()
 
 // -------------------------------------------------------------------------------------
 // Phase 3: Headers
-//
-// parsePos is at the start of the first header line (or the empty \r\n).
 // -------------------------------------------------------------------------------------
 
-const char* ConnectionBase::NextHeaderName()
+template<typename Derived>
+const char* ConnectionImpl<Derived>::NextHeaderName()
 {
     if (m_phase < HEADERS)
     {
@@ -408,8 +384,6 @@ const char* ConnectionBase::NextHeaderName()
     }
     if (m_phase > HEADERS) return nullptr;
 
-    // Skip any unconsumed value from previous header
-    //
     if (!m_valueConsumed)
     {
         SkipHeaderValue();
@@ -417,49 +391,37 @@ const char* ConnectionBase::NextHeaderName()
 
     while (true)
     {
-        // Ensure we have at least 2 bytes to check for empty line
-        //
         while (m_bufLen - m_parsePos < 2)
         {
             Compact();
             if (RecvMore() <= 0) return nullptr;
         }
 
-        // Check for empty line (\r\n) = end of headers
-        //
-        if (m_buf[m_parsePos] == '\r' && m_buf[m_parsePos + 1] == '\n')
+        if (Buf()[m_parsePos] == '\r' && Buf()[m_parsePos + 1] == '\n')
         {
             m_parsePos += 2;
             m_phase = BODY;
             return nullptr;
         }
 
-        // Parse header name until ':'
-        //
         size_t nameStart = m_parsePos;
 
         while (true)
         {
             for (size_t i = m_parsePos; i < m_bufLen; i++)
             {
-                if (m_buf[i] == ':')
+                if (Buf()[i] == ':')
                 {
-                    // Null-terminate the name in place
-                    //
                     size_t nameEnd = i;
-                    m_buf[i] = '\0';
-                    const char* name = m_buf + nameStart;
+                    Buf()[i] = '\0';
+                    const char* name = Buf() + nameStart;
                     m_parsePos = i + 1;
 
-                    // Skip optional whitespace after ':'
-                    //
-                    while (m_parsePos < m_bufLen && m_buf[m_parsePos] == ' ')
+                    while (m_parsePos < m_bufLen && Buf()[m_parsePos] == ' ')
                     {
                         m_parsePos++;
                     }
 
-                    // Detect Content-Length / Transfer-Encoding
-                    //
                     size_t nameLen = nameEnd - nameStart;
                     if (nameLen == 14 &&
                         strncasecmp(name, "content-length", 14) == 0)
@@ -481,17 +443,13 @@ const char* ConnectionBase::NextHeaderName()
                     return name;
                 }
 
-                if (m_buf[i] == '\r')
+                if (Buf()[i] == '\r')
                 {
-                    // Malformed header line (no colon)
-                    //
                     m_phase = DONE;
                     return nullptr;
                 }
             }
 
-            // Name spans buffer boundary — compact and recv more
-            //
             Compact();
             nameStart = m_parsePos;
             if (RecvMore() <= 0) return nullptr;
@@ -499,7 +457,8 @@ const char* ConnectionBase::NextHeaderName()
     }
 }
 
-Chunk* ConnectionBase::ReadHeaderValue()
+template<typename Derived>
+Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
 {
     if (m_valueConsumed) return nullptr;
 
@@ -507,14 +466,12 @@ Chunk* ConnectionBase::ReadHeaderValue()
 
     for (size_t i = m_parsePos; i < m_bufLen; i++)
     {
-        if (m_buf[i] == '\r')
+        if (Buf()[i] == '\r')
         {
-            m_chunk.data = m_buf + valueStart;
+            m_chunk.data = Buf() + valueStart;
             m_chunk.size = i - valueStart;
             m_chunk.complete = true;
 
-            // Capture special header values
-            //
             if (m_pendingContentLength)
             {
                 m_contentLength = 0;
@@ -548,9 +505,7 @@ Chunk* ConnectionBase::ReadHeaderValue()
             }
 
             m_parsePos = i;
-            // Skip \r\n
-            //
-            if (m_parsePos + 1 < m_bufLen && m_buf[m_parsePos + 1] == '\n')
+            if (m_parsePos + 1 < m_bufLen && Buf()[m_parsePos + 1] == '\n')
             {
                 m_parsePos += 2;
             }
@@ -559,12 +514,10 @@ Chunk* ConnectionBase::ReadHeaderValue()
         }
     }
 
-    // Value spans buffer boundary — return what we have
-    //
     size_t available = m_bufLen - valueStart;
     if (available > 0)
     {
-        m_chunk.data = m_buf + valueStart;
+        m_chunk.data = Buf() + valueStart;
         m_chunk.size = available;
         m_chunk.complete = false;
 
@@ -585,12 +538,11 @@ Chunk* ConnectionBase::ReadHeaderValue()
     return ReadHeaderValue();
 }
 
-void ConnectionBase::SkipHeaderValue()
+template<typename Derived>
+void ConnectionImpl<Derived>::SkipHeaderValue()
 {
     if (m_valueConsumed) return;
 
-    // If this is a special header we need the value — read it instead of skipping
-    //
     if (m_pendingContentLength || m_pendingTransferEncoding || m_pendingConnection)
     {
         while (true)
@@ -605,10 +557,10 @@ void ConnectionBase::SkipHeaderValue()
     {
         for (size_t i = m_parsePos; i < m_bufLen; i++)
         {
-            if (m_buf[i] == '\r')
+            if (Buf()[i] == '\r')
             {
                 m_parsePos = i;
-                if (m_parsePos + 1 < m_bufLen && m_buf[m_parsePos + 1] == '\n')
+                if (m_parsePos + 1 < m_bufLen && Buf()[m_parsePos + 1] == '\n')
                 {
                     m_parsePos += 2;
                 }
@@ -626,7 +578,8 @@ void ConnectionBase::SkipHeaderValue()
     }
 }
 
-void ConnectionBase::SkipHeaders()
+template<typename Derived>
+void ConnectionImpl<Derived>::SkipHeaders()
 {
     if (m_phase < HEADERS)
     {
@@ -644,12 +597,11 @@ void ConnectionBase::SkipHeaders()
 // Phase 4: Body
 // -------------------------------------------------------------------------------------
 
-int64_t ConnectionBase::ContentLength()
+template<typename Derived>
+int64_t ConnectionImpl<Derived>::ContentLength()
 {
     if (m_contentLength >= 0) return m_contentLength;
 
-    // Force header scanning to detect Content-Length
-    //
     if (m_phase < BODY)
     {
         AdvanceToPhase(BODY);
@@ -659,7 +611,8 @@ int64_t ConnectionBase::ContentLength()
     return m_contentLength;
 }
 
-Chunk* ConnectionBase::ReadBody()
+template<typename Derived>
+Chunk* ConnectionImpl<Derived>::ReadBody()
 {
     if (m_phase < BODY)
     {
@@ -672,16 +625,12 @@ Chunk* ConnectionBase::ReadBody()
         return ReadChunkedBody();
     }
 
-    // Content-Length body
-    //
     if (m_contentLength <= 0)
     {
         m_phase = DONE;
         return nullptr;
     }
 
-    // First ReadBody call: initialize remaining bytes
-    //
     if (m_bodyRemaining == 0 && m_contentLength > 0)
     {
         m_bodyRemaining = static_cast<size_t>(m_contentLength);
@@ -693,8 +642,6 @@ Chunk* ConnectionBase::ReadBody()
         return nullptr;
     }
 
-    // Return what's available in the buffer
-    //
     size_t available = m_bufLen - m_parsePos;
     if (available == 0)
     {
@@ -708,7 +655,7 @@ Chunk* ConnectionBase::ReadBody()
     }
 
     size_t toDeliver = std::min(available, m_bodyRemaining);
-    m_chunk.data = m_buf + m_parsePos;
+    m_chunk.data = Buf() + m_parsePos;
     m_chunk.size = toDeliver;
     m_bodyRemaining -= toDeliver;
     m_chunk.complete = (m_bodyRemaining == 0);
@@ -722,7 +669,8 @@ Chunk* ConnectionBase::ReadBody()
     return &m_chunk;
 }
 
-void ConnectionBase::SkipBody()
+template<typename Derived>
+void ConnectionImpl<Derived>::SkipBody()
 {
     if (m_phase < BODY)
     {
@@ -730,26 +678,18 @@ void ConnectionBase::SkipBody()
     }
     if (m_phase != BODY) return;
 
-    // Drain body bytes so the buffer is positioned correctly for keep-alive
-    //
     while (ReadBody() != nullptr) {}
 }
 
 // -------------------------------------------------------------------------------------
-// Chunked body parsing (Transfer-Encoding: chunked)
-//
-// Strips chunk framing, delivers raw data via Chunk. Each HTTP chunk:
-//   SIZE\r\n
-//   DATA\r\n
-// Terminal chunk: 0\r\n\r\n
+// Chunked body parsing
 // -------------------------------------------------------------------------------------
 
-Chunk* ConnectionBase::ReadChunkedBody()
+template<typename Derived>
+Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
 {
     if (m_chunkedDone) return nullptr;
 
-    // If we have bytes remaining in the current HTTP chunk, deliver them
-    //
     if (m_bodyRemaining > 0)
     {
         size_t available = m_bufLen - m_parsePos;
@@ -761,15 +701,13 @@ Chunk* ConnectionBase::ReadChunkedBody()
         }
 
         size_t toDeliver = std::min(available, m_bodyRemaining);
-        m_chunk.data = m_buf + m_parsePos;
+        m_chunk.data = Buf() + m_parsePos;
         m_chunk.size = toDeliver;
         m_bodyRemaining -= toDeliver;
         m_parsePos += toDeliver;
 
         if (m_bodyRemaining == 0)
         {
-            // Skip the trailing \r\n after chunk data
-            //
             while (m_bufLen - m_parsePos < 2)
             {
                 Compact();
@@ -788,21 +726,17 @@ Chunk* ConnectionBase::ReadChunkedBody()
         return &m_chunk;
     }
 
-    // Read the next chunk size line
-    //
     while (true)
     {
         for (size_t i = m_parsePos; i + 1 < m_bufLen; i++)
         {
-            if (m_buf[i] == '\r' && m_buf[i + 1] == '\n')
+            if (Buf()[i] == '\r' && Buf()[i + 1] == '\n')
             {
-                // Parse hex chunk size
-                //
                 size_t chunkSize = 0;
                 for (size_t j = m_parsePos; j < i; j++)
                 {
-                    char c = m_buf[j];
-                    if (c == ';') break; // chunk extension
+                    char c = Buf()[j];
+                    if (c == ';') break;
 
                     chunkSize <<= 4;
                     if (c >= '0' && c <= '9') chunkSize += c - '0';
@@ -810,12 +744,10 @@ Chunk* ConnectionBase::ReadChunkedBody()
                     else if (c >= 'A' && c <= 'F') chunkSize += c - 'A' + 10;
                 }
 
-                m_parsePos = i + 2; // past \r\n
+                m_parsePos = i + 2;
 
                 if (chunkSize == 0)
                 {
-                    // Terminal chunk — skip optional trailers + final \r\n
-                    //
                     m_chunkedDone = true;
                     m_phase = DONE;
                     return nullptr;
@@ -835,7 +767,8 @@ Chunk* ConnectionBase::ReadChunkedBody()
 // Response
 // -------------------------------------------------------------------------------------
 
-const char* ConnectionBase::StatusText(int code)
+template<typename Derived>
+const char* ConnectionImpl<Derived>::StatusText(int code)
 {
     switch (code)
     {
@@ -859,12 +792,14 @@ const char* ConnectionBase::StatusText(int code)
     }
 }
 
-const char* ConnectionBase::ConnectionHeaderValue() const
+template<typename Derived>
+const char* ConnectionImpl<Derived>::ConnectionHeaderValue() const
 {
     return (m_keepAlive && !m_clientClose) ? "keep-alive" : "close";
 }
 
-bool ConnectionBase::SendRaw(const void* data, size_t size)
+template<typename Derived>
+bool ConnectionImpl<Derived>::SendRaw(const void* data, size_t size)
 {
     assert(!m_sendError);
 
@@ -877,7 +812,8 @@ bool ConnectionBase::SendRaw(const void* data, size_t size)
     return true;
 }
 
-bool ConnectionBase::SendWritev(struct iovec* iov, int iovcnt)
+template<typename Derived>
+bool ConnectionImpl<Derived>::SendWritev(struct iovec* iov, int iovcnt)
 {
     assert(!m_sendError);
 
@@ -896,7 +832,9 @@ bool ConnectionBase::SendWritev(struct iovec* iov, int iovcnt)
     return true;
 }
 
-bool ConnectionBase::SendHeaders(int status, const char* contentType, size_t contentLength)
+template<typename Derived>
+bool ConnectionImpl<Derived>::SendHeaders(int status, const char* contentType,
+                                           size_t contentLength)
 {
     assert(!m_sendError);
 
@@ -913,7 +851,9 @@ bool ConnectionBase::SendHeaders(int status, const char* contentType, size_t con
     return SendRaw(hdr, len);
 }
 
-bool ConnectionBase::Send(int status, const char* contentType, const void* body, size_t size)
+template<typename Derived>
+bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
+                                    const void* body, size_t size)
 {
     assert(!m_sendError);
 
@@ -939,15 +879,15 @@ bool ConnectionBase::Send(int status, const char* contentType, const void* body,
     return SendWritev(iov, 2);
 }
 
-bool ConnectionBase::Send(int status, const char* contentType, const std::string& body)
+template<typename Derived>
+bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
+                                    const std::string& body)
 {
     return Send(status, contentType, body.data(), body.size());
 }
 
-// TODO: Set TCP_CORK before BeginChunked and clear after EndChunked to coalesce TCP segments
-// on real connections. Won't affect socketpair benchmarks but reduces packets over the wire.
-//
-bool ConnectionBase::BeginChunked(int status, const char* contentType)
+template<typename Derived>
+bool ConnectionImpl<Derived>::BeginChunked(int status, const char* contentType)
 {
     assert(!m_sendError);
 
@@ -957,7 +897,8 @@ bool ConnectionBase::BeginChunked(int status, const char* contentType)
     return true;
 }
 
-bool ConnectionBase::SendChunk(const void* data, size_t size)
+template<typename Derived>
+bool ConnectionImpl<Derived>::SendChunk(const void* data, size_t size)
 {
     assert(!m_sendError);
     if (size == 0) return false;
@@ -967,8 +908,6 @@ bool ConnectionBase::SendChunk(const void* data, size_t size)
 
     if (m_chunkedHeadersPending)
     {
-        // First chunk — send deferred chunked headers together with chunk data
-        //
         m_chunkedHeadersPending = false;
 
         char hdr[512];
@@ -999,14 +938,13 @@ bool ConnectionBase::SendChunk(const void* data, size_t size)
     return SendWritev(iov, 3);
 }
 
-bool ConnectionBase::EndChunked()
+template<typename Derived>
+bool ConnectionImpl<Derived>::EndChunked()
 {
     assert(!m_sendError);
 
     if (m_chunkedHeadersPending)
     {
-        // No chunks were sent — send headers + terminal chunk together
-        //
         m_chunkedHeadersPending = false;
 
         char hdr[512];
@@ -1030,7 +968,8 @@ bool ConnectionBase::EndChunked()
     return SendRaw("0\r\n\r\n", 5);
 }
 
-bool ConnectionBase::EndChunked(const void* lastChunkData, size_t lastChunkSize)
+template<typename Derived>
+bool ConnectionImpl<Derived>::EndChunked(const void* lastChunkData, size_t lastChunkSize)
 {
     assert(!m_sendError);
     if (lastChunkSize == 0) return EndChunked();
@@ -1040,8 +979,6 @@ bool ConnectionBase::EndChunked(const void* lastChunkData, size_t lastChunkSize)
 
     if (m_chunkedHeadersPending)
     {
-        // Only chunk — send headers + chunk + terminator in one writev
-        //
         m_chunkedHeadersPending = false;
 
         char hdr[512];
@@ -1065,8 +1002,6 @@ bool ConnectionBase::EndChunked(const void* lastChunkData, size_t lastChunkSize)
         return SendWritev(iov, 5);
     }
 
-    // Last chunk + terminator in one writev
-    //
     struct iovec iov[4] = {
         { sizeHdr, static_cast<size_t>(sizeLen) },
         { const_cast<void*>(lastChunkData), lastChunkSize },
@@ -1076,7 +1011,8 @@ bool ConnectionBase::EndChunked(const void* lastChunkData, size_t lastChunkSize)
     return SendWritev(iov, 4);
 }
 
-bool ConnectionBase::Sendfile(int fileFd, off_t offset, size_t count)
+template<typename Derived>
+bool ConnectionImpl<Derived>::Sendfile(int fileFd, off_t offset, size_t count)
 {
     assert(!m_sendError);
 
@@ -1088,6 +1024,13 @@ bool ConnectionBase::Sendfile(int fileFd, off_t offset, size_t count)
     }
     return true;
 }
+
+// -------------------------------------------------------------------------------------
+// Explicit template instantiations for known transport types
+// -------------------------------------------------------------------------------------
+
+template struct ConnectionImpl<Connection<PlaintextTransport>>;
+template struct ConnectionImpl<Connection<TlsTransport>>;
 
 } // end namespace coop::http
 } // end namespace coop

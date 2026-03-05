@@ -39,6 +39,9 @@ benchmarks/     - Benchmark code to evaluate performance of the library and of a
   respectively
 - Whenever context needs to be gathered at sufficient cost, suggest changes for CLAUDE.md directives
   that will reduce future costs.
+- Prefer CRTP and contiguous layout over ABC inheritance for hot-path objects. Pure-virtual
+  interfaces are API-boundary sugar (handler signatures, test seams), not data-owning base classes.
+  See `DESIGN_IDIOMS.md` for the three-level pattern (Interface → CRTP → Final).
 
 ### Error Handling
 - Errors should bubble up using a checked-return pattern
@@ -213,20 +216,39 @@ Per-cooperator counters (no atomics — single-threaded). Probes in scheduler, i
 context lifecycle. See `coop/perf/CLAUDE.md` for the counter table, patching engine internals,
 and instructions for adding new probes.
 
+### Bump Allocator (`coop/alloc.h`)
+Contexts have a bump heap that grows upward from just past the Launchable/lambda at the
+segment's bottom. `ctx->Allocate<T>(extra, args...)` bump-allocates `sizeof(T) + extra` bytes,
+placement-new constructs T, and returns an `Alloc<T>` RAII wrapper that destructs + de-bumps
+on scope exit. Free function `coop::Allocate<T>(extra, args...)` uses `Self()`.
+
+The bump heap enables contiguous allocations with trailing flexible arrays — the object and its
+buffer are one allocation with zero pointer indirection. Allocations are strictly LIFO.
+
 ### HTTP Server (`coop/http/`)
-Route table maps paths to handler functions that receive a `Connection&`:
+Route table maps paths to handler functions that receive a `ConnectionBase&`:
 ```cpp
 struct Route {
     const char* path;
-    void (*handler)(Connection&);
+    void (*handler)(ConnectionBase&);
 };
 ```
 
-`Connection` (`coop/http/connection.h`) is the request parser and response writer. Constructed
-stack-local per client, owns a 2KB sliding-window recv buffer. Parsing is strictly sequential
-(request line -> args -> headers -> body), lazy, and memoized. Each phase implicitly skips the
-previous phase if not consumed. All string_views and data pointers are zero-copy into the recv
-buffer.
+**Connection architecture** (`coop/http/connection.h`): Three-level CRTP hierarchy following
+the Interface → CRTP → Final pattern (see `DESIGN_IDIOMS.md`):
+- `ConnectionBase` — pure-virtual interface. Handlers take `ConnectionBase&`. Virtual dispatch
+  happens once per handler call.
+- `ConnectionImpl<Derived>` — CRTP template with all parser state and methods. Accesses the
+  recv buffer via `static_cast<Derived*>(this)->m_buf` — compile-time offset, zero indirection.
+  Accesses transport via CRTP dispatch (fully inlined). Explicit template instantiation in
+  `connection.cpp` for `PlaintextTransport` and `TlsTransport`.
+- `Connection<Transport>` — final concrete type. Owns the transport, buffer size, and trailing
+  `char m_buf[0]`. Allocated via `ctx->Allocate<Connection<T>>(bufSize, ...)` from the bump
+  heap — one contiguous allocation for the object + its recv buffer.
+
+Parsing is strictly sequential (request line -> args -> headers -> body), lazy, and memoized.
+Each phase implicitly skips the previous phase if not consumed. All string_views and data
+pointers are zero-copy into the recv buffer.
 
 **Bounded vs unbounded**: HTTP elements split into bounded (method, path, arg names, header
 names — safe to access directly via string_view/const char*) and unbounded (arg values, header
@@ -238,15 +260,17 @@ Flyweight instances are Connection members, no heap allocation.
 
 **Pull API**:
 ```cpp
-Connection conn(desc, ctx, co, timeout);
-auto* req = conn.GetRequestLine();      // RequestLine* (method, path)
-while (auto* name = conn.NextArgName()) // query string args
-    auto* val = conn.ReadArgValue();    // Chunk* (zero-copy)
-while (auto* name = conn.NextHeaderName())
-    auto* val = conn.ReadHeaderValue();
-while (auto* chunk = conn.ReadBody())   // handles chunked TE internally
+PlaintextTransport transport(desc);
+auto conn = ctx->Allocate<Connection<PlaintextTransport>>(bufSize,
+    transport, ctx, co, bufSize);
+auto* req = conn->GetRequestLine();      // RequestLine* (method, path)
+while (auto* name = conn->NextArgName()) // query string args
+    auto* val = conn->ReadArgValue();    // Chunk* (zero-copy)
+while (auto* name = conn->NextHeaderName())
+    auto* val = conn->ReadHeaderValue();
+while (auto* chunk = conn->ReadBody())   // handles chunked TE internally
     process(chunk->data, chunk->size);
-conn.Send(200, "text/plain", body);
+conn->Send(200, "text/plain", body);
 ```
 
 **Response methods**: `Send` (status + body), `SendHeaders` (headers only), `BeginChunked` /
@@ -296,6 +320,13 @@ complexity to harder-to-audit places.
 If a change touches more than ~5 files, introduces new friend declarations or extension classes,
 or discovers multiple crash bugs during implementation, stop and re-evaluate the premise. The
 implementation difficulty is signal about the design, not just about the implementation.
+
+### ABC inheritance on data-owning objects
+If a proposed design puts an abstract base class on an object that owns variable-size data or is
+accessed per-element on the hot path, push back. ABC forces pointer indirection or virtual
+dispatch for the base to reach derived-class data — exactly the wrong trade for objects where
+memory layout matters. Prefer CRTP for implementation polymorphism and pure-virtual interfaces
+only at API boundaries. See `DESIGN_IDIOMS.md`.
 
 See `DESIGN_IDIOMS.md` for patterns and idioms that should guide new API design.
 

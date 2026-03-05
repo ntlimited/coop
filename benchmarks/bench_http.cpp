@@ -17,8 +17,13 @@
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
 
+#include "coop/alloc.h"
 #include "coop/http/connection.h"
 #include "coop/http/transport.h"
+
+static constexpr size_t HTTP_BUF = coop::http::ConnectionBase::DEFAULT_BUFFER_SIZE;
+
+using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
 
 // ---------------------------------------------------------------------------
 // Helper: run a benchmark body inside a cooperator
@@ -214,10 +219,12 @@ static void BM_Http_Unix_MinimalGet(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                auto* req = conn.GetRequestLine();
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                auto* req = conn->GetRequestLine();
                 assert(req);
-                conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
+                conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
 
             DrainFd(fds[1]);
@@ -245,9 +252,11 @@ static void BM_Http_Unix_SendResponse(benchmark::State& state)
             state.ResumeTiming();
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                conn.GetRequestLine();
-                conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                conn->GetRequestLine();
+                conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
 
             state.PauseTiming();
@@ -279,10 +288,12 @@ static void BM_Http_Tcp_MinimalGet(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                auto* req = conn.GetRequestLine();
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                auto* req = conn->GetRequestLine();
                 assert(req);
-                conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
+                conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
 
             DrainFd(fds[1]);
@@ -310,9 +321,11 @@ static void BM_Http_Tcp_SendResponse(benchmark::State& state)
             state.ResumeTiming();
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                conn.GetRequestLine();
-                conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                conn->GetRequestLine();
+                conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
 
             state.PauseTiming();
@@ -342,12 +355,14 @@ static void BM_Http_Tcp_ChunkedResponse(benchmark::State& state)
             state.ResumeTiming();
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                conn.GetRequestLine();
-                conn.BeginChunked(200, "text/plain");
-                conn.SendChunk("Hello", 5);
-                conn.SendChunk(", ", 2);
-                conn.EndChunked("World!", 6);
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                conn->GetRequestLine();
+                conn->BeginChunked(200, "text/plain");
+                conn->SendChunk("Hello", 5);
+                conn->SendChunk(", ", 2);
+                conn->EndChunked("World!", 6);
             }
 
             state.PauseTiming();
@@ -378,10 +393,13 @@ static void BM_Http_Tcp_MinimalGet_NoTimeout(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co, std::chrono::seconds(0));
-                auto* req = conn.GetRequestLine();
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co,
+                    HTTP_BUF, std::chrono::seconds(0));
+                auto* req = conn->GetRequestLine();
                 assert(req);
-                conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
+                conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
 
             DrainFd(fds[1]);
@@ -416,37 +434,39 @@ static void BM_Http_Tcp_RealisticGet(benchmark::State& state)
             coop::io::SendAll(client, REQ_REALISTIC_GET, sizeof(REQ_REALISTIC_GET) - 1);
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                auto* req = conn.GetRequestLine();
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                auto* req = conn->GetRequestLine();
                 assert(req);
 
                 // Read query args
                 //
-                while (auto* name = conn.NextArgName())
+                while (auto* name = conn->NextArgName())
                 {
-                    auto* val = conn.ReadArgValue();
+                    auto* val = conn->ReadArgValue();
                     benchmark::DoNotOptimize(val);
                 }
 
                 // Search for Authorization header
                 //
                 bool authorized = false;
-                while (auto* name = conn.NextHeaderName())
+                while (auto* name = conn->NextHeaderName())
                 {
                     if (strncasecmp(name, "Authorization", 13) == 0)
                     {
-                        auto* val = conn.ReadHeaderValue();
+                        auto* val = conn->ReadHeaderValue();
                         benchmark::DoNotOptimize(val);
                         authorized = true;
                     }
                     else
                     {
-                        conn.SkipHeaderValue();
+                        conn->SkipHeaderValue();
                     }
                 }
                 benchmark::DoNotOptimize(authorized);
 
-                conn.Send(200, "application/json",
+                conn->Send(200, "application/json",
                     RESP_JSON_SMALL, sizeof(RESP_JSON_SMALL) - 1);
             }
 
@@ -476,34 +496,36 @@ static void BM_Http_Tcp_RealisticPost(benchmark::State& state)
             coop::io::SendAll(client, REQ_REALISTIC_POST, sizeof(REQ_REALISTIC_POST) - 1);
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                auto* req = conn.GetRequestLine();
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                auto* req = conn->GetRequestLine();
                 assert(req);
 
                 // Read specific headers
                 //
-                while (auto* name = conn.NextHeaderName())
+                while (auto* name = conn->NextHeaderName())
                 {
                     if (strncasecmp(name, "Content-Type", 12) == 0 ||
                         strncasecmp(name, "Authorization", 13) == 0)
                     {
-                        auto* val = conn.ReadHeaderValue();
+                        auto* val = conn->ReadHeaderValue();
                         benchmark::DoNotOptimize(val);
                     }
                     else
                     {
-                        conn.SkipHeaderValue();
+                        conn->SkipHeaderValue();
                     }
                 }
 
                 // Consume body
                 //
-                while (auto* chunk = conn.ReadBody())
+                while (auto* chunk = conn->ReadBody())
                 {
                     benchmark::DoNotOptimize(chunk);
                 }
 
-                conn.Send(200, "application/json",
+                conn->Send(200, "application/json",
                     RESP_JSON_SMALL, sizeof(RESP_JSON_SMALL) - 1);
             }
 
@@ -534,9 +556,11 @@ static void BM_Http_Tcp_Response1K(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                conn.GetRequestLine();
-                conn.Send(200, "application/json", RESP_1K, sizeof(RESP_1K) - 1);
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                conn->GetRequestLine();
+                conn->Send(200, "application/json", RESP_1K, sizeof(RESP_1K) - 1);
             }
 
             DrainFd(fds[1]);
@@ -564,9 +588,11 @@ static void BM_Http_Tcp_Response4K(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
-                conn.GetRequestLine();
-                conn.Send(200, "application/json", RESP_4K, sizeof(RESP_4K) - 1);
+                coop::http::PlaintextTransport transport(server);
+                auto conn = ctx->Allocate<HttpConn>(HTTP_BUF,
+                    transport, ctx, co, HTTP_BUF);
+                conn->GetRequestLine();
+                conn->Send(200, "application/json", RESP_4K, sizeof(RESP_4K) - 1);
             }
 
             DrainFd(fds[1]);

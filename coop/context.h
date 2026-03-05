@@ -12,6 +12,9 @@
 namespace coop
 {
 
+template<typename T> struct Alloc;
+struct AllocBuffer;
+
 struct Segment
 {
     size_t m_size;
@@ -112,6 +115,16 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         m_name = name;
     }
 
+    // Bump-allocate a typed object with optional trailing bytes from this context's segment heap.
+    // Returns an RAII Alloc<T> that destructs and de-bumps on scope exit. Defined in alloc.h.
+    //
+    template<typename T, typename... Args>
+    Alloc<T> Allocate(size_t extra, Args&&... args);
+
+    // Bump-allocate a raw byte buffer. Returns an RAII AllocBuffer. Defined in alloc.h.
+    //
+    AllocBuffer AllocateBuffer(size_t size);
+
     // Detach disassociates the context from its parent so that it will not be killed when the
     // parent is. If you have a reason to use this, it is assumed you're able to make sure no
     // there's a coherent contract where no one else is going to or already detached it.
@@ -163,6 +176,12 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         size_t samples;
     } m_statistics;
     int64_t m_lastRdtsc;
+
+    // Bump heap watermark — grows upward from just past the Launchable/lambda at segment bottom.
+    // Set by Spawn/Launch after placing the initial object. BumpAlloc advances it; BumpFree
+    // restores it (LIFO).
+    //
+    void* m_heapTop{nullptr};
 
     // Saved stack pointer — the 'bookmark' to switch back to when the context is resumed.
     //

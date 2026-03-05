@@ -59,6 +59,10 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
     assert(sizeof(Fn) <= actual.stackSize);
     new (spawnCtx->m_segment.Bottom()) Fn(fn);
 
+    uintptr_t heapStart = reinterpret_cast<uintptr_t>(spawnCtx->m_segment.Bottom()) + sizeof(Fn);
+    heapStart = (heapStart + 15) & ~uintptr_t(15);
+    spawnCtx->m_heapTop = reinterpret_cast<void*>(heapStart);
+
     spawnCtx->m_entry = &SpawnTrampoline<Fn>;
     spawnCtx->m_cleanup = &LaunchCleanup<Fn>;
     EnterContext(spawnCtx);
@@ -92,6 +96,10 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
         spawnCtx,
         std::forward<Args>(args)...
     );
+
+    uintptr_t heapStart = reinterpret_cast<uintptr_t>(spawnCtx->m_segment.Bottom()) + sizeof(T);
+    heapStart = (heapStart + 15) & ~uintptr_t(15);
+    spawnCtx->m_heapTop = reinterpret_cast<void*>(heapStart);
 
     spawnCtx->m_entry = &LaunchTrampoline<T>;
     spawnCtx->m_cleanup = &LaunchCleanup<T>;

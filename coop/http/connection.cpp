@@ -8,18 +8,14 @@
 #include "coop/context.h"
 #include "coop/cooperator.h"
 #include "coop/self.h"
-#include "coop/io/recv.h"
-#include "coop/io/send.h"
-#include "coop/io/sendfile.h"
-#include "coop/io/writev.h"
 
 namespace coop
 {
 namespace http
 {
 
-Connection::Connection(io::Descriptor& desc, Context* ctx, Cooperator* co,
-                       time::Interval timeout)
+ConnectionBase::ConnectionBase(io::Descriptor& desc, Context* ctx, Cooperator* co,
+                               time::Interval timeout)
 : m_desc(desc)
 , m_ctx(ctx)
 , m_co(co)
@@ -47,7 +43,7 @@ Connection::Connection(io::Descriptor& desc, Context* ctx, Cooperator* co,
 {
 }
 
-void Connection::Reset()
+void ConnectionBase::Reset()
 {
     Compact();
 
@@ -75,7 +71,7 @@ void Connection::Reset()
 // Buffer management
 // -------------------------------------------------------------------------------------
 
-int Connection::RecvMore()
+int ConnectionBase::RecvMore()
 {
     if (m_ctx->IsKilled()) return -1;
 
@@ -85,15 +81,7 @@ int Connection::RecvMore()
         if (m_bufLen >= BUFFER_SIZE) return 0;
     }
 
-    int n;
-    if (m_timeout.count() > 0)
-    {
-        n = io::Recv(m_desc, m_buf + m_bufLen, BUFFER_SIZE - m_bufLen, 0, m_timeout);
-    }
-    else
-    {
-        n = io::Recv(m_desc, m_buf + m_bufLen, BUFFER_SIZE - m_bufLen, 0);
-    }
+    int n = TransportRecv(m_buf + m_bufLen, BUFFER_SIZE - m_bufLen, 0, m_timeout);
 
     if (m_ctx->IsKilled()) return -1;
     if (n <= 0) return -1;
@@ -102,7 +90,7 @@ int Connection::RecvMore()
     return n;
 }
 
-void Connection::Compact()
+void ConnectionBase::Compact()
 {
     if (m_parsePos == 0) return;
 
@@ -123,7 +111,7 @@ void Connection::Compact()
 // Phase = ARGS.
 // -------------------------------------------------------------------------------------
 
-RequestLine* Connection::GetRequestLine()
+RequestLine* ConnectionBase::GetRequestLine()
 {
     if (m_requestLineParsed)
     {
@@ -152,7 +140,7 @@ RequestLine* Connection::GetRequestLine()
     }
 }
 
-bool Connection::ParseRequestLine()
+bool ConnectionBase::ParseRequestLine()
 {
     // Request line format: METHOD PATH[?QUERY] HTTP/1.x\r\n
     //
@@ -198,7 +186,7 @@ bool Connection::ParseRequestLine()
 // Phase advancement
 // -------------------------------------------------------------------------------------
 
-bool Connection::AdvanceToPhase(Phase target)
+bool ConnectionBase::AdvanceToPhase(Phase target)
 {
     while (m_phase < target)
     {
@@ -229,7 +217,7 @@ bool Connection::AdvanceToPhase(Phase target)
 
 // Skip parsePos forward through " HTTP/1.x\r\n" to reach the start of headers
 //
-void Connection::SkipToHeaders()
+void ConnectionBase::SkipToHeaders()
 {
     while (true)
     {
@@ -260,7 +248,7 @@ void Connection::SkipToHeaders()
 // The query string ends at ' ' (before HTTP version) or '\r'.
 // -------------------------------------------------------------------------------------
 
-const char* Connection::NextArgName()
+const char* ConnectionBase::NextArgName()
 {
     if (m_phase < ARGS)
     {
@@ -323,7 +311,7 @@ const char* Connection::NextArgName()
     }
 }
 
-Chunk* Connection::ReadArgValue()
+Chunk* ConnectionBase::ReadArgValue()
 {
     if (m_valueConsumed) return nullptr;
 
@@ -368,7 +356,7 @@ Chunk* Connection::ReadArgValue()
     return ReadArgValue();
 }
 
-void Connection::SkipArgValue()
+void ConnectionBase::SkipArgValue()
 {
     if (m_valueConsumed) return;
 
@@ -395,7 +383,7 @@ void Connection::SkipArgValue()
     }
 }
 
-void Connection::SkipArgs()
+void ConnectionBase::SkipArgs()
 {
     if (m_phase < ARGS)
     {
@@ -412,7 +400,7 @@ void Connection::SkipArgs()
 // parsePos is at the start of the first header line (or the empty \r\n).
 // -------------------------------------------------------------------------------------
 
-const char* Connection::NextHeaderName()
+const char* ConnectionBase::NextHeaderName()
 {
     if (m_phase < HEADERS)
     {
@@ -511,7 +499,7 @@ const char* Connection::NextHeaderName()
     }
 }
 
-Chunk* Connection::ReadHeaderValue()
+Chunk* ConnectionBase::ReadHeaderValue()
 {
     if (m_valueConsumed) return nullptr;
 
@@ -597,7 +585,7 @@ Chunk* Connection::ReadHeaderValue()
     return ReadHeaderValue();
 }
 
-void Connection::SkipHeaderValue()
+void ConnectionBase::SkipHeaderValue()
 {
     if (m_valueConsumed) return;
 
@@ -638,7 +626,7 @@ void Connection::SkipHeaderValue()
     }
 }
 
-void Connection::SkipHeaders()
+void ConnectionBase::SkipHeaders()
 {
     if (m_phase < HEADERS)
     {
@@ -656,7 +644,7 @@ void Connection::SkipHeaders()
 // Phase 4: Body
 // -------------------------------------------------------------------------------------
 
-int64_t Connection::ContentLength()
+int64_t ConnectionBase::ContentLength()
 {
     if (m_contentLength >= 0) return m_contentLength;
 
@@ -671,7 +659,7 @@ int64_t Connection::ContentLength()
     return m_contentLength;
 }
 
-Chunk* Connection::ReadBody()
+Chunk* ConnectionBase::ReadBody()
 {
     if (m_phase < BODY)
     {
@@ -734,7 +722,7 @@ Chunk* Connection::ReadBody()
     return &m_chunk;
 }
 
-void Connection::SkipBody()
+void ConnectionBase::SkipBody()
 {
     if (m_phase < BODY)
     {
@@ -756,7 +744,7 @@ void Connection::SkipBody()
 // Terminal chunk: 0\r\n\r\n
 // -------------------------------------------------------------------------------------
 
-Chunk* Connection::ReadChunkedBody()
+Chunk* ConnectionBase::ReadChunkedBody()
 {
     if (m_chunkedDone) return nullptr;
 
@@ -847,7 +835,7 @@ Chunk* Connection::ReadChunkedBody()
 // Response
 // -------------------------------------------------------------------------------------
 
-const char* Connection::StatusText(int code)
+const char* ConnectionBase::StatusText(int code)
 {
     switch (code)
     {
@@ -871,16 +859,16 @@ const char* Connection::StatusText(int code)
     }
 }
 
-const char* Connection::ConnectionHeaderValue() const
+const char* ConnectionBase::ConnectionHeaderValue() const
 {
     return (m_keepAlive && !m_clientClose) ? "keep-alive" : "close";
 }
 
-bool Connection::SendRaw(const void* data, size_t size)
+bool ConnectionBase::SendRaw(const void* data, size_t size)
 {
     assert(!m_sendError);
 
-    int result = io::SendAll(m_desc, data, size);
+    int result = TransportSendAll(data, size);
     if (result <= 0 || static_cast<size_t>(result) != size)
     {
         m_sendError = true;
@@ -889,7 +877,7 @@ bool Connection::SendRaw(const void* data, size_t size)
     return true;
 }
 
-bool Connection::SendWritev(struct iovec* iov, int iovcnt)
+bool ConnectionBase::SendWritev(struct iovec* iov, int iovcnt)
 {
     assert(!m_sendError);
 
@@ -899,7 +887,7 @@ bool Connection::SendWritev(struct iovec* iov, int iovcnt)
         total += iov[i].iov_len;
     }
 
-    int result = io::WritevAll(m_desc, iov, iovcnt);
+    int result = TransportWritevAll(iov, iovcnt);
     if (result <= 0 || static_cast<size_t>(result) != total)
     {
         m_sendError = true;
@@ -908,7 +896,7 @@ bool Connection::SendWritev(struct iovec* iov, int iovcnt)
     return true;
 }
 
-bool Connection::SendHeaders(int status, const char* contentType, size_t contentLength)
+bool ConnectionBase::SendHeaders(int status, const char* contentType, size_t contentLength)
 {
     assert(!m_sendError);
 
@@ -925,7 +913,7 @@ bool Connection::SendHeaders(int status, const char* contentType, size_t content
     return SendRaw(hdr, len);
 }
 
-bool Connection::Send(int status, const char* contentType, const void* body, size_t size)
+bool ConnectionBase::Send(int status, const char* contentType, const void* body, size_t size)
 {
     assert(!m_sendError);
 
@@ -951,7 +939,7 @@ bool Connection::Send(int status, const char* contentType, const void* body, siz
     return SendWritev(iov, 2);
 }
 
-bool Connection::Send(int status, const char* contentType, const std::string& body)
+bool ConnectionBase::Send(int status, const char* contentType, const std::string& body)
 {
     return Send(status, contentType, body.data(), body.size());
 }
@@ -959,7 +947,7 @@ bool Connection::Send(int status, const char* contentType, const std::string& bo
 // TODO: Set TCP_CORK before BeginChunked and clear after EndChunked to coalesce TCP segments
 // on real connections. Won't affect socketpair benchmarks but reduces packets over the wire.
 //
-bool Connection::BeginChunked(int status, const char* contentType)
+bool ConnectionBase::BeginChunked(int status, const char* contentType)
 {
     assert(!m_sendError);
 
@@ -969,7 +957,7 @@ bool Connection::BeginChunked(int status, const char* contentType)
     return true;
 }
 
-bool Connection::SendChunk(const void* data, size_t size)
+bool ConnectionBase::SendChunk(const void* data, size_t size)
 {
     assert(!m_sendError);
     if (size == 0) return false;
@@ -1011,7 +999,7 @@ bool Connection::SendChunk(const void* data, size_t size)
     return SendWritev(iov, 3);
 }
 
-bool Connection::EndChunked()
+bool ConnectionBase::EndChunked()
 {
     assert(!m_sendError);
 
@@ -1042,7 +1030,7 @@ bool Connection::EndChunked()
     return SendRaw("0\r\n\r\n", 5);
 }
 
-bool Connection::EndChunked(const void* lastChunkData, size_t lastChunkSize)
+bool ConnectionBase::EndChunked(const void* lastChunkData, size_t lastChunkSize)
 {
     assert(!m_sendError);
     if (lastChunkSize == 0) return EndChunked();
@@ -1088,11 +1076,11 @@ bool Connection::EndChunked(const void* lastChunkData, size_t lastChunkSize)
     return SendWritev(iov, 4);
 }
 
-bool Connection::Sendfile(int fileFd, off_t offset, size_t count)
+bool ConnectionBase::Sendfile(int fileFd, off_t offset, size_t count)
 {
     assert(!m_sendError);
 
-    int result = io::SendfileAll(m_desc, fileFd, offset, count);
+    int result = TransportSendfileAll(fileFd, offset, count);
     if (result <= 0 || static_cast<size_t>(result) != count)
     {
         m_sendError = true;

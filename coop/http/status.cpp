@@ -208,7 +208,7 @@ std::string GenerateStatusJson(Cooperator* co)
     return out;
 }
 
-void HandleStatus(Connection& conn)
+void HandleStatus(ConnectionBase& conn)
 {
     std::string body = GenerateStatusJson(conn.GetCooperator());
     conn.Send(200, "application/json", body);

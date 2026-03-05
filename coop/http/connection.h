@@ -37,19 +37,21 @@ struct Chunk
     bool complete;              // true if this is the last chunk of the current element
 };
 
-// HTTP connection parser and response writer. Owns a 2KB sliding-window recv buffer. Parsing
-// is strictly sequential (request line -> args -> headers -> body), lazy, and memoized. Each
-// phase implicitly skips the previous phase if not consumed.
+// ConnectionBase is the transport-agnostic HTTP connection parser and response writer. Owns a 2KB
+// sliding-window recv buffer. Parsing is strictly sequential (request line -> args -> headers ->
+// body), lazy, and memoized. Each phase implicitly skips the previous phase if not consumed.
 //
-// Constructed stack-local in HttpConnection::Launch(). All string_views and data pointers
-// point into the recv buffer (zero-copy). Null pointer returns = failure/end.
+// Handlers that don't need transport-specific access should take ConnectionBase& — this is the
+// "sugar" path that works identically for plaintext and TLS connections.
 //
-struct Connection
+struct ConnectionBase
 {
     static constexpr size_t BUFFER_SIZE = 2048;
 
-    Connection(io::Descriptor& desc, Context* ctx, Cooperator* co,
-               time::Interval timeout = std::chrono::seconds(30));
+    ConnectionBase(io::Descriptor& desc, Context* ctx, Cooperator* co,
+                   time::Interval timeout = std::chrono::seconds(30));
+
+    virtual ~ConnectionBase() = default;
 
     // Phase 1: Request line. Lazy, memoized. Null = parse failure.
     //
@@ -103,6 +105,14 @@ struct Connection
     io::Descriptor& GetDescriptor() { return m_desc; }
     Cooperator* GetCooperator() { return m_co; }
 
+  protected:
+    // Transport I/O dispatch — overridden by Connection<Transport> with final methods.
+    //
+    virtual int TransportRecv(void* buf, size_t size, int flags, time::Interval timeout) = 0;
+    virtual int TransportSendAll(const void* buf, size_t size) = 0;
+    virtual int TransportWritevAll(struct iovec* iov, int iovcnt) = 0;
+    virtual int TransportSendfileAll(int in_fd, off_t offset, size_t count) = 0;
+
   private:
     enum Phase
     {
@@ -136,19 +146,21 @@ struct Connection
     //
     const char* ConnectionHeaderValue() const;
 
-    // Send raw bytes via io::SendAll. Returns false on failure and poisons the connection.
+    // Send raw bytes via transport. Returns false on failure and poisons the connection.
     //
     bool SendRaw(const void* data, size_t size);
 
-    // Scatter-gather send via io::WritevAll. Returns false on failure and poisons.
+    // Scatter-gather send via transport. Returns false on failure and poisons.
     //
     bool SendWritev(struct iovec* iov, int iovcnt);
 
+  protected:
     io::Descriptor& m_desc;
     Context*        m_ctx;
     Cooperator*     m_co;
     time::Interval  m_timeout;
 
+  private:
     char            m_buf[BUFFER_SIZE];
     size_t          m_bufLen;
     size_t          m_parsePos;
@@ -192,6 +204,47 @@ struct Connection
     // Sticky error flag — once a send fails, all subsequent sends are no-ops
     //
     bool            m_sendError;
+};
+
+// Connection<Transport> is the concrete, statically-typed HTTP connection. The transport template
+// parameter controls I/O dispatch (PlaintextTransport, TlsTransport, etc.). Marked final so the
+// compiler can devirtualize the transport calls when the concrete type is visible.
+//
+// For zero-overhead I/O dispatch, use Connection<T>& directly. For transport-agnostic handlers,
+// use ConnectionBase& (the sugar path — virtual dispatch, ~2ns per I/O call).
+//
+template <typename Transport>
+struct Connection final : ConnectionBase
+{
+    Connection(Transport transport, Context* ctx, Cooperator* co,
+               time::Interval timeout = std::chrono::seconds(30))
+    : ConnectionBase(transport.Descriptor(), ctx, co, timeout)
+    , m_transport(transport)
+    {}
+
+  protected:
+    int TransportRecv(void* buf, size_t size, int flags, time::Interval timeout) override final
+    {
+        return m_transport.Recv(buf, size, flags, timeout);
+    }
+
+    int TransportSendAll(const void* buf, size_t size) override final
+    {
+        return m_transport.SendAll(buf, size);
+    }
+
+    int TransportWritevAll(struct iovec* iov, int iovcnt) override final
+    {
+        return m_transport.WritevAll(iov, iovcnt);
+    }
+
+    int TransportSendfileAll(int in_fd, off_t offset, size_t count) override final
+    {
+        return m_transport.SendfileAll(in_fd, offset, count);
+    }
+
+  private:
+    Transport m_transport;
 };
 
 } // end namespace coop::http

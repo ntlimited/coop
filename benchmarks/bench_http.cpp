@@ -18,6 +18,7 @@
 #include "coop/io/send.h"
 
 #include "coop/http/connection.h"
+#include "coop/http/transport.h"
 
 // ---------------------------------------------------------------------------
 // Helper: run a benchmark body inside a cooperator
@@ -213,7 +214,7 @@ static void BM_Http_Unix_MinimalGet(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 auto* req = conn.GetRequestLine();
                 assert(req);
                 conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
@@ -244,7 +245,7 @@ static void BM_Http_Unix_SendResponse(benchmark::State& state)
             state.ResumeTiming();
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 conn.GetRequestLine();
                 conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
@@ -278,7 +279,7 @@ static void BM_Http_Tcp_MinimalGet(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 auto* req = conn.GetRequestLine();
                 assert(req);
                 conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
@@ -309,7 +310,7 @@ static void BM_Http_Tcp_SendResponse(benchmark::State& state)
             state.ResumeTiming();
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 conn.GetRequestLine();
                 conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
             }
@@ -341,7 +342,7 @@ static void BM_Http_Tcp_ChunkedResponse(benchmark::State& state)
             state.ResumeTiming();
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 conn.GetRequestLine();
                 conn.BeginChunked(200, "text/plain");
                 conn.SendChunk("Hello", 5);
@@ -377,7 +378,7 @@ static void BM_Http_Tcp_MinimalGet_NoTimeout(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(server, ctx, co, std::chrono::seconds(0));
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co, std::chrono::seconds(0));
                 auto* req = conn.GetRequestLine();
                 assert(req);
                 conn.Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
@@ -415,7 +416,7 @@ static void BM_Http_Tcp_RealisticGet(benchmark::State& state)
             coop::io::SendAll(client, REQ_REALISTIC_GET, sizeof(REQ_REALISTIC_GET) - 1);
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 auto* req = conn.GetRequestLine();
                 assert(req);
 
@@ -475,7 +476,7 @@ static void BM_Http_Tcp_RealisticPost(benchmark::State& state)
             coop::io::SendAll(client, REQ_REALISTIC_POST, sizeof(REQ_REALISTIC_POST) - 1);
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 auto* req = conn.GetRequestLine();
                 assert(req);
 
@@ -533,7 +534,7 @@ static void BM_Http_Tcp_Response1K(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 conn.GetRequestLine();
                 conn.Send(200, "application/json", RESP_1K, sizeof(RESP_1K) - 1);
             }
@@ -563,7 +564,7 @@ static void BM_Http_Tcp_Response4K(benchmark::State& state)
             coop::io::SendAll(client, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1);
 
             {
-                coop::http::Connection conn(server, ctx, co);
+                coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, co);
                 conn.GetRequestLine();
                 conn.Send(200, "application/json", RESP_4K, sizeof(RESP_4K) - 1);
             }

@@ -1,5 +1,7 @@
 #include "server.h"
 #include "connection.h"
+#include "transport.h"
+#include "tls_transport.h"
 
 #include <cstring>
 #include <fcntl.h>
@@ -11,6 +13,8 @@
 #include "coop/cooperator.h"
 #include "coop/launchable.h"
 #include "coop/io/io.h"
+#include "coop/io/ssl/connection.h"
+#include "coop/io/ssl/context.h"
 
 namespace coop
 {
@@ -44,7 +48,7 @@ bool HasPathTraversal(const char* path)
 // Try to serve a static file matching the requested path from the search paths.
 // Returns true if a file was found and served.
 //
-bool ServeFile(Connection& conn, std::string_view reqPath,
+bool ServeFile(ConnectionBase& conn, std::string_view reqPath,
                const char* const* searchPaths)
 {
     // Path traversal check — reqPath is a string_view, need null-terminated copy
@@ -97,6 +101,40 @@ bool ServeFile(Connection& conn, std::string_view reqPath,
     return false;
 }
 
+void HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
+                   const char* const* searchPaths)
+{
+    auto* req = conn.GetRequestLine();
+    if (!req)
+    {
+        if (!conn.SendError())
+        {
+            conn.Send(400, "text/plain", "Bad Request\n");
+        }
+        return;
+    }
+
+    for (int i = 0; i < routeCount; i++)
+    {
+        if (req->path == routes[i].path)
+        {
+            routes[i].handler(conn);
+            return;
+        }
+    }
+
+    if (searchPaths && ServeFile(conn, req->path, searchPaths))
+    {
+        return;
+    }
+
+    conn.Send(404, "text/plain", "Not Found\n");
+}
+
+// -------------------------------------------------------------------------------------
+// Plaintext HTTP connection handler
+// -------------------------------------------------------------------------------------
+
 struct HttpConnection : Launchable
 {
     HttpConnection(Context* ctx, int fd, Cooperator* co,
@@ -117,47 +155,15 @@ struct HttpConnection : Launchable
 
     virtual void Launch() final
     {
-        Connection conn(m_fd, GetContext(), m_co, m_timeout);
+        PlaintextTransport transport(m_fd);
+        Connection<PlaintextTransport> conn(transport, GetContext(), m_co, m_timeout);
 
         while (!GetContext()->IsKilled())
         {
-            auto* req = conn.GetRequestLine();
-            if (!req)
-            {
-                if (!conn.SendError())
-                {
-                    conn.Send(400, "text/plain", "Bad Request\n");
-                }
-                return;
-            }
-
-            bool handled = false;
-            for (int i = 0; i < m_routeCount; i++)
-            {
-                if (req->path == m_routes[i].path)
-                {
-                    m_routes[i].handler(conn);
-                    handled = true;
-                    break;
-                }
-            }
-
-            if (!handled)
-            {
-                if (m_searchPaths && ServeFile(conn, req->path, m_searchPaths))
-                {
-                    handled = true;
-                }
-                else
-                {
-                    conn.Send(404, "text/plain", "Not Found\n");
-                }
-            }
+            HandleRequest(conn, m_routes, m_routeCount, m_searchPaths);
 
             if (conn.SendError() || !conn.KeepAlive()) return;
 
-            // Drain any unconsumed body before resetting for the next request
-            //
             conn.SkipBody();
             conn.Reset();
         }
@@ -167,6 +173,58 @@ struct HttpConnection : Launchable
     Cooperator*         m_co;
     const Route*        m_routes;
     int                 m_routeCount;
+    const char* const*  m_searchPaths;
+    time::Interval      m_timeout;
+};
+
+// -------------------------------------------------------------------------------------
+// TLS HTTP connection handler
+// -------------------------------------------------------------------------------------
+
+struct HttpTlsConnection : Launchable
+{
+    HttpTlsConnection(Context* ctx, int fd, Cooperator* co,
+                      const Route* routes, int routeCount,
+                      io::ssl::Context& sslCtx,
+                      const char* const* searchPaths,
+                      time::Interval timeout)
+    : Launchable(ctx)
+    , m_fd(fd)
+    , m_co(co)
+    , m_routes(routes)
+    , m_routeCount(routeCount)
+    , m_sslCtx(sslCtx)
+    , m_searchPaths(searchPaths)
+    , m_timeout(timeout)
+    {
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        ctx->SetName("HttpTlsConnection");
+    }
+
+    virtual void Launch() final
+    {
+        io::ssl::Connection sslConn(m_sslCtx, m_fd, io::ssl::SocketBio{});
+        if (sslConn.Handshake() != 0) return;
+
+        TlsTransport transport(sslConn, m_fd);
+        Connection<TlsTransport> conn(transport, GetContext(), m_co, m_timeout);
+
+        while (!GetContext()->IsKilled())
+        {
+            HandleRequest(conn, m_routes, m_routeCount, m_searchPaths);
+
+            if (conn.SendError() || !conn.KeepAlive()) return;
+
+            conn.SkipBody();
+            conn.Reset();
+        }
+    }
+
+    io::Descriptor      m_fd;
+    Cooperator*         m_co;
+    const Route*        m_routes;
+    int                 m_routeCount;
+    io::ssl::Context&   m_sslCtx;
     const char* const*  m_searchPaths;
     time::Interval      m_timeout;
 };
@@ -215,6 +273,56 @@ void RunServer(
 
         static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 32768};
         co->Launch<HttpConnection>(config, fd, co, routes, routeCount, searchPaths, timeout);
+        ctx->Yield();
+    }
+}
+
+void RunTlsServer(
+    Context* ctx,
+    int port,
+    const Route* routes,
+    int routeCount,
+    io::ssl::Context& sslCtx,
+    const char* name /* = "HttpsServer" */,
+    const char* const* searchPaths /* = nullptr */,
+    time::Interval timeout /* = std::chrono::seconds(30) */)
+{
+    ctx->SetName(name);
+
+    int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    assert(serverFd > 0);
+
+    int on = 1;
+    int ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    assert(ret == 0);
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
+    assert(ret == 0);
+
+    ret = listen(serverFd, 32);
+    assert(ret == 0);
+
+    auto* co = ctx->GetCooperator();
+    io::Descriptor desc(serverFd);
+
+    while (!ctx->IsKilled())
+    {
+        int fd = io::Accept(desc);
+        if (fd < 0)
+        {
+            break;
+        }
+
+        // TLS handshake + HTTP requires more stack for OpenSSL
+        //
+        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 65536};
+        co->Launch<HttpTlsConnection>(config, fd, co, routes, routeCount,
+                                      sslCtx, searchPaths, timeout);
         ctx->Yield();
     }
 }

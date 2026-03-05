@@ -11,6 +11,7 @@
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
 #include "coop/http/connection.h"
+#include "coop/http/transport.h"
 
 #include "test_helpers.h"
 
@@ -80,7 +81,7 @@ TEST(HttpTest, GetRequestLine)
 
         SendString(client, "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         auto* req = conn.GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->method, "GET");
@@ -99,7 +100,7 @@ TEST(HttpTest, PostRequestLine)
 
         SendString(client, "POST /submit HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         auto* req = conn.GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->method, "POST");
@@ -122,7 +123,7 @@ TEST(HttpTest, GetArgs)
 
         SendString(client, "GET /search?q=hello&lang=en HTTP/1.1\r\nHost: localhost\r\n\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         auto* req = conn.GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->path, "/search");
@@ -175,7 +176,7 @@ TEST(HttpTest, Headers)
             "Content-Type: text/plain\r\n"
             "\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         conn.GetRequestLine();
 
         // First header: Host
@@ -228,7 +229,7 @@ TEST(HttpTest, PostWithBody)
             "\r\n"
             "Hello, World!");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         auto* req = conn.GetRequestLine();
         ASSERT_NE(req, nullptr);
         EXPECT_EQ(req->method, "POST");
@@ -271,7 +272,7 @@ TEST(HttpTest, ChunkedBody)
             "0\r\n"
             "\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         auto* req = conn.GetRequestLine();
         ASSERT_NE(req, nullptr);
 
@@ -312,7 +313,7 @@ TEST(HttpTest, SkipArgsToHeaders)
             "X-Custom: test\r\n"
             "\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         conn.GetRequestLine();
 
         // Skip args, go straight to headers
@@ -343,7 +344,7 @@ TEST(HttpTest, SkipHeadersToBody)
             "\r\n"
             "test");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         conn.GetRequestLine();
         conn.SkipHeaders();
 
@@ -374,7 +375,7 @@ TEST(HttpTest, SendResponse)
 
         SendString(client, "GET / HTTP/1.1\r\n\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         conn.GetRequestLine();
         conn.Send(200, "text/plain", "OK!\n");
 
@@ -406,7 +407,7 @@ TEST(HttpTest, ChunkedResponse)
 
         SendString(client, "GET / HTTP/1.1\r\n\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         conn.GetRequestLine();
 
         conn.BeginChunked(200, "text/plain");
@@ -441,7 +442,7 @@ TEST(HttpTest, MalformedRequest)
         //
         SendString(client, "GARBAGE\r\n\r\n");
 
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator());
+        coop::http::Connection conn(coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         auto* req = conn.GetRequestLine();
         EXPECT_EQ(req, nullptr);
     });
@@ -462,7 +463,8 @@ TEST(HttpTest, RecvTimeout)
 
         // Don't send anything — Connection should time out
         //
-        coop::http::Connection conn(server, ctx, ctx->GetCooperator(),
+        coop::http::Connection conn(coop::http::PlaintextTransport(server),
+                                     ctx, ctx->GetCooperator(),
                                      std::chrono::milliseconds(50));
 
         auto* req = conn.GetRequestLine();

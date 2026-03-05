@@ -86,6 +86,9 @@ int main(int argc, char* argv[])
         if (!certPath) certPath = "test_cert.pem";
         if (!keyPath) keyPath = "test_key.pem";
 
+        // 65KB stack — cert buffers alone are 16KB, plus SSL context and server state.
+        //
+        SpawnConfiguration tlsConfig = {.priority = 0, .stackSize = 65536};
         cooperator.Submit([](Context* ctx, void* arg) {
             auto* a = static_cast<TlsArgs*>(arg);
 
@@ -109,7 +112,7 @@ int main(int argc, char* argv[])
 
             http::RunTlsServer(ctx, a->port, routes, routeCount, sslCtx, "BenchTlsServer",
                                searchPaths, std::chrono::seconds(0));
-        }, new TlsArgs{port, nullptr});
+        }, new TlsArgs{port, nullptr}, tlsConfig);
     }
     else
     {

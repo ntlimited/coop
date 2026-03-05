@@ -14,16 +14,20 @@
 #include "coop/thread.h"
 
 #include "coop/io/descriptor.h"
+#include "coop/io/read_file.h"
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
+#include "coop/io/ssl/ssl.h"
 
 #include "coop/alloc.h"
 #include "coop/http/connection.h"
 #include "coop/http/transport.h"
+#include "coop/http/tls_transport.h"
 
 static constexpr size_t HTTP_BUF = coop::http::ConnectionBase::DEFAULT_BUFFER_SIZE;
 
 using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
+using HttpTlsConn = coop::http::Connection<coop::http::TlsTransport>;
 
 // ---------------------------------------------------------------------------
 // Helper: run a benchmark body inside a cooperator
@@ -36,7 +40,8 @@ struct BenchmarkArgs
 };
 
 static void RunBenchmark(benchmark::State& state,
-    std::function<void(coop::Context*, benchmark::State&)> fn)
+    std::function<void(coop::Context*, benchmark::State&)> fn,
+    coop::SpawnConfiguration config = coop::s_defaultConfiguration)
 {
     coop::Cooperator cooperator;
     coop::Thread t(&cooperator);
@@ -50,7 +55,7 @@ static void RunBenchmark(benchmark::State& state,
         auto* a = static_cast<BenchmarkArgs*>(arg);
         (*a->fn)(ctx, *a->state);
         ctx->GetCooperator()->Shutdown();
-    }, &args);
+    }, &args, config);
 }
 
 // ---------------------------------------------------------------------------
@@ -600,3 +605,403 @@ static void BM_Http_Tcp_Response4K(benchmark::State& state)
     });
 }
 BENCHMARK(BM_Http_Tcp_Response4K);
+
+// ---------------------------------------------------------------------------
+// TLS HTTP benchmarks — full-stack: TLS encryption + HTTP parse + response
+//
+// These measure what users actually experience: Connection<TlsTransport>
+// parsing encrypted HTTP traffic. Client runs on a separate context because
+// TLS I/O is cooperative (both sides need to drive the handshake and
+// encrypt/decrypt data).
+//
+// Uses kTLS (socket BIO) over TCP — the production path from RunTlsServer.
+// ---------------------------------------------------------------------------
+
+// TLS contexts need larger stacks for the SSL state.
+//
+static constexpr coop::SpawnConfiguration s_tlsConfig = {
+    .priority = 0,
+    .stackSize = 65536,
+};
+
+namespace
+{
+
+struct HttpCertData
+{
+    char cert[8192];
+    int certLen;
+    char key[8192];
+    int keyLen;
+    bool loaded;
+};
+
+HttpCertData s_httpCerts = {};
+
+void EnsureHttpCertsLoaded()
+{
+    if (s_httpCerts.loaded) return;
+    s_httpCerts.certLen = coop::io::ReadFile(
+        "cert.pem", s_httpCerts.cert, sizeof(s_httpCerts.cert));
+    assert(s_httpCerts.certLen > 0);
+    s_httpCerts.keyLen = coop::io::ReadFile(
+        "key.pem", s_httpCerts.key, sizeof(s_httpCerts.key));
+    assert(s_httpCerts.keyLen > 0);
+    s_httpCerts.loaded = true;
+}
+
+struct HttpSSLContextPair
+{
+    coop::io::ssl::Context server{coop::io::ssl::Mode::Server};
+    coop::io::ssl::Context client{coop::io::ssl::Mode::Client};
+
+    HttpSSLContextPair()
+    {
+        [[maybe_unused]] bool r;
+        r = server.LoadCertificate(s_httpCerts.cert, s_httpCerts.certLen);
+        assert(r);
+        r = server.LoadPrivateKey(s_httpCerts.key, s_httpCerts.keyLen);
+        assert(r);
+        server.EnableKTLS();
+        client.EnableKTLS();
+    }
+};
+
+} // end anonymous namespace
+
+// Helper: run a TLS HTTP benchmark. Sets up TCP pair, handshakes both sides on separate
+// contexts, then calls the benchmark body with the established TLS connections.
+//
+// `clientFn` runs on a spawned context and sends encrypted HTTP requests.
+// `serverFn` runs on the main context and parses/responds via Connection<TlsTransport>.
+//
+// Cert loading happens once per process via EnsureCertsLoaded.
+//
+static void RunTlsBenchmark(
+    benchmark::State& state,
+    std::function<void(coop::Context*, benchmark::State&,
+                       coop::io::ssl::Connection&, coop::io::Descriptor&,
+                       coop::io::ssl::Connection&, coop::io::Descriptor&)> fn)
+{
+    std::function<void(coop::Context*, benchmark::State&)> wrapper =
+        [&fn](coop::Context* ctx, benchmark::State& state)
+    {
+        EnsureHttpCertsLoaded();
+        HttpSSLContextPair ssl;
+
+        int fds[2];
+        MakeTcpPair(fds);
+
+        coop::io::Descriptor serverDesc(fds[0]);
+        coop::io::Descriptor clientDesc(fds[1]);
+
+        coop::io::ssl::Connection serverConn(
+            ssl.server, serverDesc, coop::io::ssl::SocketBio{});
+        coop::io::ssl::Connection clientConn(
+            ssl.client, clientDesc, coop::io::ssl::SocketBio{});
+
+        // Handshake both sides cooperatively.
+        //
+        bool handshakeDone = false;
+        ctx->GetCooperator()->Spawn(s_tlsConfig, [&](coop::Context*)
+        {
+            [[maybe_unused]] int r = serverConn.Handshake();
+            assert(r == 0);
+            handshakeDone = true;
+        });
+
+        [[maybe_unused]] int r = clientConn.Handshake();
+        assert(r == 0);
+        while (!handshakeDone) ctx->Yield(true);
+
+        fn(ctx, state, serverConn, serverDesc, clientConn, clientDesc);
+    };
+
+    RunBenchmark(state, wrapper, s_tlsConfig);
+}
+
+// TLS client pump: sends requests and drains responses until `done` is set.
+// Runs on a spawned context. The server-side benchmark loop drives iteration count.
+// On exit from the benchmark loop, the server closes its side of the TCP pair,
+// which causes the client's next SSL_read to fail, breaking the pump.
+//
+// Drains each response by scanning for the end of headers (\r\n\r\n), extracting
+// Content-Length, then reading exactly that many body bytes.
+//
+static void TlsClientPump(
+    coop::io::ssl::Connection& clientConn,
+    const char* request, size_t requestLen,
+    bool& done, bool& exited)
+{
+    char buf[8192];
+    size_t buffered = 0;
+
+    while (!done)
+    {
+        int r = coop::io::ssl::SendAll(clientConn, request, requestLen);
+        if (r <= 0) break;
+
+        // Recv until we have a complete response. Small responses fit in one TLS record;
+        // larger ones may need multiple reads.
+        //
+        while (true)
+        {
+            int n = coop::io::ssl::Recv(clientConn, buf + buffered, sizeof(buf) - buffered);
+            if (n <= 0) goto out;
+            buffered += n;
+
+            // Find \r\n\r\n — end of headers
+            //
+            auto* end = static_cast<char*>(
+                memmem(buf, buffered, "\r\n\r\n", 4));
+            if (!end) continue;
+
+            size_t headerEnd = (end - buf) + 4;
+
+            // Extract Content-Length
+            //
+            size_t contentLength = 0;
+            auto* cl = static_cast<char*>(
+                memmem(buf, headerEnd, "Content-Length: ", 16));
+            if (cl) contentLength = strtoul(cl + 16, nullptr, 10);
+
+            size_t totalResponse = headerEnd + contentLength;
+            if (buffered >= totalResponse)
+            {
+                // Carry over leftover bytes from the next response
+                //
+                size_t leftover = buffered - totalResponse;
+                if (leftover > 0) memmove(buf, buf + totalResponse, leftover);
+                buffered = leftover;
+                break;
+            }
+        }
+    }
+out:
+    exited = true;
+}
+
+// TLS minimal GET — parse request line + send response. Direct comparison with
+// BM_Http_Tcp_MinimalGet.
+//
+static void BM_Http_Tls_MinimalGet(benchmark::State& state)
+{
+    RunTlsBenchmark(state,
+        [](coop::Context* ctx, benchmark::State& state,
+           coop::io::ssl::Connection& serverConn, coop::io::Descriptor& serverDesc,
+           coop::io::ssl::Connection& clientConn, coop::io::Descriptor& clientDesc)
+    {
+        auto* co = ctx->GetCooperator();
+        bool done = false, exited = false;
+
+        co->Spawn(s_tlsConfig, [&](coop::Context*)
+        {
+            TlsClientPump(clientConn, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1,
+                done, exited);
+        });
+
+        for (auto _ : state)
+        {
+            coop::http::TlsTransport transport(serverConn, serverDesc);
+            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
+                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto* req = conn->GetRequestLine();
+            assert(req);
+            conn->Send(200, "text/plain", RESP_BODY, sizeof(RESP_BODY) - 1);
+        }
+
+        done = true;
+        shutdown(serverDesc.m_fd, SHUT_RDWR);
+        while (!exited) ctx->Yield(true);
+    });
+}
+BENCHMARK(BM_Http_Tls_MinimalGet);
+
+// TLS realistic GET — parse args + search headers + send JSON. Direct comparison with
+// BM_Http_Tcp_RealisticGet.
+//
+static void BM_Http_Tls_RealisticGet(benchmark::State& state)
+{
+    InitResponseBodies();
+
+    RunTlsBenchmark(state,
+        [](coop::Context* ctx, benchmark::State& state,
+           coop::io::ssl::Connection& serverConn, coop::io::Descriptor& serverDesc,
+           coop::io::ssl::Connection& clientConn, coop::io::Descriptor& clientDesc)
+    {
+        auto* co = ctx->GetCooperator();
+        bool done = false, exited = false;
+
+        co->Spawn(s_tlsConfig, [&](coop::Context*)
+        {
+            TlsClientPump(clientConn,
+                REQ_REALISTIC_GET, sizeof(REQ_REALISTIC_GET) - 1, done, exited);
+        });
+
+        for (auto _ : state)
+        {
+            coop::http::TlsTransport transport(serverConn, serverDesc);
+            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
+                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto* req = conn->GetRequestLine();
+            assert(req);
+
+            while (auto* name = conn->NextArgName())
+            {
+                auto* val = conn->ReadArgValue();
+                benchmark::DoNotOptimize(val);
+            }
+
+            bool authorized = false;
+            while (auto* name = conn->NextHeaderName())
+            {
+                if (strncasecmp(name, "Authorization", 13) == 0)
+                {
+                    auto* val = conn->ReadHeaderValue();
+                    benchmark::DoNotOptimize(val);
+                    authorized = true;
+                }
+                else
+                {
+                    conn->SkipHeaderValue();
+                }
+            }
+            benchmark::DoNotOptimize(authorized);
+
+            conn->Send(200, "application/json",
+                RESP_JSON_SMALL, sizeof(RESP_JSON_SMALL) - 1);
+        }
+
+        done = true;
+        shutdown(serverDesc.m_fd, SHUT_RDWR);
+        while (!exited) ctx->Yield(true);
+    });
+}
+BENCHMARK(BM_Http_Tls_RealisticGet);
+
+// TLS realistic POST — parse headers + consume body + respond. Direct comparison with
+// BM_Http_Tcp_RealisticPost.
+//
+static void BM_Http_Tls_RealisticPost(benchmark::State& state)
+{
+    RunTlsBenchmark(state,
+        [](coop::Context* ctx, benchmark::State& state,
+           coop::io::ssl::Connection& serverConn, coop::io::Descriptor& serverDesc,
+           coop::io::ssl::Connection& clientConn, coop::io::Descriptor& clientDesc)
+    {
+        auto* co = ctx->GetCooperator();
+        bool done = false, exited = false;
+
+        co->Spawn(s_tlsConfig, [&](coop::Context*)
+        {
+            TlsClientPump(clientConn,
+                REQ_REALISTIC_POST, sizeof(REQ_REALISTIC_POST) - 1, done, exited);
+        });
+
+        for (auto _ : state)
+        {
+            coop::http::TlsTransport transport(serverConn, serverDesc);
+            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
+                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            auto* req = conn->GetRequestLine();
+            assert(req);
+
+            while (auto* name = conn->NextHeaderName())
+            {
+                if (strncasecmp(name, "Content-Type", 12) == 0 ||
+                    strncasecmp(name, "Authorization", 13) == 0)
+                {
+                    auto* val = conn->ReadHeaderValue();
+                    benchmark::DoNotOptimize(val);
+                }
+                else
+                {
+                    conn->SkipHeaderValue();
+                }
+            }
+
+            while (auto* chunk = conn->ReadBody())
+            {
+                benchmark::DoNotOptimize(chunk);
+            }
+
+            conn->Send(200, "application/json",
+                RESP_JSON_SMALL, sizeof(RESP_JSON_SMALL) - 1);
+        }
+
+        done = true;
+        shutdown(serverDesc.m_fd, SHUT_RDWR);
+        while (!exited) ctx->Yield(true);
+    });
+}
+BENCHMARK(BM_Http_Tls_RealisticPost);
+
+// TLS response size scaling — 1KB and 4KB.
+//
+static void BM_Http_Tls_Response1K(benchmark::State& state)
+{
+    InitResponseBodies();
+
+    RunTlsBenchmark(state,
+        [](coop::Context* ctx, benchmark::State& state,
+           coop::io::ssl::Connection& serverConn, coop::io::Descriptor& serverDesc,
+           coop::io::ssl::Connection& clientConn, coop::io::Descriptor& clientDesc)
+    {
+        auto* co = ctx->GetCooperator();
+        bool done = false, exited = false;
+
+        co->Spawn(s_tlsConfig, [&](coop::Context*)
+        {
+            TlsClientPump(clientConn, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1,
+                done, exited);
+        });
+
+        for (auto _ : state)
+        {
+            coop::http::TlsTransport transport(serverConn, serverDesc);
+            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
+                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            conn->GetRequestLine();
+            conn->Send(200, "application/json", RESP_1K, sizeof(RESP_1K) - 1);
+        }
+
+        done = true;
+        shutdown(serverDesc.m_fd, SHUT_RDWR);
+        while (!exited) ctx->Yield(true);
+    });
+}
+BENCHMARK(BM_Http_Tls_Response1K);
+
+static void BM_Http_Tls_Response4K(benchmark::State& state)
+{
+    InitResponseBodies();
+
+    RunTlsBenchmark(state,
+        [](coop::Context* ctx, benchmark::State& state,
+           coop::io::ssl::Connection& serverConn, coop::io::Descriptor& serverDesc,
+           coop::io::ssl::Connection& clientConn, coop::io::Descriptor& clientDesc)
+    {
+        auto* co = ctx->GetCooperator();
+        bool done = false, exited = false;
+
+        co->Spawn(s_tlsConfig, [&](coop::Context*)
+        {
+            TlsClientPump(clientConn, REQ_MINIMAL, sizeof(REQ_MINIMAL) - 1,
+                done, exited);
+        });
+
+        for (auto _ : state)
+        {
+            coop::http::TlsTransport transport(serverConn, serverDesc);
+            auto conn = ctx->Allocate<HttpTlsConn>(HTTP_BUF,
+                transport, ctx, co, HTTP_BUF, std::chrono::seconds(0));
+            conn->GetRequestLine();
+            conn->Send(200, "application/json", RESP_4K, sizeof(RESP_4K) - 1);
+        }
+
+        done = true;
+        shutdown(serverDesc.m_fd, SHUT_RDWR);
+        while (!exited) ctx->Yield(true);
+    });
+}
+BENCHMARK(BM_Http_Tls_Response4K);

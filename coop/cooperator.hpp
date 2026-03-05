@@ -46,6 +46,7 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
 
     SpawnConfiguration actual = config;
     actual.stackSize = StackPool::RoundUpStackSize(config.stackSize);
+    assert(actual.stackSize >= sizeof(Context));
 
     auto* alloc = m_stackPool.Allocate(actual.stackSize);
     if (!alloc)
@@ -81,6 +82,7 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
 
     SpawnConfiguration actual = config;
     actual.stackSize = StackPool::RoundUpStackSize(config.stackSize);
+    assert(actual.stackSize >= sizeof(Context));
 
     auto* alloc = m_stackPool.Allocate(actual.stackSize);
     if (!alloc)

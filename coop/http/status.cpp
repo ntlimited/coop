@@ -8,6 +8,8 @@
 #include "coop/cooperator.h"
 #include "coop/context.h"
 #include "coop/detail/scheduler_state.h"
+#include "coop/perf/counters.h"
+#include "coop/perf/patch.h"
 
 namespace coop
 {
@@ -214,8 +216,66 @@ void HandleStatus(ConnectionBase& conn)
     conn.Send(200, "application/json", body);
 }
 
+std::string GeneratePerfJson(Cooperator* co)
+{
+    std::string out;
+    out.reserve(1024);
+    JsonWriter w(out);
+
+    w.BeginObject();
+
+    w.Key("mode");
+    w.Int(COOP_PERF_MODE);
+
+    w.Key("enabled");
+    w.Bool(perf::IsEnabled());
+
+    w.Key("probeCount");
+    w.UInt(perf::ProbeCount());
+
+    w.Key("counters");
+    w.BeginObject();
+
+#if COOP_PERF_MODE > 0
+    auto& counters = co->GetPerfCounters();
+    for (size_t i = 0; i < static_cast<size_t>(perf::Counter::COUNT); i++)
+    {
+        auto c = static_cast<perf::Counter>(i);
+        w.Key(perf::CounterName(c));
+        w.UInt(counters.Get(c));
+    }
+#else
+    (void)co;
+#endif
+
+    w.EndObject();
+    w.EndObject();
+    return out;
+}
+
+void HandlePerf(ConnectionBase& conn)
+{
+    std::string body = GeneratePerfJson(conn.GetCooperator());
+    conn.Send(200, "application/json", body);
+}
+
+void HandlePerfEnable(ConnectionBase& conn)
+{
+    perf::Enable();
+    conn.Send(200, "application/json", "{\"ok\":true}");
+}
+
+void HandlePerfDisable(ConnectionBase& conn)
+{
+    perf::Disable();
+    conn.Send(200, "application/json", "{\"ok\":true}");
+}
+
 Route s_statusRoutes[] = {
-    {"/api/status", HandleStatus},
+    {"/api/status",       HandleStatus},
+    {"/api/perf",         HandlePerf},
+    {"/api/perf/enable",  HandlePerfEnable},
+    {"/api/perf/disable", HandlePerfDisable},
 };
 
 static constexpr int STATUS_ROUTE_COUNT = sizeof(s_statusRoutes) / sizeof(s_statusRoutes[0]);

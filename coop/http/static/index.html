@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>coop status</title>
+<title>coop dashboard</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -11,13 +11,32 @@ body {
     padding: 20px;
 }
 h1 { color: #7fdbca; margin-bottom: 16px; font-size: 18px; }
+
+/* Tabs */
+.tabs {
+    display: flex; gap: 2px; margin-bottom: 20px;
+}
+.tab {
+    padding: 8px 20px; background: #16213e; border: none; color: #888;
+    font-family: inherit; font-size: 13px; cursor: pointer;
+    border-radius: 6px 6px 0 0; text-transform: uppercase; letter-spacing: 1px;
+}
+.tab.active { background: #0f3460; color: #7fdbca; }
+.tab:hover { color: #c3cee3; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* Summary bar */
 .summary {
     display: flex; gap: 24px; margin-bottom: 20px;
     padding: 12px; background: #16213e; border-radius: 6px;
+    flex-wrap: wrap;
 }
 .stat { display: flex; flex-direction: column; }
 .stat-label { color: #888; font-size: 11px; text-transform: uppercase; }
 .stat-value { color: #7fdbca; font-size: 20px; font-weight: bold; }
+
+/* Charts */
 .chart-container {
     background: #16213e; border-radius: 6px; padding: 12px;
     margin-bottom: 20px;
@@ -28,8 +47,11 @@ canvas { display: block; width: 100%; }
     display: flex; flex-wrap: wrap; gap: 12px;
     margin-top: 8px; font-size: 11px;
 }
-.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-item { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.legend-item.dimmed { opacity: 0.3; }
 .legend-swatch { width: 10px; height: 10px; border-radius: 2px; }
+
+/* Context tree */
 .ctx {
     margin-left: 20px; padding: 6px 10px;
     border-left: 2px solid #333; margin-bottom: 4px;
@@ -48,10 +70,66 @@ canvas { display: block; width: 100%; }
 .ctx-stats { color: #666; font-size: 12px; margin-top: 2px; }
 .error { color: #f07178; padding: 20px; }
 #updated { color: #555; font-size: 11px; margin-top: 12px; }
+
+/* Perf tab */
+.perf-header {
+    display: flex; align-items: center; gap: 16px; margin-bottom: 16px;
+}
+.perf-mode {
+    font-size: 12px; color: #888; padding: 4px 10px;
+    background: #16213e; border-radius: 4px;
+}
+.perf-mode .mode-val { color: #c792ea; font-weight: bold; }
+.toggle-btn {
+    padding: 6px 16px; border: 1px solid #7fdbca; background: transparent;
+    color: #7fdbca; font-family: inherit; font-size: 12px; cursor: pointer;
+    border-radius: 4px; text-transform: uppercase; letter-spacing: 1px;
+}
+.toggle-btn:hover { background: #7fdbca22; }
+.toggle-btn.enabled { border-color: #f07178; color: #f07178; }
+.toggle-btn.enabled:hover { background: #f0717822; }
+.toggle-btn:disabled { opacity: 0.3; cursor: default; }
+
+/* Counter table */
+.counter-table {
+    width: 100%; border-collapse: collapse; margin-bottom: 20px;
+    background: #16213e; border-radius: 6px; overflow: hidden;
+}
+.counter-table th {
+    text-align: left; padding: 8px 12px; color: #888; font-size: 11px;
+    text-transform: uppercase; border-bottom: 1px solid #ffffff10;
+}
+.counter-table td {
+    padding: 6px 12px; border-bottom: 1px solid #ffffff08; font-size: 13px;
+}
+.counter-table tr:last-child td { border-bottom: none; }
+.counter-table .counter-name { color: #c3cee3; }
+.counter-table .counter-value { color: #7fdbca; text-align: right; font-variant-numeric: tabular-nums; }
+.counter-table .counter-rate { color: #c792ea; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Chart group selector */
+.chart-groups {
+    display: flex; gap: 4px; margin-bottom: 12px;
+}
+.chart-group-btn {
+    padding: 4px 12px; border: 1px solid #ffffff20; background: transparent;
+    color: #888; font-family: inherit; font-size: 11px; cursor: pointer;
+    border-radius: 3px; text-transform: uppercase;
+}
+.chart-group-btn.active { border-color: #7fdbca; color: #7fdbca; background: #7fdbca15; }
+.chart-group-btn:hover { color: #c3cee3; }
 </style>
 </head>
 <body>
-<h1>coop status</h1>
+<h1>coop dashboard</h1>
+
+<div class="tabs">
+    <button class="tab active" onclick="switchTab('status')">Status</button>
+    <button class="tab" onclick="switchTab('perf')">Perf</button>
+</div>
+
+<!-- STATUS TAB -->
+<div id="tab-status" class="tab-content active">
 <div class="summary">
     <div class="stat"><span class="stat-label">contexts</span><span class="stat-value" id="s-ctx">-</span></div>
     <div class="stat"><span class="stat-label">yielded</span><span class="stat-value" id="s-yld">-</span></div>
@@ -64,31 +142,63 @@ canvas { display: block; width: 100%; }
     <div class="legend" id="legend"></div>
 </div>
 <div id="tree"></div>
+</div>
+
+<!-- PERF TAB -->
+<div id="tab-perf" class="tab-content">
+<div class="perf-header">
+    <span class="perf-mode">mode <span class="mode-val" id="perf-mode">-</span></span>
+    <span class="perf-mode">probes <span class="mode-val" id="perf-probes">-</span></span>
+    <button class="toggle-btn" id="perf-toggle" onclick="togglePerf()" disabled>Enable</button>
+</div>
+<div class="summary" id="perf-summary"></div>
+<div class="chart-container">
+    <div class="chart-title">counter rates (per second)</div>
+    <div class="chart-groups" id="perf-chart-groups"></div>
+    <canvas id="perf-chart" height="240"></canvas>
+    <div class="legend" id="perf-legend"></div>
+</div>
+<table class="counter-table">
+    <thead><tr><th>Counter</th><th>Value</th><th>Rate /s</th></tr></thead>
+    <tbody id="perf-table-body"></tbody>
+</table>
+</div>
+
 <div id="updated"></div>
+
 <script>
+// ---- Tab switching ----
+function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+    document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
+    document.getElementById('tab-' + name).classList.add('active');
+    document.querySelectorAll('.tab').forEach(function(t) {
+        if (t.textContent.toLowerCase() === name) t.classList.add('active');
+    });
+}
+
+// ---- Shared ----
 var COLORS = [
     '#7fdbca', '#c792ea', '#f78c6c', '#82aaff', '#c3e88d',
     '#ff5370', '#e6db74', '#89ddff', '#f07178', '#ffcb6b'
 ];
 var MAX_POINTS = 60;
+var POLL_MS = 1000;
 
-// { contextName: [delta0, delta1, ...] }
-var history = {};
-// { contextName: ticksLastSeen }
+// ---- Status tab state ----
+var statusHistory = {};
 var prevTicks = null;
-// Stable color assignment
-var colorMap = {};
-var nextColor = 0;
+var statusColorMap = {};
+var statusNextColor = 0;
 
-function colorFor(name) {
-    if (!(name in colorMap)) {
-        colorMap[name] = COLORS[nextColor % COLORS.length];
-        nextColor++;
+function statusColorFor(name) {
+    if (!(name in statusColorMap)) {
+        statusColorMap[name] = COLORS[statusNextColor % COLORS.length];
+        statusNextColor++;
     }
-    return colorMap[name];
+    return statusColorMap[name];
 }
 
-// Walk the context tree and collect { name: totalTicks } for all leaf-ish contexts
 function flattenTicks(ctx, prefix, out) {
     var name = prefix ? prefix + '/' + ctx.name : ctx.name;
     out[name] = ctx.statistics.ticks;
@@ -99,145 +209,95 @@ function flattenTicks(ctx, prefix, out) {
     }
 }
 
-function recordDeltas(data) {
+function recordStatusDeltas(data) {
     var current = {};
     for (var i = 0; i < data.contexts.length; i++) {
         flattenTicks(data.contexts[i], '', current);
     }
-
-    // First fetch — seed prevTicks but don't record (no meaningful deltas yet)
-    if (prevTicks === null) {
-        prevTicks = current;
-        return;
-    }
-
-    // Compute deltas against previous snapshot
+    if (prevTicks === null) { prevTicks = current; return; }
     var deltas = {};
     for (var name in current) {
-        var prev = prevTicks[name] || 0;
-        deltas[name] = current[name] - prev;
+        deltas[name] = current[name] - (prevTicks[name] || 0);
     }
     prevTicks = current;
-
-    // Push deltas into history, capping length
-    // Also prune contexts that have disappeared
-    var activeNames = {};
+    var active = {};
     for (var name in deltas) {
-        activeNames[name] = true;
-        if (!history[name]) history[name] = [];
-        history[name].push(deltas[name]);
-        if (history[name].length > MAX_POINTS) {
-            history[name].shift();
-        }
+        active[name] = true;
+        if (!statusHistory[name]) statusHistory[name] = [];
+        statusHistory[name].push(deltas[name]);
+        if (statusHistory[name].length > MAX_POINTS) statusHistory[name].shift();
     }
-    for (var name in history) {
-        if (!activeNames[name]) {
-            delete history[name];
-        }
+    for (var name in statusHistory) {
+        if (!active[name]) delete statusHistory[name];
     }
 }
 
-function drawChart() {
-    var canvas = document.getElementById('chart');
+function drawStackedChart(canvasId, legendId, hist, colorFn) {
+    var canvas = document.getElementById(canvasId);
     var dpr = window.devicePixelRatio || 1;
     var rect = canvas.getBoundingClientRect();
     canvas.width = rect.width * dpr;
     canvas.height = rect.height * dpr;
     var ctx = canvas.getContext('2d');
     ctx.scale(dpr, dpr);
-    var W = rect.width;
-    var H = rect.height;
-
+    var W = rect.width, H = rect.height;
     ctx.clearRect(0, 0, W, H);
 
-    var names = Object.keys(history);
+    var names = Object.keys(hist);
     if (names.length === 0) return;
 
-    // Find the max number of data points and the global max delta
     var maxLen = 0;
-    var maxVal = 1;
     for (var i = 0; i < names.length; i++) {
-        var h = history[names[i]];
-        if (h.length > maxLen) maxLen = h.length;
-        for (var j = 0; j < h.length; j++) {
-            if (h[j] > maxVal) maxVal = h[j];
-        }
+        if (hist[names[i]].length > maxLen) maxLen = hist[names[i]].length;
     }
 
-    var padL = 48, padR = 8, padT = 8, padB = 20;
-    var plotW = W - padL - padR;
-    var plotH = H - padT - padB;
+    var padL = 60, padR = 8, padT = 8, padB = 20;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
 
-    // Grid lines
-    ctx.strokeStyle = '#ffffff10';
-    ctx.lineWidth = 1;
-    var gridLines = 4;
-    for (var i = 0; i <= gridLines; i++) {
-        var y = padT + (plotH / gridLines) * i;
-        ctx.beginPath();
-        ctx.moveTo(padL, y);
-        ctx.lineTo(W - padR, y);
-        ctx.stroke();
-
-        ctx.fillStyle = '#555';
-        ctx.font = '10px Consolas, Monaco, monospace';
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'middle';
-        var label = Math.round(maxVal * (1 - i / gridLines));
-        ctx.fillText(label, padL - 6, y);
-    }
-
-    // Draw stacked area chart
-    // First, build per-column stacked totals
+    // Build stacked columns
     var stacked = [];
     for (var col = 0; col < maxLen; col++) {
         stacked[col] = [];
-        var cumulative = 0;
+        var cum = 0;
         for (var ni = 0; ni < names.length; ni++) {
-            var h = history[names[ni]];
+            var h = hist[names[ni]];
             var offset = maxLen - h.length;
-            var val = col >= offset ? h[col - offset] : 0;
-            cumulative += val;
-            stacked[col].push(cumulative);
+            cum += col >= offset ? h[col - offset] : 0;
+            stacked[col].push(cum);
         }
     }
 
-    // Adjust maxVal to stacked max
     var stackedMax = 1;
     for (var col = 0; col < maxLen; col++) {
         var top = stacked[col][names.length - 1];
         if (top > stackedMax) stackedMax = top;
     }
 
-    function xFor(col) {
-        return padL + (plotW / Math.max(MAX_POINTS - 1, 1)) * col;
-    }
-    function yFor(val) {
-        return padT + plotH - (val / stackedMax) * plotH;
+    function xFor(c) { return padL + (plotW / Math.max(MAX_POINTS - 1, 1)) * c; }
+    function yFor(v) { return padT + plotH - (v / stackedMax) * plotH; }
+
+    // Grid
+    ctx.strokeStyle = '#ffffff10'; ctx.lineWidth = 1;
+    for (var i = 0; i <= 4; i++) {
+        var y = padT + (plotH / 4) * i;
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+        ctx.fillStyle = '#555'; ctx.font = '10px Consolas, Monaco, monospace';
+        ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        ctx.fillText(formatNum(Math.round(stackedMax * (1 - i / 4))), padL - 6, y);
     }
 
-    // Draw areas back to front (top series first so bottom paints over)
+    // Areas
     for (var ni = names.length - 1; ni >= 0; ni--) {
-        ctx.fillStyle = colorFor(names[ni]) + '40';
-        ctx.strokeStyle = colorFor(names[ni]);
+        ctx.fillStyle = colorFn(names[ni]) + '40';
+        ctx.strokeStyle = colorFn(names[ni]);
         ctx.lineWidth = 1.5;
-
         ctx.beginPath();
         ctx.moveTo(xFor(0), yFor(0));
-
-        for (var col = 0; col < maxLen; col++) {
-            ctx.lineTo(xFor(col), yFor(stacked[col][ni]));
-        }
-
-        // Close back along the bottom of this band
+        for (var col = 0; col < maxLen; col++) ctx.lineTo(xFor(col), yFor(stacked[col][ni]));
         for (var col = maxLen - 1; col >= 0; col--) {
-            var bottom = ni > 0 ? stacked[col][ni - 1] : 0;
-            ctx.lineTo(xFor(col), yFor(bottom));
+            ctx.lineTo(xFor(col), yFor(ni > 0 ? stacked[col][ni - 1] : 0));
         }
-        ctx.closePath();
-        ctx.fill();
-
-        // Stroke the top edge
+        ctx.closePath(); ctx.fill();
         ctx.beginPath();
         for (var col = 0; col < maxLen; col++) {
             if (col === 0) ctx.moveTo(xFor(col), yFor(stacked[col][ni]));
@@ -246,22 +306,26 @@ function drawChart() {
         ctx.stroke();
     }
 
-    // Update legend
-    var legend = document.getElementById('legend');
+    // Legend
+    var legend = document.getElementById(legendId);
     legend.innerHTML = '';
     for (var i = 0; i < names.length; i++) {
         var item = document.createElement('span');
         item.className = 'legend-item';
         var swatch = document.createElement('span');
         swatch.className = 'legend-swatch';
-        swatch.style.backgroundColor = colorFor(names[i]);
+        swatch.style.backgroundColor = colorFn(names[i]);
         item.appendChild(swatch);
-        // Show just the last segment of the path for brevity
-        var parts = names[i].split('/');
-        var label = parts[parts.length - 1];
-        item.appendChild(document.createTextNode(label));
+        item.appendChild(document.createTextNode(names[i]));
         legend.appendChild(item);
     }
+}
+
+function formatNum(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return '' + n;
 }
 
 function renderCtx(c, root) {
@@ -299,32 +363,212 @@ function renderCtx(c, root) {
     return d;
 }
 
-function refresh() {
-    fetch('/api/status').then(function(r) { return r.json(); }).then(function(data) {
-        document.getElementById('s-ctx').textContent = data.contextsCount;
-        document.getElementById('s-yld').textContent = data.yieldedCount;
-        document.getElementById('s-blk').textContent = data.blockedCount;
-        document.getElementById('s-tck').textContent = data.ticks;
+function refreshStatus(data) {
+    document.getElementById('s-ctx').textContent = data.contextsCount;
+    document.getElementById('s-yld').textContent = data.yieldedCount;
+    document.getElementById('s-blk').textContent = data.blockedCount;
+    document.getElementById('s-tck').textContent = data.ticks;
+    recordStatusDeltas(data);
+    drawStackedChart('chart', 'legend', statusHistory, statusColorFor);
+    var tree = document.getElementById('tree');
+    tree.innerHTML = '';
+    for (var i = 0; i < data.contexts.length; i++) {
+        tree.appendChild(renderCtx(data.contexts[i], true));
+    }
+}
 
-        recordDeltas(data);
-        drawChart();
+// ---- Perf tab state ----
+var COUNTER_GROUPS = {
+    'all':       null,
+    'scheduler': ['scheduler_loop', 'ctx_resume', 'ctx_yield', 'ctx_block', 'ctx_spawn', 'ctx_exit'],
+    'io':        ['io_submit', 'io_complete', 'poll_cycle', 'poll_submit', 'poll_cqe'],
+};
+var perfActiveGroup = 'all';
+var perfHistory = {};
+var perfPrev = null;
+var perfLastTime = null;
+var perfRates = {};
+var perfColorMap = {};
+var perfNextColor = 0;
+var perfHidden = {};
 
-        var tree = document.getElementById('tree');
-        tree.innerHTML = '';
-        for (var i = 0; i < data.contexts.length; i++) {
-            tree.appendChild(renderCtx(data.contexts[i], true));
-        }
-        document.getElementById('updated').textContent =
-            'updated ' + new Date().toLocaleTimeString();
-    }).catch(function(e) {
-        document.getElementById('tree').innerHTML =
-            '<div class="error">fetch failed: ' + e.message + '</div>';
+function perfColorFor(name) {
+    if (!(name in perfColorMap)) {
+        perfColorMap[name] = COLORS[perfNextColor % COLORS.length];
+        perfNextColor++;
+    }
+    return perfColorMap[name];
+}
+
+function initPerfGroups() {
+    var container = document.getElementById('perf-chart-groups');
+    container.innerHTML = '';
+    for (var group in COUNTER_GROUPS) {
+        var btn = document.createElement('button');
+        btn.className = 'chart-group-btn' + (group === perfActiveGroup ? ' active' : '');
+        btn.textContent = group;
+        btn.setAttribute('data-group', group);
+        btn.onclick = function() {
+            perfActiveGroup = this.getAttribute('data-group');
+            document.querySelectorAll('.chart-group-btn').forEach(function(b) {
+                b.classList.toggle('active', b.getAttribute('data-group') === perfActiveGroup);
+            });
+            drawPerfChart();
+        };
+        container.appendChild(btn);
+    }
+}
+
+function filteredPerfHistory() {
+    var filter = COUNTER_GROUPS[perfActiveGroup];
+    if (!filter) return perfHistory;
+    var out = {};
+    for (var i = 0; i < filter.length; i++) {
+        if (perfHistory[filter[i]]) out[filter[i]] = perfHistory[filter[i]];
+    }
+    return out;
+}
+
+function drawPerfChart() {
+    var hist = filteredPerfHistory();
+    // Remove hidden series
+    var visible = {};
+    for (var k in hist) {
+        if (!perfHidden[k]) visible[k] = hist[k];
+    }
+    drawStackedChart('perf-chart', 'perf-legend', visible, perfColorFor);
+
+    // Make legend items clickable for toggling
+    var legend = document.getElementById('perf-legend');
+    var items = legend.querySelectorAll('.legend-item');
+    var names = Object.keys(hist);
+    items.forEach(function(item, i) {
+        var name = names[i];
+        if (!name) return;
+        if (perfHidden[name]) item.classList.add('dimmed');
+        item.onclick = function() {
+            perfHidden[name] = !perfHidden[name];
+            drawPerfChart();
+        };
     });
 }
 
+function refreshPerf(data) {
+    // Header
+    var modeNames = {0: 'disabled', 1: 'always-on', 2: 'dynamic'};
+    document.getElementById('perf-mode').textContent =
+        data.mode + ' (' + (modeNames[data.mode] || '?') + ')';
+    document.getElementById('perf-probes').textContent = data.probeCount;
+
+    var toggleBtn = document.getElementById('perf-toggle');
+    if (data.mode === 2) {
+        toggleBtn.disabled = false;
+        toggleBtn.textContent = data.enabled ? 'Disable' : 'Enable';
+        toggleBtn.className = 'toggle-btn' + (data.enabled ? ' enabled' : '');
+    } else {
+        toggleBtn.disabled = true;
+        toggleBtn.textContent = data.mode === 1 ? 'Always On' : 'Disabled';
+        toggleBtn.className = 'toggle-btn';
+    }
+
+    // Compute rates
+    var now = Date.now();
+    var counters = data.counters;
+    var names = Object.keys(counters);
+
+    if (perfPrev !== null && perfLastTime !== null) {
+        var dt = (now - perfLastTime) / 1000;
+        if (dt > 0) {
+            for (var i = 0; i < names.length; i++) {
+                var name = names[i];
+                var delta = counters[name] - (perfPrev[name] || 0);
+                var rate = Math.round(delta / dt);
+                perfRates[name] = rate;
+
+                if (!perfHistory[name]) perfHistory[name] = [];
+                perfHistory[name].push(rate);
+                if (perfHistory[name].length > MAX_POINTS) perfHistory[name].shift();
+            }
+        }
+    }
+    perfPrev = counters;
+    perfLastTime = now;
+
+    // Summary — top 4 counters by rate
+    var summary = document.getElementById('perf-summary');
+    summary.innerHTML = '';
+    var sorted = names.slice().sort(function(a, b) { return (perfRates[b] || 0) - (perfRates[a] || 0); });
+    var topN = Math.min(6, sorted.length);
+    for (var i = 0; i < topN; i++) {
+        var name = sorted[i];
+        var div = document.createElement('div');
+        div.className = 'stat';
+        var label = document.createElement('span');
+        label.className = 'stat-label';
+        label.textContent = name;
+        div.appendChild(label);
+        var val = document.createElement('span');
+        val.className = 'stat-value';
+        val.textContent = formatNum(perfRates[name] || 0) + '/s';
+        div.appendChild(val);
+        summary.appendChild(div);
+    }
+
+    // Table
+    var tbody = document.getElementById('perf-table-body');
+    tbody.innerHTML = '';
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        var tr = document.createElement('tr');
+        var tdName = document.createElement('td');
+        tdName.className = 'counter-name';
+        tdName.textContent = name;
+        tr.appendChild(tdName);
+        var tdVal = document.createElement('td');
+        tdVal.className = 'counter-value';
+        tdVal.textContent = counters[name].toLocaleString();
+        tr.appendChild(tdVal);
+        var tdRate = document.createElement('td');
+        tdRate.className = 'counter-rate';
+        tdRate.textContent = perfRates[name] !== undefined ? formatNum(perfRates[name]) + '/s' : '-';
+        tr.appendChild(tdRate);
+        tbody.appendChild(tr);
+    }
+
+    drawPerfChart();
+}
+
+function togglePerf() {
+    var btn = document.getElementById('perf-toggle');
+    var action = btn.textContent.toLowerCase() === 'enable' ? 'enable' : 'disable';
+    fetch('/api/perf/' + action, {method: 'POST'}).then(function() {
+        refresh();
+    });
+}
+
+// ---- Main refresh loop ----
+function refresh() {
+    Promise.all([
+        fetch('/api/status').then(function(r) { return r.json(); }),
+        fetch('/api/perf').then(function(r) { return r.json(); }),
+    ]).then(function(results) {
+        refreshStatus(results[0]);
+        refreshPerf(results[1]);
+        document.getElementById('updated').textContent =
+            'updated ' + new Date().toLocaleTimeString();
+    }).catch(function(e) {
+        document.getElementById('updated').textContent =
+            'error: ' + e.message;
+    });
+}
+
+initPerfGroups();
 refresh();
-setInterval(refresh, 2000);
-window.addEventListener('resize', drawChart);
+setInterval(refresh, POLL_MS);
+window.addEventListener('resize', function() {
+    drawStackedChart('chart', 'legend', statusHistory, statusColorFor);
+    drawPerfChart();
+});
 </script>
 </body>
 </html>

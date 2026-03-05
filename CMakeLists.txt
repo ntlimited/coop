@@ -36,6 +36,13 @@ add_library(coop STATIC ${COOP_SOURCES})
 target_include_directories(coop PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_options(coop PRIVATE -Wcpp)
 
+# Compile out trace/debug logging in release builds — eliminates ~1% overhead from runtime
+# level checks in the IO hot path (spdlog::trace calls on every Submit/Complete/Poll).
+#
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    target_compile_definitions(coop PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO)
+endif()
+
 # External libraries
 find_library(URING_LIB uring REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
@@ -107,6 +114,7 @@ add_executable(coop_tests
     tests/test_shutdown.cpp
     tests/test_io.cpp
     tests/test_stress.cpp
+    tests/test_http.cpp
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 include(GoogleTest)
@@ -122,8 +130,12 @@ add_executable(coop_benchmarks
     benchmarks/bench_scheduler.cpp
     benchmarks/bench_uring_config.cpp
     benchmarks/bench_ssl.cpp
+    benchmarks/bench_http.cpp
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
+
+add_executable(bench_server benchmarks/bench_server.cpp)
+target_link_libraries(bench_server PRIVATE coop)
 
 add_executable(diag_ktls benchmarks/diag_ktls.cpp)
 target_link_libraries(diag_ktls PRIVATE coop)

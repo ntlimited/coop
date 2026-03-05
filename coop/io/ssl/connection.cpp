@@ -112,7 +112,7 @@ int Connection::FlushWrite()
         {
             break;
         }
-        spdlog::trace("ssl flush_write fd={} wbio_bytes={}", m_desc.m_fd, n);
+        SPDLOG_TRACE("ssl flush_write fd={} wbio_bytes={}", m_desc.m_fd, n);
 
         int at = 0;
         while (at < n)
@@ -139,13 +139,13 @@ int Connection::FeedRead()
     int n = io::Recv(m_desc, m_buffer, m_bufferSize);
     if (n <= 0)
     {
-        spdlog::trace("ssl feed_read fd={} recv={}", m_desc.m_fd, n);
+        SPDLOG_TRACE("ssl feed_read fd={} recv={}", m_desc.m_fd, n);
         return n;
     }
 
     int written = BIO_write(m_rbio, m_buffer, n);
     assert(written == n);
-    spdlog::trace("ssl feed_read fd={} recv={} rbio_fed={}", m_desc.m_fd, n, written);
+    SPDLOG_TRACE("ssl feed_read fd={} recv={} rbio_fed={}", m_desc.m_fd, n, written);
     return written;
 }
 
@@ -169,7 +169,7 @@ int Connection::Handshake()
 //
 int Connection::HandshakeSocketBio()
 {
-    spdlog::debug("ssl socket-bio handshake start fd={}", m_desc.m_fd);
+    SPDLOG_DEBUG("ssl socket-bio handshake start fd={}", m_desc.m_fd);
     for (;;)
     {
         int ret = SSL_do_handshake(m_ssl);
@@ -179,7 +179,7 @@ int Connection::HandshakeSocketBio()
             //
             m_ktlsTx = BIO_get_ktls_send(SSL_get_wbio(m_ssl)) != 0;
             m_ktlsRx = BIO_get_ktls_recv(SSL_get_rbio(m_ssl)) != 0;
-            spdlog::debug("ssl socket-bio handshake complete fd={} ktls_tx={} ktls_rx={}",
+            SPDLOG_DEBUG("ssl socket-bio handshake complete fd={} ktls_tx={} ktls_rx={}",
                 m_desc.m_fd, m_ktlsTx, m_ktlsRx);
             return 0;
         }
@@ -189,7 +189,7 @@ int Connection::HandshakeSocketBio()
         {
         case SSL_ERROR_WANT_READ:
         {
-            spdlog::trace("ssl socket-bio handshake fd={} WANT_READ", m_desc.m_fd);
+            SPDLOG_TRACE("ssl socket-bio handshake fd={} WANT_READ", m_desc.m_fd);
             int r = io::Poll(m_desc, POLLIN);
             if (r < 0)
             {
@@ -201,7 +201,7 @@ int Connection::HandshakeSocketBio()
 
         case SSL_ERROR_WANT_WRITE:
         {
-            spdlog::trace("ssl socket-bio handshake fd={} WANT_WRITE", m_desc.m_fd);
+            SPDLOG_TRACE("ssl socket-bio handshake fd={} WANT_WRITE", m_desc.m_fd);
             int r = io::Poll(m_desc, POLLOUT);
             if (r < 0)
             {
@@ -227,7 +227,7 @@ int Connection::HandshakeSocketBio()
 //
 int Connection::HandshakeMemoryBio()
 {
-    spdlog::debug("ssl handshake start fd={}", m_desc.m_fd);
+    SPDLOG_DEBUG("ssl handshake start fd={}", m_desc.m_fd);
     for (;;)
     {
         int ret = SSL_do_handshake(m_ssl);
@@ -235,7 +235,7 @@ int Connection::HandshakeMemoryBio()
         {
             // Handshake complete. Flush any final output (e.g. Finished message).
             //
-            spdlog::debug("ssl handshake complete fd={}", m_desc.m_fd);
+            SPDLOG_DEBUG("ssl handshake complete fd={}", m_desc.m_fd);
             return FlushWrite();
         }
 
@@ -243,7 +243,7 @@ int Connection::HandshakeMemoryBio()
         switch (err)
         {
         case SSL_ERROR_WANT_WRITE:
-            spdlog::trace("ssl handshake fd={} WANT_WRITE", m_desc.m_fd);
+            SPDLOG_TRACE("ssl handshake fd={} WANT_WRITE", m_desc.m_fd);
             if (FlushWrite() < 0)
             {
                 return -1;
@@ -253,7 +253,7 @@ int Connection::HandshakeMemoryBio()
         case SSL_ERROR_WANT_READ:
             // Flush first — the handshake may have produced output before asking for input.
             //
-            spdlog::trace("ssl handshake fd={} WANT_READ", m_desc.m_fd);
+            SPDLOG_TRACE("ssl handshake fd={} WANT_READ", m_desc.m_fd);
             if (FlushWrite() < 0)
             {
                 return -1;

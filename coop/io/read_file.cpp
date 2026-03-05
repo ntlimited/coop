@@ -69,7 +69,7 @@ int ReadFile(const char* path, void* buf, size_t bufSize)
     }
 
     desc.Close();
-    spdlog::debug("readfile path={} bytes={}", path, total);
+    SPDLOG_DEBUG("readfile path={} bytes={}", path, total);
     return static_cast<int>(total);
 }
 

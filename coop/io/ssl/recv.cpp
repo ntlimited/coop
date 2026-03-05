@@ -25,20 +25,20 @@ namespace ssl
 //
 static int RecvKtls(Connection& conn, void* buf, size_t size)
 {
-    spdlog::trace("ssl ktls recv fd={} maxsize={}", conn.m_desc.m_fd, size);
+    SPDLOG_TRACE("ssl ktls recv fd={} maxsize={}", conn.m_desc.m_fd, size);
     for (;;)
     {
         ssize_t ret = ::read(conn.m_desc.m_fd, buf, size);
         if (ret > 0)
         {
-            spdlog::trace("ssl ktls recv fd={} read={}", conn.m_desc.m_fd, ret);
+            SPDLOG_TRACE("ssl ktls recv fd={} read={}", conn.m_desc.m_fd, ret);
             return (int)ret;
         }
         if (ret == 0) return 0;
 
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
-            spdlog::trace("ssl ktls recv fd={} EAGAIN", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl ktls recv fd={} EAGAIN", conn.m_desc.m_fd);
             int r = io::Poll(conn.m_desc, POLLIN);
             if (r < 0) return -1;
             continue;
@@ -54,13 +54,13 @@ static int RecvKtls(Connection& conn, void* buf, size_t size)
 //
 static int RecvSocketBio(Connection& conn, void* buf, size_t size)
 {
-    spdlog::trace("ssl socket-bio recv fd={} maxsize={}", conn.m_desc.m_fd, size);
+    SPDLOG_TRACE("ssl socket-bio recv fd={} maxsize={}", conn.m_desc.m_fd, size);
     for (;;)
     {
         int ret = SSL_read(conn.m_ssl, buf, size);
         if (ret > 0)
         {
-            spdlog::trace("ssl socket-bio recv fd={} read={}", conn.m_desc.m_fd, ret);
+            SPDLOG_TRACE("ssl socket-bio recv fd={} read={}", conn.m_desc.m_fd, ret);
             return ret;
         }
 
@@ -69,7 +69,7 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size)
         {
         case SSL_ERROR_WANT_READ:
         {
-            spdlog::trace("ssl socket-bio recv fd={} WANT_READ", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl socket-bio recv fd={} WANT_READ", conn.m_desc.m_fd);
             int r = io::Poll(conn.m_desc, POLLIN);
             if (r < 0) return -1;
             break;
@@ -79,7 +79,7 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size)
         {
             // Renegotiation
             //
-            spdlog::trace("ssl socket-bio recv fd={} WANT_WRITE", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl socket-bio recv fd={} WANT_WRITE", conn.m_desc.m_fd);
             int r = io::Poll(conn.m_desc, POLLOUT);
             if (r < 0) return -1;
             break;
@@ -121,13 +121,13 @@ int Recv(Connection& conn, void* buf, size_t size)
 
     // Memory BIO: existing path
     //
-    spdlog::trace("ssl recv fd={} maxsize={}", conn.m_desc.m_fd, size);
+    SPDLOG_TRACE("ssl recv fd={} maxsize={}", conn.m_desc.m_fd, size);
     for (;;)
     {
         int ret = SSL_read(conn.m_ssl, buf, size);
         if (ret > 0)
         {
-            spdlog::trace("ssl recv fd={} read={}", conn.m_desc.m_fd, ret);
+            SPDLOG_TRACE("ssl recv fd={} read={}", conn.m_desc.m_fd, ret);
             return ret;
         }
 
@@ -135,7 +135,7 @@ int Recv(Connection& conn, void* buf, size_t size)
         switch (err)
         {
         case SSL_ERROR_WANT_READ:
-            spdlog::trace("ssl recv fd={} WANT_READ", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl recv fd={} WANT_READ", conn.m_desc.m_fd);
             if (conn.FlushWrite() < 0)
             {
                 return -1;
@@ -149,7 +149,7 @@ int Recv(Connection& conn, void* buf, size_t size)
         case SSL_ERROR_WANT_WRITE:
             // Can happen during TLS renegotiation.
             //
-            spdlog::trace("ssl recv fd={} WANT_WRITE", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl recv fd={} WANT_WRITE", conn.m_desc.m_fd);
             if (conn.FlushWrite() < 0)
             {
                 return -1;

@@ -20,7 +20,7 @@ Descriptor::Descriptor(int fd, Uring* ring /* = GetUring() */)
 , m_registeredIndex(-1)
 {
     assert(m_ring);
-    spdlog::debug("descriptor create fd={}", m_fd);
+    SPDLOG_DEBUG("descriptor create fd={}", m_fd);
     m_ring->m_descriptors.Push(this);
 }
 
@@ -30,7 +30,7 @@ Descriptor::Descriptor(Registered, int fd, Uring* ring /* = GetUring() */)
 , m_registeredIndex(-1)
 {
     assert(m_ring);
-    spdlog::debug("descriptor create registered fd={}", m_fd);
+    SPDLOG_DEBUG("descriptor create registered fd={}", m_fd);
     m_ring->m_descriptors.Push(this);
     m_ring->Register(this);
 }
@@ -59,7 +59,7 @@ int Descriptor::Close()
     {
         return 0;
     }
-    spdlog::debug("descriptor close fd={}", m_fd);
+    SPDLOG_DEBUG("descriptor close fd={}", m_fd);
     int result = io::Close(*this);
     m_fd = -1;
     return result;

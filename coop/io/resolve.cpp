@@ -94,7 +94,7 @@ static void ParseResolvConf()
             if (inet_pton(AF_INET, ip, &addr.sin_addr) == 1)
             {
                 s_resolv.nameservers.push_back(addr);
-                spdlog::debug("resolve: nameserver {}", ip);
+                SPDLOG_DEBUG("resolve: nameserver {}", ip);
             }
         }
         else if (strncmp(line, "options", 7) == 0 && (line[7] == ' ' || line[7] == '\t'))
@@ -196,7 +196,7 @@ static void ParseHosts()
 
             std::string name(tok, end - tok);
             s_hosts.entries[name] = addr;
-            spdlog::debug("resolve: hosts entry {} -> {}", name, ip);
+            SPDLOG_DEBUG("resolve: hosts entry {} -> {}", name, ip);
 
             tok = end;
         }
@@ -340,14 +340,14 @@ static int ParseDnsResponse(const uint8_t* pkt, int pktLen, uint16_t expectedId,
 {
     if (pktLen < 12)
     {
-        spdlog::debug("resolve: response too short len={}", pktLen);
+        SPDLOG_DEBUG("resolve: response too short len={}", pktLen);
         return -EPROTO;
     }
 
     uint16_t id = (pkt[0] << 8) | pkt[1];
     if (id != expectedId)
     {
-        spdlog::debug("resolve: id mismatch expected={} got={}", expectedId, id);
+        SPDLOG_DEBUG("resolve: id mismatch expected={} got={}", expectedId, id);
         return -EPROTO;
     }
 
@@ -358,7 +358,7 @@ static int ParseDnsResponse(const uint8_t* pkt, int pktLen, uint16_t expectedId,
     //
     if (!(flags1 & 0x80))
     {
-        spdlog::debug("resolve: QR bit not set");
+        SPDLOG_DEBUG("resolve: QR bit not set");
         return -EPROTO;
     }
 
@@ -367,12 +367,12 @@ static int ParseDnsResponse(const uint8_t* pkt, int pktLen, uint16_t expectedId,
     int rcode = flags2 & 0x0F;
     if (rcode == 3) // NXDOMAIN
     {
-        spdlog::debug("resolve: NXDOMAIN");
+        SPDLOG_DEBUG("resolve: NXDOMAIN");
         return -ENOENT;
     }
     if (rcode != 0)
     {
-        spdlog::debug("resolve: DNS error rcode={}", rcode);
+        SPDLOG_DEBUG("resolve: DNS error rcode={}", rcode);
         return -EPROTO;
     }
 
@@ -420,7 +420,7 @@ static int ParseDnsResponse(const uint8_t* pkt, int pktLen, uint16_t expectedId,
         pos += rdlen;
     }
 
-    spdlog::debug("resolve: no A record in {} answers", ancount);
+    SPDLOG_DEBUG("resolve: no A record in {} answers", ancount);
     return -ENOENT;
 }
 
@@ -444,7 +444,7 @@ static int DoResolve4(const char* hostname, struct in_addr* result, time::Interv
     if (it != s_hosts.entries.end())
     {
         *result = it->second;
-        spdlog::debug("resolve: {} found in /etc/hosts", hostname);
+        SPDLOG_DEBUG("resolve: {} found in /etc/hosts", hostname);
         return 0;
     }
 
@@ -484,7 +484,7 @@ static int DoResolve4(const char* hostname, struct in_addr* result, time::Interv
             int ret = Connect(desc, (struct sockaddr*)&ns, sizeof(ns));
             if (ret < 0)
             {
-                spdlog::debug("resolve: connect to nameserver failed ret={}", ret);
+                SPDLOG_DEBUG("resolve: connect to nameserver failed ret={}", ret);
                 desc.Close();
                 continue;
             }
@@ -492,7 +492,7 @@ static int DoResolve4(const char* hostname, struct in_addr* result, time::Interv
             ret = Send(desc, query, queryLen);
             if (ret < 0)
             {
-                spdlog::debug("resolve: send failed ret={}", ret);
+                SPDLOG_DEBUG("resolve: send failed ret={}", ret);
                 desc.Close();
                 continue;
             }
@@ -503,13 +503,13 @@ static int DoResolve4(const char* hostname, struct in_addr* result, time::Interv
 
             if (ret == -ETIMEDOUT)
             {
-                spdlog::debug("resolve: timeout from nameserver, attempt {}", attempt + 1);
+                SPDLOG_DEBUG("resolve: timeout from nameserver, attempt {}", attempt + 1);
                 continue;
             }
 
             if (ret < 0)
             {
-                spdlog::debug("resolve: recv failed ret={}", ret);
+                SPDLOG_DEBUG("resolve: recv failed ret={}", ret);
                 continue;
             }
 
@@ -518,7 +518,7 @@ static int DoResolve4(const char* hostname, struct in_addr* result, time::Interv
             {
                 char ipStr[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, result, ipStr, sizeof(ipStr));
-                spdlog::debug("resolve: {} -> {}", hostname, ipStr);
+                SPDLOG_DEBUG("resolve: {} -> {}", hostname, ipStr);
                 return 0;
             }
 
@@ -529,7 +529,7 @@ static int DoResolve4(const char* hostname, struct in_addr* result, time::Interv
                 return parseRet;
             }
 
-            spdlog::debug("resolve: parse error ret={}, retrying", parseRet);
+            SPDLOG_DEBUG("resolve: parse error ret={}, retrying", parseRet);
         }
     }
 

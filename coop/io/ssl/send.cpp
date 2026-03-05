@@ -25,20 +25,20 @@ namespace ssl
 //
 static int SendKtls(Connection& conn, const void* buf, size_t size)
 {
-    spdlog::trace("ssl ktls send fd={} size={}", conn.m_desc.m_fd, size);
+    SPDLOG_TRACE("ssl ktls send fd={} size={}", conn.m_desc.m_fd, size);
     for (;;)
     {
         ssize_t ret = ::write(conn.m_desc.m_fd, buf, size);
         if (ret > 0)
         {
-            spdlog::trace("ssl ktls send fd={} written={}", conn.m_desc.m_fd, ret);
+            SPDLOG_TRACE("ssl ktls send fd={} written={}", conn.m_desc.m_fd, ret);
             return (int)ret;
         }
         if (ret == 0) return 0;
 
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
-            spdlog::trace("ssl ktls send fd={} EAGAIN", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl ktls send fd={} EAGAIN", conn.m_desc.m_fd);
             int r = io::Poll(conn.m_desc, POLLOUT);
             if (r < 0) return -1;
             continue;
@@ -54,13 +54,13 @@ static int SendKtls(Connection& conn, const void* buf, size_t size)
 //
 static int SendSocketBio(Connection& conn, const void* buf, size_t size)
 {
-    spdlog::trace("ssl socket-bio send fd={} size={}", conn.m_desc.m_fd, size);
+    SPDLOG_TRACE("ssl socket-bio send fd={} size={}", conn.m_desc.m_fd, size);
     for (;;)
     {
         int ret = SSL_write(conn.m_ssl, buf, size);
         if (ret > 0)
         {
-            spdlog::trace("ssl socket-bio send fd={} written={}", conn.m_desc.m_fd, ret);
+            SPDLOG_TRACE("ssl socket-bio send fd={} written={}", conn.m_desc.m_fd, ret);
             return ret;
         }
 
@@ -69,7 +69,7 @@ static int SendSocketBio(Connection& conn, const void* buf, size_t size)
         {
         case SSL_ERROR_WANT_WRITE:
         {
-            spdlog::trace("ssl socket-bio send fd={} WANT_WRITE", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl socket-bio send fd={} WANT_WRITE", conn.m_desc.m_fd);
             int r = io::Poll(conn.m_desc, POLLOUT);
             if (r < 0) return -1;
             break;
@@ -79,7 +79,7 @@ static int SendSocketBio(Connection& conn, const void* buf, size_t size)
         {
             // Renegotiation
             //
-            spdlog::trace("ssl socket-bio send fd={} WANT_READ", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl socket-bio send fd={} WANT_READ", conn.m_desc.m_fd);
             int r = io::Poll(conn.m_desc, POLLIN);
             if (r < 0) return -1;
             break;
@@ -121,7 +121,7 @@ int Send(Connection& conn, const void* buf, size_t size)
 
     // Memory BIO: existing path
     //
-    spdlog::trace("ssl send fd={} size={}", conn.m_desc.m_fd, size);
+    SPDLOG_TRACE("ssl send fd={} size={}", conn.m_desc.m_fd, size);
     for (;;)
     {
         int ret = SSL_write(conn.m_ssl, buf, size);
@@ -129,7 +129,7 @@ int Send(Connection& conn, const void* buf, size_t size)
         {
             // Plaintext was encrypted. Push the ciphertext out.
             //
-            spdlog::trace("ssl send fd={} written={}", conn.m_desc.m_fd, ret);
+            SPDLOG_TRACE("ssl send fd={} written={}", conn.m_desc.m_fd, ret);
             if (conn.FlushWrite() < 0)
             {
                 return -1;
@@ -141,7 +141,7 @@ int Send(Connection& conn, const void* buf, size_t size)
         switch (err)
         {
         case SSL_ERROR_WANT_WRITE:
-            spdlog::trace("ssl send fd={} WANT_WRITE", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl send fd={} WANT_WRITE", conn.m_desc.m_fd);
             if (conn.FlushWrite() < 0)
             {
                 return -1;
@@ -151,7 +151,7 @@ int Send(Connection& conn, const void* buf, size_t size)
         case SSL_ERROR_WANT_READ:
             // Can happen during TLS renegotiation.
             //
-            spdlog::trace("ssl send fd={} WANT_READ", conn.m_desc.m_fd);
+            SPDLOG_TRACE("ssl send fd={} WANT_READ", conn.m_desc.m_fd);
             if (conn.FlushWrite() < 0)
             {
                 return -1;

@@ -16,7 +16,7 @@ namespace io
 
 int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
 {
-    spdlog::trace("splice in={} out={} len={}", in.m_fd, out.m_fd, len);
+    SPDLOG_TRACE("splice in={} out={} len={}", in.m_fd, out.m_fd, len);
 
     // Phase 1: move data from input socket into pipe
     //
@@ -30,7 +30,7 @@ int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
 
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
-            spdlog::trace("splice in={} EAGAIN", in.m_fd);
+            SPDLOG_TRACE("splice in={} EAGAIN", in.m_fd);
             int r = Poll(in, POLLIN);
             if (r < 0) return -1;
             continue;
@@ -55,7 +55,7 @@ int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
 
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
-            spdlog::trace("splice out={} EAGAIN", out.m_fd);
+            SPDLOG_TRACE("splice out={} EAGAIN", out.m_fd);
             int r = Poll(out, POLLOUT);
             if (r < 0) return -1;
             continue;
@@ -65,7 +65,7 @@ int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
         return -1;
     }
 
-    spdlog::trace("splice in={} out={} transferred={}", in.m_fd, out.m_fd, n);
+    SPDLOG_TRACE("splice in={} out={} transferred={}", in.m_fd, out.m_fd, n);
     return (int)n;
 }
 

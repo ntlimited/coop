@@ -26,7 +26,7 @@ COOP_IO_IMPLEMENTATIONS(Connect, io_uring_prep_connect, CONNECT_ARGS)
 
 int Connect(Descriptor& desc, const char* hostname, int port)
 {
-    spdlog::debug("connect fd={} host={} port={}", desc.m_fd, hostname, port);
+    SPDLOG_DEBUG("connect fd={} host={} port={}", desc.m_fd, hostname, port);
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -47,7 +47,7 @@ int Connect(Descriptor& desc, const char* hostname, int port)
     }
 
     int result = Connect(desc, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
-    spdlog::debug("connect fd={} host={} port={} result={}", desc.m_fd, hostname, port, result);
+    SPDLOG_DEBUG("connect fd={} host={} port={} result={}", desc.m_fd, hostname, port, result);
     return result;
 }
 

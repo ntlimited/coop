@@ -82,6 +82,42 @@ by the round-robin cycle time.
 `Init()` uses a progressive fallback chain: `DEFER_TASKRUN` -> `COOP_TASKRUN` -> `SINGLE_ISSUER`
 only -> bare init. Each step logs a warning.
 
+**SQPOLL** (`sqpoll`): `IORING_SETUP_SQPOLL` — a kernel thread polls the SQ ring for new
+entries, eliminating `io_uring_enter()` syscalls for submission. Incompatible with
+`coopTaskrun`/`deferTaskrun` — disable those when enabling SQPOLL. Requires `CAP_SYS_ADMIN`
+(or cgroup permissions) and a larger ring (1024+ entries) to avoid SQ overflow under
+concurrent load. `sqpollIdleMs` controls how long the kernel thread busy-polls before going
+idle (0 = kernel default ~1000ms). Under sustained load the idle timeout is irrelevant; tune
+for bursty workloads.
+
+**Benchmark finding**: SQPOLL yields 44-70% throughput improvement under concurrent load
+(345K req/s vs 203K baseline at 256 connections). The win scales with concurrency because the
+kernel thread amortizes submission cost across more in-flight operations. At low concurrency
+(10 connections) the improvement is ~32%. The default `COOP_TASKRUN` mode is flat at ~200K
+regardless of concurrency. See `bench_server.cpp --sqpoll` for testing.
+
+## IO Operation Macros (`detail/op_macros.h`)
+
+Two macro sets for generating the 4 standard operation variants:
+
+- `COOP_IO_IMPLEMENTATIONS(name, prep_fn, ARGS)` — standard path, blocking variants go
+  through io_uring unconditionally.
+- `COOP_IO_IMPLEMENTATIONS_FASTPATH(name, prep_fn, try_fn, ARGS)` — blocking variants try
+  a nonblocking direct syscall before constructing Handle/Coordinator/SQE machinery. On
+  success or hard error, returns immediately. On EAGAIN/EWOULDBLOCK, falls through to io_uring.
+
+**Fast path trade-off**: saves ~500ns per operation when data is immediately available (skips
+Handle construction, Coordinator TryAcquire, SQE allocation, Poll, Finalize). Costs a wasted
+syscall when data is not available (EAGAIN). Currently used by Recv and Send. Under sustained
+concurrent load, recv often EAGAINs (request hasn't arrived yet), adding a syscall per request
+for no benefit. The fast path primarily helps latency in the pre-staged data case (keep-alive
+connections, buffered sends).
+
+**Adding fast path to new operations**: write a static inline `Try*` wrapper that calls the
+direct syscall with appropriate nonblocking flags (e.g. `MSG_DONTWAIT` for socket ops), then
+use `COOP_IO_IMPLEMENTATIONS_FASTPATH`. The Try function signature must match
+`int try_fn(int fd, ...args...)` using standard syscall return conventions.
+
 ## Sendfile (`sendfile.h`)
 
 Sends file data directly to a socket via the `sendfile()` syscall — zero userspace copies. Uses

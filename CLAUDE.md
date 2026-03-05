@@ -164,10 +164,7 @@ for children to exit via `m_lastChild` coordinator, then `ContextSwitch(EXITED)`
 cooperator. See `coop/CLAUDE.md` for the full lifecycle and Launchable destruction details.
 
 ### IO (`coop/io/`)
-All IO goes through io_uring. See `coop/io/CLAUDE.md` for Handle lifecycle
-(submit/complete/wait/destruction), uring configuration, and zero-copy operation internals.
-
-Each operation has 4 variants:
+All IO goes through io_uring. Each operation has 4 variants:
 1. `bool Op(Handle&, ...)` — async
 2. `bool Op(Handle&, ..., time::Interval)` — async + timeout
 3. `int Op(Descriptor&, ...)` — blocking (creates Coordinator internally)
@@ -176,25 +173,14 @@ Each operation has 4 variants:
 Key operations: `Accept`, `Recv`, `Send`, `Read`, `ReadFile`, `Open`, `Close`, `Shutdown`,
 `Connect`, `Sendfile`, `Splice`
 
-`Accept` args default to `nullptr, nullptr, 0` (addr, addrLen, flags) so existing `Accept(desc)`
-call sites continue to work. Pass a `sockaddr*` and `socklen_t*` to retrieve peer addresses.
-
-Blocking variant pattern:
-```cpp
-int Recv(Descriptor& desc, void* buf, size_t size) {
-    Coordinator coord;
-    Handle handle(Self(), desc, &coord);
-    if (!Recv(handle, buf, size)) return -EAGAIN;
-    return handle.Wait();  // blocks via CoordinateWith until IO completes
-}
-```
+Blocking variants use `COOP_IO_IMPLEMENTATIONS` macros or `COOP_IO_IMPLEMENTATIONS_FASTPATH`
+(tries a nonblocking direct syscall before io_uring — used by Recv and Send). See
+`coop/io/CLAUDE.md` for Handle lifecycle, uring configuration (COOP_TASKRUN, SQPOLL),
+fast-path details, and zero-copy operation internals.
 
 **Connect** accepts either a dotted-quad IP or a hostname. Hostnames are resolved cooperatively
 via `Resolve4` (DNS over UDP through io_uring). `PlaintextStream` wraps a `Descriptor` for
 socket IO (`Recv`, `Send`, `SendAll`). `ReadFile(path, buf, bufSize)` reads an entire file.
-
-**Sendfile** / **Splice** provide zero-copy data transfer (file-to-socket and socket-to-socket
-respectively). See `coop/io/CLAUDE.md` for details.
 
 ### SSL/TLS (`coop/io/ssl/`)
 Two BIO modes: **Memory BIO** (default, staging buffer) and **Socket BIO** (real fd, enables

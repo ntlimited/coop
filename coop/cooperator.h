@@ -11,6 +11,7 @@
 #include "detail/fixed_list.h"
 #include "spawn_configuration.h"
 #include "stack_pool.h"
+#include "perf/counters.h"
 #include "io/uring.h"
 
 extern "C" void CoopContextEntry(coop::Context* ctx);
@@ -152,6 +153,8 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         return &m_uring;
     }
 
+    perf::Counters& GetPerfCounters() { return m_perf; }
+
     size_t ContextsCount() const
     {
         return m_contexts.Size();
@@ -199,6 +202,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     io::Uring       m_uring;
     StackPool       m_stackPool;
+    perf::Counters  m_perf;
 
     void*           m_sp{nullptr};
 

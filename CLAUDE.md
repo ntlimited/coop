@@ -187,6 +187,13 @@ Two BIO modes: **Memory BIO** (default, staging buffer) and **Socket BIO** (real
 kTLS). See `coop/io/ssl/CLAUDE.md` for BIO modes, kTLS activation, TCP_NODELAY rationale, and
 data path dispatch.
 
+### Performance Counters (`coop/perf/`)
+Three compile-time modes via `COOP_PERF_MODE`: 0=disabled (default, zero overhead), 1=always-on
+(direct increment, ~1ns), 2=dynamic (`asm goto` NOP/JMP binary patching, toggled at runtime).
+Per-cooperator counters (no atomics — single-threaded). Probes in scheduler, io_uring, and
+context lifecycle. See `coop/perf/CLAUDE.md` for the counter table, patching engine internals,
+and instructions for adding new probes.
+
 ### HTTP Server (`coop/http/`)
 Route table maps paths to handler functions that receive a `Connection&`:
 ```cpp

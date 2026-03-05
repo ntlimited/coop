@@ -7,6 +7,7 @@
 #include "cooperator.h"
 #include "detail/context_switch.h"
 #include "launchable.h"
+#include "perf/probe.h"
 
 namespace coop
 {
@@ -116,17 +117,20 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         }
         case SchedulerJumpResult::EXITED:
         {
+            COOP_PERF_INC(m_perf, perf::Counter::ContextExit);
             m_stackPool.Free(m_scheduled, m_scheduled->m_segment.Size());
             break;
         }
         case SchedulerJumpResult::YIELDED:
         {
+            COOP_PERF_INC(m_perf, perf::Counter::ContextYield);
             m_scheduled->m_state = SchedulerState::YIELDED;
             m_yielded.Push(m_scheduled);
             break;
         }
         case SchedulerJumpResult::BLOCKED:
         {
+            COOP_PERF_INC(m_perf, perf::Counter::ContextBlock);
             m_scheduled->m_state = SchedulerState::BLOCKED;
             m_blocked.Push(m_scheduled);
             break;
@@ -211,6 +215,7 @@ void Cooperator::Launch()
         int remainingIterations = 16;
         while (remainingIterations && !m_yielded.IsEmpty())
         {
+            COOP_PERF_INC(m_perf, perf::Counter::SchedulerLoop);
             remainingIterations--;
 
             // Pop off a context and resume it
@@ -249,6 +254,7 @@ void Cooperator::Resume(Context* ctx)
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
 
+    COOP_PERF_INC(m_perf, perf::Counter::ContextResume);
     auto ret = ContextSwitch(&m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
     HandleCooperatorResumption(static_cast<SchedulerJumpResult>(ret));
 }
@@ -420,6 +426,7 @@ namespace coop
 
 void Cooperator::EnterContext(Context* ctx)
 {
+    COOP_PERF_INC(m_perf, perf::Counter::ContextSpawn);
     auto now = rdtsc();
 
     Context* lastCtx = m_scheduled;

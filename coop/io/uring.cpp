@@ -5,6 +5,8 @@
 #include "handle.h"
 
 #include "coop/context.h"
+#include "coop/cooperator.h"
+#include "coop/perf/probe.h"
 
 // Compat defines for kernels/liburing that don't expose these yet. These are stable kernel ABI.
 //
@@ -155,6 +157,8 @@ int Uring::Poll()
     // bookkeeping (__io_uring_flush_sq + sq_ring_needs_enter) on the nothing-to-do path —
     // roughly 5-10ns per call, ~2-3% of the yield hot path.
     //
+    COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollCycle);
+
     // Two conditions require a submit:
     //   1. m_pendingSqes > 0: new SQEs from Handle::Submit/SubmitLinked/Cancel need flushing.
     //      io_uring_enter() also runs task_work as a side effect, so this covers both.
@@ -172,6 +176,7 @@ int Uring::Poll()
     //
     if (m_pendingSqes > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN))
     {
+        COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollSubmit);
         io_uring_submit(&m_ring);
         m_pendingSqes = 0;
     }
@@ -187,6 +192,7 @@ int Uring::Poll()
     while (io_uring_peek_cqe(&m_ring, &cqe) == 0)
     {
         SPDLOG_TRACE("uring cqe result={}", cqe->res);
+        COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollCqe);
         Handle::Callback(cqe);
         dispatched++;
     }

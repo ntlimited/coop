@@ -43,6 +43,11 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     target_compile_definitions(coop PRIVATE SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_WARN)
 endif()
 
+# Performance counter mode: 0=disabled (default), 1=always-on, 2=dynamic (NOP/JMP patching)
+#
+set(COOP_PERF_MODE "0" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")
+target_compile_definitions(coop PUBLIC COOP_PERF_MODE=${COOP_PERF_MODE})
+
 # External libraries
 find_library(URING_LIB uring REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
@@ -115,6 +120,7 @@ add_executable(coop_tests
     tests/test_io.cpp
     tests/test_stress.cpp
     tests/test_http.cpp
+    tests/test_perf.cpp
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 include(GoogleTest)

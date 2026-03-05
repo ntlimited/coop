@@ -100,6 +100,25 @@ Two ways to create contexts:
 Both accept optional `SpawnConfiguration` and `Context::Handle*`.
 Both are available as free functions (prefer these) or as `Cooperator` methods.
 
+### Submit (`coop/cooperator.h`)
+Cross-thread API for queuing work onto a cooperator from external threads. Uses eventfd for
+wake notification and an intrusive linked list (unbounded, no capacity limit).
+```cpp
+// Fire-and-forget with lambda (heap-allocated, freed after execution)
+cooperator.Submit([&](Context* ctx) { ... });
+cooperator.Submit(config, [&](Context* ctx) { ... });
+
+// Blocking: caller blocks until the spawned context completes
+cooperator.SubmitSync([&](Context* ctx) { ... });
+
+// Legacy function-pointer style (wraps to template Submit)
+cooperator.Submit(&MyFunc, argPtr);
+cooperator.Submit(&MyFunc, argPtr, config);
+```
+`Submit` returns false if the cooperator is shutting down. `SubmitSync` returns false without
+blocking on shutdown. Submissions are drained on every scheduler iteration (after each Poll
+and resume batch), giving tighter pickup guarantees than the previous semaphore-based system.
+
 ### Launchable (`coop/launchable.h`)
 OOP alternative to lambda spawning. Subclass, implement `virtual void Launch() final`. Instance is
 placement-new'd onto the context's stack segment.

@@ -1,6 +1,9 @@
 #include <mutex>
 #include <new>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <thread>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,13 +28,18 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 , m_shutdown(false)
 , m_uring(config.uring)
 , m_scheduled(nullptr)
-, m_submissionSemaphore(0)
-, m_submissionAvailabilitySemaphore(8)
+, m_submitFd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
 {
+    assert(m_submitFd >= 0);
 }
 
 Cooperator::~Cooperator()
 {
+    if (m_submitFd >= 0)
+    {
+        close(m_submitFd);
+    }
+
     std::lock_guard<std::mutex> lock(s_registryMutex);
     if (!Disconnected())
     {
@@ -42,15 +50,7 @@ Cooperator::~Cooperator()
 void Cooperator::Shutdown()
 {
     m_shutdown.store(true, std::memory_order_relaxed);
-
-    // Wake the cooperator if it is blocked waiting for submissions
-    //
-    m_submissionSemaphore.release();
-
-    // Wake anyone blocked in Submit. The released caller will see m_shutdown and chain-release
-    // so that all blocked callers eventually drain out.
-    //
-    m_submissionAvailabilitySemaphore.release();
+    WakeCooperator();
 }
 
 void Cooperator::ShutdownAll()
@@ -76,26 +76,106 @@ void Cooperator::ResetGlobalShutdown()
     s_registryShutdown.store(false, std::memory_order_relaxed);
 }
 
-bool Cooperator::Submit(Submission func, void* arg, SpawnConfiguration const& config /* = s_defaultConfiguration */)
+bool Cooperator::Submit(
+    void(*func)(Context*, void*),
+    void* arg,
+    SpawnConfiguration const& config /* = s_defaultConfiguration */)
 {
-    m_submissionAvailabilitySemaphore.acquire();
+    return Submit([func, arg](Context* ctx) { func(ctx, arg); }, config);
+}
 
-    if (m_shutdown.load(std::memory_order_relaxed))
+void Cooperator::PushSubmission(SubmissionEntry* entry)
+{
+    std::lock_guard<std::mutex> lock(m_submissionLock);
+    entry->m_next = nullptr;
+    if (m_submissionTail)
     {
-        // Chain-release so the next blocked caller also wakes up and drains out
-        //
-        m_submissionAvailabilitySemaphore.release();
-        return false;
+        m_submissionTail->m_next = entry;
+    }
+    else
+    {
+        m_submissionHead = entry;
+    }
+    m_submissionTail = entry;
+    m_hasSubmissions.store(true, std::memory_order_release);
+}
+
+void Cooperator::WakeCooperator()
+{
+    uint64_t val = 1;
+    [[maybe_unused]] auto ret = write(m_submitFd, &val, sizeof(val));
+}
+
+void Cooperator::DrainSubmissions()
+{
+    if (!m_hasSubmissions.load(std::memory_order_acquire))
+    {
+        return;
     }
 
-    m_submissionLock.lock();
-    auto ret =  m_submissions.Push(ExecutionSubmission{func, arg, config});
-    m_submissionLock.unlock();
-    if (ret)
+    SubmissionEntry* head;
     {
-        m_submissionSemaphore.release();
+        std::lock_guard<std::mutex> lock(m_submissionLock);
+        head = m_submissionHead;
+        m_submissionHead = nullptr;
+        m_submissionTail = nullptr;
+        m_hasSubmissions.store(false, std::memory_order_relaxed);
     }
-    return ret;
+
+    while (head)
+    {
+        auto* entry = head;
+        head = head->m_next;
+        SpawnFromSubmission(entry);
+    }
+}
+
+void Cooperator::WaitForSubmission()
+{
+    // Drain the eventfd counter (non-blocking) before blocking, to avoid stale wakes
+    //
+    uint64_t val;
+    while (read(m_submitFd, &val, sizeof(val)) > 0) {}
+
+    // Block until the eventfd is readable (a Submit writes to it) or a signal interrupts
+    //
+    struct pollfd pfd;
+    pfd.fd = m_submitFd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    while (poll(&pfd, 1, -1) < 0 && errno == EINTR) {}
+}
+
+void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
+{
+    auto* completion = entry->m_completion;
+    Spawn(entry->m_config, [entry, completion](Context* ctx)
+    {
+        entry->m_invoke(entry, ctx);
+        entry->m_destroy(entry);
+        if (completion)
+        {
+            completion->release();
+        }
+    });
+}
+
+void Cooperator::DrainRemainingSubmissions()
+{
+    std::lock_guard<std::mutex> lock(m_submissionLock);
+    auto* head = m_submissionHead;
+    m_submissionHead = nullptr;
+    m_submissionTail = nullptr;
+    while (head)
+    {
+        auto* entry = head;
+        head = head->m_next;
+        if (entry->m_completion)
+        {
+            entry->m_completion->release();
+        }
+        entry->m_destroy(entry);
+    }
 }
 
 void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
@@ -189,6 +269,7 @@ void Cooperator::Launch()
         if (m_shutdown.load(std::memory_order_relaxed) && !shutdownKillDone)
         {
             shutdownKillDone = true;
+            DrainSubmissions();
             Spawn([this](Context* killCtx)
             {
                 m_contexts.Visit([&](Context* c) -> bool
@@ -208,29 +289,33 @@ void Cooperator::Launch()
             // move them from blocked to yielded.
             //
             m_uring.Poll();
+            DrainSubmissions();
+
             if (!m_yielded.IsEmpty())
             {
                 continue;
             }
 
-            // If there are blocked contexts, they may be waiting on IO that hasn't completed
-            // yet. Keep spinning on uring completions (same behavior as the old dedicated uring
-            // context). Only block on submissions when there's truly nothing in flight.
+            // If there are blocked contexts or pending IO, they may be waiting on completions.
+            // Keep spinning on uring completions. Only block on submissions when there's truly
+            // nothing in flight and we're not shutting down.
             //
-            if (!m_blocked.IsEmpty())
+            if (!m_blocked.IsEmpty() || m_uring.PendingOps() > 0)
             {
-                SpawnSubmitted(false);
                 continue;
             }
-            SpawnSubmitted(true /* wait */);
+
+            if (m_shutdown.load(std::memory_order_relaxed))
+            {
+                continue;
+            }
+
+            WaitForSubmission();
+            DrainSubmissions();
             continue;
         }
-        else
-        {
-            // Spawn all submitted tasks
-            //
-            while (SpawnSubmitted(false));
-        }
+
+        DrainSubmissions();
 
         int remainingIterations = 16;
         while (remainingIterations && !m_yielded.IsEmpty())
@@ -245,12 +330,16 @@ void Cooperator::Launch()
             Resume(ctx);
             m_uring.Poll();
 
-            if (!m_submissions.IsEmpty())
+            if (m_hasSubmissions.load(std::memory_order_relaxed))
             {
                 break;
             }
         }
     }
+
+    // Signal any SubmitSync callers that arrived after the loop exited
+    //
+    DrainRemainingSubmissions();
 
     {
         std::lock_guard<std::mutex> lock(s_registryMutex);
@@ -338,42 +427,6 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
 
     auto ret = ContextSwitch(&prev->m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
-}
-
-bool Cooperator::SpawnSubmitted(bool wait /* = false */)
-{
-    if (wait)
-    {
-        m_submissionSemaphore.acquire();
-    }
-    else
-    {
-        if (!m_submissionSemaphore.try_acquire())
-        {
-            return false;
-        }
-    }
-
-    m_submissionLock.lock();
-
-    ExecutionSubmission submitted;
-    if (!m_submissions.Pop(submitted))
-    {
-        // Woken by Shutdown() releasing the semaphore, not by an actual submission
-        //
-        m_submissionLock.unlock();
-        return false;
-    }
-
-    m_submissionLock.unlock();
-    m_submissionAvailabilitySemaphore.release();
-
-    Spawn(submitted.config, [&](Context* ctx)
-    {
-        submitted.func(ctx, submitted.arg);
-    });
-
-    return true;
 }
 
 void Cooperator::SanityCheck()
@@ -488,27 +541,6 @@ void Cooperator::EnterContext(Context* ctx)
     }
 }
 
-namespace
-{
-
-struct BoundaryCrossingKillArgs
-{
-    Context::Handle* handle;
-    std::mutex mutex;
-};
-
-void BoundaryCrossingKill(Context* taskCtx, void* args)
-{
-    // We cannot just do taskCtx->Kill(...) because we need to validate the handle/context. We could
-    // refactor that logic here, technically, but it's got some nice clarity in its current form, imo.
-    //
-    auto* bc = reinterpret_cast<BoundaryCrossingKillArgs*>(args);
-    taskCtx->GetCooperator()->BoundarySafeKill(bc->handle, true /* crossed */);
-    bc->mutex.unlock();
-}
-
-} // end anonymous namespace
-
 // BoundarySafeKill is invoked by Handles, which can be called within the cooperator's thread or
 // from outside of it (boundary crossing).
 //
@@ -518,24 +550,18 @@ void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /*
     {
         assert(!crossed);
 
-        // This is the "boundary crossing" part
+        // Cross the thread boundary: submit work onto the cooperator and block until it
+        // completes. SubmitSync guarantees the kill logic runs before we return.
         //
-        BoundaryCrossingKillArgs args;
-        args.mutex.lock();
-        args.handle = handle;
-
-        if (!Submit(&BoundaryCrossingKill, &args))
+        if (!SubmitSync([handle](Context* ctx)
+        {
+            ctx->GetCooperator()->BoundarySafeKill(handle, true /* crossed */);
+        }))
         {
             // Cooperator is shutting down; the kill will be handled by the shutdown sweep
             //
             return;
         }
-
-        // This gets unlocked in the submitted func; technically we don't need to do this but
-        // it preserves the same contract as when we kill from inside the boundary and don't
-        // return until the acutal kill logic has gotten to run for the targetted context
-        //
-        args.mutex.lock();
         return;
     }
 

@@ -45,18 +45,24 @@ and `BLOCKED` (waiting for a coordinator release, e.g. IO completion or lock acq
 The cooperator loop in `Cooperator::Launch()`:
 ```
 while (has yielded contexts OR not shutdown OR shutdown kill not done):
-    1. If shutdown requested and kill not done: spawn kill context (kills all others)
+    1. If shutdown requested and kill not done: drain submissions, spawn kill context
     2. If yielded list empty:
-       a. Poll io_uring (may move blocked -> yielded)
-       b. If still empty and blocked exist: try SpawnSubmitted(false), continue
-       c. If nothing at all: SpawnSubmitted(true) blocks waiting for external Submit()
-    3. Pop up to 16 yielded contexts, Resume each one:
+       a. Poll io_uring + drain submissions (may move blocked -> yielded)
+       b. If blocked/pending IO exist: keep spinning
+       c. If truly idle and not shutdown: WaitForSubmission() blocks on eventfd
+    3. Drain submissions, then pop up to 16 yielded contexts, Resume each one:
        - After each Resume returns (context yielded/blocked/exited): poll io_uring
-       - This interleaved polling is critical -- CQE processing between context
+       - Break early if m_hasSubmissions is set (atomic flag, no syscall)
+       - Interleaved polling is critical -- CQE processing between context
          resumes is what unblocks Handle::Flash barriers during destruction
 ```
 
-**Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and wakes the submission semaphore.
+**Submission system**: eventfd-based. External threads push `SubmissionEntry` nodes to an
+intrusive FIFO (mutex-protected), then `write()` to the eventfd. The cooperator checks
+`m_hasSubmissions` (atomic flag, zero cost on miss) and drains the list by spawning contexts.
+`WaitForSubmission()` uses `poll()` on the eventfd when the cooperator is truly idle.
+
+**Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and writes to the eventfd.
 The loop spawns a temporary kill context that visits all live contexts and fires their kill
 signals (`schedule=false` -> moved to yielded, not immediately switched to). Handlers that
 loop (accept loops, read loops) check `IsKilled()` and break. Handlers that want kill-aware

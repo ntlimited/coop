@@ -131,59 +131,34 @@ TEST(ShutdownTest, SubmitDrainsDuringShutdown)
 {
     coop::Cooperator cooperator;
 
-    auto noop = [](coop::Context*, void*) {};
-
-    // The availability semaphore starts at 8, but the FixedList<8> ring buffer uses one slot
-    // as sentinel so the actual queue capacity is 7. Fill 7 slots so the next Submit blocks
-    // on the queue being full.
+    // Submit is now unbounded (no capacity limit). Verify that submissions queued before
+    // Launch() are processed, and that Submit returns false after shutdown.
     //
-    for (int i = 0; i < 7; i++)
-    {
-        EXPECT_TRUE(cooperator.Submit(noop, nullptr));
-    }
+    std::atomic<int> executed{0};
+    constexpr int PRE_SUBMIT_COUNT = 10;
 
-    // Now launch threads that will block in Submit because the availability semaphore is
-    // exhausted (no cooperator thread is consuming submissions).
-    //
-    constexpr int BLOCKED_SUBMITTERS = 4;
-    std::atomic<int> entered{0};
-    std::atomic<int> rejected{0};
-    std::vector<std::thread> blockedThreads;
-
-    for (int i = 0; i < BLOCKED_SUBMITTERS; i++)
+    for (int i = 0; i < PRE_SUBMIT_COUNT; i++)
     {
-        blockedThreads.emplace_back([&]()
+        EXPECT_TRUE(cooperator.Submit([&executed](coop::Context*)
         {
-            entered.fetch_add(1, std::memory_order_relaxed);
-            bool ok = cooperator.Submit(noop, nullptr);
-            if (!ok)
-            {
-                rejected.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
+            executed.fetch_add(1, std::memory_order_relaxed);
+        }));
     }
 
-    // Wait for the submitter threads to enter Submit
+    // Launch + immediate shutdown from inside
     //
-    while (entered.load(std::memory_order_relaxed) < BLOCKED_SUBMITTERS)
+    cooperator.Submit([](coop::Context* ctx)
     {
-        std::this_thread::yield();
-    }
+        ctx->GetCooperator()->Shutdown();
+    });
 
-    // Small delay to let them actually block on the semaphore
+    cooperator.Launch();
+
+    EXPECT_EQ(executed.load(std::memory_order_relaxed), PRE_SUBMIT_COUNT);
+
+    // Submit after shutdown should return false
     //
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-    // Shutdown triggers chain-release on the availability semaphore, waking all blocked threads
-    //
-    cooperator.Shutdown();
-
-    for (auto& th : blockedThreads)
-    {
-        th.join();
-    }
-
-    EXPECT_EQ(rejected.load(std::memory_order_relaxed), BLOCKED_SUBMITTERS);
+    EXPECT_FALSE(cooperator.Submit([](coop::Context*, void*) {}, nullptr));
 }
 
 // Create 3 cooperators on separate threads, call ShutdownAll(), verify all exit cleanly.

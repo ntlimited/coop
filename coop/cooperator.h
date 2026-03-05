@@ -8,7 +8,6 @@
 #include "detail/embedded_list.h"
 #include "context.h"
 #include "cooperator_configuration.h"
-#include "detail/fixed_list.h"
 #include "spawn_configuration.h"
 #include "stack_pool.h"
 #include "perf/counters.h"
@@ -98,24 +97,25 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         return Launch<T>(s_defaultConfiguration, h, std::forward<Args&&>(args)...);
     }
 
-    using Submission = void(*)(Context*, void*);
+    // Submit queues work from an external thread onto this cooperator. The cooperator wakes via
+    // eventfd and spawns a context to execute the lambda. Fire-and-forget — the lambda is
+    // heap-allocated and freed after execution. Returns false if the cooperator is shutting down.
+    //
+    template<typename Fn>
+    bool Submit(Fn&& fn, SpawnConfiguration const& config = s_defaultConfiguration);
 
-    // Submit is the out-of-context version of Spawn that uses pthread_create style arguments
-    // (doesn't get the sexy lambda syntax) because we need to pass control to the cooperator's
-    // thread and can't guarantee lifetimes.
+    // SubmitSync queues work and blocks the calling thread until the spawned context completes.
+    // The caller's lambda lifetime is guaranteed (caller is blocked). Returns false without
+    // blocking if the cooperator is shutting down.
     //
-    // This also (a) locks in a way that the cooperator will actually have to contend for in the
-    // worst case and (b) has funky guarantees around scheduling; submitted executions are
-    // periodically picked up by the cooperator while spawned executions have control immediately
-    // passed to them.
-    //
-    // In general, this is expected to be used rarely.
-    //
-    // TODO some kind of more coherent guarantees (like that submissions are picked up on the
-    // next context switch/yield)
+    template<typename Fn>
+    bool SubmitSync(Fn&& fn, SpawnConfiguration const& config = s_defaultConfiguration);
+
+    // Legacy Submit with pthread_create-style function pointer + void* arg. Wraps to the
+    // template Submit internally.
     //
     bool Submit(
-        Submission func,
+        void(*func)(Context*, void*),
         void* arg = nullptr,
         SpawnConfiguration const& config = s_defaultConfiguration);
 
@@ -130,8 +130,6 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     void Block(Context* ctx);
 
     void Unblock(Context* ctx, const bool schedule);
-
-    bool SpawnSubmitted(bool wait = false);
 
     void Shutdown();
 
@@ -183,6 +181,18 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     void PrintContextTree(Context* ctx = nullptr, int indent = 0) ;
 
+    // Type-erased submission entry for cross-thread work dispatch. Public because TypedSubmission
+    // (in cooperator.hpp) inherits from it.
+    //
+    struct SubmissionEntry
+    {
+        SubmissionEntry* m_next{nullptr};
+        void (*m_invoke)(SubmissionEntry*, Context*);
+        void (*m_destroy)(SubmissionEntry*);
+        SpawnConfiguration m_config;
+        std::binary_semaphore* m_completion{nullptr};
+    };
+
   private:
     // Shared logic for entering a newly created context. Handles saving the spawning context's
     // state, setting up the new stack via ContextInit, and switching to it. Used by both Spawn
@@ -206,17 +216,18 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     void*           m_sp{nullptr};
 
-    struct ExecutionSubmission
-    {
-        Submission          func;
-        void*               arg;
-        SpawnConfiguration  config;
-    };
+    void PushSubmission(SubmissionEntry* entry);
+    void WakeCooperator();
+    void DrainSubmissions();
+    void WaitForSubmission();
+    void SpawnFromSubmission(SubmissionEntry* entry);
+    void DrainRemainingSubmissions();
 
-    std::counting_semaphore<8>          m_submissionSemaphore;
-    std::counting_semaphore<8>          m_submissionAvailabilitySemaphore;
-    std::mutex                          m_submissionLock;
-    FixedList<ExecutionSubmission, 8>   m_submissions;
+    int                     m_submitFd;
+    std::mutex              m_submissionLock;
+    SubmissionEntry*        m_submissionHead{nullptr};
+    SubmissionEntry*        m_submissionTail{nullptr};
+    std::atomic<bool>       m_hasSubmissions{false};
 
     // TODO this is a super dirty thing where the context removes itself from the
     // contexts list when it destructs.

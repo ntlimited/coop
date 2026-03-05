@@ -54,7 +54,7 @@ parser state. `SkipBody()` must be called before `Reset()` to drain unconsumed b
 ## Performance Profile (perf observations)
 
 Under wrk load, the HTTP server is **overwhelmingly kernel-bound**. Top userspace symbols:
-- `Cooperator::SpawnSubmitted` ~2% (per-connection context spawning)
+- `Cooperator::DrainSubmissions` ~2% (per-connection context spawning)
 - `snprintf` ~0.5% (response header formatting)
 - `Uring::Poll` ~0.3%
 - `Connection::SkipHeaders` ~0.1%

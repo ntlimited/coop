@@ -153,6 +153,18 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     perf::Counters& GetPerfCounters() { return m_perf; }
 
+    const char* GetName() const { return m_name ? m_name : ""; }
+
+    // Visit all registered cooperators under the registry lock. The callback receives each
+    // cooperator pointer. Return false from the callback to stop iteration early.
+    //
+    template<typename Fn>
+    static void VisitRegistry(Fn const& fn)
+    {
+        std::lock_guard<std::mutex> lock(s_registryMutex);
+        s_registry.Visit(fn);
+    }
+
     size_t ContextsCount() const
     {
         return m_contexts.Size();
@@ -213,6 +225,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     io::Uring       m_uring;
     StackPool       m_stackPool;
     perf::Counters  m_perf;
+    const char*     m_name;
 
     void*           m_sp{nullptr};
 

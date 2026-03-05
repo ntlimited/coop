@@ -29,6 +29,7 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 , m_shutdown(false)
 , m_uring(config.uring)
 , m_scheduled(nullptr)
+, m_name(config.name)
 , m_submitFd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
 {
     assert(m_submitFd >= 0);

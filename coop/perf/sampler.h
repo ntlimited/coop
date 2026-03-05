@@ -7,6 +7,7 @@ namespace coop
 {
 
 struct Context;
+struct Cooperator;
 
 namespace perf
 {
@@ -28,9 +29,10 @@ namespace perf
 
 struct Sample
 {
-    uintptr_t pc;           // instruction pointer at sample time
-    Context*  context;      // currently-running context (null = cooperator code)
-    uint64_t  timestamp;    // rdtsc at sample time
+    uintptr_t    pc;           // instruction pointer at sample time
+    Context*     context;      // currently-running context (null = cooperator code)
+    Cooperator*  cooperator;   // cooperator thread that was sampled (null = no cooperator)
+    uint64_t     timestamp;    // rdtsc at sample time
 };
 
 // Start sampling at the given frequency (Hz). Common values: 99, 997 (primes avoid aliasing

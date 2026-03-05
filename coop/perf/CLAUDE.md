@@ -74,9 +74,10 @@ is coherent with the dcache (syncs on next taken branch).
 ## CPU Sampler (`sampler.h`, `sampler.cpp`)
 
 SIGPROF-based CPU profiler, independent of perf counters. Uses `ITIMER_PROF` to fire at a
-configurable Hz, captures RIP + current context from the signal handler into a lock-free ring
-buffer (8192 entries). Per-context `m_statistics.samples` is also incremented in the handler
-(safe: same thread).
+configurable Hz, captures RIP + current context + cooperator from the signal handler into a
+lock-free ring buffer (8192 entries). Per-context `m_statistics.samples` is also incremented
+in the handler (safe: same thread). Each `Sample` includes the `Cooperator*` that was active,
+enabling per-cooperator grouping in multi-cooperator processes.
 
 **API**: `StartSampling(hz)`, `StopSampling()`, `IsSampling()`, `SamplingHz()`,
 `ReadSamples(out, max)`, `ResetSamples()`, `TotalSamples()`, `SampleCapacity()`.

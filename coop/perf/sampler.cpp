@@ -50,7 +50,7 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
     }
 
     size_t idx = g_head.fetch_add(1, std::memory_order_relaxed) & RING_MASK;
-    g_ring[idx] = {pc, ctx, rdtsc()};
+    g_ring[idx] = {pc, ctx, co, rdtsc()};
     g_total.fetch_add(1, std::memory_order_relaxed);
 
     // Per-context sample count — safe because signal fires on the same thread as the context.

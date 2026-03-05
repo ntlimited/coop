@@ -95,3 +95,86 @@ TEST(PerfTest, DisabledMode)
 }
 
 #endif
+
+// ---- Multi-cooperator tests (mode-independent) ----
+
+TEST(PerfTest, CooperatorName)
+{
+    coop::CooperatorConfiguration config = {
+        .name = "test-cooperator",
+    };
+    coop::Cooperator cooperator(config);
+    EXPECT_STREQ(cooperator.GetName(), "test-cooperator");
+}
+
+TEST(PerfTest, CooperatorNameDefault)
+{
+    coop::Cooperator cooperator;
+    EXPECT_STREQ(cooperator.GetName(), "");
+}
+
+TEST(PerfTest, VisitRegistryMultipleCooperators)
+{
+    constexpr int N = 3;
+    const char* names[] = {"worker-0", "worker-1", "worker-2"};
+
+    coop::CooperatorConfiguration configs[N] = {
+        {.uring = coop::io::s_defaultUringConfiguration, .name = names[0]},
+        {.uring = coop::io::s_defaultUringConfiguration, .name = names[1]},
+        {.uring = coop::io::s_defaultUringConfiguration, .name = names[2]},
+    };
+    coop::Cooperator cooperators[N] = {
+        coop::Cooperator(configs[0]),
+        coop::Cooperator(configs[1]),
+        coop::Cooperator(configs[2]),
+    };
+
+    std::vector<std::unique_ptr<coop::Thread>> threads;
+    std::atomic<int> running{0};
+
+    for (int i = 0; i < N; i++)
+    {
+        threads.emplace_back(std::make_unique<coop::Thread>(&cooperators[i]));
+        cooperators[i].Submit([](coop::Context* ctx, void* arg)
+        {
+            auto* running = static_cast<std::atomic<int>*>(arg);
+            running->fetch_add(1, std::memory_order_relaxed);
+            while (!ctx->IsKilled())
+            {
+                ctx->Yield(true);
+            }
+        }, &running);
+    }
+
+    while (running.load(std::memory_order_relaxed) < N)
+    {
+        std::this_thread::yield();
+    }
+
+    // VisitRegistry should see all N cooperators
+    //
+    int count = 0;
+    bool foundNames[N] = {};
+    coop::Cooperator::VisitRegistry([&](coop::Cooperator* co) -> bool
+    {
+        for (int i = 0; i < N; i++)
+        {
+            if (co == &cooperators[i])
+            {
+                foundNames[i] = true;
+            }
+        }
+        count++;
+        return true;
+    });
+
+    EXPECT_GE(count, N);
+    for (int i = 0; i < N; i++)
+    {
+        EXPECT_TRUE(foundNames[i]) << "cooperator " << names[i] << " not found in registry";
+    }
+
+    coop::Cooperator::ShutdownAll();
+    threads.clear();
+    coop::Cooperator::ResetGlobalShutdown();
+}

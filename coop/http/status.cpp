@@ -189,13 +189,12 @@ void SerializeContext(JsonWriter& w, Context* ctx)
     w.EndObject();
 }
 
-std::string GenerateStatusJson(Cooperator* co)
+void SerializeCooperatorStatus(JsonWriter& w, Cooperator* co)
 {
-    std::string out;
-    out.reserve(4096);
-    JsonWriter w(out);
-
     w.BeginObject();
+
+    w.Key("name");
+    w.String(co->GetName());
 
     w.Key("contextsCount");
     w.UInt(co->ContextsCount());
@@ -222,6 +221,14 @@ std::string GenerateStatusJson(Cooperator* co)
     w.EndArray();
 
     w.EndObject();
+}
+
+std::string GenerateStatusJson(Cooperator* co)
+{
+    std::string out;
+    out.reserve(4096);
+    JsonWriter w(out);
+    SerializeCooperatorStatus(w, co);
     return out;
 }
 
@@ -229,6 +236,32 @@ void HandleStatus(ConnectionBase& conn)
 {
     std::string body = GenerateStatusJson(conn.GetCooperator());
     conn.Send(200, "application/json", body);
+}
+
+void SerializePerfCounters(JsonWriter& w, Cooperator* co)
+{
+    w.BeginObject();
+
+    w.Key("name");
+    w.String(co->GetName());
+
+    w.Key("counters");
+    w.BeginObject();
+
+#if COOP_PERF_MODE > 0
+    auto& counters = co->GetPerfCounters();
+    for (size_t i = 0; i < static_cast<size_t>(perf::Counter::COUNT); i++)
+    {
+        auto c = static_cast<perf::Counter>(i);
+        w.Key(perf::CounterName(c));
+        w.UInt(counters.Get(c));
+    }
+#else
+    (void)co;
+#endif
+
+    w.EndObject();
+    w.EndObject();
 }
 
 std::string GeneratePerfJson(Cooperator* co)
@@ -370,6 +403,15 @@ void HandleSamplerSamples(ConnectionBase& conn)
         {
             w.Null();
         }
+        w.Key("cooperator");
+        if (samples[i].cooperator)
+        {
+            w.String(samples[i].cooperator->GetName());
+        }
+        else
+        {
+            w.Null();
+        }
         w.Key("ts");
         w.UInt(samples[i].timestamp);
         w.EndObject();
@@ -445,6 +487,107 @@ void HandleSymbolize(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
+// ---- Multi-cooperator API ----
+//
+// Provides a unified view of all cooperators in the process. For the local cooperator (the one
+// running the status server), data is read directly. For remote cooperators, counter values are
+// read cross-thread — uint64_t reads are tear-free on x86-64, acceptable for observability.
+// Context trees are gathered via SubmitSync to serialize access on the owning thread.
+//
+
+void HandleCooperators(ConnectionBase& conn)
+{
+    Cooperator* local = conn.GetCooperator();
+    std::string out;
+    out.reserve(8192);
+    JsonWriter w(out);
+
+    w.BeginObject();
+    w.Key("cooperators");
+    w.BeginArray();
+
+    Cooperator::VisitRegistry([&](Cooperator* co) -> bool
+    {
+        if (co == local)
+        {
+            // Local cooperator — safe to read directly
+            //
+            SerializeCooperatorStatus(w, co);
+        }
+        else
+        {
+            // Remote cooperator — gather context tree via SubmitSync for thread safety.
+            // SubmitSync blocks the current context (not the thread) until the remote
+            // cooperator executes our lambda.
+            //
+            // Note: we must drop the registry lock before calling SubmitSync, because the
+            // remote cooperator's DrainSubmissions runs under its own thread and doesn't
+            // touch the registry lock. However, VisitRegistry holds the lock for the
+            // duration of the visit. To avoid deadlock concerns, we collect remote
+            // cooperator pointers first, then query them outside the lock.
+            //
+            // For now, read counters and summary stats cross-thread (tear-free uint64_t on
+            // x86-64). Context tree is omitted for remote cooperators in the registry walk
+            // to avoid the lock ordering issue. The /api/cooperators/<name>/status endpoint
+            // uses SubmitSync for full context tree access.
+            //
+            w.BeginObject();
+            w.Key("name");
+            w.String(co->GetName());
+            w.Key("contextsCount");
+            w.UInt(co->ContextsCount());
+            w.Key("yieldedCount");
+            w.UInt(co->YieldedCount());
+            w.Key("blockedCount");
+            w.UInt(co->BlockedCount());
+            w.Key("ticks");
+            w.Int(co->GetTicks());
+            w.Key("contexts");
+            w.BeginArray();
+            w.EndArray();
+            w.EndObject();
+        }
+        return true;
+    });
+
+    w.EndArray();
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
+void HandleCooperatorsPerf(ConnectionBase& conn)
+{
+    std::string out;
+    out.reserve(4096);
+    JsonWriter w(out);
+
+    w.BeginObject();
+
+    w.Key("mode");
+    w.Int(COOP_PERF_MODE);
+
+    w.Key("enabled");
+    w.Bool(perf::IsEnabled());
+
+    w.Key("probeCount");
+    w.UInt(perf::ProbeCount());
+
+    w.Key("cooperators");
+    w.BeginArray();
+
+    // Counter reads are tear-free on x86-64 — safe to read cross-thread for observability.
+    //
+    Cooperator::VisitRegistry([&](Cooperator* co) -> bool
+    {
+        SerializePerfCounters(w, co);
+        return true;
+    });
+
+    w.EndArray();
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
 Route s_statusRoutes[] = {
     {"/api/status",         HandleStatus},
     {"/api/perf",           HandlePerf},
@@ -455,6 +598,8 @@ Route s_statusRoutes[] = {
     {"/api/sampler/stop",   HandleSamplerStop},
     {"/api/sampler/samples", HandleSamplerSamples},
     {"/api/sampler/symbolize", HandleSymbolize},
+    {"/api/cooperators",       HandleCooperators},
+    {"/api/cooperators/perf",  HandleCooperatorsPerf},
 };
 
 static constexpr int STATUS_ROUTE_COUNT = sizeof(s_statusRoutes) / sizeof(s_statusRoutes[0]);

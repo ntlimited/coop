@@ -216,6 +216,13 @@ Per-cooperator counters (no atomics — single-threaded). Probes in scheduler, i
 context lifecycle. See `coop/perf/CLAUDE.md` for the counter table, patching engine internals,
 and instructions for adding new probes.
 
+**Multi-cooperator observability**: Cooperators can be named via `CooperatorConfiguration::name`.
+A global registry (`Cooperator::VisitRegistry`) enumerates all live cooperators. The status
+server exposes `/api/cooperators` (all cooperators' summary + context trees for the local one,
+summary-only for remote ones) and `/api/cooperators/perf` (per-cooperator counter breakdown).
+Counter reads are tear-free on x86-64 and safe to read cross-thread for observability.
+CPU sampler samples include the `Cooperator*` that was active at sample time.
+
 ### Bump Allocator (`coop/alloc.h`)
 Contexts have a bump heap that grows upward from just past the Launchable/lambda at the
 segment's bottom. `ctx->Allocate<T>(extra, args...)` bump-allocates `sizeof(T) + extra` bytes,
@@ -290,7 +297,8 @@ before `Reset()` to keep the parser positioned correctly.
 Optional `searchPaths` for static file fallback, optional `timeout` (default 30s).
 
 `SpawnStatusServer(co, port, staticPath)` provides a JSON API at `/api/status` and serves the
-dashboard from static files.
+dashboard from static files. Multi-cooperator endpoints: `/api/cooperators` (all cooperators),
+`/api/cooperators/perf` (per-cooperator counters).
 
 ## Design Review
 

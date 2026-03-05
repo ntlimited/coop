@@ -158,6 +158,9 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         size_t ticks;
         size_t yields;
         size_t blocks;
+        size_t ioSubmits;
+        size_t ioCompletes;
+        size_t samples;
     } m_statistics;
     int64_t m_lastRdtsc;
 

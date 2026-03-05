@@ -2,12 +2,15 @@
 #include <new>
 #include <thread>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cooperator.h"
 #include "detail/context_switch.h"
 #include "launchable.h"
+#include "perf/patch.h"
 #include "perf/probe.h"
+#include "perf/sampler.h"
 
 namespace coop
 {
@@ -155,6 +158,23 @@ void Cooperator::Launch()
     m_lastRdtsc = rdtsc();
 
     m_uring.Init();
+
+    // Check COOP_PERF=1 env var to enable dynamic perf probes at startup (mode 2 only).
+    // Static local ensures this runs once even with multiple cooperators.
+    //
+    static bool envChecked = []{
+        const char* perfEnv = getenv("COOP_PERF");
+        if (perfEnv && perfEnv[0] == '1') perf::Enable();
+
+        const char* sampleEnv = getenv("COOP_SAMPLE");
+        if (sampleEnv)
+        {
+            int hz = atoi(sampleEnv);
+            if (hz > 0) perf::StartSampling(hz);
+        }
+        return true;
+    }();
+    (void)envChecked;
 
     bool shutdownKillDone = false;
 
@@ -586,14 +606,16 @@ void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 
         }
         const char* status = ctx->m_state == coop::SchedulerState::RUNNING ? "Running" :
             ctx->m_state == SchedulerState::YIELDED ? "Yielded" : "Blocked";
-        printf("%s (%p) [%s%s] {yields=%lu, blocks=%lu,ticks=%lu}\n",
+        printf("%s (%p) [%s%s] {yields=%lu, blocks=%lu, ticks=%lu, io=%lu/%lu}\n",
             ctx->GetName(),
             ctx,
             status,
             ctx->IsKilled() ? "!" : "",
             ctx->m_statistics.yields,
             ctx->m_statistics.blocks,
-            ctx->m_statistics.ticks);
+            ctx->m_statistics.ticks,
+            ctx->m_statistics.ioSubmits,
+            ctx->m_statistics.ioCompletes);
         ctx->m_children.Visit([&](coop::Context* child) -> bool
         {
             PrintContextTree(child, indent + 1);

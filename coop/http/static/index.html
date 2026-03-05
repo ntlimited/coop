@@ -118,6 +118,40 @@ canvas { display: block; width: 100%; }
 }
 .chart-group-btn.active { border-color: #7fdbca; color: #7fdbca; background: #7fdbca15; }
 .chart-group-btn:hover { color: #c3cee3; }
+
+/* Flame graph */
+.flame-container {
+    position: relative; background: #16213e; border-radius: 6px; padding: 12px;
+}
+.flame-toolbar {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+}
+.flame-metric-btn {
+    padding: 4px 12px; border: 1px solid #ffffff20; background: transparent;
+    color: #888; font-family: inherit; font-size: 11px; cursor: pointer;
+    border-radius: 3px; text-transform: uppercase;
+}
+.flame-metric-btn.active { border-color: #7fdbca; color: #7fdbca; background: #7fdbca15; }
+.flame-metric-btn:hover { color: #c3cee3; }
+.flame-breadcrumb {
+    display: flex; align-items: center; gap: 4px;
+    margin-left: 16px; font-size: 11px; color: #888;
+}
+.flame-crumb {
+    cursor: pointer; color: #7fdbca; text-decoration: underline;
+}
+.flame-crumb:hover { color: #c3cee3; }
+.flame-crumb-sep { color: #555; }
+.flame-canvas { display: block; width: 100%; cursor: pointer; }
+.flame-tooltip {
+    display: none; position: absolute; background: #0f3460ee; color: #e0e0e0;
+    padding: 8px 12px; border-radius: 4px; font-size: 12px; pointer-events: none;
+    white-space: nowrap; z-index: 10; border: 1px solid #7fdbca44;
+}
+.flame-tooltip .ft-name { color: #c3cee3; font-weight: bold; }
+.flame-tooltip .ft-state { font-size: 11px; margin-left: 6px; }
+.flame-tooltip .ft-detail { color: #888; margin-top: 2px; }
+.flame-empty { color: #555; padding: 40px; text-align: center; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -125,6 +159,7 @@ canvas { display: block; width: 100%; }
 
 <div class="tabs">
     <button class="tab active" onclick="switchTab('status')">Status</button>
+    <button class="tab" onclick="switchTab('flame')">Flame</button>
     <button class="tab" onclick="switchTab('perf')">Perf</button>
 </div>
 
@@ -142,6 +177,23 @@ canvas { display: block; width: 100%; }
     <div class="legend" id="legend"></div>
 </div>
 <div id="tree"></div>
+</div>
+
+<!-- FLAME TAB -->
+<div id="tab-flame" class="tab-content">
+<div class="flame-container">
+    <div class="flame-toolbar">
+        <button class="flame-metric-btn active" data-metric="deltaTicks" onclick="setFlameMetric(this)">Ticks</button>
+        <button class="flame-metric-btn" data-metric="deltaYields" onclick="setFlameMetric(this)">Yields</button>
+        <button class="flame-metric-btn" data-metric="deltaBlocks" onclick="setFlameMetric(this)">Blocks</button>
+        <button class="flame-metric-btn" data-metric="deltaIoSubmits" onclick="setFlameMetric(this)">IO Sub</button>
+        <button class="flame-metric-btn" data-metric="deltaIoCompletes" onclick="setFlameMetric(this)">IO Cmp</button>
+        <div class="flame-breadcrumb" id="flame-breadcrumb"></div>
+    </div>
+    <canvas class="flame-canvas" id="flame-canvas" height="400"></canvas>
+    <div class="flame-tooltip" id="flame-tooltip"></div>
+    <div class="flame-empty" id="flame-empty">Waiting for data...</div>
+</div>
 </div>
 
 <!-- PERF TAB -->
@@ -353,6 +405,7 @@ function renderCtx(c, root) {
     s.textContent = 'ticks=' + c.statistics.ticks +
         ' yields=' + c.statistics.yields +
         ' blocks=' + c.statistics.blocks +
+        ' io=' + (c.statistics.ioSubmits || 0) + '/' + (c.statistics.ioCompletes || 0) +
         ' priority=' + c.priority;
     d.appendChild(s);
     if (c.children) {
@@ -546,6 +599,346 @@ function togglePerf() {
     });
 }
 
+// ---- Flame graph ----
+var flamePrevSnapshot = null;  // {name -> {ticks, yields, blocks}}
+var flameDeltaRoots = null;    // enriched tree with deltas
+var flameMetric = 'deltaTicks';
+var flameZoomNode = null;      // null = show all roots
+var flameRects = [];           // layout output for hit testing
+var FLAME_BAR_H = 22;
+var FLAME_MIN_PX = 2;
+
+// Build a flat snapshot from the context tree: key=path, val={ticks,yields,blocks,name,state}
+//
+function flameSnapshot(contexts) {
+    var snap = {};
+    function walk(ctx, prefix) {
+        var path = prefix ? prefix + '/' + ctx.name : ctx.name;
+        snap[path] = {
+            ticks: ctx.statistics.ticks,
+            yields: ctx.statistics.yields,
+            blocks: ctx.statistics.blocks,
+            ioSubmits: ctx.statistics.ioSubmits || 0,
+            ioCompletes: ctx.statistics.ioCompletes || 0
+        };
+        if (ctx.children) {
+            for (var i = 0; i < ctx.children.length; i++) walk(ctx.children[i], path);
+        }
+    }
+    for (var i = 0; i < contexts.length; i++) walk(contexts[i], '');
+    return snap;
+}
+
+// Enrich tree nodes with delta values and totalDelta (self + all descendants)
+//
+function computeFlameDelta(contexts, prev) {
+    function enrichNode(ctx, prefix) {
+        var path = prefix ? prefix + '/' + ctx.name : ctx.name;
+        var p = prev[path] || {ticks: 0, yields: 0, blocks: 0, ioSubmits: 0, ioCompletes: 0};
+        var node = {
+            name: ctx.name,
+            state: ctx.state,
+            deltaTicks: ctx.statistics.ticks - p.ticks,
+            deltaYields: ctx.statistics.yields - p.yields,
+            deltaBlocks: ctx.statistics.blocks - p.blocks,
+            deltaIoSubmits: (ctx.statistics.ioSubmits || 0) - p.ioSubmits,
+            deltaIoCompletes: (ctx.statistics.ioCompletes || 0) - p.ioCompletes,
+            children: []
+        };
+        if (ctx.children) {
+            for (var i = 0; i < ctx.children.length; i++) {
+                node.children.push(enrichNode(ctx.children[i], path));
+            }
+        }
+        // totalDelta = self metric + all descendants' metric (computed per metric later)
+        return node;
+    }
+    var roots = [];
+    for (var i = 0; i < contexts.length; i++) roots.push(enrichNode(contexts[i], ''));
+    return roots;
+}
+
+function flameTotal(node, metric) {
+    var t = node[metric];
+    for (var i = 0; i < node.children.length; i++) t += flameTotal(node.children[i], metric);
+    return t;
+}
+
+// Flatten tree into drawable rectangles
+//
+function flattenFlame(nodes, metric, totalWidth, canvasW) {
+    var rects = [];
+    // If totalWidth is 0, nothing to draw
+    if (totalWidth <= 0) return rects;
+
+    function layout(node, depth, x, parentW) {
+        var nodeTotal = flameTotal(node, metric);
+        var w = (nodeTotal / totalWidth) * canvasW;
+        if (w < FLAME_MIN_PX) w = FLAME_MIN_PX;
+        var selfVal = node[metric];
+        var childrenTotal = 0;
+        for (var i = 0; i < node.children.length; i++) {
+            childrenTotal += flameTotal(node.children[i], metric);
+        }
+        rects.push({
+            x: x, w: w, depth: depth,
+            name: node.name, state: node.state,
+            value: nodeTotal, selfValue: selfVal,
+            node: node
+        });
+        // Layout children within this node's span
+        var cx = x;
+        for (var i = 0; i < node.children.length; i++) {
+            var childTotal = flameTotal(node.children[i], metric);
+            var cw = (childTotal / totalWidth) * canvasW;
+            if (cw < FLAME_MIN_PX) cw = FLAME_MIN_PX;
+            layout(node.children[i], depth + 1, cx, cw);
+            cx += cw;
+        }
+    }
+
+    var x = 0;
+    for (var i = 0; i < nodes.length; i++) {
+        layout(nodes[i], 0, x, 0);
+        var nodeTotal = flameTotal(nodes[i], metric);
+        x += (nodeTotal / totalWidth) * canvasW;
+    }
+    return rects;
+}
+
+function flameColorForState(state, name) {
+    var base;
+    if (state === 'running') base = [127, 219, 202];
+    else if (state === 'yielded') base = [230, 219, 116];
+    else base = [240, 113, 120]; // blocked
+    // Hash name for saturation variation
+    var hash = 0;
+    for (var i = 0; i < name.length; i++) hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+    var variation = ((hash & 0x7f) - 64) * 0.15; // -0.15 to +0.15
+    var r = Math.max(0, Math.min(255, base[0] + base[0] * variation));
+    var g = Math.max(0, Math.min(255, base[1] + base[1] * variation));
+    var b = Math.max(0, Math.min(255, base[2] + base[2] * variation));
+    return 'rgb(' + Math.round(r) + ',' + Math.round(g) + ',' + Math.round(b) + ')';
+}
+
+function drawFlame() {
+    var canvas = document.getElementById('flame-canvas');
+    var emptyDiv = document.getElementById('flame-empty');
+    if (!flameDeltaRoots || flameDeltaRoots.length === 0) {
+        canvas.style.display = 'none';
+        emptyDiv.style.display = 'block';
+        emptyDiv.textContent = flamePrevSnapshot ? 'No active contexts' : 'Waiting for data...';
+        return;
+    }
+
+    // Determine what to draw: zoomed node or all roots
+    var drawNodes = flameZoomNode ? [flameZoomNode] : flameDeltaRoots;
+
+    var totalW = 0;
+    for (var i = 0; i < drawNodes.length; i++) totalW += flameTotal(drawNodes[i], flameMetric);
+
+    if (totalW <= 0) {
+        canvas.style.display = 'none';
+        emptyDiv.style.display = 'block';
+        emptyDiv.textContent = 'No activity in current interval';
+        return;
+    }
+
+    canvas.style.display = 'block';
+    emptyDiv.style.display = 'none';
+
+    var dpr = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    var W = rect.width;
+
+    // Compute rects to find max depth
+    flameRects = flattenFlame(drawNodes, flameMetric, totalW, W);
+    var maxDepth = 0;
+    for (var i = 0; i < flameRects.length; i++) {
+        if (flameRects[i].depth > maxDepth) maxDepth = flameRects[i].depth;
+    }
+    var H = (maxDepth + 1) * (FLAME_BAR_H + 1) + 8;
+    canvas.height = H * dpr;
+    canvas.style.height = H + 'px';
+    canvas.width = W * dpr;
+
+    var ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+
+    for (var i = 0; i < flameRects.length; i++) {
+        var r = flameRects[i];
+        var y = r.depth * (FLAME_BAR_H + 1) + 1;
+
+        ctx.fillStyle = flameColorForState(r.state, r.name);
+        ctx.fillRect(r.x, y, Math.max(r.w - 1, 1), FLAME_BAR_H);
+
+        // Text label if bar is wide enough
+        if (r.w > 40) {
+            ctx.fillStyle = '#000';
+            ctx.font = '11px Consolas, Monaco, monospace';
+            ctx.textBaseline = 'middle';
+            var label = r.name;
+            var maxTextW = r.w - 6;
+            if (ctx.measureText(label).width > maxTextW) {
+                while (label.length > 1 && ctx.measureText(label + '…').width > maxTextW) {
+                    label = label.slice(0, -1);
+                }
+                label += '…';
+            }
+            ctx.fillText(label, r.x + 3, y + FLAME_BAR_H / 2);
+        }
+    }
+}
+
+function flameHitTest(mx, my) {
+    for (var i = flameRects.length - 1; i >= 0; i--) {
+        var r = flameRects[i];
+        var y = r.depth * (FLAME_BAR_H + 1) + 1;
+        if (mx >= r.x && mx <= r.x + r.w && my >= y && my <= y + FLAME_BAR_H) {
+            return r;
+        }
+    }
+    return null;
+}
+
+function updateFlameBreadcrumb() {
+    var bc = document.getElementById('flame-breadcrumb');
+    bc.innerHTML = '';
+    if (!flameZoomNode) return;
+    // Build path from root to zoom node
+    var path = [];
+    function findPath(nodes, target) {
+        for (var i = 0; i < nodes.length; i++) {
+            if (nodes[i] === target) { path.push(nodes[i]); return true; }
+            if (findPath(nodes[i].children, target)) { path.push(nodes[i]); return true; }
+        }
+        return false;
+    }
+    if (flameDeltaRoots) findPath(flameDeltaRoots, flameZoomNode);
+    path.reverse();
+
+    // "root" link
+    var root = document.createElement('span');
+    root.className = 'flame-crumb';
+    root.textContent = 'root';
+    root.onclick = function() { flameZoomNode = null; updateFlameBreadcrumb(); drawFlame(); };
+    bc.appendChild(root);
+
+    for (var i = 0; i < path.length; i++) {
+        var sep = document.createElement('span');
+        sep.className = 'flame-crumb-sep';
+        sep.textContent = ' › ';
+        bc.appendChild(sep);
+
+        var crumb = document.createElement('span');
+        if (i < path.length - 1) {
+            crumb.className = 'flame-crumb';
+            crumb.onclick = (function(node) {
+                return function() { flameZoomNode = node; updateFlameBreadcrumb(); drawFlame(); };
+            })(path[i]);
+        } else {
+            crumb.style.color = '#c3cee3';
+        }
+        crumb.textContent = path[i].name;
+        bc.appendChild(crumb);
+    }
+}
+
+function setFlameMetric(btn) {
+    flameMetric = btn.getAttribute('data-metric');
+    document.querySelectorAll('.flame-metric-btn').forEach(function(b) {
+        b.classList.toggle('active', b === btn);
+    });
+    drawFlame();
+}
+
+// Canvas mouse handlers
+//
+(function() {
+    var canvas = document.getElementById('flame-canvas');
+    var tooltip = document.getElementById('flame-tooltip');
+
+    canvas.addEventListener('mousemove', function(e) {
+        var rect = canvas.getBoundingClientRect();
+        var mx = e.clientX - rect.left;
+        var my = e.clientY - rect.top;
+        var hit = flameHitTest(mx, my);
+        if (hit) {
+            var metricLabel = flameMetric.replace('delta', '').toLowerCase();
+            var grandTotal = 0;
+            var drawNodes = flameZoomNode ? [flameZoomNode] : (flameDeltaRoots || []);
+            for (var i = 0; i < drawNodes.length; i++) grandTotal += flameTotal(drawNodes[i], flameMetric);
+            var pct = grandTotal > 0 ? (hit.value / grandTotal * 100).toFixed(1) : '0.0';
+            tooltip.innerHTML =
+                '<div><span class="ft-name">' + hit.name + '</span>' +
+                '<span class="ft-state badge badge-' + hit.state + '">' + hit.state + '</span></div>' +
+                '<div class="ft-detail">' + metricLabel + ': ' + hit.value +
+                ' (' + pct + '%) — self: ' + hit.selfValue + '</div>';
+            tooltip.style.display = 'block';
+            var tx = e.clientX - canvas.parentElement.getBoundingClientRect().left + 12;
+            var ty = e.clientY - canvas.parentElement.getBoundingClientRect().top + 12;
+            // Keep tooltip in view
+            if (tx + tooltip.offsetWidth > canvas.parentElement.offsetWidth - 8) {
+                tx = tx - tooltip.offsetWidth - 24;
+            }
+            tooltip.style.left = tx + 'px';
+            tooltip.style.top = ty + 'px';
+        } else {
+            tooltip.style.display = 'none';
+        }
+    });
+
+    canvas.addEventListener('mouseleave', function() {
+        tooltip.style.display = 'none';
+    });
+
+    canvas.addEventListener('click', function(e) {
+        var rect = canvas.getBoundingClientRect();
+        var mx = e.clientX - rect.left;
+        var my = e.clientY - rect.top;
+        var hit = flameHitTest(mx, my);
+        if (hit && hit.node.children.length > 0) {
+            flameZoomNode = hit.node;
+            updateFlameBreadcrumb();
+            drawFlame();
+        } else if (!hit) {
+            // Click background = zoom out one level or reset
+            flameZoomNode = null;
+            updateFlameBreadcrumb();
+            drawFlame();
+        }
+    });
+})();
+
+function refreshFlame(data) {
+    var currentSnap = flameSnapshot(data.contexts);
+    if (flamePrevSnapshot === null) {
+        flamePrevSnapshot = currentSnap;
+        return;
+    }
+    flameDeltaRoots = computeFlameDelta(data.contexts, flamePrevSnapshot);
+    flamePrevSnapshot = currentSnap;
+
+    // If zoomed node no longer exists, reset zoom
+    if (flameZoomNode) {
+        var found = false;
+        function findNode(nodes, target) {
+            for (var i = 0; i < nodes.length; i++) {
+                if (nodes[i].name === target.name) { flameZoomNode = nodes[i]; found = true; return; }
+                findNode(nodes[i].children, target);
+                if (found) return;
+            }
+        }
+        findNode(flameDeltaRoots, flameZoomNode);
+        if (!found) { flameZoomNode = null; updateFlameBreadcrumb(); }
+    }
+
+    if (document.getElementById('tab-flame').classList.contains('active')) {
+        drawFlame();
+    }
+}
+
 // ---- Main refresh loop ----
 function refresh() {
     Promise.all([
@@ -553,6 +946,7 @@ function refresh() {
         fetch('/api/perf').then(function(r) { return r.json(); }),
     ]).then(function(results) {
         refreshStatus(results[0]);
+        refreshFlame(results[0]);
         refreshPerf(results[1]);
         document.getElementById('updated').textContent =
             'updated ' + new Date().toLocaleTimeString();
@@ -568,6 +962,7 @@ setInterval(refresh, POLL_MS);
 window.addEventListener('resize', function() {
     drawStackedChart('chart', 'legend', statusHistory, statusColorFor);
     drawPerfChart();
+    drawFlame();
 });
 </script>
 </body>

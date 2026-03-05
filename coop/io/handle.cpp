@@ -64,6 +64,7 @@ void Handle::Submit(struct io_uring_sqe* sqe)
     SPDLOG_TRACE("handle submit ctx={}", m_context->GetName());
 
     COOP_PERF_INC(m_context->GetCooperator()->GetPerfCounters(), perf::Counter::IoSubmit);
+    ++m_context->m_statistics.ioSubmits;
     m_timedOut = false;
     m_pendingCqes = 1;
     m_ring->m_pendingOps++;
@@ -195,6 +196,7 @@ void Handle::Finalize()
 void Handle::Complete(struct io_uring_cqe* cqe)
 {
     COOP_PERF_INC(m_context->GetCooperator()->GetPerfCounters(), perf::Counter::IoComplete);
+    ++m_context->m_statistics.ioCompletes;
     m_result = cqe->res;
     SPDLOG_TRACE("handle complete result={}", m_result);
     io_uring_cqe_seen(&m_ring->m_ring, cqe);

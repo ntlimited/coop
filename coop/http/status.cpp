@@ -10,6 +10,7 @@
 #include "coop/detail/scheduler_state.h"
 #include "coop/perf/counters.h"
 #include "coop/perf/patch.h"
+#include "coop/perf/sampler.h"
 
 namespace coop
 {
@@ -123,6 +124,12 @@ struct JsonWriter
         Comma();
         m_out += val ? "true" : "false";
     }
+
+    void Null()
+    {
+        Comma();
+        m_out += "null";
+    }
 };
 
 const char* StateString(SchedulerState state)
@@ -160,6 +167,12 @@ void SerializeContext(JsonWriter& w, Context* ctx)
     w.UInt(ctx->m_statistics.yields);
     w.Key("blocks");
     w.UInt(ctx->m_statistics.blocks);
+    w.Key("ioSubmits");
+    w.UInt(ctx->m_statistics.ioSubmits);
+    w.Key("ioCompletes");
+    w.UInt(ctx->m_statistics.ioCompletes);
+    w.Key("samples");
+    w.UInt(ctx->m_statistics.samples);
     w.EndObject();
 
     w.Key("children");
@@ -271,16 +284,121 @@ void HandlePerfDisable(ConnectionBase& conn)
     conn.Send(200, "application/json", "{\"ok\":true}");
 }
 
+// ---- Sampler API ----
+
+void HandleSampler(ConnectionBase& conn)
+{
+    std::string out;
+    out.reserve(256);
+    JsonWriter w(out);
+    w.BeginObject();
+    w.Key("sampling");
+    w.Bool(perf::IsSampling());
+    w.Key("hz");
+    w.Int(perf::SamplingHz());
+    w.Key("totalSamples");
+    w.UInt(perf::TotalSamples());
+    w.Key("capacity");
+    w.UInt(perf::SampleCapacity());
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
+void HandleSamplerStart(ConnectionBase& conn)
+{
+    // Read hz from query string if provided, default 99
+    //
+    int hz = 99;
+    while (auto* name = conn.NextArgName())
+    {
+        if (name == std::string_view("hz"))
+        {
+            if (auto* chunk = conn.ReadArgValue())
+            {
+                char buf[16] = {};
+                size_t len = chunk->size < sizeof(buf) - 1 ? chunk->size : sizeof(buf) - 1;
+                memcpy(buf, chunk->data, len);
+                int val = atoi(buf);
+                if (val > 0) hz = val;
+            }
+        }
+    }
+    bool ok = perf::StartSampling(hz);
+    conn.Send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+void HandleSamplerStop(ConnectionBase& conn)
+{
+    perf::StopSampling();
+    conn.Send(200, "application/json", "{\"ok\":true}");
+}
+
+void HandleSamplerSamples(ConnectionBase& conn)
+{
+    // Read up to 1024 recent samples
+    //
+    static constexpr size_t MAX_READ = 1024;
+    perf::Sample samples[MAX_READ];
+    size_t count = perf::ReadSamples(samples, MAX_READ);
+
+    std::string out;
+    out.reserve(count * 48 + 64);
+    JsonWriter w(out);
+    w.BeginObject();
+    w.Key("count");
+    w.UInt(count);
+    w.Key("samples");
+    w.BeginArray();
+    for (size_t i = 0; i < count; i++)
+    {
+        w.BeginObject();
+        w.Key("pc");
+        // Hex string for the address
+        char pcBuf[20];
+        snprintf(pcBuf, sizeof(pcBuf), "0x%lx", samples[i].pc);
+        w.String(pcBuf);
+        w.Key("context");
+        if (samples[i].context)
+        {
+            w.String(samples[i].context->GetName());
+        }
+        else
+        {
+            w.Null();
+        }
+        w.Key("ts");
+        w.UInt(samples[i].timestamp);
+        w.EndObject();
+    }
+    w.EndArray();
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
 Route s_statusRoutes[] = {
-    {"/api/status",       HandleStatus},
-    {"/api/perf",         HandlePerf},
-    {"/api/perf/enable",  HandlePerfEnable},
-    {"/api/perf/disable", HandlePerfDisable},
+    {"/api/status",         HandleStatus},
+    {"/api/perf",           HandlePerf},
+    {"/api/perf/enable",    HandlePerfEnable},
+    {"/api/perf/disable",   HandlePerfDisable},
+    {"/api/sampler",        HandleSampler},
+    {"/api/sampler/start",  HandleSamplerStart},
+    {"/api/sampler/stop",   HandleSamplerStop},
+    {"/api/sampler/samples", HandleSamplerSamples},
 };
 
 static constexpr int STATUS_ROUTE_COUNT = sizeof(s_statusRoutes) / sizeof(s_statusRoutes[0]);
 
 } // end anonymous namespace
+
+const Route* StatusRoutes()
+{
+    return s_statusRoutes;
+}
+
+int StatusRouteCount()
+{
+    return STATUS_ROUTE_COUNT;
+}
 
 void SpawnStatusServer(Cooperator* co, int port,
                        const char* const* searchPaths /* = nullptr */)

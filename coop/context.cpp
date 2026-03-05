@@ -34,6 +34,9 @@ Context::Context(
     m_statistics.ticks = 0;
     m_statistics.yields = 0;
     m_statistics.blocks = 0;
+    m_statistics.ioSubmits = 0;
+    m_statistics.ioCompletes = 0;
+    m_statistics.samples = 0;
     m_lastRdtsc = 0;
 }
 

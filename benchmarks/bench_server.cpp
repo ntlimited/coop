@@ -7,6 +7,7 @@
 #include "coop/thread.h"
 #include "coop/http/server.h"
 #include "coop/http/connection.h"
+#include "coop/http/status.h"
 #include "coop/io/ssl/context.h"
 
 using namespace coop;
@@ -21,10 +22,12 @@ void HandleJson(http::ConnectionBase& conn)
     conn.Send(200, "application/json", R"({"message":"Hello, World!"})", 27);
 }
 
-static const http::Route s_routes[] = {
+static const http::Route s_appRoutes[] = {
     {"/plaintext", HandlePlaintext},
     {"/json", HandleJson},
 };
+
+static constexpr int APP_ROUTE_COUNT = sizeof(s_appRoutes) / sizeof(s_appRoutes[0]);
 
 struct TlsArgs
 {
@@ -37,6 +40,7 @@ int main(int argc, char* argv[])
     signal(SIGPIPE, SIG_IGN);
 
     int port = 8080;
+    bool status = false;
     bool sqpoll = false;
     bool tls = false;
     const char* certPath = nullptr;
@@ -48,6 +52,7 @@ int main(int argc, char* argv[])
         else if (strcmp(argv[i], "--tls") == 0) tls = true;
         else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) certPath = argv[++i];
         else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) keyPath = argv[++i];
+        else if (strcmp(argv[i], "--status") == 0) status = true;
         else port = atoi(argv[i]);
     }
 
@@ -58,6 +63,20 @@ int main(int argc, char* argv[])
         config.uring.coopTaskrun = false;
         config.uring.entries = 1024;
     }
+
+    // Build route table: app routes + optional status routes
+    //
+    static http::Route routes[APP_ROUTE_COUNT + 16]; // room for status + sampler routes
+    static int routeCount = 0;
+    for (int i = 0; i < APP_ROUTE_COUNT; i++) routes[routeCount++] = s_appRoutes[i];
+    if (status)
+    {
+        for (int i = 0; i < http::StatusRouteCount(); i++)
+            routes[routeCount++] = http::StatusRoutes()[i];
+    }
+
+    static const char* staticPaths[] = {"static", nullptr};
+    static const char* const* searchPaths = status ? staticPaths : nullptr;
 
     Cooperator cooperator(config);
     Thread t(&cooperator);
@@ -88,15 +107,15 @@ int main(int argc, char* argv[])
             sslCtx.LoadPrivateKey(keyBuf, keyLen);
             sslCtx.EnableKTLS();
 
-            http::RunTlsServer(ctx, a->port, s_routes, 2, sslCtx, "BenchTlsServer",
-                               nullptr, std::chrono::seconds(0));
+            http::RunTlsServer(ctx, a->port, routes, routeCount, sslCtx, "BenchTlsServer",
+                               searchPaths, std::chrono::seconds(0));
         }, new TlsArgs{port, nullptr});
     }
     else
     {
         cooperator.Submit([](Context* ctx, void* arg) {
             int port = static_cast<int>(reinterpret_cast<intptr_t>(arg));
-            http::RunServer(ctx, port, s_routes, 2, "BenchServer", nullptr,
+            http::RunServer(ctx, port, routes, routeCount, "BenchServer", searchPaths,
                             std::chrono::seconds(0));
         }, reinterpret_cast<void*>(static_cast<intptr_t>(port)));
     }

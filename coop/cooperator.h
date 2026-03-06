@@ -12,6 +12,7 @@
 #include "stack_pool.h"
 #include "perf/counters.h"
 #include "io/uring.h"
+#include "topology.h"
 
 extern "C" void CoopContextEntry(coop::Context* ctx);
 
@@ -151,6 +152,9 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         return &m_uring;
     }
 
+    int CpuId() const { return m_cpuId; }
+    int NumaNode() const { return m_numaNode; }
+
     perf::Counters& GetPerfCounters() { return m_perf; }
 
     const char* GetName() const { return m_name; }
@@ -218,6 +222,10 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     int64_t m_lastRdtsc;
     int64_t m_ticks;
+
+    int m_cpuId{-1};
+    int m_numaNode{-1};
+    CooperatorConfiguration m_config;
 
     std::atomic<bool> m_shutdown;
     Context*        m_scheduled;

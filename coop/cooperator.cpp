@@ -27,6 +27,7 @@ Cooperator::RegistryList Cooperator::s_registry;
 Cooperator::Cooperator(CooperatorConfiguration const& config)
 : m_lastRdtsc(0)
 , m_ticks(0)
+, m_config(config)
 , m_shutdown(false)
 , m_uring(config.uring)
 , m_scheduled(nullptr)
@@ -225,6 +226,23 @@ void Cooperator::Launch()
 
     Cooperator::thread_cooperator = this;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
+
+    // Pin this thread to a CPU core. If the config specifies a core, use it; otherwise
+    // auto-assign round-robin across available cores.
+    //
+    {
+        int cpu = m_config.cpuAffinity;
+        if (cpu < 0)
+        {
+            cpu = NextRoundRobinCpu();
+        }
+        if (cpu >= 0 && PinThread(cpu) == 0)
+        {
+            m_cpuId = cpu;
+            m_numaNode = GetTopology().NumaNodeForCpu(cpu);
+        }
+    }
+
     m_lastRdtsc = rdtsc();
 
     m_uring.Init();

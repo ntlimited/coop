@@ -25,11 +25,17 @@ struct CooperatorConfiguration
         }
         return *this;
     }
+
+    // CPU core to pin this cooperator's thread to. -1 (default) means auto round-robin
+    // across available cores. Values >= 0 pin to that specific logical core ID.
+    //
+    int cpuAffinity = -1;
 };
 
 static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
     .uring = io::s_defaultUringConfiguration,
     .name = {},
+    .cpuAffinity = -1,
 };
 
 } // end namespace coop

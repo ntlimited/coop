@@ -245,7 +245,7 @@ TEST(StressTest, ChannelShutdownManyReceivers)
             ctx->GetCooperator()->Spawn([&](coop::Context* receiver)
             {
                 int value = 0;
-                bool result = ch.Recv(receiver, value);
+                bool result = ch.Recv(value);
                 EXPECT_FALSE(result);
                 wakeCount++;
             });
@@ -253,7 +253,7 @@ TEST(StressTest, ChannelShutdownManyReceivers)
 
         // All receivers are blocked on the empty channel
         //
-        ch.Shutdown(ctx);
+        ch.Shutdown();
 
         while (wakeCount < NUM_RECEIVERS)
         {
@@ -273,14 +273,12 @@ TEST(StressTest, ChannelShutdownManySenders)
     {
         constexpr int NUM_SENDERS = 200;
 
-        // Capacity 2 = 1 usable slot
-        //
-        int buffer[2];
-        coop::Channel<int> ch(ctx, buffer, 2);
+        int buffer[1];
+        coop::Channel<int> ch(ctx, buffer, 1);
 
         // Fill the channel
         //
-        ASSERT_TRUE(ch.TrySend(ctx, 0));
+        ASSERT_TRUE(ch.TrySend(0));
 
         int wakeCount = 0;
 
@@ -288,7 +286,7 @@ TEST(StressTest, ChannelShutdownManySenders)
         {
             ctx->GetCooperator()->Spawn([&](coop::Context* sender)
             {
-                bool result = ch.Send(sender, 42);
+                bool result = ch.Send(42);
                 EXPECT_FALSE(result);
                 wakeCount++;
             });
@@ -296,7 +294,7 @@ TEST(StressTest, ChannelShutdownManySenders)
 
         // All senders are blocked on the full channel
         //
-        ch.Shutdown(ctx);
+        ch.Shutdown();
 
         while (wakeCount < NUM_SENDERS)
         {
@@ -333,7 +331,7 @@ TEST(StressTest, ChannelHighThroughput)
             {
                 for (int i = 0; i < ITEMS_PER_PRODUCER; i++)
                 {
-                    ch.Send(producer, i);
+                    ch.Send(i);
                     produced.fetch_add(1, std::memory_order_relaxed);
                 }
             });
@@ -344,7 +342,7 @@ TEST(StressTest, ChannelHighThroughput)
             ctx->GetCooperator()->Spawn([&](coop::Context* consumer)
             {
                 int value = 0;
-                while (ch.Recv(consumer, value))
+                while (ch.Recv(value))
                 {
                     consumed.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -356,7 +354,7 @@ TEST(StressTest, ChannelHighThroughput)
             ctx->Yield(true);
         }
 
-        ch.Shutdown(ctx);
+        ch.Shutdown();
 
         while (consumed.load(std::memory_order_relaxed) < TOTAL_ITEMS)
         {

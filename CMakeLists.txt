@@ -74,6 +74,9 @@ target_link_libraries(chat_server PRIVATE coop)
 add_executable(tcp_proxy examples/tcp_proxy.cpp)
 target_link_libraries(tcp_proxy PRIVATE coop)
 
+add_executable(pipeline examples/pipeline.cpp)
+target_link_libraries(pipeline PRIVATE coop)
+
 # Generate a self-signed TLS certificate for testing if one doesn't already exist
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/bin/cert.pem ${CMAKE_BINARY_DIR}/bin/key.pem
@@ -140,6 +143,7 @@ gtest_discover_tests(coop_tests)
 # Benchmarks
 add_executable(coop_benchmarks
     benchmarks/bench_embedded_list.cpp
+    benchmarks/bench_channel.cpp
     benchmarks/bench_coordinator.cpp
     benchmarks/bench_io.cpp
     benchmarks/bench_pthread.cpp

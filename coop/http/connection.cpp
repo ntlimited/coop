@@ -127,14 +127,16 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
 
     while (true)
     {
-        for (size_t i = m_parsePos; i + 1 < m_bufLen; i++)
+        size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
+        char* cr = avail > 0
+            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+            : nullptr;
+
+        if (cr && cr + 1 < RecvBuf() + m_bufLen && cr[1] == '\n')
         {
-            if (RecvBuf()[i] == '\r' && RecvBuf()[i + 1] == '\n')
-            {
-                if (!ParseRequestLine()) return nullptr;
-                m_phase = ARGS;
-                return &m_requestLine;
-            }
+            if (!ParseRequestLine()) return nullptr;
+            m_phase = ARGS;
+            return &m_requestLine;
         }
 
         Compact();
@@ -145,21 +147,26 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
 template<typename Derived>
 bool ConnectionImpl<Derived>::ParseRequestLine()
 {
-    size_t start = m_parsePos;
+    char* base = RecvBuf();
+    char* end = base + m_bufLen;
+    char* p = base + m_parsePos;
 
-    size_t i = start;
-    while (i < m_bufLen && RecvBuf()[i] != ' ') i++;
+    // Find method end (first space)
+    //
+    char* sp = static_cast<char*>(memchr(p, ' ', end - p));
+    if (!sp) return false;
+
+    m_requestLine.method = std::string_view(p, sp - p);
+    p = sp + 1;
+    size_t pathStart = p - base;
+
+    // Path end — multi-delimiter, keep byte loop (typically < 20 chars)
+    //
+    size_t i = pathStart;
+    while (i < m_bufLen && base[i] != '?' && base[i] != ' ' && base[i] != '\r') i++;
     if (i >= m_bufLen) return false;
 
-    m_requestLine.method = std::string_view(RecvBuf() +start, i - start);
-
-    i++;
-    size_t pathStart = i;
-
-    while (i < m_bufLen && RecvBuf()[i] != '?' && RecvBuf()[i] != ' ' && RecvBuf()[i] != '\r') i++;
-    if (i >= m_bufLen) return false;
-
-    m_requestLine.path = std::string_view(RecvBuf() +pathStart, i - pathStart);
+    m_requestLine.path = std::string_view(base + pathStart, i - pathStart);
 
     if (RecvBuf()[i] == '?')
     {
@@ -212,15 +219,17 @@ void ConnectionImpl<Derived>::SkipToHeaders()
 {
     while (true)
     {
-        for (size_t i = m_parsePos; i < m_bufLen; i++)
+        size_t avail = m_bufLen - m_parsePos;
+        char* nl = avail > 0
+            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\n', avail))
+            : nullptr;
+
+        if (nl)
         {
-            if (RecvBuf()[i] == '\n')
-            {
-                m_parsePos = i + 1;
-                m_phase = HEADERS;
-                m_valueConsumed = true;
-                return;
-            }
+            m_parsePos = (nl - RecvBuf()) + 1;
+            m_phase = HEADERS;
+            m_valueConsumed = true;
+            return;
         }
 
         Compact();
@@ -411,46 +420,65 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
 
         while (true)
         {
-            for (size_t i = m_parsePos; i < m_bufLen; i++)
+            size_t avail = m_bufLen - m_parsePos;
+            char* colon = avail > 0
+                ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, ':', avail))
+                : nullptr;
+
+            if (colon)
             {
-                if (RecvBuf()[i] == ':')
-                {
-                    size_t nameEnd = i;
-                    RecvBuf()[i] = '\0';
-                    const char* name = RecvBuf() +nameStart;
-                    m_parsePos = i + 1;
-
-                    while (m_parsePos < m_bufLen && RecvBuf()[m_parsePos] == ' ')
-                    {
-                        m_parsePos++;
-                    }
-
-                    size_t nameLen = nameEnd - nameStart;
-                    if (nameLen == 14 &&
-                        strncasecmp(name, "content-length", 14) == 0)
-                    {
-                        m_pendingContentLength = true;
-                    }
-                    if (nameLen == 17 &&
-                        strncasecmp(name, "transfer-encoding", 17) == 0)
-                    {
-                        m_pendingTransferEncoding = true;
-                    }
-                    if (nameLen == 10 &&
-                        strncasecmp(name, "connection", 10) == 0)
-                    {
-                        m_pendingConnection = true;
-                    }
-
-                    m_valueConsumed = false;
-                    return name;
-                }
-
-                if (RecvBuf()[i] == '\r')
+                // Check for \r before the colon (malformed)
+                //
+                char* cr = static_cast<char*>(
+                    memchr(RecvBuf() + m_parsePos, '\r',
+                           colon - (RecvBuf() + m_parsePos)));
+                if (cr)
                 {
                     m_phase = DONE;
                     return nullptr;
                 }
+
+                size_t i = colon - RecvBuf();
+                size_t nameEnd = i;
+                RecvBuf()[i] = '\0';
+                const char* name = RecvBuf() + nameStart;
+                m_parsePos = i + 1;
+
+                while (m_parsePos < m_bufLen && RecvBuf()[m_parsePos] == ' ')
+                {
+                    m_parsePos++;
+                }
+
+                size_t nameLen = nameEnd - nameStart;
+                if (nameLen == 14 &&
+                    strncasecmp(name, "content-length", 14) == 0)
+                {
+                    m_pendingContentLength = true;
+                }
+                if (nameLen == 17 &&
+                    strncasecmp(name, "transfer-encoding", 17) == 0)
+                {
+                    m_pendingTransferEncoding = true;
+                }
+                if (nameLen == 10 &&
+                    strncasecmp(name, "connection", 10) == 0)
+                {
+                    m_pendingConnection = true;
+                }
+
+                m_valueConsumed = false;
+                return name;
+            }
+
+            // No colon — check for \r
+            //
+            char* cr = avail > 0
+                ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+                : nullptr;
+            if (cr)
+            {
+                m_phase = DONE;
+                return nullptr;
             }
 
             Compact();
@@ -467,54 +495,57 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
 
     size_t valueStart = m_parsePos;
 
-    for (size_t i = m_parsePos; i < m_bufLen; i++)
+    size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
+    char* cr = avail > 0
+        ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+        : nullptr;
+
+    if (cr)
     {
-        if (RecvBuf()[i] == '\r')
+        size_t i = cr - RecvBuf();
+        m_chunk.data = RecvBuf() + valueStart;
+        m_chunk.size = i - valueStart;
+        m_chunk.complete = true;
+
+        if (m_pendingContentLength)
         {
-            m_chunk.data = RecvBuf() +valueStart;
-            m_chunk.size = i - valueStart;
-            m_chunk.complete = true;
-
-            if (m_pendingContentLength)
+            m_contentLength = 0;
+            const char* p = static_cast<const char*>(m_chunk.data);
+            for (size_t j = 0; j < m_chunk.size; j++)
             {
-                m_contentLength = 0;
-                const char* p = static_cast<const char*>(m_chunk.data);
-                for (size_t j = 0; j < m_chunk.size; j++)
+                if (p[j] >= '0' && p[j] <= '9')
                 {
-                    if (p[j] >= '0' && p[j] <= '9')
-                    {
-                        m_contentLength = m_contentLength * 10 + (p[j] - '0');
-                    }
+                    m_contentLength = m_contentLength * 10 + (p[j] - '0');
                 }
-                m_pendingContentLength = false;
             }
-            if (m_pendingTransferEncoding)
-            {
-                if (m_chunk.size >= 7 &&
-                    strncasecmp(static_cast<const char*>(m_chunk.data), "chunked", 7) == 0)
-                {
-                    m_chunkedBody = true;
-                }
-                m_pendingTransferEncoding = false;
-            }
-            if (m_pendingConnection)
-            {
-                if (m_chunk.size >= 5 &&
-                    strncasecmp(static_cast<const char*>(m_chunk.data), "close", 5) == 0)
-                {
-                    m_clientClose = true;
-                }
-                m_pendingConnection = false;
-            }
-
-            m_parsePos = i;
-            if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
-            {
-                m_parsePos += 2;
-            }
-            m_valueConsumed = true;
-            return &m_chunk;
+            m_pendingContentLength = false;
         }
+        if (m_pendingTransferEncoding)
+        {
+            if (m_chunk.size >= 7 &&
+                strncasecmp(static_cast<const char*>(m_chunk.data), "chunked", 7) == 0)
+            {
+                m_chunkedBody = true;
+            }
+            m_pendingTransferEncoding = false;
+        }
+        if (m_pendingConnection)
+        {
+            if (m_chunk.size >= 5 &&
+                strncasecmp(static_cast<const char*>(m_chunk.data), "close", 5) == 0)
+            {
+                m_clientClose = true;
+            }
+            m_pendingConnection = false;
+        }
+
+        m_parsePos = i;
+        if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
+        {
+            m_parsePos += 2;
+        }
+        m_valueConsumed = true;
+        return &m_chunk;
     }
 
     size_t available = m_bufLen - valueStart;
@@ -558,18 +589,20 @@ void ConnectionImpl<Derived>::SkipHeaderValue()
 
     while (true)
     {
-        for (size_t i = m_parsePos; i < m_bufLen; i++)
+        size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
+        char* cr = avail > 0
+            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+            : nullptr;
+
+        if (cr)
         {
-            if (RecvBuf()[i] == '\r')
+            m_parsePos = cr - RecvBuf();
+            if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
             {
-                m_parsePos = i;
-                if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
-                {
-                    m_parsePos += 2;
-                }
-                m_valueConsumed = true;
-                return;
+                m_parsePos += 2;
             }
+            m_valueConsumed = true;
+            return;
         }
 
         Compact();
@@ -731,34 +764,36 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
 
     while (true)
     {
-        for (size_t i = m_parsePos; i + 1 < m_bufLen; i++)
+        size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
+        char* cr = avail > 0
+            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+            : nullptr;
+
+        if (cr && cr + 1 < RecvBuf() + m_bufLen && cr[1] == '\n')
         {
-            if (RecvBuf()[i] == '\r' && RecvBuf()[i + 1] == '\n')
+            size_t i = cr - RecvBuf();
+            size_t chunkSize = 0;
+            for (size_t j = m_parsePos; j < i; j++)
             {
-                size_t chunkSize = 0;
-                for (size_t j = m_parsePos; j < i; j++)
-                {
-                    char c = RecvBuf()[j];
-                    if (c == ';') break;
+                char c = RecvBuf()[j];
+                if (c == ';') break;
 
-                    chunkSize <<= 4;
-                    if (c >= '0' && c <= '9') chunkSize += c - '0';
-                    else if (c >= 'a' && c <= 'f') chunkSize += c - 'a' + 10;
-                    else if (c >= 'A' && c <= 'F') chunkSize += c - 'A' + 10;
-                }
-
-                m_parsePos = i + 2;
-
-                if (chunkSize == 0)
-                {
-                    m_chunkedDone = true;
-                    m_phase = DONE;
-                    return nullptr;
-                }
-
-                m_bodyRemaining = chunkSize;
-                return ReadChunkedBody();
+                chunkSize <<= 4;
+                chunkSize += c & 0xF;
+                if (c > '9') c += 9;
             }
+
+            m_parsePos = i + 2;
+
+            if (chunkSize == 0)
+            {
+                m_chunkedDone = true;
+                m_phase = DONE;
+                return nullptr;
+            }
+
+            m_bodyRemaining = chunkSize;
+            return ReadChunkedBody();
         }
 
         Compact();

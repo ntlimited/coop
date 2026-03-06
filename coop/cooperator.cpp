@@ -1,5 +1,6 @@
 #include <mutex>
 #include <new>
+#include <pthread.h>
 #include <sys/eventfd.h>
 #include <thread>
 #include <unistd.h>
@@ -29,10 +30,11 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 , m_shutdown(false)
 , m_uring(config.uring)
 , m_scheduled(nullptr)
-, m_name(config.name)
+, m_name{}
 , m_submitFd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
 {
     assert(m_submitFd >= 0);
+    memcpy(m_name, config.name, sizeof(m_name));
 }
 
 Cooperator::~Cooperator()
@@ -222,6 +224,7 @@ void Cooperator::Launch()
     }
 
     Cooperator::thread_cooperator = this;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
     m_lastRdtsc = rdtsc();
 
     m_uring.Init();

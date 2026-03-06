@@ -3,6 +3,7 @@
 #include <type_traits>
 
 #include "context.h"
+#include "context_var.h"
 #include "detail/scheduler_state.h"
 #include "self.h"
 
@@ -10,24 +11,31 @@ namespace coop
 {
 
 // Typed entry points that know how to invoke the lambda (Spawn) or Launchable (Launch) stored
-// at the segment's bottom. Called from CoopContextEntry via ctx->m_entry.
+// at the segment's bottom, past the ContextVar region. Called from CoopContextEntry via
+// ctx->m_entry.
 //
 template<typename Fn>
 void SpawnTrampoline(Context* ctx)
 {
-    (*reinterpret_cast<Fn*>(ctx->m_segment.Bottom()))(ctx);
+    auto* fn = reinterpret_cast<Fn*>(
+        static_cast<char*>(ctx->m_segment.Bottom()) + ContextVarTotalSize());
+    (*fn)(ctx);
 }
 
 template<typename T>
 void LaunchTrampoline(Context* ctx)
 {
-    reinterpret_cast<T*>(ctx->m_segment.Bottom())->Launch();
+    auto* obj = reinterpret_cast<T*>(
+        static_cast<char*>(ctx->m_segment.Bottom()) + ContextVarTotalSize());
+    obj->Launch();
 }
 
 template<typename T>
 void LaunchCleanup(Context* ctx)
 {
-    reinterpret_cast<T*>(ctx->m_segment.Bottom())->~T();
+    auto* obj = reinterpret_cast<T*>(
+        static_cast<char*>(ctx->m_segment.Bottom()) + ContextVarTotalSize());
+    obj->~T();
 }
 
 template<typename Fn>
@@ -57,10 +65,14 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
     auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, handle, this);
     m_contexts.Push(spawnCtx);
 
-    assert(sizeof(Fn) <= actual.stackSize);
-    new (spawnCtx->m_segment.Bottom()) Fn(fn);
+    size_t varSize = ContextVarTotalSize();
+    void* launchBase = static_cast<char*>(spawnCtx->m_segment.Bottom()) + varSize;
 
-    uintptr_t heapStart = reinterpret_cast<uintptr_t>(spawnCtx->m_segment.Bottom()) + sizeof(Fn);
+    assert(varSize + sizeof(Fn) <= actual.stackSize);
+    detail::ContextVarRegistry::Instance().ConstructAll(spawnCtx->m_segment.Bottom());
+    new (launchBase) Fn(fn);
+
+    uintptr_t heapStart = reinterpret_cast<uintptr_t>(launchBase) + sizeof(Fn);
     heapStart = (heapStart + 15) & ~uintptr_t(15);
     spawnCtx->m_heapTop = reinterpret_cast<void*>(heapStart);
 
@@ -93,13 +105,17 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
     auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, handle, this);
     m_contexts.Push(spawnCtx);
 
-    assert(sizeof(T) <= actual.stackSize);
-    auto* launchable = new (spawnCtx->m_segment.Bottom()) T(
+    size_t varSize = ContextVarTotalSize();
+    void* launchBase = static_cast<char*>(spawnCtx->m_segment.Bottom()) + varSize;
+
+    assert(varSize + sizeof(T) <= actual.stackSize);
+    detail::ContextVarRegistry::Instance().ConstructAll(spawnCtx->m_segment.Bottom());
+    auto* launchable = new (launchBase) T(
         spawnCtx,
         std::forward<Args>(args)...
     );
 
-    uintptr_t heapStart = reinterpret_cast<uintptr_t>(spawnCtx->m_segment.Bottom()) + sizeof(T);
+    uintptr_t heapStart = reinterpret_cast<uintptr_t>(launchBase) + sizeof(T);
     heapStart = (heapStart + 15) & ~uintptr_t(15);
     spawnCtx->m_heapTop = reinterpret_cast<void*>(heapStart);
 

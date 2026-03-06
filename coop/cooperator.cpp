@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "cooperator.h"
+#include "context_var.h"
 #include "detail/context_switch.h"
 #include "io/descriptor.h"
 #include "io/read.h"
@@ -504,6 +505,12 @@ extern "C" void CoopContextEntry(coop::Context* ctx)
     {
         ctx->m_cleanup(ctx);
     }
+
+    // Destruct ContextVar slots. These run after the task and its Launchable are gone but before
+    // ~Context(), so the context is still alive for any non-cooperative teardown. ContextVar
+    // destructors must not yield or block.
+    //
+    coop::detail::ContextVarRegistry::Instance().DestructAll(ctx->m_segment.Bottom());
 
     // Context destructor must run while we're still on this context's stack so that kill signals
     // can context-switch to waiters safely.

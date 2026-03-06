@@ -158,6 +158,8 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     perf::Counters& GetPerfCounters() { return m_perf; }
 
+    epoch::Manager& GetEpochManager() { return m_epochMgr; }
+
     const char* GetName() const { return m_name; }
 
     // Visit all registered cooperators under the registry lock. The callback receives each
@@ -255,6 +257,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // epoch::Manager::SafeEpoch() on other cooperators to compute the global reclamation horizon.
     //
     std::atomic<epoch::Epoch>           m_epochWatermark{epoch::Epoch::Alive()};
+
+    // Per-cooperator epoch manager. Constructed with this* so it can be a member even before
+    // thread_cooperator is set. Declared after m_epochWatermark so its destructor (which resets
+    // the watermark) runs while m_epochWatermark is still valid.
+    //
+    epoch::Manager                      m_epochMgr;
 
     // TODO this is a super dirty thing where the context removes itself from the
     // contexts list when it destructs.

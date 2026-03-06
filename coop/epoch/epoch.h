@@ -98,7 +98,16 @@ struct RetireEntry
 //
 struct Manager
 {
+    // Default constructor: reads Cooperator::thread_cooperator. Must be called from a
+    // cooperator thread (i.e. inside a running cooperator). Asserts on misuse.
+    //
     Manager();
+
+    // Cooperator-owned constructor: takes an explicit back-pointer. Used when Manager is
+    // a member of Cooperator itself — thread_cooperator is not yet set at that point.
+    //
+    explicit Manager(Cooperator* co);
+
     ~Manager();
 
     // ---- Epoch counter ----

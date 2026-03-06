@@ -36,6 +36,12 @@ Manager::Manager()
         "epoch::Manager created outside a cooperator thread; call from a bootstrap task");
 }
 
+Manager::Manager(Cooperator* co)
+: m_cooperator(co)
+{
+    assert(co != nullptr);
+}
+
 Manager::~Manager()
 {
     // Reset the watermark so other cooperators' SafeEpoch() doesn't block on a dead manager.

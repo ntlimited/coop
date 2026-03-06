@@ -34,6 +34,7 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 , m_scheduled(nullptr)
 , m_name{}
 , m_submitFd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
+, m_epochMgr(this)
 {
     assert(m_submitFd >= 0);
     memcpy(m_name, config.name, sizeof(m_name));
@@ -226,6 +227,7 @@ void Cooperator::Launch()
     }
 
     Cooperator::thread_cooperator = this;
+    epoch::SetManager(&m_epochMgr);
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
 
     // Pin this thread to a CPU core. If the config specifies a core, use it; otherwise
@@ -360,6 +362,8 @@ void Cooperator::Launch()
             m_uring.Poll();
         }
     }
+
+    epoch::SetManager(nullptr);
 
     // Signal any SubmitSync callers that arrived after the loop exited
     //

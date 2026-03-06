@@ -29,16 +29,14 @@ struct TestEntry : coop::epoch::RetireEntry
     }
 };
 
-// Run a test inside a cooperator with an epoch::Manager bootstrapped on the cooperator thread.
+// Run a test inside a cooperator. The epoch::Manager is provided automatically by the
+// Cooperator — no bootstrap boilerplate required.
 //
 inline void RunWithEpoch(std::function<void(coop::Context*, coop::epoch::Manager&)> fn)
 {
     test::RunInCooperator([fn = std::move(fn)](coop::Context* ctx)
     {
-        coop::epoch::Manager mgr;
-        coop::epoch::SetManager(&mgr);
-        fn(ctx, mgr);
-        coop::epoch::SetManager(nullptr);
+        fn(ctx, *coop::epoch::GetManager());
     });
 }
 

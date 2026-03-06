@@ -64,6 +64,7 @@ add_executable(echo_server examples/echo_server.cpp)
 target_link_libraries(echo_server PRIVATE coop)
 target_link_options(echo_server PRIVATE -rdynamic)
 
+
 add_executable(echo_client examples/echo_client.cpp)
 target_link_libraries(echo_client PRIVATE coop)
 
@@ -130,6 +131,7 @@ add_executable(coop_tests
     tests/test_perf.cpp
     tests/test_alloc.cpp
     tests/test_topology.cpp
+    tests/test_epoch.cpp
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 include(GoogleTest)

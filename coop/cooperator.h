@@ -7,6 +7,7 @@
 
 #include "detail/embedded_list.h"
 #include "context.h"
+#include "epoch/epoch.h"
 #include "cooperator_configuration.h"
 #include "spawn_configuration.h"
 #include "stack_pool.h"
@@ -247,7 +248,13 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     std::mutex              m_submissionLock;
     SubmissionEntry*        m_submissionHead{nullptr};
     SubmissionEntry*        m_submissionTail{nullptr};
-    std::atomic<bool>       m_hasSubmissions{false};
+    std::atomic<bool>                   m_hasSubmissions{false};
+
+    // Minimum pinned epoch across all contexts on this cooperator. Written by the cooperator
+    // thread (via epoch::Manager::PublishWatermark) after each pin/unpin. Read cross-thread by
+    // epoch::Manager::SafeEpoch() on other cooperators to compute the global reclamation horizon.
+    //
+    std::atomic<epoch::Epoch>           m_epochWatermark{epoch::Epoch::Alive()};
 
     // TODO this is a super dirty thing where the context removes itself from the
     // contexts list when it destructs.
@@ -257,6 +264,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // super complex as it is right now.
     //
     friend struct Context;
+    friend struct epoch::Manager;
     friend void ::CoopContextEntry(::coop::Context*);
     Context::AllContextsList    m_contexts;
     Context::ContextStateList   m_yielded;

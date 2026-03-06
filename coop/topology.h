@@ -40,4 +40,8 @@ int NextRoundRobinCpu();
 //
 int PinThread(int cpu_id);
 
+// Returns true if thread pinning is disabled via COOP_NO_PIN=1.
+//
+bool PinningDisabled();
+
 } // end namespace coop

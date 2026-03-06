@@ -228,8 +228,9 @@ void Cooperator::Launch()
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
 
     // Pin this thread to a CPU core. If the config specifies a core, use it; otherwise
-    // auto-assign round-robin across available cores.
+    // auto-assign round-robin across available cores. COOP_NO_PIN=1 disables pinning.
     //
+    if (!PinningDisabled())
     {
         int cpu = m_config.cpuAffinity;
         if (cpu < 0)

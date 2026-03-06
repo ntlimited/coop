@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "types.h"
 #include "coop/io/descriptor.h"
 #include "coop/time/interval.h"
 
@@ -16,25 +17,6 @@ struct Cooperator;
 
 namespace http
 {
-
-// Bounded element from the request line. String_views point into the recv buffer — valid until
-// the next operation that may compact the buffer (advancing phases, reading more data).
-//
-struct RequestLine
-{
-    std::string_view method;
-    std::string_view path;      // before '?'
-};
-
-// Zero-copy chunk from the recv buffer. Returned by read methods for unbounded elements (arg
-// values, header values, body). Null pointer return = failure/end.
-//
-struct Chunk
-{
-    const void* data;
-    size_t size;
-    bool complete;              // true if this is the last chunk of the current element
-};
 
 // ConnectionBase is the handler-facing interface. Handlers take ConnectionBase& for transport-
 // agnostic request processing. Virtual dispatch at the handler boundary; the parser internals

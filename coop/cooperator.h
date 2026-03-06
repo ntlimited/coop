@@ -153,7 +153,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     perf::Counters& GetPerfCounters() { return m_perf; }
 
-    const char* GetName() const { return m_name ? m_name : ""; }
+    const char* GetName() const { return m_name; }
 
     // Visit all registered cooperators under the registry lock. The callback receives each
     // cooperator pointer. Return false from the callback to stop iteration early.
@@ -225,7 +225,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     io::Uring       m_uring;
     StackPool       m_stackPool;
     perf::Counters  m_perf;
-    const char*     m_name;
+    char            m_name[COOPERATOR_NAME_MAX];
 
     void*           m_sp{nullptr};
 

@@ -329,21 +329,26 @@ void HandleSampler(ConnectionBase& conn)
     w.BeginObject();
     w.Key("sampling");
     w.Bool(perf::IsSampling());
+    w.Key("stacks");
+    w.Bool(perf::IsStackMode());
     w.Key("hz");
     w.Int(perf::SamplingHz());
     w.Key("totalSamples");
     w.UInt(perf::TotalSamples());
     w.Key("capacity");
     w.UInt(perf::SampleCapacity());
+    w.Key("stackSubsample");
+    w.Int(perf::StackSubsample());
     w.EndObject();
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
 void HandleSamplerStart(ConnectionBase& conn)
 {
-    // Read hz from query string if provided, default 99
+    // Read hz and stacks from query string
     //
     int hz = 99;
+    bool stacks = false;
     while (auto* name = conn.NextArgName())
     {
         if (name == std::string_view("hz"))
@@ -357,9 +362,17 @@ void HandleSamplerStart(ConnectionBase& conn)
                 if (val > 0) hz = val;
             }
         }
+        else if (name == std::string_view("stacks"))
+        {
+            if (auto* chunk = conn.ReadArgValue())
+            {
+                stacks = chunk->size > 0 &&
+                    static_cast<const char*>(chunk->data)[0] == '1';
+            }
+        }
     }
     perf::ResetSamples();
-    bool ok = perf::StartSampling(hz);
+    bool ok = perf::StartSampling(hz, stacks);
     conn.Send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
@@ -369,19 +382,23 @@ void HandleSamplerStop(ConnectionBase& conn)
     conn.Send(200, "application/json", "{\"ok\":true}");
 }
 
-void HandleSamplerSamples(ConnectionBase& conn)
+void SerializeSampleContext(JsonWriter& w, const char* ctxName, const char* coopName)
 {
-    // Read up to full ring capacity. Heap-allocated because 8192 * sizeof(Sample) = ~192KB
-    // which exceeds the 32KB HTTP connection stack.
-    //
+    w.Key("context");
+    if (ctxName) w.String(ctxName);
+    else w.Null();
+    w.Key("cooperator");
+    if (coopName) w.String(coopName);
+    else w.Null();
+}
+
+static void SerializePcSamples(JsonWriter& w, std::string& out)
+{
     static constexpr size_t MAX_READ = 8192;
     auto* samples = new perf::Sample[MAX_READ];
     size_t count = perf::ReadSamples(samples, MAX_READ);
 
-    std::string out;
-    out.reserve(count * 48 + 64);
-    JsonWriter w(out);
-    w.BeginObject();
+    out.reserve(out.size() + count * 48 + 64);
     w.Key("count");
     w.UInt(count);
     w.Key("samples");
@@ -390,35 +407,76 @@ void HandleSamplerSamples(ConnectionBase& conn)
     {
         w.BeginObject();
         w.Key("pc");
-        // Hex string for the address
         char pcBuf[20];
         snprintf(pcBuf, sizeof(pcBuf), "0x%lx", samples[i].pc);
         w.String(pcBuf);
-        w.Key("context");
-        if (samples[i].context)
-        {
-            w.String(samples[i].context->GetName());
-        }
-        else
-        {
-            w.Null();
-        }
-        w.Key("cooperator");
-        if (samples[i].cooperator)
-        {
-            w.String(samples[i].cooperator->GetName());
-        }
-        else
-        {
-            w.Null();
-        }
+        SerializeSampleContext(w,
+            samples[i].context ? samples[i].context->GetName() : nullptr,
+            samples[i].cooperator ? samples[i].cooperator->GetName() : nullptr);
         w.Key("ts");
         w.UInt(samples[i].timestamp);
         w.EndObject();
     }
     w.EndArray();
-    w.EndObject();
     delete[] samples;
+}
+
+static void SerializeStackSamples(JsonWriter& w, std::string& out)
+{
+    static constexpr size_t MAX_READ = 2048;
+    auto* samples = new perf::StackSample[MAX_READ];
+    size_t count = perf::ReadStackSamples(samples, MAX_READ);
+
+    out.reserve(out.size() + count * 200 + 64);
+    w.Key("stackCount");
+    w.UInt(count);
+    w.Key("stackSamples");
+    w.BeginArray();
+    for (size_t i = 0; i < count; i++)
+    {
+        w.BeginObject();
+        w.Key("frames");
+        w.BeginArray();
+        for (int f = 0; f < samples[i].depth; f++)
+        {
+            char pcBuf[20];
+            snprintf(pcBuf, sizeof(pcBuf), "0x%lx", samples[i].frames[f]);
+            w.String(pcBuf);
+        }
+        w.EndArray();
+        SerializeSampleContext(w,
+            samples[i].context ? samples[i].context->GetName() : nullptr,
+            samples[i].cooperator ? samples[i].cooperator->GetName() : nullptr);
+        w.Key("ts");
+        w.UInt(samples[i].timestamp);
+        w.EndObject();
+    }
+    w.EndArray();
+    delete[] samples;
+}
+
+void HandleSamplerSamples(ConnectionBase& conn)
+{
+    bool stackMode = perf::IsStackMode();
+
+    std::string out;
+    JsonWriter w(out);
+    w.BeginObject();
+    w.Key("stacks");
+    w.Bool(stackMode);
+
+    // PC ring is always populated (full-rate RIP capture).
+    //
+    SerializePcSamples(w, out);
+
+    // In stack mode, also include the subsampled stack traces.
+    //
+    if (stackMode)
+    {
+        SerializeStackSamples(w, out);
+    }
+
+    w.EndObject();
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
@@ -465,19 +523,36 @@ void HandleSymbolize(ConnectionBase& conn)
         snprintf(pcKey, sizeof(pcKey), "0x%lx", pc);
 
         Dl_info info;
-        if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_sname)
+        w.Key(pcKey);
+        if (dladdr(reinterpret_cast<void*>(pc), &info))
         {
-            // Try to demangle C++ names
-            //
-            int status;
-            char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
-            w.Key(pcKey);
-            w.String(status == 0 ? demangled : info.dli_sname);
-            free(demangled);
+            if (info.dli_sname)
+            {
+                int status;
+                char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+                w.String(status == 0 ? demangled : info.dli_sname);
+                free(demangled);
+            }
+            else if (info.dli_fname)
+            {
+                // No symbol name but we know the shared object — report lib+offset
+                // rounded to 64-byte granularity to merge nearby instructions
+                //
+                const char* libname = info.dli_fname;
+                const char* slash = strrchr(libname, '/');
+                if (slash) libname = slash + 1;
+                auto offset = (pc - reinterpret_cast<uintptr_t>(info.dli_fbase)) & ~0x3FUL;
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s+0x%lx", libname, offset);
+                w.String(buf);
+            }
+            else
+            {
+                w.String("???");
+            }
         }
         else
         {
-            w.Key(pcKey);
             w.String("???");
         }
     }

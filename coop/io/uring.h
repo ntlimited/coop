@@ -36,6 +36,7 @@ struct Uring
     }
 
     int PendingOps() const { return m_pendingOps; }
+    int RingFd() const { return m_ring.ring_fd; }
 
     void Init();
 

@@ -75,6 +75,12 @@ void Uring::Init()
     {
         params.sq_thread_idle = m_config.sqpollIdleMs;
     }
+    if (m_config.attachSqFd >= 0)
+    {
+        flags |= IORING_SETUP_ATTACH_WQ;
+        params.flags = flags;
+        params.wq_fd = m_config.attachSqFd;
+    }
 
     int ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
     if (ret == -EINVAL && (flags & IORING_SETUP_DEFER_TASKRUN))

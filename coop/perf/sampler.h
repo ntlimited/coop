@@ -24,7 +24,9 @@ namespace perf
 //
 // Thread safety: the signal fires on the cooperator thread that consumed CPU time. The handler
 // reads the thread-local cooperator's m_scheduled pointer to attribute samples. With multiple
-// cooperator threads, each gets its own signals and reads its own thread-local state.
+// cooperator threads, each gets its own signals and reads its own thread-local state. Each sample
+// includes both the Context* and Cooperator* that were active at sample time, enabling
+// per-cooperator flame graph grouping in multi-cooperator processes.
 //
 
 struct Sample
@@ -35,11 +37,24 @@ struct Sample
     uint64_t     timestamp;    // rdtsc at sample time
 };
 
+static constexpr int MAX_STACK_DEPTH = 32;
+
+struct StackSample
+{
+    uintptr_t    frames[MAX_STACK_DEPTH];
+    uint8_t      depth;        // number of valid frames
+    Context*     context;
+    Cooperator*  cooperator;
+    uint64_t     timestamp;
+};
+
 // Start sampling at the given frequency (Hz). Common values: 99, 997 (primes avoid aliasing
 // with periodic workloads). Installs SIGPROF handler and arms ITIMER_PROF. Safe to call
-// multiple times (updates frequency). Returns false on error.
+// multiple times (updates frequency). When stacks=true, also captures call stacks via frame
+// pointer walking (every Nth signal, configurable via SetStackSubsample). Returns false on
+// error.
 //
-bool StartSampling(int hz = 99);
+bool StartSampling(int hz = 99, bool stacks = false);
 
 // Stop sampling. Disarms the timer and restores the default SIGPROF handler.
 //
@@ -48,6 +63,10 @@ void StopSampling();
 // Returns true if sampling is currently active.
 //
 bool IsSampling();
+
+// Returns true if the current (or most recent) sampling session used stack mode.
+//
+bool IsStackMode();
 
 // Returns the configured sampling frequency in Hz (0 if not sampling).
 //
@@ -59,15 +78,25 @@ int SamplingHz();
 //
 size_t ReadSamples(Sample* out, size_t maxSamples);
 
+// Read up to `maxSamples` stack samples. Only valid when IsStackMode() is true.
+//
+size_t ReadStackSamples(StackSample* out, size_t maxSamples);
+
 // Reset the ring buffer and total count. Call before StartSampling to get a clean window.
 //
 void ResetSamples();
+
+// Configure stack subsample ratio — frame pointer walk runs every Nth signal (default 10).
+// Other signals still record RIP to the PC ring. Lower values = more stacks but more overhead.
+//
+void SetStackSubsample(int every);
+int StackSubsample();
 
 // Total number of samples captured since sampling was last started.
 //
 size_t TotalSamples();
 
-// Ring buffer capacity.
+// Ring buffer capacity (for the active mode's ring).
 //
 size_t SampleCapacity();
 

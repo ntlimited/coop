@@ -268,6 +268,8 @@ void RunServer(
     int on = 1;
     int ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     assert(ret == 0);
+    ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+    assert(ret == 0);
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -277,7 +279,7 @@ void RunServer(
     ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
     assert(ret == 0);
 
-    ret = listen(serverFd, 32);
+    ret = listen(serverFd, 512);
     assert(ret == 0);
 
     auto* co = ctx->GetCooperator();
@@ -315,6 +317,8 @@ void RunTlsServer(
     int on = 1;
     int ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     assert(ret == 0);
+    ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+    assert(ret == 0);
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -324,7 +328,7 @@ void RunTlsServer(
     ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
     assert(ret == 0);
 
-    ret = listen(serverFd, 32);
+    ret = listen(serverFd, 512);
     assert(ret == 0);
 
     auto* co = ctx->GetCooperator();

@@ -14,6 +14,10 @@ struct Thread
     Thread(Cooperator* m);
     ~Thread();
 
+    // Pin this thread to a specific CPU core. Returns true on success.
+    //
+    bool PinToCore(int core);
+
     Cooperator* m_cooperator;
     std::thread m_thread;
 };

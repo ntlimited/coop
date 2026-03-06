@@ -12,9 +12,11 @@
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
 #include "coop/http/connection.h"
+#include "coop/http/client.h"
 #include "coop/http/transport.h"
 
 using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
+using HttpClient = coop::http::ClientConnection<coop::http::PlaintextTransport>;
 
 static constexpr size_t HTTP_EXTRA = HttpConn::ExtraBytes();
 
@@ -498,5 +500,447 @@ TEST(HttpTest, RecvTimeout)
 
         auto* req = conn->GetRequestLine();
         EXPECT_EQ(req, nullptr);
+    });
+}
+
+// ====================================================================================
+// HTTP Client tests
+// ====================================================================================
+
+static constexpr size_t CLIENT_EXTRA = HttpClient::ExtraBytes();
+
+// Helper: send a raw HTTP response on a descriptor.
+//
+void SendResponse(coop::io::Descriptor& desc, const char* s)
+{
+    coop::io::SendAll(desc, s, strlen(s));
+}
+
+// -------------------------------------------------------------------------------------
+// Client: parse response status line
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, GetResponseLine)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendResponse(server, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 200);
+        EXPECT_EQ(resp->reason, "OK");
+    });
+}
+
+TEST(HttpClientTest, ResponseLine404)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendResponse(server, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 404);
+        EXPECT_EQ(resp->reason, "Not Found");
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: parse response headers
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, ResponseHeaders)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "X-Custom: hello\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n");
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 200);
+
+        // Content-Type
+        //
+        const char* name = conn->NextHeaderName();
+        ASSERT_NE(name, nullptr);
+        EXPECT_STREQ(name, "Content-Type");
+        auto* chunk = conn->ReadHeaderValue();
+        ASSERT_NE(chunk, nullptr);
+        EXPECT_EQ(std::string_view(static_cast<const char*>(chunk->data), chunk->size),
+                  "application/json");
+
+        // X-Custom
+        //
+        name = conn->NextHeaderName();
+        ASSERT_NE(name, nullptr);
+        EXPECT_STREQ(name, "X-Custom");
+        chunk = conn->ReadHeaderValue();
+        ASSERT_NE(chunk, nullptr);
+        EXPECT_EQ(std::string_view(static_cast<const char*>(chunk->data), chunk->size),
+                  "hello");
+
+        // Content-Length (special header — captured internally)
+        //
+        name = conn->NextHeaderName();
+        ASSERT_NE(name, nullptr);
+        EXPECT_STREQ(name, "Content-Length");
+        conn->SkipHeaderValue();
+
+        // End of headers
+        //
+        EXPECT_EQ(conn->NextHeaderName(), nullptr);
+        EXPECT_EQ(conn->ContentLength(), 0);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: read body with Content-Length
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, ResponseBody)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 13\r\n"
+            "\r\n"
+            "Hello, World!");
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 200);
+
+        conn->SkipHeaders();
+        EXPECT_EQ(conn->ContentLength(), 13);
+
+        std::string body;
+        while (auto* chunk = conn->ReadBody())
+        {
+            body.append(static_cast<const char*>(chunk->data), chunk->size);
+            if (chunk->complete) break;
+        }
+        EXPECT_EQ(body, "Hello, World!");
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: chunked response body
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, ChunkedResponseBody)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "5\r\n"
+            "Hello\r\n"
+            "7\r\n"
+            ", World\r\n"
+            "0\r\n"
+            "\r\n");
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        conn->GetResponseLine();
+        conn->SkipHeaders();
+
+        std::string body;
+        while (auto* chunk = conn->ReadBody())
+        {
+            body.append(static_cast<const char*>(chunk->data), chunk->size);
+        }
+        EXPECT_EQ(body, "Hello, World");
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: send GET request
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, SendGetRequest)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "example.com");
+
+        bool ok = conn->Get("/plaintext");
+        EXPECT_TRUE(ok);
+
+        // Read what the server side received
+        //
+        std::string req = RecvAll(server);
+        EXPECT_NE(req.find("GET /plaintext HTTP/1.1\r\n"), std::string::npos);
+        EXPECT_NE(req.find("Host: example.com\r\n"), std::string::npos);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: send POST request with body
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, SendPostRequest)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "example.com");
+
+        const char* body = R"({"key":"value"})";
+        bool ok = conn->Post("/api/data", "application/json", body, strlen(body));
+        EXPECT_TRUE(ok);
+
+        std::string req = RecvAll(server);
+        EXPECT_NE(req.find("POST /api/data HTTP/1.1\r\n"), std::string::npos);
+        EXPECT_NE(req.find("Host: example.com\r\n"), std::string::npos);
+        EXPECT_NE(req.find("Content-Type: application/json\r\n"), std::string::npos);
+        EXPECT_NE(req.find("Content-Length: 15\r\n"), std::string::npos);
+        EXPECT_NE(req.find(body), std::string::npos);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: roundtrip — send request, parse response
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, Roundtrip)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        // Client sends GET
+        //
+        conn->Get("/hello");
+
+        // Server side: read request, send response
+        //
+        std::string req = RecvAll(server);
+        EXPECT_NE(req.find("GET /hello"), std::string::npos);
+
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "world");
+
+        // Client parses response
+        //
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 200);
+
+        conn->SkipHeaders();
+
+        std::string body;
+        while (auto* chunk = conn->ReadBody())
+        {
+            body.append(static_cast<const char*>(chunk->data), chunk->size);
+        }
+        EXPECT_EQ(body, "world");
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: keep-alive — multiple requests on one connection
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, KeepAlive)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        for (int i = 0; i < 3; i++)
+        {
+            conn->Get("/ping");
+
+            // Drain request on server side
+            //
+            RecvAll(server);
+
+            // Server responds
+            //
+            SendResponse(server,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: 4\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n"
+                "pong");
+
+            auto* resp = conn->GetResponseLine();
+            ASSERT_NE(resp, nullptr);
+            EXPECT_EQ(resp->status, 200);
+
+            conn->SkipHeaders();
+
+            std::string body;
+            while (auto* chunk = conn->ReadBody())
+            {
+                body.append(static_cast<const char*>(chunk->data), chunk->size);
+            }
+            EXPECT_EQ(body, "pong");
+            EXPECT_TRUE(conn->KeepAlive());
+
+            conn->SkipBody();
+            conn->Reset();
+        }
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: Connection: close detection
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, ConnectionClose)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 2\r\n"
+            "\r\n"
+            "OK");
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        conn->GetResponseLine();
+        conn->SkipHeaders();
+        conn->SkipBody();
+
+        EXPECT_FALSE(conn->KeepAlive());
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: connection closed before response — GetResponseLine returns null
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, ConnectionClosedReturnsNull)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        server.Close();
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        EXPECT_EQ(conn->GetResponseLine(), nullptr);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: malformed response — GetResponseLine returns null
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, MalformedResponseReturnsNull)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendResponse(server, "GARBAGE\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        EXPECT_EQ(conn->GetResponseLine(), nullptr);
     });
 }

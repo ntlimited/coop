@@ -100,9 +100,8 @@ TEST(PerfTest, DisabledMode)
 
 TEST(PerfTest, CooperatorName)
 {
-    coop::CooperatorConfiguration config = {
-        .name = "test-cooperator",
-    };
+    coop::CooperatorConfiguration config;
+    config.SetName("test-cooperator");
     coop::Cooperator cooperator(config);
     EXPECT_STREQ(cooperator.GetName(), "test-cooperator");
 }
@@ -118,11 +117,8 @@ TEST(PerfTest, VisitRegistryMultipleCooperators)
     constexpr int N = 3;
     const char* names[] = {"worker-0", "worker-1", "worker-2"};
 
-    coop::CooperatorConfiguration configs[N] = {
-        {.uring = coop::io::s_defaultUringConfiguration, .name = names[0]},
-        {.uring = coop::io::s_defaultUringConfiguration, .name = names[1]},
-        {.uring = coop::io::s_defaultUringConfiguration, .name = names[2]},
-    };
+    coop::CooperatorConfiguration configs[N];
+    for (int i = 0; i < N; i++) configs[i].SetName(names[i]);
     coop::Cooperator cooperators[N] = {
         coop::Cooperator(configs[0]),
         coop::Cooperator(configs[1]),

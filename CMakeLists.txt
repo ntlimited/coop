@@ -34,7 +34,7 @@ file(GLOB_RECURSE COOP_SOURCES
 
 add_library(coop STATIC ${COOP_SOURCES})
 target_include_directories(coop PUBLIC ${CMAKE_SOURCE_DIR})
-target_compile_options(coop PRIVATE -Wcpp)
+target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer)
 
 # Compile out trace/debug logging in release builds — eliminates ~1% overhead from runtime
 # level checks in the IO hot path (spdlog::trace calls on every Submit/Complete/Poll).
@@ -44,12 +44,13 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
 endif()
 
 # Performance counter mode: 0=disabled, 1=always-on, 2=dynamic (NOP/JMP patching)
-# Default: always-on in debug (useful diagnostics, negligible cost), disabled in release.
+# Default: always-on in debug (useful diagnostics, negligible cost), dynamic in release
+# (zero overhead when off, togglable at runtime for observability).
 #
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(COOP_PERF_MODE "1" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")
 else()
-    set(COOP_PERF_MODE "0" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")
+    set(COOP_PERF_MODE "2" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")
 endif()
 target_compile_definitions(coop PUBLIC COOP_PERF_MODE=${COOP_PERF_MODE})
 
@@ -151,6 +152,10 @@ target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
 add_executable(bench_server benchmarks/bench_server.cpp)
 target_link_libraries(bench_server PRIVATE coop)
 target_link_options(bench_server PRIVATE -rdynamic)
+
+add_executable(bench_client benchmarks/bench_client.cpp)
+target_link_libraries(bench_client PRIVATE coop)
+target_link_options(bench_client PRIVATE -rdynamic)
 
 add_executable(diag_ktls benchmarks/diag_ktls.cpp)
 target_link_libraries(diag_ktls PRIVATE coop)

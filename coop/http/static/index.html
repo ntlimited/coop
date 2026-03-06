@@ -71,6 +71,28 @@ canvas { display: block; width: 100%; }
 .error { color: #f07178; padding: 20px; }
 #updated { color: #555; font-size: 11px; margin-top: 12px; }
 
+/* Cooperator sections */
+.coop-section {
+    margin-bottom: 16px; padding: 12px; background: #0f3460;
+    border-radius: 6px; border-left: 3px solid #7fdbca;
+}
+.coop-section.remote { border-left-color: #c792ea; }
+.coop-header {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+}
+.coop-name {
+    font-weight: bold; color: #7fdbca; font-size: 14px;
+}
+.coop-section.remote .coop-name { color: #c792ea; }
+.coop-badge {
+    font-size: 10px; padding: 1px 6px; border-radius: 3px;
+    background: #16213e; color: #888; text-transform: uppercase;
+}
+.coop-summary {
+    display: flex; gap: 16px; font-size: 12px; color: #888; margin-bottom: 6px;
+}
+.coop-summary .cs-val { color: #c3cee3; font-weight: bold; }
+
 /* Perf tab */
 .perf-header {
     display: flex; align-items: center; gap: 16px; margin-bottom: 16px;
@@ -197,10 +219,10 @@ canvas { display: block; width: 100%; }
 <!-- STATUS TAB -->
 <div id="tab-status" class="tab-content active">
 <div class="summary">
+    <div class="stat"><span class="stat-label">cooperators</span><span class="stat-value" id="s-coops">-</span></div>
     <div class="stat"><span class="stat-label">contexts</span><span class="stat-value" id="s-ctx">-</span></div>
     <div class="stat"><span class="stat-label">yielded</span><span class="stat-value" id="s-yld">-</span></div>
     <div class="stat"><span class="stat-label">blocked</span><span class="stat-value" id="s-blk">-</span></div>
-    <div class="stat"><span class="stat-label">ticks</span><span class="stat-value" id="s-tck">-</span></div>
 </div>
 <div class="chart-container">
     <div class="chart-title">ticks per context (delta per update)</div>
@@ -253,6 +275,8 @@ canvas { display: block; width: 100%; }
     <button class="toggle-btn" id="sampler-toggle" onclick="toggleSampler()">Start Sampling</button>
     <label>Hz:</label>
     <input type="number" id="sampler-hz" value="997" min="1" max="9999">
+    <button class="chart-group-btn" id="sampler-mode" onclick="toggleSamplerMode()">Snapshot</button>
+    <label><input type="checkbox" id="sampler-stacks"> Stacks</label>
     <span class="sampler-status" id="sampler-status"><span class="ss-idle">idle</span></span>
 </div>
 <div class="sampler-info" id="sampler-info">
@@ -302,6 +326,10 @@ function statusColorFor(name) {
     return statusColorMap[name];
 }
 
+function coopLabel(co) {
+    return co.name || '(unnamed)';
+}
+
 function flattenTicks(ctx, prefix, out) {
     var name = prefix ? prefix + '/' + ctx.name : ctx.name;
     out[name] = ctx.statistics.ticks;
@@ -312,10 +340,14 @@ function flattenTicks(ctx, prefix, out) {
     }
 }
 
-function recordStatusDeltas(data) {
+function recordStatusDeltas(cooperators) {
     var current = {};
-    for (var i = 0; i < data.contexts.length; i++) {
-        flattenTicks(data.contexts[i], '', current);
+    for (var ci = 0; ci < cooperators.length; ci++) {
+        var co = cooperators[ci];
+        var prefix = cooperators.length > 1 ? coopLabel(co) : '';
+        for (var i = 0; i < co.contexts.length; i++) {
+            flattenTicks(co.contexts[i], prefix, current);
+        }
     }
     if (prevTicks === null) { prevTicks = current; return; }
     var deltas = {};
@@ -467,17 +499,72 @@ function renderCtx(c, root) {
     return d;
 }
 
+function renderCoopSection(co, isMulti) {
+    var section = document.createElement('div');
+    var isRemote = co.contexts.length === 0 && co.contextsCount > 0;
+    section.className = 'coop-section' + (isRemote ? ' remote' : '');
+
+    if (isMulti) {
+        var header = document.createElement('div');
+        header.className = 'coop-header';
+        var name = document.createElement('span');
+        name.className = 'coop-name';
+        name.textContent = coopLabel(co);
+        header.appendChild(name);
+        if (isRemote) {
+            var badge = document.createElement('span');
+            badge.className = 'coop-badge';
+            badge.textContent = 'remote';
+            header.appendChild(badge);
+        }
+        section.appendChild(header);
+    }
+
+    var summary = document.createElement('div');
+    summary.className = 'coop-summary';
+    summary.innerHTML =
+        'contexts: <span class="cs-val">' + co.contextsCount + '</span> ' +
+        'yielded: <span class="cs-val">' + co.yieldedCount + '</span> ' +
+        'blocked: <span class="cs-val">' + co.blockedCount + '</span> ' +
+        'ticks: <span class="cs-val">' + co.ticks + '</span>';
+    section.appendChild(summary);
+
+    for (var i = 0; i < co.contexts.length; i++) {
+        section.appendChild(renderCtx(co.contexts[i], true));
+    }
+    if (isRemote) {
+        var note = document.createElement('div');
+        note.style.cssText = 'color:#555;font-size:11px;font-style:italic;margin-top:4px';
+        note.textContent = 'context tree not available for remote cooperators';
+        section.appendChild(note);
+    }
+    return section;
+}
+
 function refreshStatus(data) {
-    document.getElementById('s-ctx').textContent = data.contextsCount;
-    document.getElementById('s-yld').textContent = data.yieldedCount;
-    document.getElementById('s-blk').textContent = data.blockedCount;
-    document.getElementById('s-tck').textContent = data.ticks;
-    recordStatusDeltas(data);
+    var cooperators = data.cooperators;
+    var isMulti = cooperators.length > 1;
+
+    // Aggregate stats
+    var totalCtx = 0, totalYld = 0, totalBlk = 0;
+    for (var i = 0; i < cooperators.length; i++) {
+        totalCtx += cooperators[i].contextsCount;
+        totalYld += cooperators[i].yieldedCount;
+        totalBlk += cooperators[i].blockedCount;
+    }
+
+    document.getElementById('s-coops').textContent = cooperators.length;
+    document.getElementById('s-ctx').textContent = totalCtx;
+    document.getElementById('s-yld').textContent = totalYld;
+    document.getElementById('s-blk').textContent = totalBlk;
+
+    recordStatusDeltas(cooperators);
     drawStackedChart('chart', 'legend', statusHistory, statusColorFor);
+
     var tree = document.getElementById('tree');
     tree.innerHTML = '';
-    for (var i = 0; i < data.contexts.length; i++) {
-        tree.appendChild(renderCtx(data.contexts[i], true));
+    for (var i = 0; i < cooperators.length; i++) {
+        tree.appendChild(renderCoopSection(cooperators[i], isMulti));
     }
 }
 
@@ -557,6 +644,18 @@ function drawPerfChart() {
     });
 }
 
+function aggregateCounters(cooperators) {
+    // Merge counters from all cooperators into a single map
+    var merged = {};
+    for (var ci = 0; ci < cooperators.length; ci++) {
+        var counters = cooperators[ci].counters;
+        for (var name in counters) {
+            merged[name] = (merged[name] || 0) + counters[name];
+        }
+    }
+    return merged;
+}
+
 function refreshPerf(data) {
     // Header
     var modeNames = {0: 'disabled', 1: 'always-on', 2: 'dynamic'};
@@ -575,10 +674,13 @@ function refreshPerf(data) {
         toggleBtn.className = 'toggle-btn';
     }
 
+    // Aggregate counters across all cooperators
+    var cooperators = data.cooperators || [];
+    var counters = aggregateCounters(cooperators);
+    var names = Object.keys(counters);
+
     // Compute rates
     var now = Date.now();
-    var counters = data.counters;
-    var names = Object.keys(counters);
 
     if (perfPrev !== null && perfLastTime !== null) {
         var dt = (now - perfLastTime) / 1000;
@@ -598,7 +700,7 @@ function refreshPerf(data) {
     perfPrev = counters;
     perfLastTime = now;
 
-    // Summary — top 4 counters by rate
+    // Summary — top 6 counters by rate
     var summary = document.getElementById('perf-summary');
     summary.innerHTML = '';
     var sorted = names.slice().sort(function(a, b) { return (perfRates[b] || 0) - (perfRates[a] || 0); });
@@ -618,9 +720,34 @@ function refreshPerf(data) {
         summary.appendChild(div);
     }
 
-    // Table
+    // Table — show per-cooperator breakdown if multiple
     var tbody = document.getElementById('perf-table-body');
     tbody.innerHTML = '';
+    var isMulti = cooperators.length > 1;
+
+    if (isMulti) {
+        // Header row per cooperator
+        var headerTr = document.createElement('tr');
+        var th0 = document.createElement('th');
+        th0.textContent = 'Counter';
+        headerTr.appendChild(th0);
+        for (var ci = 0; ci < cooperators.length; ci++) {
+            var th = document.createElement('th');
+            th.textContent = coopLabel(cooperators[ci]);
+            th.style.textAlign = 'right';
+            headerTr.appendChild(th);
+        }
+        var thTotal = document.createElement('th');
+        thTotal.textContent = 'Total';
+        thTotal.style.textAlign = 'right';
+        headerTr.appendChild(thTotal);
+        var thRate = document.createElement('th');
+        thRate.textContent = 'Rate /s';
+        thRate.style.textAlign = 'right';
+        headerTr.appendChild(thRate);
+        tbody.appendChild(headerTr);
+    }
+
     for (var i = 0; i < names.length; i++) {
         var name = names[i];
         var tr = document.createElement('tr');
@@ -628,6 +755,17 @@ function refreshPerf(data) {
         tdName.className = 'counter-name';
         tdName.textContent = name;
         tr.appendChild(tdName);
+
+        if (isMulti) {
+            for (var ci = 0; ci < cooperators.length; ci++) {
+                var td = document.createElement('td');
+                td.className = 'counter-value';
+                var val = cooperators[ci].counters[name] || 0;
+                td.textContent = val.toLocaleString();
+                tr.appendChild(td);
+            }
+        }
+
         var tdVal = document.createElement('td');
         tdVal.className = 'counter-value';
         tdVal.textContent = counters[name].toLocaleString();
@@ -963,12 +1101,34 @@ function setFlameMetric(btn) {
 })();
 
 function refreshFlame(data) {
-    var currentSnap = flameSnapshot(data.contexts);
+    // Gather all contexts from all cooperators
+    var cooperators = data.cooperators;
+    var allContexts = [];
+    for (var ci = 0; ci < cooperators.length; ci++) {
+        var co = cooperators[ci];
+        if (cooperators.length > 1) {
+            // Wrap each cooperator's contexts under a virtual cooperator node
+            allContexts.push({
+                name: coopLabel(co),
+                state: 'running',
+                killed: false,
+                priority: 0,
+                statistics: {ticks: co.ticks, yields: 0, blocks: 0, ioSubmits: 0, ioCompletes: 0},
+                children: co.contexts
+            });
+        } else {
+            for (var i = 0; i < co.contexts.length; i++) {
+                allContexts.push(co.contexts[i]);
+            }
+        }
+    }
+
+    var currentSnap = flameSnapshot(allContexts);
     if (flamePrevSnapshot === null) {
         flamePrevSnapshot = currentSnap;
         return;
     }
-    flameDeltaRoots = computeFlameDelta(data.contexts, flamePrevSnapshot);
+    flameDeltaRoots = computeFlameDelta(allContexts, flamePrevSnapshot);
     flamePrevSnapshot = currentSnap;
 
     // If zoomed node no longer exists, reset zoom
@@ -997,6 +1157,9 @@ var samplerSymbolCache = {};  // pc string -> symbol name
 var samplerFlameData = null;  // {contexts: [{name, samples, functions: [{name, count}]}]}
 var samplerRects = [];
 var SAMPLER_BAR_H = 22;
+var samplerCumulative = false;
+var samplerAccum = {};  // coopName -> {ctxName -> {funcMap: {sym -> count}, total}}
+var samplerAccumTotal = 0;
 
 function toggleSampler() {
     samplerActive = !samplerActive;
@@ -1004,8 +1167,21 @@ function toggleSampler() {
     btn.textContent = samplerActive ? 'Stop Sampling' : 'Start Sampling';
     btn.className = 'toggle-btn' + (samplerActive ? ' enabled' : '');
     if (samplerActive) {
+        // Reset accumulator on start
+        samplerAccum = {};
+        samplerAccumTotal = 0;
         runSamplerCycle();
     }
+}
+
+function toggleSamplerMode() {
+    samplerCumulative = !samplerCumulative;
+    var btn = document.getElementById('sampler-mode');
+    btn.textContent = samplerCumulative ? 'Cumulative' : 'Snapshot';
+    btn.className = 'chart-group-btn' + (samplerCumulative ? ' active' : '');
+    // Reset accumulator when switching modes
+    samplerAccum = {};
+    samplerAccumTotal = 0;
 }
 
 function runSamplerCycle() {
@@ -1013,10 +1189,12 @@ function runSamplerCycle() {
     samplerCycleRunning = true;
 
     var hz = parseInt(document.getElementById('sampler-hz').value) || 997;
+    var useStacks = document.getElementById('sampler-stacks').checked;
     var statusEl = document.getElementById('sampler-status');
-    statusEl.innerHTML = '<span class="ss-active">sampling at ' + hz + ' Hz...</span>';
+    statusEl.innerHTML = '<span class="ss-active">sampling at ' + hz + ' Hz' +
+        (useStacks ? ' (stacks)' : '') + '...</span>';
 
-    fetch('/api/sampler/start?hz=' + hz, {method: 'POST'})
+    fetch('/api/sampler/start?hz=' + hz + (useStacks ? '&stacks=1' : ''), {method: 'POST'})
         .then(function() {
             // Wait 1 second for samples to accumulate
             //
@@ -1030,12 +1208,20 @@ function runSamplerCycle() {
             return fetch('/api/sampler/samples').then(function(r) { return r.json(); });
         })
         .then(function(data) {
-            // Find PCs we haven't symbolized yet
+            // Find PCs we haven't symbolized yet — from both PC ring and stack ring
             //
             var unknownPCs = [];
             for (var i = 0; i < data.samples.length; i++) {
-                var pc = data.samples[i].pc;
-                if (!samplerSymbolCache[pc]) unknownPCs.push(pc);
+                if (!samplerSymbolCache[data.samples[i].pc])
+                    unknownPCs.push(data.samples[i].pc);
+            }
+            if (data.stackSamples) {
+                for (var i = 0; i < data.stackSamples.length; i++) {
+                    var frames = data.stackSamples[i].frames || [];
+                    for (var f = 0; f < frames.length; f++) {
+                        if (!samplerSymbolCache[frames[f]]) unknownPCs.push(frames[f]);
+                    }
+                }
             }
 
             if (unknownPCs.length > 0) {
@@ -1085,46 +1271,200 @@ function runSamplerCycle() {
         });
 }
 
-function buildSamplerFlame(data) {
-    // Group samples by context, then by symbol within each context
+function ingestSamples(data) {
+    if (data.stacks && data.stackSamples) {
+        return ingestStackSamples(data);
+    }
+    // PC-only mode: parse into the coopMap structure
     //
-    var ctxMap = {};  // contextName -> {funcMap: {symbol -> count}, total: N}
-    var totalSamples = 0;
+    var coopMap = {};
+    var count = 0;
 
     for (var i = 0; i < data.samples.length; i++) {
         var s = data.samples[i];
+        var coopName = s.cooperator || '(none)';
         var ctxName = s.context || '(cooperator)';
         var symbol = samplerSymbolCache[s.pc] || s.pc;
-
-        // Shorten symbol: strip parameters for readability
-        //
         var shortSym = shortenSymbol(symbol);
 
-        if (!ctxMap[ctxName]) ctxMap[ctxName] = {funcMap: {}, total: 0};
-        ctxMap[ctxName].funcMap[shortSym] = (ctxMap[ctxName].funcMap[shortSym] || 0) + 1;
-        ctxMap[ctxName].total++;
-        totalSamples++;
+        if (!coopMap[coopName]) coopMap[coopName] = {ctxMap: {}, total: 0};
+        if (!coopMap[coopName].ctxMap[ctxName])
+            coopMap[coopName].ctxMap[ctxName] = {funcMap: {}, total: 0};
+        coopMap[coopName].ctxMap[ctxName].funcMap[shortSym] =
+            (coopMap[coopName].ctxMap[ctxName].funcMap[shortSym] || 0) + 1;
+        coopMap[coopName].ctxMap[ctxName].total++;
+        coopMap[coopName].total++;
+        count++;
     }
+    return {coopMap: coopMap, count: count, stacks: false};
+}
 
-    // Convert to sorted array
+// Build a call tree from stack samples. Each sample has frames[] from leaf to root.
+// We build a tree from root to leaf (flame graph convention).
+//
+function ingestStackSamples(data) {
+    // stackTree: coopName -> ctxName -> tree node
+    // tree node: {name, count, children: {name -> node}}
     //
-    var contexts = [];
-    for (var name in ctxMap) {
-        var functions = [];
-        for (var fn in ctxMap[name].funcMap) {
-            functions.push({name: fn, count: ctxMap[name].funcMap[fn]});
+    var coopMap = {};
+    var count = 0;
+    var stackSamples = data.stackSamples || [];
+
+    for (var i = 0; i < stackSamples.length; i++) {
+        var s = stackSamples[i];
+        var coopName = s.cooperator || '(none)';
+        var ctxName = s.context || '(cooperator)';
+        var frames = s.frames || [];
+
+        if (!coopMap[coopName]) coopMap[coopName] = {trees: {}, total: 0};
+        if (!coopMap[coopName].trees[ctxName])
+            coopMap[coopName].trees[ctxName] = {name: ctxName, count: 0, children: {}};
+
+        var node = coopMap[coopName].trees[ctxName];
+        node.count++;
+        coopMap[coopName].total++;
+        count++;
+
+        // Walk frames from root (last) to leaf (first) to build top-down tree
+        //
+        for (var f = frames.length - 1; f >= 0; f--) {
+            var sym = samplerSymbolCache[frames[f]] || frames[f];
+            var shortSym = shortenSymbol(sym);
+            if (!node.children[shortSym]) {
+                node.children[shortSym] = {name: shortSym, count: 0, children: {}};
+            }
+            node.children[shortSym].count++;
+            node = node.children[shortSym];
         }
-        functions.sort(function(a, b) { return b.count - a.count; });
-        contexts.push({name: name, samples: ctxMap[name].total, functions: functions});
+    }
+    return {coopMap: coopMap, count: count, stacks: true};
+}
+
+function mergeTreeNodes(dst, src) {
+    dst.count += src.count;
+    for (var childName in src.children) {
+        if (!dst.children[childName]) {
+            dst.children[childName] = {name: childName, count: 0, children: {}};
+        }
+        mergeTreeNodes(dst.children[childName], src.children[childName]);
+    }
+}
+
+function mergeIntoAccum(ingested) {
+    var coopMap = ingested.coopMap;
+    var isStacks = ingested.stacks;
+
+    for (var coopName in coopMap) {
+        var cm = coopMap[coopName];
+
+        if (isStacks) {
+            if (!samplerAccum[coopName]) samplerAccum[coopName] = {trees: {}, total: 0};
+            for (var ctxName in cm.trees) {
+                if (!samplerAccum[coopName].trees[ctxName]) {
+                    samplerAccum[coopName].trees[ctxName] = {
+                        name: ctxName, count: 0, children: {}
+                    };
+                }
+                mergeTreeNodes(samplerAccum[coopName].trees[ctxName], cm.trees[ctxName]);
+            }
+            samplerAccum[coopName].total += cm.total;
+        } else {
+            if (!samplerAccum[coopName]) samplerAccum[coopName] = {ctxMap: {}, total: 0};
+            for (var ctxName in cm.ctxMap) {
+                if (!samplerAccum[coopName].ctxMap[ctxName])
+                    samplerAccum[coopName].ctxMap[ctxName] = {funcMap: {}, total: 0};
+                var src = cm.ctxMap[ctxName];
+                var dst = samplerAccum[coopName].ctxMap[ctxName];
+                for (var fn in src.funcMap) {
+                    dst.funcMap[fn] = (dst.funcMap[fn] || 0) + src.funcMap[fn];
+                }
+                dst.total += src.total;
+            }
+            samplerAccum[coopName].total += cm.total;
+        }
+    }
+}
+
+function coopMapToFlameData(coopMap, totalSamples, isStacks) {
+    if (isStacks) return treeToFlameData(coopMap, totalSamples);
+
+    var coopNames = Object.keys(coopMap);
+    var hasMultipleCoops = coopNames.length > 1;
+
+    var contexts = [];
+    for (var ci = 0; ci < coopNames.length; ci++) {
+        var coopName = coopNames[ci];
+        var cm = coopMap[coopName];
+        var ctxNames = Object.keys(cm.ctxMap);
+
+        for (var ti = 0; ti < ctxNames.length; ti++) {
+            var ctxName = ctxNames[ti];
+            var ctxData = cm.ctxMap[ctxName];
+            var functions = [];
+            for (var fn in ctxData.funcMap) {
+                functions.push({name: fn, count: ctxData.funcMap[fn]});
+            }
+            functions.sort(function(a, b) { return b.count - a.count; });
+            var displayName = hasMultipleCoops ? coopName + '/' + ctxName : ctxName;
+            contexts.push({
+                name: displayName, samples: ctxData.total, functions: functions,
+                cooperator: coopName
+            });
+        }
     }
     contexts.sort(function(a, b) { return b.samples - a.samples; });
+    return {contexts: contexts, total: totalSamples, stacks: false};
+}
 
-    samplerFlameData = {contexts: contexts, total: totalSamples};
+// Convert tree-structured coopMap into flame graph data.
+// Returns {roots: [{name, count, children: [...]}], total, stacks: true}
+// Each root is a context, children are sorted by count descending.
+//
+function treeToFlameData(coopMap, totalSamples) {
+    var coopNames = Object.keys(coopMap);
+    var hasMultipleCoops = coopNames.length > 1;
 
-    // Update info
-    //
-    document.getElementById('si-samples').textContent = totalSamples;
-    document.getElementById('si-contexts').textContent = contexts.length;
+    var roots = [];
+    for (var ci = 0; ci < coopNames.length; ci++) {
+        var coopName = coopNames[ci];
+        var cm = coopMap[coopName];
+        for (var ctxName in cm.trees) {
+            var tree = cm.trees[ctxName];
+            var displayName = hasMultipleCoops ? coopName + '/' + ctxName : ctxName;
+            roots.push(flattenTree(tree, displayName));
+        }
+    }
+    roots.sort(function(a, b) { return b.count - a.count; });
+    return {roots: roots, total: totalSamples, stacks: true};
+}
+
+// Convert {name, count, children: {name -> node}} into {name, count, children: [sorted array]}
+//
+function flattenTree(node, displayName) {
+    var children = [];
+    for (var childName in node.children) {
+        children.push(flattenTree(node.children[childName], childName));
+    }
+    children.sort(function(a, b) { return b.count - a.count; });
+    return {name: displayName || node.name, count: node.count, children: children};
+}
+
+function buildSamplerFlame(data) {
+    var ingested = ingestSamples(data);
+
+    if (samplerCumulative) {
+        mergeIntoAccum(ingested);
+        samplerAccumTotal += ingested.count;
+        samplerFlameData = coopMapToFlameData(samplerAccum, samplerAccumTotal, ingested.stacks);
+    } else {
+        samplerFlameData = coopMapToFlameData(ingested.coopMap, ingested.count, ingested.stacks);
+    }
+
+    var ctxCount = samplerFlameData.stacks
+        ? samplerFlameData.roots.length
+        : samplerFlameData.contexts.length;
+    document.getElementById('si-samples').textContent = samplerFlameData.total;
+    document.getElementById('si-contexts').textContent = ctxCount;
     document.getElementById('si-symbols').textContent = Object.keys(samplerSymbolCache).length;
 }
 
@@ -1173,48 +1513,63 @@ function drawSamplerFlame() {
     var rect = canvas.getBoundingClientRect();
     var W = rect.width;
 
-    // Build rectangles: top row = contexts, bottom rows = functions per context
-    //
     samplerRects = [];
     var total = samplerFlameData.total;
-    var x = 0;
 
-    for (var ci = 0; ci < samplerFlameData.contexts.length; ci++) {
-        var ctx = samplerFlameData.contexts[ci];
-        var ctxW = (ctx.samples / total) * W;
-        if (ctxW < 2) ctxW = 2;
-
-        // Context bar (depth 0)
+    if (samplerFlameData.stacks) {
+        // Tree mode: recursively lay out flame graph from roots
         //
-        samplerRects.push({
-            x: x, w: ctxW, depth: 0,
-            name: ctx.name, count: ctx.samples,
-            pct: (ctx.samples / total * 100).toFixed(1),
-            isContext: true
-        });
-
-        // Function bars (depth 1+)
+        var maxDepth = 0;
+        var x = 0;
+        for (var ri = 0; ri < samplerFlameData.roots.length; ri++) {
+            var root = samplerFlameData.roots[ri];
+            var rootW = (root.count / total) * W;
+            if (rootW < 2) rootW = 2;
+            var d = layoutFlameNode(root, 0, x, rootW, total, W, root.name);
+            if (d > maxDepth) maxDepth = d;
+            x += rootW;
+        }
+    } else {
+        // Flat mode: top row = contexts, second row = functions
         //
-        var fx = x;
-        for (var fi = 0; fi < ctx.functions.length; fi++) {
-            var fn = ctx.functions[fi];
-            var fnW = (fn.count / total) * W;
-            if (fnW < 1) fnW = 1;
+        var x = 0;
+        for (var ci = 0; ci < samplerFlameData.contexts.length; ci++) {
+            var ctx = samplerFlameData.contexts[ci];
+            var ctxW = (ctx.samples / total) * W;
+            if (ctxW < 2) ctxW = 2;
 
             samplerRects.push({
-                x: fx, w: fnW, depth: 1,
-                name: fn.name, count: fn.count,
-                pct: (fn.count / total * 100).toFixed(1),
-                contextName: ctx.name,
-                isContext: false
+                x: x, w: ctxW, depth: 0,
+                name: ctx.name, count: ctx.samples,
+                pct: (ctx.samples / total * 100).toFixed(1),
+                isContext: true
             });
-            fx += fnW;
+
+            var fx = x;
+            for (var fi = 0; fi < ctx.functions.length; fi++) {
+                var fn = ctx.functions[fi];
+                var fnW = (fn.count / total) * W;
+                if (fnW < 1) fnW = 1;
+                samplerRects.push({
+                    x: fx, w: fnW, depth: 1,
+                    name: fn.name, count: fn.count,
+                    pct: (fn.count / total * 100).toFixed(1),
+                    contextName: ctx.name,
+                    isContext: false
+                });
+                fx += fnW;
+            }
+            x += ctxW;
         }
-        x += ctxW;
+        var maxDepth = 1;
     }
 
-    var maxDepth = 1;
-    var H = (maxDepth + 1) * (SAMPLER_BAR_H + 1) + 8;
+    var actualMaxDepth = 0;
+    for (var i = 0; i < samplerRects.length; i++) {
+        if (samplerRects[i].depth > actualMaxDepth) actualMaxDepth = samplerRects[i].depth;
+    }
+
+    var H = (actualMaxDepth + 1) * (SAMPLER_BAR_H + 1) + 8;
     canvas.height = H * dpr;
     canvas.style.height = H + 'px';
     canvas.width = W * dpr;
@@ -1240,9 +1595,11 @@ function drawSamplerFlame() {
             ctxColorMap[r.name] = color;
             ctxColorIdx++;
         } else {
-            // Function bar: slightly dimmer version of context color
+            // Deeper frames get progressively dimmer
             //
-            color = (ctxColorMap[r.contextName] || '#888') + 'cc';
+            var base = ctxColorMap[r.contextName] || '#888';
+            var alpha = Math.max(0.4, 1.0 - r.depth * 0.08);
+            color = base + Math.round(alpha * 255).toString(16).padStart(2, '0');
         }
 
         c.fillStyle = color;
@@ -1264,6 +1621,30 @@ function drawSamplerFlame() {
             c.fillText(label, r.x + 3, y + SAMPLER_BAR_H / 2);
         }
     }
+}
+
+// Recursively lay out a flame graph tree node. Returns max depth reached.
+//
+function layoutFlameNode(node, depth, x, w, total, canvasW, contextName) {
+    samplerRects.push({
+        x: x, w: w, depth: depth,
+        name: node.name, count: node.count,
+        pct: (node.count / total * 100).toFixed(1),
+        isContext: depth === 0,
+        contextName: contextName
+    });
+
+    var maxDepth = depth;
+    var cx = x;
+    for (var i = 0; i < node.children.length; i++) {
+        var child = node.children[i];
+        var childW = (child.count / total) * canvasW;
+        if (childW < 1) childW = 1;
+        var d = layoutFlameNode(child, depth + 1, cx, childW, total, canvasW, contextName);
+        if (d > maxDepth) maxDepth = d;
+        cx += childW;
+    }
+    return maxDepth;
 }
 
 // Sampler canvas mouse handlers
@@ -1311,8 +1692,8 @@ function drawSamplerFlame() {
 // ---- Main refresh loop ----
 function refresh() {
     Promise.all([
-        fetch('/api/status').then(function(r) { return r.json(); }),
-        fetch('/api/perf').then(function(r) { return r.json(); }),
+        fetch('/api/cooperators').then(function(r) { return r.json(); }),
+        fetch('/api/cooperators/perf').then(function(r) { return r.json(); }),
     ]).then(function(results) {
         refreshStatus(results[0]);
         refreshFlame(results[0]);

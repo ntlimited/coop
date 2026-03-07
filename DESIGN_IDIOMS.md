@@ -108,6 +108,30 @@ This is not lazy evaluation for its own sake. It is the principle that in a coop
 cost of an operation should be borne by the context that benefits from it, and the framework should
 not preemptively consume resources (CPU, memory, IO bandwidth) on speculation.
 
+## Semantic wrapper types over raw integers
+
+When a `uint64_t` has domain meaning — an epoch, an era, a transaction ID, a packed status+value —
+wrap it in a named struct. The struct owns the bit layout and exposes intent-revealing accessors.
+Callsites read meaning, not shifts and masks.
+
+```cpp
+struct TxnEntry {
+    uint64_t m_bits;
+    Status status()    const { return static_cast<Status>(m_bits >> 62); }
+    Era    commitEra() const { return Era{m_bits & kEraMask}; }
+};
+```
+
+The compiler inlines these completely — same codegen as the raw version, zero runtime cost. The
+value is not abstraction for its own sake; it is that the bit layout is defined in one place and
+every reader of the type gets it right mechanically. A raw `uint64_t` with a comment is a bug
+waiting for someone who doesn't read comments.
+
+This extends to any typed identity: `TxnID`, `Era`, `ObjID`, `epoch::Epoch`. If two values have
+different comparison semantics, different valid ranges, or different sentinel values, they are
+different types — even if the underlying representation is the same. Mixing them up should be a
+compile error, not a runtime mystery.
+
 ## IKWIAD (in release mode)
 
 "I Know What I am Doing" is a core principal for us. We're a micro-stack, green threading library:

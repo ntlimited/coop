@@ -128,7 +128,7 @@ struct ChatHandler : coop::Launchable
             writerCtx->SetName("ChatWriter");
             Message msg;
 
-            while (outbound->Recv(writerCtx, msg))
+            while (outbound->Recv(msg))
             {
                 int sent = stream->SendAll(msg.data, msg.len);
                 if (sent <= 0)
@@ -154,7 +154,7 @@ struct ChatHandler : coop::Launchable
             msg.len = snprintf(msg.data, sizeof(msg.data), "[fd=%d] %.*s", rawFd, n, recvBuf);
             msg.senderFd = rawFd;
 
-            if (!m_broadcast->Send(ctx, msg))
+            if (!m_broadcast->Send(msg))
             {
                 break;
             }
@@ -165,7 +165,7 @@ struct ChatHandler : coop::Launchable
         //
         spdlog::info("chat: disconnected fd={} slot={}", rawFd, slot);
         m_registry->Unregister(slot);
-        m_outbound.Shutdown(ctx);
+        m_outbound.Shutdown();
 
         if (m_registry->clients[slot].writerHandle)
         {
@@ -245,7 +245,7 @@ void SpawningTask(coop::Context* ctx, void*)
         bcastCtx->SetName("Broadcaster");
         Message msg;
 
-        while (bcastRecv->Recv(bcastCtx, msg))
+        while (bcastRecv->Recv(msg))
         {
             for (int32_t i = 0; i < MAX_CLIENTS; i++)
             {
@@ -261,7 +261,7 @@ void SpawningTask(coop::Context* ctx, void*)
                     continue;
                 }
 
-                registry.clients[i].outbound->TrySend(bcastCtx, msg);
+                registry.clients[i].outbound->TrySend(msg);
             }
         }
     });
@@ -296,7 +296,7 @@ void SpawningTask(coop::Context* ctx, void*)
 
     // Shut down the broadcast channel so the broadcaster exits cleanly
     //
-    broadcast.Shutdown(ctx);
+    broadcast.Shutdown();
 }
 
 int main()

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <thread>
 
 #include "coop/chan/channel.h"
 #include "coop/chan/select.h"
@@ -9,6 +10,7 @@
 #include "coop/chan/pipe.h"
 #include "coop/chan/merge.h"
 #include "coop/chan/filter.h"
+#include "coop/chan/passage.h"
 #include "test_helpers.h"
 
 TEST(ChannelTest, SendRecv)
@@ -1481,5 +1483,212 @@ TEST(ChannelTest, FilterStopEarly)
 
         src.Shutdown();
         hProd.Kill();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Passage tests
+// ---------------------------------------------------------------------------
+
+// External thread sends N items; cooperator consumer receives them all.
+//
+TEST(PassageTest, BasicSendRecv)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
+
+        constexpr int N = 10;
+        std::thread sender([&]
+        {
+            for (int i = 0; i < N; i++)
+                EXPECT_TRUE(passage.Send(i));
+        });
+
+        int sum = 0;
+        for (int i = 0; i < N; i++)
+        {
+            int v;
+            ASSERT_TRUE(passage.Chan().Recv(v));
+            sum += v;
+        }
+
+        sender.join();
+        EXPECT_EQ(sum, 45);  // 0+1+...+9
+    });
+}
+
+// Multiple external threads send concurrently; all items are delivered.
+//
+TEST(PassageTest, MultipleProducers)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int NTHREADS = 4;
+        constexpr int PER_THREAD = 16;
+        constexpr int TOTAL = NTHREADS * PER_THREAD;
+
+        // Use a large enough passage so no thread drops items.
+        //
+        coop::chan::Passage<int, TOTAL> passage(ctx, ctx->GetCooperator());
+
+        std::thread senders[NTHREADS];
+        for (int t = 0; t < NTHREADS; t++)
+        {
+            senders[t] = std::thread([&, t]
+            {
+                for (int i = 0; i < PER_THREAD; i++)
+                    while (!passage.Send(t * PER_THREAD + i)) {}
+            });
+        }
+
+        int received = 0;
+        while (received < TOTAL)
+        {
+            int v;
+            ASSERT_TRUE(passage.Chan().Recv(v));
+            received++;
+        }
+
+        for (auto& t : senders) t.join();
+        EXPECT_EQ(received, TOTAL);
+    });
+}
+
+// External ring capacity limit: Send() returns false when the ring is full.
+//
+TEST(PassageTest, BackpressureRingFull)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int, 2> passage(ctx, ctx->GetCooperator());
+
+        // Fill ring from the cooperator thread itself (no external thread needed).
+        //
+        EXPECT_TRUE(passage.Send(1));
+        EXPECT_TRUE(passage.Send(2));
+        EXPECT_FALSE(passage.Send(3));  // ring full — back-pressure
+
+        // Drain so the consumer loop terminates cleanly.
+        //
+        int v;
+        EXPECT_TRUE(passage.Chan().Recv(v)); EXPECT_EQ(v, 1);
+        EXPECT_TRUE(passage.Chan().Recv(v)); EXPECT_EQ(v, 2);
+    });
+}
+
+// After Shutdown(), Chan().Recv() returns false once internal channel is drained.
+//
+TEST(PassageTest, ShutdownDrainsInternalChannel)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
+
+        constexpr int N = 5;
+        std::thread sender([&]
+        {
+            for (int i = 0; i < N; i++)
+                while (!passage.Send(i)) {}
+        });
+
+        // Receive all N items.
+        //
+        for (int i = 0; i < N; i++)
+        {
+            int v;
+            ASSERT_TRUE(passage.Chan().Recv(v));
+        }
+
+        sender.join();
+        passage.Shutdown();
+
+        // Internal channel is shut down — next Recv returns false.
+        //
+        int v;
+        EXPECT_FALSE(passage.Chan().Recv(v));
+    });
+}
+
+// Passage composes with Pipe: items cross the thread boundary then are transformed.
+//
+TEST(PassageTest, PipeComposition)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
+        auto doubled = coop::chan::Pipe(ctx, passage.Chan(),
+            [](int v) { return v * 2; });
+
+        constexpr int N = 5;
+        std::thread sender([&]
+        {
+            for (int i = 0; i < N; i++)
+                while (!passage.Send(i)) {}
+        });
+
+        int sum = 0;
+        for (int i = 0; i < N; i++)
+        {
+            int v;
+            ASSERT_TRUE(doubled.Chan().Recv(v));
+            sum += v;
+        }
+
+        sender.join();
+        EXPECT_EQ(sum, (0 + 1 + 2 + 3 + 4) * 2);  // 20
+    });
+}
+
+// Passage::Recv() — adaptive yield → timed-wait path
+//
+TEST(PassageTest, AdaptiveRecv)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 20;
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
+
+        std::thread sender([&]
+        {
+            for (int i = 0; i < N; i++)
+                while (!passage.Send(i)) {}
+        });
+
+        int sum = 0;
+        for (int i = 0; i < N; i++)
+        {
+            int v;
+            ASSERT_TRUE(passage.Recv(v));
+            sum += v;
+        }
+
+        sender.join();
+        EXPECT_EQ(sum, N * (N - 1) / 2);  // 0..19
+    });
+}
+
+// Shutdown while Passage::Recv() is in the timed-wait phase should return false.
+//
+TEST(PassageTest, AdaptiveRecvShutdown)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
+
+        // Spawn a context that shuts down the passage after a short cooperative delay.
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < 20; i++)
+                coop::Yield();
+            passage.Shutdown();
+        });
+
+        // Recv should eventually return false once shutdown propagates.
+        //
+        int v;
+        bool result = passage.Recv(v);
+        EXPECT_FALSE(result);
     });
 }

@@ -1,6 +1,10 @@
 #include <benchmark/benchmark.h>
 
+#include <atomic>
+#include <thread>
+
 #include "coop/chan/channel.h"
+#include "coop/chan/passage.h"
 #include "coop/context.h"
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"
@@ -443,3 +447,226 @@ static void BM_Channel_Pipeline_Depth(benchmark::State& state)
     });
 }
 BENCHMARK(BM_Channel_Pipeline_Depth)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(64);
+
+// ---------------------------------------------------------------------------
+// Passage benchmarks — cross-thread channel vs intra-cooperator Channel
+// ---------------------------------------------------------------------------
+//
+// BM_Passage_Throughput: one external thread sends into a Passage<int,N>; one cooperator
+// context receives from Chan(). Directly comparable to BM_Channel_Throughput which uses
+// two cooperator contexts on the same thread. The gap between them is the cost of the
+// mutex, atomic CAS, heap-allocated drain submission, and cross-thread wakeup (eventfd).
+//
+// BM_Passage_NProducers: N external threads send concurrently into a single Passage.
+// Measures how the mutex contention on the ring buffer scales with producer count.
+//
+
+static void BM_Passage_Throughput(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        const int cap = static_cast<int>(state.range(0));
+        (void)cap;  // Passage ring N is fixed at 256 — cap param drives BATCH below
+
+        constexpr size_t RING = 256;
+        const int BATCH = static_cast<int>(state.range(0));
+
+        coop::chan::Passage<int, RING> passage(ctx, ctx->GetCooperator());
+
+        std::atomic<bool> stop{false};
+
+        std::thread sender([&]
+        {
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                for (int i = 0; i < BATCH; i++)
+                {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    // Spin on full ring. Also check stop: Shutdown() makes Send() return
+                    // false permanently, so without the stop check this would spin forever.
+                    while (!passage.Send(i) && !stop.load(std::memory_order_relaxed)) {}
+                }
+            }
+        });
+
+        int64_t totalItems = 0;
+        for (auto _ : state)
+        {
+            for (int i = 0; i < BATCH; i++)
+            {
+                int v;
+                passage.Chan().Recv(v);
+                benchmark::DoNotOptimize(v);
+            }
+            totalItems += BATCH;
+        }
+
+        // Signal sender to stop, shut down so any spin on full ring unblocks, then join.
+        // Join is fast — sender exits its current inner loop iteration then checks stop.
+        //
+        stop.store(true, std::memory_order_release);
+        passage.Shutdown();
+        sender.join();
+
+        state.SetItemsProcessed(totalItems);
+    });
+}
+BENCHMARK(BM_Passage_Throughput)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
+
+// ---------------------------------------------------------------------------
+// BM_Passage_NProducers — throughput vs producer count (fixed BATCH)
+// ---------------------------------------------------------------------------
+
+static void BM_Passage_NProducers(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        const int nProducers = static_cast<int>(state.range(0));
+        constexpr int BATCH = 1024;
+        constexpr size_t RING = 512;
+
+        coop::chan::Passage<int, RING> passage(ctx, ctx->GetCooperator());
+
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> senders(nProducers);
+
+        for (int p = 0; p < nProducers; p++)
+        {
+            senders[p] = std::thread([&]
+            {
+                while (!stop.load(std::memory_order_relaxed))
+                {
+                    for (int i = 0; i < BATCH; i++)
+                    {
+                        if (stop.load(std::memory_order_relaxed)) return;
+                        while (!passage.Send(i) && !stop.load(std::memory_order_relaxed)) {}
+                    }
+                }
+            });
+        }
+
+        int64_t totalItems = 0;
+        for (auto _ : state)
+        {
+            for (int i = 0; i < BATCH; i++)
+            {
+                int v;
+                passage.Chan().Recv(v);
+                benchmark::DoNotOptimize(v);
+            }
+            totalItems += BATCH;
+        }
+
+        stop.store(true, std::memory_order_release);
+        passage.Shutdown();
+        for (auto& t : senders) t.join();
+
+        state.SetItemsProcessed(totalItems);
+    });
+}
+BENCHMARK(BM_Passage_NProducers)->Arg(1)->Arg(2)->Arg(4)->Arg(8);
+
+// ---------------------------------------------------------------------------
+// BM_Passage_AdaptiveRecv_Throughput / BM_Passage_AdaptiveRecv_NProducers
+// ---------------------------------------------------------------------------
+//
+// Same as BM_Passage_Throughput / BM_Passage_NProducers but using Passage::Recv()
+// instead of Chan().Recv(). Passage::Recv() uses an adaptive yield → timed-wait
+// strategy: yields up to kYieldThreshold times (giving Poll() a chance to process
+// the SubmissionDrainer CQE), then falls back to CoordinateWithKill with a growing
+// timeout SQE. Compare against the _Throughput / _NProducers variants above to
+// measure the benefit of the adaptive path over plain blocking CoordinateWith.
+//
+
+static void BM_Passage_AdaptiveRecv_Throughput(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        constexpr size_t RING = 256;
+        const int BATCH = static_cast<int>(state.range(0));
+
+        coop::chan::Passage<int, RING> passage(ctx, ctx->GetCooperator());
+
+        std::atomic<bool> stop{false};
+
+        std::thread sender([&]
+        {
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                for (int i = 0; i < BATCH; i++)
+                {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    while (!passage.Send(i) && !stop.load(std::memory_order_relaxed)) {}
+                }
+            }
+        });
+
+        int64_t totalItems = 0;
+        for (auto _ : state)
+        {
+            for (int i = 0; i < BATCH; i++)
+            {
+                int v;
+                passage.Recv(v);
+                benchmark::DoNotOptimize(v);
+            }
+            totalItems += BATCH;
+        }
+
+        stop.store(true, std::memory_order_release);
+        passage.Shutdown();
+        sender.join();
+
+        state.SetItemsProcessed(totalItems);
+    });
+}
+BENCHMARK(BM_Passage_AdaptiveRecv_Throughput)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
+
+static void BM_Passage_AdaptiveRecv_NProducers(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        const int nProducers = static_cast<int>(state.range(0));
+        constexpr int BATCH = 1024;
+        constexpr size_t RING = 512;
+
+        coop::chan::Passage<int, RING> passage(ctx, ctx->GetCooperator());
+
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> senders(nProducers);
+
+        for (int p = 0; p < nProducers; p++)
+        {
+            senders[p] = std::thread([&]
+            {
+                while (!stop.load(std::memory_order_relaxed))
+                {
+                    for (int i = 0; i < BATCH; i++)
+                    {
+                        if (stop.load(std::memory_order_relaxed)) return;
+                        while (!passage.Send(i) && !stop.load(std::memory_order_relaxed)) {}
+                    }
+                }
+            });
+        }
+
+        int64_t totalItems = 0;
+        for (auto _ : state)
+        {
+            for (int i = 0; i < BATCH; i++)
+            {
+                int v;
+                passage.Recv(v);
+                benchmark::DoNotOptimize(v);
+            }
+            totalItems += BATCH;
+        }
+
+        stop.store(true, std::memory_order_release);
+        passage.Shutdown();
+        for (auto& t : senders) t.join();
+
+        state.SetItemsProcessed(totalItems);
+    });
+}
+BENCHMARK(BM_Passage_AdaptiveRecv_NProducers)->Arg(1)->Arg(2)->Arg(4)->Arg(8);

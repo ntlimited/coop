@@ -5,6 +5,7 @@
 #include "coop/channel.h"
 #include "coop/select.h"
 #include "coop/self.h"
+#include "coop/ticker.h"
 #include "test_helpers.h"
 
 TEST(ChannelTest, SendRecv)
@@ -895,5 +896,70 @@ TEST(ChannelTest, SelectAny)
         EXPECT_EQ(sum, 10);  // 1+2+3+4
 
         ch2.Shutdown();
+    });
+}
+
+// Ticker fires at least N times before Stop() is called explicitly.
+//
+TEST(ChannelTest, TickerRecv)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+
+        int ticks = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            EXPECT_TRUE(ticker.Chan().Recv());
+            ticks++;
+        }
+
+        ticker.Stop();
+        EXPECT_EQ(ticks, 3);
+    });
+}
+
+// Ticker composes with SelectWithKill; Stop() after counting enough ticks.
+//
+TEST(ChannelTest, TickerSelect)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+
+        int ticks = 0;
+        while (coop::SelectWithKill(ctx,
+            coop::On(ticker.Chan(), [&]{ ticks++; })
+        ) && ticks < 3) {}
+
+        ticker.Stop();
+        EXPECT_GE(ticks, 3);
+    });
+}
+
+// Stop() immediately after construction must not hang.
+//
+TEST(ChannelTest, TickerStopImmediate)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+        ticker.Stop();
+        // If we reach here without hanging, the test passes.
+    });
+}
+
+// ~Ticker() calls Stop() automatically; no explicit Stop() needed.
+//
+TEST(ChannelTest, TickerDestroyWithoutStop)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        {
+            coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+            // Let one tick arrive then let the destructor stop it.
+            ticker.Chan().Recv();
+        }
+        // If we reach here without hanging, the test passes.
     });
 }

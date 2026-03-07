@@ -22,7 +22,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(spdlog)
 
-# Collect library sources
+# coop/chan — channel toolkit (compiled separately, folded into libcoop.a)
+#
+# Keeping chan as its own CMake target gives clean module boundaries and dependency
+# tracking as the toolkit grows. The OBJECT library approach folds the compiled objects
+# directly into the final libcoop.a so consumers see a single library.
+#
+file(GLOB COOP_CHAN_SOURCES coop/chan/*.cpp)
+add_library(coop_chan OBJECT ${COOP_CHAN_SOURCES})
+target_include_directories(coop_chan PUBLIC ${CMAKE_SOURCE_DIR})
+target_compile_options(coop_chan PRIVATE -Wcpp -fno-omit-frame-pointer)
+
+# Collect remaining library sources (exclude coop/chan/ — handled by coop_chan above)
+#
 file(GLOB_RECURSE COOP_SOURCES
     coop/*.cpp
     coop/*.S
@@ -31,8 +43,9 @@ file(GLOB_RECURSE COOP_SOURCES
     coop/io/*.cpp
     coop/http/*.cpp
 )
+list(FILTER COOP_SOURCES EXCLUDE REGEX ".*/coop/chan/.*")
 
-add_library(coop STATIC ${COOP_SOURCES})
+add_library(coop STATIC ${COOP_SOURCES} $<TARGET_OBJECTS:coop_chan>)
 target_include_directories(coop PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer)
 

@@ -8,6 +8,7 @@
 #include "coop/chan/ticker.h"
 #include "coop/chan/pipe.h"
 #include "coop/chan/merge.h"
+#include "coop/chan/filter.h"
 #include "test_helpers.h"
 
 TEST(ChannelTest, SendRecv)
@@ -1358,5 +1359,127 @@ TEST(ChannelTest, MergeChained)
             count++;
 
         EXPECT_EQ(count, 3 * N);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Filter tests
+// ---------------------------------------------------------------------------
+
+// Filter passes only items matching the predicate.
+//
+TEST(ChannelTest, FilterBasic)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 10;
+
+        int buf[4];
+        coop::chan::Channel<int> src(ctx, buf, 4);
+
+        auto evens = coop::chan::Filter(ctx, src, [](int v) { return v % 2 == 0; });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++)
+                src.Send(i);
+            src.Shutdown();
+        });
+
+        int count = 0;
+        int value = 0;
+        while (evens.Chan().Recv(value))
+        {
+            EXPECT_EQ(value % 2, 0);
+            count++;
+        }
+
+        EXPECT_EQ(count, N / 2);
+    });
+}
+
+// Filter that passes nothing still propagates shutdown.
+//
+TEST(ChannelTest, FilterRejectAll)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf[4];
+        coop::chan::Channel<int> src(ctx, buf, 4);
+
+        auto none = coop::chan::Filter(ctx, src, [](int) { return false; });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < 5; i++)
+                src.Send(i);
+            src.Shutdown();
+        });
+
+        int value = 0;
+        EXPECT_FALSE(none.Chan().Recv(value));
+    });
+}
+
+// Filter composes with Pipe: pipe → filter → consumer.
+//
+TEST(ChannelTest, FilterPipeComposition)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf[4];
+        coop::chan::Channel<int> src(ctx, buf, 4);
+
+        auto doubled = coop::chan::Pipe(ctx, src, [](int v) { return v * 2; });
+        auto big     = coop::chan::Filter(ctx, doubled.Chan(),
+                                          [](int v) { return v > 10; });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < 10; i++)
+                src.Send(i);
+            src.Shutdown();
+        });
+
+        // doubled: 0,2,4,6,8,10,12,14,16,18 → big keeps > 10: 12,14,16,18
+        //
+        int count = 0;
+        int value = 0;
+        while (big.Chan().Recv(value))
+        {
+            EXPECT_GT(value, 10);
+            count++;
+        }
+
+        EXPECT_EQ(count, 4);
+    });
+}
+
+// Stop() shuts down early, same as Pipe.
+//
+TEST(ChannelTest, FilterStopEarly)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf[64];
+        coop::chan::Channel<int> src(ctx, buf, 64);
+
+        // Pass everything so no items are dropped.
+        //
+        auto pass = coop::chan::Filter(ctx, src, [](int) { return true; });
+
+        coop::Context::Handle hProd;
+        ctx->GetCooperator()->Spawn(
+            [&](coop::Context*) { int i = 0; while (src.Send(i++)) {} }, &hProd);
+
+        int value = 0;
+        EXPECT_TRUE(pass.Chan().Recv(value));
+
+        pass.Stop();
+        while (pass.Chan().Recv(value)) {}
+        EXPECT_FALSE(pass.Chan().Recv(value));
+
+        src.Shutdown();
+        hProd.Kill();
     });
 }

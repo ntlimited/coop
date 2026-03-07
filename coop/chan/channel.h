@@ -73,27 +73,7 @@ struct BaseChannel
         return m_shutdown;
     }
 
-    bool Shutdown()
-    {
-        if (m_shutdown)
-        {
-            return false;
-        }
-
-        m_shutdown = true;
-        Context* ctx = Self();
-
-        if (m_recv.IsHeld())
-        {
-            m_recv.Release(ctx);
-        }
-        if (m_send.IsHeld())
-        {
-            m_send.Release(ctx);
-        }
-
-        return true;
-    }
+    bool Shutdown();
 
     Coordinator m_recv;
     Coordinator m_send;

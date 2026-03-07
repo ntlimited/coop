@@ -30,6 +30,8 @@
 
 namespace coop
 {
+namespace chan
+{
 
 struct Ticker
 {
@@ -111,4 +113,5 @@ inline Ticker::~Ticker()
     Stop();
 }
 
+} // end namespace chan
 } // end namespace coop

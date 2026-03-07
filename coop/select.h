@@ -40,6 +40,8 @@
 
 namespace coop
 {
+namespace chan
+{
 
 // ---------------------------------------------------------------------------
 // Internal no-ops used as default send/shutdown handlers
@@ -371,7 +373,7 @@ bool Select(Context* ctx, Cases&&... cases)
     return std::apply(
         [ctx](auto&&... cs)
         {
-            using LastCase = std::decay_t<detail::LastType<decltype(cs)...>>;
+            using LastCase = std::decay_t<coop::detail::LastType<decltype(cs)...>>;
             constexpr bool hasDefault = IsDefaultCase<LastCase>::value;
             constexpr bool hasTimeout = IsTimeoutCase<LastCase>::value;
 
@@ -428,7 +430,7 @@ bool SelectWithKill(Context* ctx, Cases&&... cases)
     return std::apply(
         [ctx](auto&&... cs)
         {
-            using LastCase = std::decay_t<detail::LastType<decltype(cs)...>>;
+            using LastCase = std::decay_t<coop::detail::LastType<decltype(cs)...>>;
             constexpr bool hasDefault = IsDefaultCase<LastCase>::value;
             constexpr bool hasTimeout = IsTimeoutCase<LastCase>::value;
 
@@ -542,4 +544,5 @@ bool SelectAnyVoidWithKill(Channels&... channels)
     return ok;
 }
 
+} // namespace chan
 } // namespace coop

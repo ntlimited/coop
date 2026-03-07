@@ -13,7 +13,7 @@ TEST(ChannelTest, SendRecv)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[4];
-        coop::Channel<int> ch(ctx, buffer, 4);
+        coop::chan::Channel<int> ch(ctx, buffer, 4);
 
         ctx->GetCooperator()->Spawn([&](coop::Context* sender)
         {
@@ -31,7 +31,7 @@ TEST(ChannelTest, TrySendFull)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[2];
-        coop::Channel<int> ch(ctx, buffer, 2);
+        coop::chan::Channel<int> ch(ctx, buffer, 2);
 
         EXPECT_TRUE(ch.TrySend(1));
         EXPECT_TRUE(ch.TrySend(2));
@@ -44,7 +44,7 @@ TEST(ChannelTest, TryRecvEmpty)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[4];
-        coop::Channel<int> ch(ctx, buffer, 4);
+        coop::chan::Channel<int> ch(ctx, buffer, 4);
 
         int value = 0;
         EXPECT_FALSE(ch.TryRecv(value));
@@ -56,7 +56,7 @@ TEST(ChannelTest, Shutdown)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[4];
-        coop::Channel<int> ch(ctx, buffer, 4);
+        coop::chan::Channel<int> ch(ctx, buffer, 4);
 
         EXPECT_FALSE(ch.IsShutdown());
         ch.Shutdown();
@@ -71,7 +71,7 @@ TEST(ChannelTest, SendBlocksWhenFull)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[1];
-        coop::Channel<int> ch(ctx, buffer, 1);
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
 
         int step = 0;
 
@@ -117,7 +117,7 @@ TEST(ChannelTest, RecvBlocksWhenEmpty)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[4];
-        coop::Channel<int> ch(ctx, buffer, 4);
+        coop::chan::Channel<int> ch(ctx, buffer, 4);
 
         int step = 0;
         int received = 0;
@@ -152,7 +152,7 @@ TEST(ChannelTest, ShutdownWakesBlockedRecv)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[4];
-        coop::Channel<int> ch(ctx, buffer, 4);
+        coop::chan::Channel<int> ch(ctx, buffer, 4);
 
         bool recvResult = true;
 
@@ -177,7 +177,7 @@ TEST(ChannelTest, ShutdownWakesBlockedSend)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[1];
-        coop::Channel<int> ch(ctx, buffer, 1);
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
 
         // Fill the channel
         //
@@ -205,7 +205,7 @@ TEST(ChannelTest, SendAll)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[4];
-        coop::Channel<int> ch(ctx, buf, 4);
+        coop::chan::Channel<int> ch(ctx, buf, 4);
 
         const int data[] = { 10, 20, 30, 40 };
         EXPECT_TRUE(ch.SendAll(data, 4));
@@ -226,7 +226,7 @@ TEST(ChannelTest, SendAllBlocks)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[2];
-        coop::Channel<int> ch(ctx, buf, 2);
+        coop::chan::Channel<int> ch(ctx, buf, 2);
 
         int recvd[4] = {};
         int nRecvd = 0;
@@ -257,7 +257,7 @@ TEST(ChannelTest, Drain)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[4];
-        coop::Channel<int> ch(ctx, buf, 4);
+        coop::chan::Channel<int> ch(ctx, buf, 4);
 
         EXPECT_TRUE(ch.TrySend(1));
         EXPECT_TRUE(ch.TrySend(2));
@@ -283,7 +283,7 @@ TEST(ChannelTest, DrainPartial)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[4];
-        coop::Channel<int> ch(ctx, buf, 4);
+        coop::chan::Channel<int> ch(ctx, buf, 4);
 
         for (int i = 1; i <= 4; i++)
             EXPECT_TRUE(ch.TrySend(i));
@@ -311,7 +311,7 @@ TEST(ChannelTest, MultipleProducersConsumers)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buffer[8];
-        coop::Channel<int> ch(ctx, buffer, 8);
+        coop::chan::Channel<int> ch(ctx, buffer, 8);
 
         constexpr int NUM_PRODUCERS = 3;
         constexpr int ITEMS_PER_PRODUCER = 10;
@@ -387,8 +387,8 @@ TEST(ChannelTest, SelectRecv)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf1[4], buf2[4];
-        coop::Channel<int> ch1(ctx, buf1, 4);
-        coop::Channel<int> ch2(ctx, buf2, 4);
+        coop::chan::Channel<int> ch1(ctx, buf1, 4);
+        coop::chan::Channel<int> ch2(ctx, buf2, 4);
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -405,14 +405,14 @@ TEST(ChannelTest, SelectRecv)
         int sum = 0, count = 0;
         bool done1 = false, done2 = false;
 
-        auto on1 = coop::On(ch1, [&](int v) { sum += v; count++; }, [&]{ done1 = true; });
-        auto on2 = coop::On(ch2, [&](int v) { sum += v; count++; }, [&]{ done2 = true; });
+        auto on1 = coop::chan::On(ch1, [&](int v) { sum += v; count++; }, [&]{ done1 = true; });
+        auto on2 = coop::chan::On(ch2, [&](int v) { sum += v; count++; }, [&]{ done2 = true; });
 
         while (!done1 || !done2)
         {
-            if      (!done1 && !done2) coop::Select(ctx, on1, on2);
-            else if (!done1)           coop::Select(ctx, on1);
-            else                       coop::Select(ctx, on2);
+            if      (!done1 && !done2) coop::chan::Select(ctx, on1, on2);
+            else if (!done1)           coop::chan::Select(ctx, on1);
+            else                       coop::chan::Select(ctx, on2);
         }
 
         // sum of (0+10+20+30) + (0+100+200+300) = 60 + 600 = 660
@@ -429,8 +429,8 @@ TEST(ChannelTest, SelectRecvShutdown)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf1[4], buf2[4];
-        coop::Channel<int> ch1(ctx, buf1, 4);
-        coop::Channel<int> ch2(ctx, buf2, 4);
+        coop::chan::Channel<int> ch1(ctx, buf1, 4);
+        coop::chan::Channel<int> ch2(ctx, buf2, 4);
 
         // ch1 gets one item then shuts down; ch2 is never written to.
         //
@@ -444,9 +444,9 @@ TEST(ChannelTest, SelectRecvShutdown)
 
         // Loop until Select returns false (ch1 shutdown fires).
         //
-        while (coop::Select(ctx,
-            coop::On(ch1, [&](int v) { received = v; }),
-            coop::On(ch2, [&](int v) { (void)v; })
+        while (coop::chan::Select(ctx,
+            coop::chan::On(ch1, [&](int v) { received = v; }),
+            coop::chan::On(ch2, [&](int v) { (void)v; })
         )) {}
 
         EXPECT_EQ(received, 42);
@@ -461,7 +461,7 @@ TEST(ChannelTest, FixedChannel)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::FixedChannel<int, 4> ch(ctx);
+        coop::chan::FixedChannel<int, 4> ch(ctx);
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -483,7 +483,7 @@ TEST(ChannelTest, MoveOnlyType)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::FixedChannel<std::unique_ptr<int>, 4> ch(ctx);
+        coop::chan::FixedChannel<std::unique_ptr<int>, 4> ch(ctx);
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -510,7 +510,7 @@ TEST(ChannelTest, MoveOnlyTypeBlocking)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::FixedChannel<std::unique_ptr<int>, 1> ch(ctx);
+        coop::chan::FixedChannel<std::unique_ptr<int>, 1> ch(ctx);
 
         // Fill the channel.
         //
@@ -542,7 +542,7 @@ TEST(ChannelTest, MoveOnlyTypeSelect)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::FixedChannel<std::unique_ptr<int>, 4> ch(ctx);
+        coop::chan::FixedChannel<std::unique_ptr<int>, 4> ch(ctx);
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -551,8 +551,8 @@ TEST(ChannelTest, MoveOnlyTypeSelect)
         });
 
         int received = -1;
-        bool ok = coop::Select(ctx,
-            coop::On(ch, [&](std::unique_ptr<int> v){ received = *v; })
+        bool ok = coop::chan::Select(ctx,
+            coop::chan::On(ch, [&](std::unique_ptr<int> v){ received = *v; })
         );
 
         EXPECT_TRUE(ok);
@@ -566,7 +566,7 @@ TEST(ChannelTest, VoidChannel)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::FixedChannel<void, 4> ch(ctx);
+        coop::chan::FixedChannel<void, 4> ch(ctx);
 
         int count = 0;
 
@@ -588,8 +588,8 @@ TEST(ChannelTest, VoidChannelSelect)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::FixedChannel<void, 4> sig(ctx);
-        coop::FixedChannel<int,  4> data(ctx);
+        coop::chan::FixedChannel<void, 4> sig(ctx);
+        coop::chan::FixedChannel<int,  4> data(ctx);
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -602,14 +602,14 @@ TEST(ChannelTest, VoidChannelSelect)
         int signals = 0, dataVal = -1;
         bool sigDone = false, dataDone = false;
 
-        auto onSig  = coop::On(sig,  [&]()      { signals++; },   [&]{ sigDone  = true; });
-        auto onData = coop::On(data, [&](int v) { dataVal = v; }, [&]{ dataDone = true; });
+        auto onSig  = coop::chan::On(sig,  [&]()      { signals++; },   [&]{ sigDone  = true; });
+        auto onData = coop::chan::On(data, [&](int v) { dataVal = v; }, [&]{ dataDone = true; });
 
         while (!sigDone || !dataDone)
         {
-            if      (!sigDone && !dataDone) coop::Select(ctx, onSig, onData);
-            else if (!sigDone)              coop::Select(ctx, onSig);
-            else                            coop::Select(ctx, onData);
+            if      (!sigDone && !dataDone) coop::chan::Select(ctx, onSig, onData);
+            else if (!sigDone)              coop::chan::Select(ctx, onSig);
+            else                            coop::chan::Select(ctx, onData);
         }
 
         EXPECT_EQ(signals,  1);
@@ -623,8 +623,8 @@ TEST(ChannelTest, SelectAnyVoid)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::FixedChannel<void, 4> ch1(ctx);
-        coop::FixedChannel<void, 4> ch2(ctx);
+        coop::chan::FixedChannel<void, 4> ch1(ctx);
+        coop::chan::FixedChannel<void, 4> ch2(ctx);
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -633,7 +633,7 @@ TEST(ChannelTest, SelectAnyVoid)
         });
 
         int count = 0;
-        while (coop::SelectAnyVoid(ch1, ch2)) count++;
+        while (coop::chan::SelectAnyVoid(ch1, ch2)) count++;
 
         EXPECT_EQ(count, 4);
         ch2.Shutdown();
@@ -647,17 +647,17 @@ TEST(ChannelTest, SelectSend)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf1[1], buf2[1];
-        coop::Channel<int> ch1(ctx, buf1, 1);
-        coop::Channel<int> ch2(ctx, buf2, 1);
+        coop::chan::Channel<int> ch1(ctx, buf1, 1);
+        coop::chan::Channel<int> ch2(ctx, buf2, 1);
 
         // Fill ch1 so only ch2 has space.
         //
         EXPECT_TRUE(ch1.TrySend(0));
 
         int sent = -1;
-        coop::Select(ctx,
-            coop::OnSend(ch1, 10, [&]{ sent = 1; }),
-            coop::OnSend(ch2, 20, [&]{ sent = 2; })
+        coop::chan::Select(ctx,
+            coop::chan::OnSend(ch1, 10, [&]{ sent = 1; }),
+            coop::chan::OnSend(ch2, 20, [&]{ sent = 2; })
         );
 
         EXPECT_EQ(sent, 2);
@@ -679,8 +679,8 @@ TEST(ChannelTest, SelectMixedRecvSend)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf1[4], buf2[1];
-        coop::Channel<int> recvCh(ctx, buf1, 4);
-        coop::Channel<int> sendCh(ctx, buf2, 1);
+        coop::chan::Channel<int> recvCh(ctx, buf1, 4);
+        coop::chan::Channel<int> sendCh(ctx, buf2, 1);
 
         // Fill sendCh so its send case must wait for a receiver to drain it.
         //
@@ -696,9 +696,9 @@ TEST(ChannelTest, SelectMixedRecvSend)
         int received = -1;
         bool gotRecv = false, gotSend = false;
 
-        coop::Select(ctx,
-            coop::On(recvCh,     [&](int v){ received = v; gotRecv = true; }),
-            coop::OnSend(sendCh, 99, [&]{ gotSend = true; })
+        coop::chan::Select(ctx,
+            coop::chan::On(recvCh,     [&](int v){ received = v; gotRecv = true; }),
+            coop::chan::OnSend(sendCh, 99, [&]{ gotSend = true; })
         );
 
         EXPECT_TRUE(gotRecv);
@@ -718,7 +718,7 @@ TEST(ChannelTest, SelectSendShutdown)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[1];
-        coop::Channel<int> ch(ctx, buf, 1);
+        coop::chan::Channel<int> ch(ctx, buf, 1);
 
         // Fill the channel so the send case will block.
         //
@@ -731,8 +731,8 @@ TEST(ChannelTest, SelectSendShutdown)
             ch.Shutdown();
         });
 
-        bool ok = coop::Select(ctx,
-            coop::OnSend(ch, 42, [&]{}, [&]{ shutdownSeen = true; })
+        bool ok = coop::chan::Select(ctx,
+            coop::chan::OnSend(ch, 42, [&]{}, [&]{ shutdownSeen = true; })
         );
 
         EXPECT_FALSE(ok);
@@ -747,16 +747,16 @@ TEST(ChannelTest, SelectDefault)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[4];
-        coop::Channel<int> ch(ctx, buf, 4);
+        coop::chan::Channel<int> ch(ctx, buf, 4);
 
         bool defaultFired = false;
         int received = -1;
 
         // Channel empty — default fires.
         //
-        bool ok = coop::Select(ctx,
-            coop::On(ch, [&](int v){ received = v; }),
-            coop::Default([&]{ defaultFired = true; })
+        bool ok = coop::chan::Select(ctx,
+            coop::chan::On(ch, [&](int v){ received = v; }),
+            coop::chan::Default([&]{ defaultFired = true; })
         );
 
         EXPECT_FALSE(ok);
@@ -768,9 +768,9 @@ TEST(ChannelTest, SelectDefault)
         ch.TrySend(42);
         defaultFired = false;
 
-        ok = coop::Select(ctx,
-            coop::On(ch, [&](int v){ received = v; }),
-            coop::Default([&]{ defaultFired = true; })
+        ok = coop::chan::Select(ctx,
+            coop::chan::On(ch, [&](int v){ received = v; }),
+            coop::chan::Default([&]{ defaultFired = true; })
         );
 
         EXPECT_TRUE(ok);
@@ -788,16 +788,16 @@ TEST(ChannelTest, SelectTimeout)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[4];
-        coop::Channel<int> ch(ctx, buf, 4);
+        coop::chan::Channel<int> ch(ctx, buf, 4);
 
         bool timedOut = false;
         int received = -1;
 
         // Nothing will send — timeout should fire.
         //
-        bool ok = coop::Select(ctx,
-            coop::On(ch, [&](int v) { received = v; }),
-            coop::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
+        bool ok = coop::chan::Select(ctx,
+            coop::chan::On(ch, [&](int v) { received = v; }),
+            coop::chan::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
         );
 
         EXPECT_FALSE(ok);
@@ -815,7 +815,7 @@ TEST(ChannelTest, SelectTimeoutNotFired)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf[4];
-        coop::Channel<int> ch(ctx, buf, 4);
+        coop::chan::Channel<int> ch(ctx, buf, 4);
 
         bool timedOut = false;
 
@@ -824,9 +824,9 @@ TEST(ChannelTest, SelectTimeoutNotFired)
             ch.Send(99);
         });
 
-        bool ok = coop::Select(ctx,
-            coop::On(ch, [&](int v) { EXPECT_EQ(v, 99); }),
-            coop::Timeout(std::chrono::milliseconds(5000), [&]{ timedOut = true; })
+        bool ok = coop::chan::Select(ctx,
+            coop::chan::On(ch, [&](int v) { EXPECT_EQ(v, 99); }),
+            coop::chan::Timeout(std::chrono::milliseconds(5000), [&]{ timedOut = true; })
         );
 
         EXPECT_TRUE(ok);
@@ -843,8 +843,8 @@ TEST(ChannelTest, SelectTimeoutMixed)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int recvBuf[4], sendBuf[1];
-        coop::Channel<int> recvCh(ctx, recvBuf, 4);
-        coop::Channel<int> sendCh(ctx, sendBuf, 1);
+        coop::chan::Channel<int> recvCh(ctx, recvBuf, 4);
+        coop::chan::Channel<int> sendCh(ctx, sendBuf, 1);
 
         // Fill sendCh so its send case must wait.
         //
@@ -852,10 +852,10 @@ TEST(ChannelTest, SelectTimeoutMixed)
 
         bool timedOut = false;
 
-        bool ok = coop::Select(ctx,
-            coop::On(recvCh, [&](int) {}),
-            coop::OnSend(sendCh, 42),
-            coop::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
+        bool ok = coop::chan::Select(ctx,
+            coop::chan::On(recvCh, [&](int) {}),
+            coop::chan::OnSend(sendCh, 42),
+            coop::chan::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
         );
 
         EXPECT_FALSE(ok);
@@ -874,8 +874,8 @@ TEST(ChannelTest, SelectAny)
     test::RunInCooperator([](coop::Context* ctx)
     {
         int buf1[4], buf2[4];
-        coop::Channel<int> ch1(ctx, buf1, 4);
-        coop::Channel<int> ch2(ctx, buf2, 4);
+        coop::chan::Channel<int> ch1(ctx, buf1, 4);
+        coop::chan::Channel<int> ch2(ctx, buf2, 4);
 
         // ch1 sends 4 items and shuts down; ch2 has no items.
         //
@@ -886,7 +886,7 @@ TEST(ChannelTest, SelectAny)
         });
 
         int v, sum = 0, count = 0;
-        while (coop::SelectAny(&v, ch1, ch2))
+        while (coop::chan::SelectAny(&v, ch1, ch2))
         {
             sum += v;
             count++;
@@ -905,7 +905,7 @@ TEST(ChannelTest, TickerRecv)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+        coop::chan::Ticker ticker(ctx, std::chrono::milliseconds(5));
 
         int ticks = 0;
         for (int i = 0; i < 3; i++)
@@ -925,11 +925,11 @@ TEST(ChannelTest, TickerSelect)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+        coop::chan::Ticker ticker(ctx, std::chrono::milliseconds(5));
 
         int ticks = 0;
-        while (coop::SelectWithKill(ctx,
-            coop::On(ticker.Chan(), [&]{ ticks++; })
+        while (coop::chan::SelectWithKill(ctx,
+            coop::chan::On(ticker.Chan(), [&]{ ticks++; })
         ) && ticks < 3) {}
 
         ticker.Stop();
@@ -943,7 +943,7 @@ TEST(ChannelTest, TickerStopImmediate)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+        coop::chan::Ticker ticker(ctx, std::chrono::milliseconds(5));
         ticker.Stop();
         // If we reach here without hanging, the test passes.
     });
@@ -956,7 +956,7 @@ TEST(ChannelTest, TickerDestroyWithoutStop)
     test::RunInCooperator([](coop::Context* ctx)
     {
         {
-            coop::Ticker ticker(ctx, std::chrono::milliseconds(5));
+            coop::chan::Ticker ticker(ctx, std::chrono::milliseconds(5));
             // Let one tick arrive then let the destructor stop it.
             ticker.Chan().Recv();
         }

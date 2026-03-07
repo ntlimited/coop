@@ -5,7 +5,6 @@
 #include "coordinator.h"
 #include "epoch/epoch.h"
 #include "signal.h"
-#include "channel.h"
 #include "detail/embedded_list.h"
 #include "detail/scheduler_state.h"
 #include "spawn_configuration.h"

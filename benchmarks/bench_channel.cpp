@@ -46,7 +46,7 @@ static void BM_Channel_Uncontended(benchmark::State& state)
     {
         constexpr int CAP = 64;
         int buf[CAP];
-        coop::Channel<int> ch(ctx, buf, CAP);
+        coop::chan::Channel<int> ch(ctx, buf, CAP);
 
         for (auto _ : state)
         {
@@ -73,7 +73,7 @@ static void BM_Channel_PingPong(benchmark::State& state)
     RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
     {
         int buf[1];
-        coop::Channel<int> ch(ctx, buf, 1);
+        coop::chan::Channel<int> ch(ctx, buf, 1);
 
         bool done = false;
 
@@ -116,7 +116,7 @@ static void BM_Channel_Throughput(benchmark::State& state)
     {
         const int cap = static_cast<int>(state.range(0));
         std::vector<int> buf(cap);
-        coop::Channel<int> ch(ctx, buf.data(), cap);
+        coop::chan::Channel<int> ch(ctx, buf.data(), cap);
 
         // Fixed batch per outer iteration — large enough that the benchmark
         // loop overhead is negligible compared to the transfer work.
@@ -172,7 +172,7 @@ static void BM_Channel_Throughput_NProducers(benchmark::State& state)
         const int nProducers = static_cast<int>(state.range(0));
         constexpr int CAP = 64;
         int buf[CAP];
-        coop::Channel<int> ch(ctx, buf, CAP);
+        coop::chan::Channel<int> ch(ctx, buf, CAP);
 
         constexpr int BATCH = 4096;
         int64_t totalItems = 0;
@@ -225,7 +225,7 @@ static void BM_Channel_SendAll_Drain(benchmark::State& state)
     {
         const int cap = static_cast<int>(state.range(0));
         std::vector<int> buf(cap);
-        coop::Channel<int> ch(ctx, buf.data(), cap);
+        coop::chan::Channel<int> ch(ctx, buf.data(), cap);
 
         constexpr int BATCH = 4096;
         std::vector<int> sendBuf(BATCH);
@@ -281,7 +281,7 @@ BENCHMARK(BM_Channel_SendAll_Drain)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Ar
 
 // Run one stage for the duration of the benchmark.
 //
-static void RunPipelineStage(coop::Channel<int>& in, coop::Channel<int>& out, int batchSize)
+static void RunPipelineStage(coop::chan::Channel<int>& in, coop::chan::Channel<int>& out, int batchSize)
 {
     std::vector<int> buf(batchSize);
 
@@ -323,9 +323,9 @@ static void BM_Channel_Pipeline_NStages(benchmark::State& state)
         constexpr int BATCH = 1024;
 
         std::vector<std::vector<int>> bufs(nStages + 1, std::vector<int>(DEPTH));
-        std::vector<std::unique_ptr<coop::Channel<int>>> chs;
+        std::vector<std::unique_ptr<coop::chan::Channel<int>>> chs;
         for (int i = 0; i <= nStages; i++)
-            chs.push_back(std::make_unique<coop::Channel<int>>(ctx, bufs[i].data(), DEPTH));
+            chs.push_back(std::make_unique<coop::chan::Channel<int>>(ctx, bufs[i].data(), DEPTH));
 
         for (int s = 0; s < nStages; s++)
         {
@@ -393,9 +393,9 @@ static void BM_Channel_Pipeline_Depth(benchmark::State& state)
         const int batch = std::max(depth * 4, 256);
 
         std::vector<std::vector<int>> bufs(N_STAGES + 1, std::vector<int>(depth));
-        std::vector<std::unique_ptr<coop::Channel<int>>> chs;
+        std::vector<std::unique_ptr<coop::chan::Channel<int>>> chs;
         for (int i = 0; i <= N_STAGES; i++)
-            chs.push_back(std::make_unique<coop::Channel<int>>(ctx, bufs[i].data(), depth));
+            chs.push_back(std::make_unique<coop::chan::Channel<int>>(ctx, bufs[i].data(), depth));
 
         for (int s = 0; s < N_STAGES; s++)
         {

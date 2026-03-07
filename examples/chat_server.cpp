@@ -48,7 +48,7 @@ struct ClientSlot
 {
     bool                        active;
     int32_t                     fd;
-    coop::SendChannel<Message>* outbound;
+    coop::chan::SendChannel<Message>* outbound;
     coop::Context::Handle       writerHandle;
 };
 
@@ -61,7 +61,7 @@ struct ClientRegistry
         memset(clients, 0, sizeof(clients));
     }
 
-    int32_t Register(int32_t fd, coop::SendChannel<Message>* outbound)
+    int32_t Register(int32_t fd, coop::chan::SendChannel<Message>* outbound)
     {
         for (int32_t i = 0; i < MAX_CLIENTS; i++)
         {
@@ -88,7 +88,7 @@ struct ChatHandler : coop::Launchable
     ChatHandler(
         coop::Context* ctx,
         int fd,
-        coop::SendChannel<Message>* broadcast,
+        coop::chan::SendChannel<Message>* broadcast,
         ClientRegistry* registry)
     : coop::Launchable(ctx)
     , m_fd(fd)
@@ -121,7 +121,7 @@ struct ChatHandler : coop::Launchable
         // Spawn the writer context as a child. It reads from our outbound channel and writes
         // to the socket.
         //
-        coop::RecvChannel<Message>* outbound = &m_outbound;
+        coop::chan::RecvChannel<Message>* outbound = &m_outbound;
         auto* stream = &m_stream;
         coop::Spawn([outbound, stream, rawFd](coop::Context* writerCtx)
         {
@@ -174,10 +174,10 @@ struct ChatHandler : coop::Launchable
     }
 
     coop::io::Descriptor        m_fd;
-    coop::SendChannel<Message>* m_broadcast;
+    coop::chan::SendChannel<Message>* m_broadcast;
     ClientRegistry*             m_registry;
     Message                     m_outboundBuffer[OUTBOUND_BUFFER_SLOTS];
-    coop::Channel<Message>      m_outbound;
+    coop::chan::Channel<Message>      m_outbound;
     coop::io::PlaintextStream   m_stream;
 };
 
@@ -214,7 +214,7 @@ void SpawningTask(coop::Context* ctx, void*)
     // Broadcast channel and client registry live on this context's stack
     //
     Message broadcastBuffer[BROADCAST_BUFFER_SLOTS];
-    coop::Channel<Message> broadcast(ctx, broadcastBuffer, BROADCAST_BUFFER_SLOTS);
+    coop::chan::Channel<Message> broadcast(ctx, broadcastBuffer, BROADCAST_BUFFER_SLOTS);
     ClientRegistry registry;
 
     // Acceptor: binds and listens, launches a ChatHandler per connection
@@ -239,7 +239,7 @@ void SpawningTask(coop::Context* ctx, void*)
 
     // Broadcaster: reads from the broadcast channel and fans out to all connected clients
     //
-    coop::RecvChannel<Message>* bcastRecv = &broadcast;
+    coop::chan::RecvChannel<Message>* bcastRecv = &broadcast;
     coop::Spawn([bcastRecv, &registry](coop::Context* bcastCtx)
     {
         bcastCtx->SetName("Broadcaster");

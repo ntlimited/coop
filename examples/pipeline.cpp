@@ -8,6 +8,7 @@
 #include "coop/thread.h"
 
 using namespace coop;
+using namespace coop::chan;
 
 // ---------------------------------------------------------------------------
 // Channel pipeline example

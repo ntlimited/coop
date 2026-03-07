@@ -236,7 +236,7 @@ TEST(StressTest, ChannelShutdownManyReceivers)
         constexpr int NUM_RECEIVERS = 200;
 
         int buffer[4];
-        coop::Channel<int> ch(ctx, buffer, 4);
+        coop::chan::Channel<int> ch(ctx, buffer, 4);
 
         int wakeCount = 0;
 
@@ -274,7 +274,7 @@ TEST(StressTest, ChannelShutdownManySenders)
         constexpr int NUM_SENDERS = 200;
 
         int buffer[1];
-        coop::Channel<int> ch(ctx, buffer, 1);
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
 
         // Fill the channel
         //
@@ -320,7 +320,7 @@ TEST(StressTest, ChannelHighThroughput)
         // Small buffer to maximize contention
         //
         int buffer[4];
-        coop::Channel<int> ch(ctx, buffer, 4);
+        coop::chan::Channel<int> ch(ctx, buffer, 4);
 
         std::atomic<int> produced{0};
         std::atomic<int> consumed{0};

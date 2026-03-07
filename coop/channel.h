@@ -27,6 +27,8 @@
 
 namespace coop
 {
+namespace chan
+{
 
 // NOTE: there is almost certainly a good amount of refactoring (I would hope?) around all of the
 // subtly different logic in the send/recv implementations. Or maybe not and that's why it's
@@ -700,4 +702,5 @@ struct FixedChannel<void, N> : Channel<void>
     explicit FixedChannel(Context* ctx) : Channel<void>(ctx, N) {}
 };
 
+} // end namespace chan
 } // end namespace coop

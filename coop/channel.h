@@ -622,6 +622,29 @@ struct Channel<void> : BaseChannel
         return true;
     }
 
+    // Complete a send after m_send has been acquired externally via CoordinateWith.
+    //
+    bool SendAcquired()
+    {
+        Context* ctx = Self();
+
+        if (IsShutdown())
+        {
+            m_send.Release(ctx);
+            return false;
+        }
+
+        m_count++;
+
+        if (!IsFull())
+            m_send.Release(ctx);
+
+        if (m_recv.IsHeld() && !IsEmpty())
+            m_recv.Release(ctx);
+
+        return true;
+    }
+
   private:
     bool RecvImpl()
     {

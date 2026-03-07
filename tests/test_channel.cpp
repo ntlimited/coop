@@ -554,6 +554,106 @@ TEST(ChannelTest, SelectAnyVoid)
     });
 }
 
+// Send-select: block until one of N channels has space, send to whichever fires first.
+//
+TEST(ChannelTest, SelectSend)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf1[1], buf2[1];
+        coop::Channel<int> ch1(ctx, buf1, 1);
+        coop::Channel<int> ch2(ctx, buf2, 1);
+
+        // Fill ch1 so only ch2 has space.
+        //
+        EXPECT_TRUE(ch1.TrySend(0));
+
+        int sent = -1;
+        coop::Select(ctx,
+            coop::OnSend(ch1, 10, [&]{ sent = 1; }),
+            coop::OnSend(ch2, 20, [&]{ sent = 2; })
+        );
+
+        EXPECT_EQ(sent, 2);
+
+        int v;
+        EXPECT_TRUE(ch2.TryRecv(v));
+        EXPECT_EQ(v, 20);
+
+        ch1.Shutdown();
+        ch2.Shutdown();
+    });
+}
+
+// Mixed recv+send select: block on whichever operation becomes possible first.
+// The recv case fires because a spawned sender delivers to the recv channel.
+//
+TEST(ChannelTest, SelectMixedRecvSend)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf1[4], buf2[1];
+        coop::Channel<int> recvCh(ctx, buf1, 4);
+        coop::Channel<int> sendCh(ctx, buf2, 1);
+
+        // Fill sendCh so its send case must wait for a receiver to drain it.
+        //
+        EXPECT_TRUE(sendCh.TrySend(0));
+
+        // Spawned context will unblock the recv case.
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            recvCh.Send(42);
+        });
+
+        int received = -1;
+        bool gotRecv = false, gotSend = false;
+
+        coop::Select(ctx,
+            coop::On(recvCh,     [&](int v){ received = v; gotRecv = true; }),
+            coop::OnSend(sendCh, 99, [&]{ gotSend = true; })
+        );
+
+        EXPECT_TRUE(gotRecv);
+        EXPECT_FALSE(gotSend);
+        EXPECT_EQ(received, 42);
+
+        recvCh.Shutdown();
+        sendCh.Shutdown();
+    });
+}
+
+// Send-select: shutdown on the target channel fires the shutdown callback and
+// Select returns false.
+//
+TEST(ChannelTest, SelectSendShutdown)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf[1];
+        coop::Channel<int> ch(ctx, buf, 1);
+
+        // Fill the channel so the send case will block.
+        //
+        EXPECT_TRUE(ch.TrySend(0));
+
+        bool shutdownSeen = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch.Shutdown();
+        });
+
+        bool ok = coop::Select(ctx,
+            coop::OnSend(ch, 42, [&]{}, [&]{ shutdownSeen = true; })
+        );
+
+        EXPECT_FALSE(ok);
+        EXPECT_TRUE(shutdownSeen);
+    });
+}
+
 // SelectAny — receive from whichever of N same-typed channels fires, without
 // caring which one it was. Loop exits when the fired channel shuts down.
 //

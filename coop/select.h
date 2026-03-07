@@ -5,13 +5,24 @@
 #include "channel.h"
 #include "coordinate_with.h"
 
-// Select across channels using CoordinateWith under the hood. Usage:
+// Select across channels using CoordinateWith under the hood.
+//
+// Recv cases (On) and send cases (OnSend) can be freely mixed in a single Select call.
+// The underlying CoordinateWith fires on whichever coordinator becomes available first:
+// m_recv not held ↔ channel non-empty (recv ready), m_send not held ↔ channel non-full
+// (send ready).
 //
 //   // Loop until any channel shuts down:
 //   while (coop::Select(ctx,
 //       coop::On(ch1, [&](int v) { use(v); }),
 //       coop::On(ch2, [&](int v) { use(v); })
 //   )) {}
+//
+//   // Mixed recv + send select:
+//   coop::Select(ctx,
+//       coop::On(recvCh,  [&](int v) { use(v); }),
+//       coop::OnSend(sendCh, value, [&]{ sent(); })
+//   );
 //
 //   // Loop until all channels shut down (shutdown callback marks each done):
 //   auto on1 = coop::On(ch1, [&](int v) { use(v); }, [&]{ done1 = true; });
@@ -22,7 +33,7 @@
 //       else                       coop::Select(ctx, on2);
 //   }
 //
-// Select returns true if the selected channel delivered a value (value handler called),
+// Select returns true if the selected case completed its operation (recv'd or sent),
 // false if the selected channel was shut down (shutdown handler called, if any).
 // SelectWithKill additionally returns false on kill; call IsKilled() to distinguish.
 //
@@ -31,10 +42,15 @@ namespace coop
 {
 
 // ---------------------------------------------------------------------------
-// Internal no-op used as the default shutdown handler
+// Internal no-ops used as default send/shutdown handlers
 // ---------------------------------------------------------------------------
 
 struct NoShutdown
+{
+    void operator()() const {}
+};
+
+struct NoSent
 {
     void operator()() const {}
 };
@@ -91,6 +107,57 @@ struct RecvCase<void, OnValue, OnShutdown>
 };
 
 // ---------------------------------------------------------------------------
+// SendCase — produced by OnSend()
+// ---------------------------------------------------------------------------
+
+template<typename T, typename OnSent, typename OnShutdown>
+struct SendCase
+{
+    SendChannel<T>& ch;
+    T value;
+    OnSent     onSent;
+    OnShutdown onShutdown;
+
+    Coordinator* Coord() { return &ch.m_send; }
+
+    bool Fire()
+    {
+        if (!ch.SendAcquired(std::move(value)))
+        {
+            onShutdown();
+            return false;
+        }
+        onSent();
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SendCase<void> — produced by OnSend() for Channel<void>; no value to send
+// ---------------------------------------------------------------------------
+
+template<typename OnSent, typename OnShutdown>
+struct SendCase<void, OnSent, OnShutdown>
+{
+    Channel<void>& ch;
+    OnSent     onSent;
+    OnShutdown onShutdown;
+
+    Coordinator* Coord() { return &ch.m_send; }
+
+    bool Fire()
+    {
+        if (!ch.SendAcquired())
+        {
+            onShutdown();
+            return false;
+        }
+        onSent();
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // On — create a recv case (shutdown callback is optional)
 // ---------------------------------------------------------------------------
 
@@ -123,7 +190,53 @@ auto On(Channel<void>& ch, OnValue&& onValue, OnShutdown&& onShutdown)
 }
 
 // ---------------------------------------------------------------------------
-// Select — block until one recv case fires
+// OnSend — create a send case (sent/shutdown callbacks are optional)
+// ---------------------------------------------------------------------------
+
+template<typename T>
+auto OnSend(SendChannel<T>& ch, T value)
+    -> SendCase<T, NoSent, NoShutdown>
+{
+    return { ch, std::move(value), NoSent{}, NoShutdown{} };
+}
+
+template<typename T, typename OnSent>
+auto OnSend(SendChannel<T>& ch, T value, OnSent&& onSent)
+    -> SendCase<T, std::decay_t<OnSent>, NoShutdown>
+{
+    return { ch, std::move(value), std::forward<OnSent>(onSent), NoShutdown{} };
+}
+
+template<typename T, typename OnSent, typename OnShutdown>
+auto OnSend(SendChannel<T>& ch, T value, OnSent&& onSent, OnShutdown&& onShutdown)
+    -> SendCase<T, std::decay_t<OnSent>, std::decay_t<OnShutdown>>
+{
+    return { ch, std::move(value), std::forward<OnSent>(onSent),
+             std::forward<OnShutdown>(onShutdown) };
+}
+
+auto OnSend(Channel<void>& ch)
+    -> SendCase<void, NoSent, NoShutdown>
+{
+    return { ch, NoSent{}, NoShutdown{} };
+}
+
+template<typename OnSent>
+auto OnSend(Channel<void>& ch, OnSent&& onSent)
+    -> SendCase<void, std::decay_t<OnSent>, NoShutdown>
+{
+    return { ch, std::forward<OnSent>(onSent), NoShutdown{} };
+}
+
+template<typename OnSent, typename OnShutdown>
+auto OnSend(Channel<void>& ch, OnSent&& onSent, OnShutdown&& onShutdown)
+    -> SendCase<void, std::decay_t<OnSent>, std::decay_t<OnShutdown>>
+{
+    return { ch, std::forward<OnSent>(onSent), std::forward<OnShutdown>(onShutdown) };
+}
+
+// ---------------------------------------------------------------------------
+// Select — block until one case fires
 // ---------------------------------------------------------------------------
 
 template<typename... Cases>

@@ -8,7 +8,6 @@
 #include "coop/coordinator.h"
 #include "coop/cooperator.h"
 #include "coop/cooperator.hpp"
-#include "coop/perf/probe.h"
 #include "coop/self.h"
 #include "coop/time/interval.h"
 
@@ -295,7 +294,6 @@ bool Passage<T, N>::Recv(T& value)
         {
             m_recvDryCount  = 0;
             m_recvTimeoutUs = kTimeoutInitialUs;
-            COOP_PERF_INC(GetPerfCounters(), perf::Counter::PassageRecvFast);
 
             // Maintain the invariant: held ↔ ring empty. Before this pop the ring was
             // non-empty → m_recv was not held. If ring is now empty, re-acquire (fast:
@@ -329,7 +327,6 @@ bool Passage<T, N>::Recv(T& value)
         if (m_recvDryCount < kYieldThreshold)
         {
             m_recvDryCount++;
-            COOP_PERF_INC(GetPerfCounters(), perf::Counter::PassageRecvYield);
             Yield();
             continue;
         }
@@ -338,7 +335,6 @@ bool Passage<T, N>::Recv(T& value)
         // so the cooperator wakes even if the wake lambda is delayed.
         //
         m_recvDryCount = 0;
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::PassageRecvWait);
 
         auto r = CoordinateWithKill(ctx, &m_state->m_recv,
                                     time::Interval(m_recvTimeoutUs));

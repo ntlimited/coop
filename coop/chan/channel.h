@@ -3,7 +3,6 @@
 #include <utility>
 
 #include "coop/coordinator.h"
-#include "coop/perf/probe.h"
 #include "coop/self.h"
 
 // This is a pretty close facsimile of golang's channel implementation and is meant to be a second
@@ -155,7 +154,6 @@ struct RecvChannel : virtual TypedBaseChannel<T>
         }
 
         RecvImpl(value);
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanRecv);
         Context* ctx = Self();
 
         if (Base::IsEmpty())
@@ -196,7 +194,6 @@ struct RecvChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanRecvBlock);
         Base::m_recv.Acquire(ctx);
 
         // Spurious-wakeup loop: Drain and TryRecv pre-acquire m_recv while still running
@@ -217,8 +214,6 @@ struct RecvChannel : virtual TypedBaseChannel<T>
             //
             Base::m_recv.Acquire(ctx);
         }
-
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanRecv);
 
         // If we are shutdown, no more things can come through so signal anyone else who is waiting
         // on the coordinator; alternatively, if there is more to recv, then let go of it for the
@@ -319,7 +314,6 @@ struct SendChannel : virtual TypedBaseChannel<T>
 
         [[maybe_unused]] bool sent = SendImpl(std::move(value));
         assert(sent);
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanSend);
         Context* ctx = Self();
 
         if (Base::IsFull())
@@ -349,7 +343,6 @@ struct SendChannel : virtual TypedBaseChannel<T>
         {
             [[maybe_unused]] bool sent = SendImpl(std::move(value));
             assert(sent);
-            COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanSend);
             Context* ctx = Self();
 
             if (Base::IsFull())
@@ -367,7 +360,6 @@ struct SendChannel : virtual TypedBaseChannel<T>
         // Blocking path: note that IsShutdown() can get flipped while we were coordinating
         //
         Context* ctx = Self();
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanSendBlock);
         Base::m_send.Acquire(ctx);
         if (Base::IsShutdown())
         {
@@ -377,7 +369,6 @@ struct SendChannel : virtual TypedBaseChannel<T>
 
         [[maybe_unused]] bool sent = SendImpl(std::move(value));
         assert(sent);
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanSend);
 
         // If there is space, let go of the coordinator so that the preconditions still stand. This
         // in theory wouldn't happen today but if we change the unblock mechanics to not just
@@ -526,7 +517,6 @@ struct Channel<void> : BaseChannel
         if (IsShutdown() || IsFull()) return false;
 
         m_count++;
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanSend);
         Context* ctx = Self();
 
         if (IsFull())
@@ -543,7 +533,6 @@ struct Channel<void> : BaseChannel
         if (TrySend()) return true;
 
         Context* ctx = Self();
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanSendBlock);
         m_send.Acquire(ctx);
         if (IsShutdown())
         {
@@ -552,7 +541,6 @@ struct Channel<void> : BaseChannel
         }
 
         m_count++;
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanSend);
 
         if (!IsFull())
             m_send.Release(ctx);
@@ -568,7 +556,6 @@ struct Channel<void> : BaseChannel
         if (IsEmpty()) return false;
 
         m_count--;
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanRecv);
         Context* ctx = Self();
 
         if (IsEmpty())
@@ -593,7 +580,6 @@ struct Channel<void> : BaseChannel
             return false;
         }
 
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanRecvBlock);
         m_recv.Acquire(ctx);
 
         while (!RecvImpl())
@@ -605,8 +591,6 @@ struct Channel<void> : BaseChannel
             }
             m_recv.Acquire(ctx);
         }
-
-        COOP_PERF_INC(GetPerfCounters(), perf::Counter::ChanRecv);
 
         if ((IsShutdown() && IsEmpty()) || !IsEmpty())
             m_recv.Release(ctx);

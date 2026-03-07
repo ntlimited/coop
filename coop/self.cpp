@@ -28,11 +28,6 @@ bool ::coop::IsShuttingDown()
     return Cooperator::thread_cooperator;
 }
 
-::coop::perf::Counters& ::coop::GetPerfCounters()
-{
-    return Cooperator::thread_cooperator->GetPerfCounters();
-}
-
 ::coop::io::Uring* ::coop::GetUring()
 {
     return Cooperator::thread_cooperator->GetUring();

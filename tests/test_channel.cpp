@@ -7,6 +7,7 @@
 #include "coop/self.h"
 #include "coop/chan/ticker.h"
 #include "coop/chan/pipe.h"
+#include "coop/chan/merge.h"
 #include "test_helpers.h"
 
 TEST(ChannelTest, SendRecv)
@@ -1148,5 +1149,214 @@ TEST(ChannelTest, PipeSelectComposition)
         )) {}
 
         EXPECT_EQ(count, N);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Merge tests
+// ---------------------------------------------------------------------------
+
+// Items from both sources arrive interleaved in availability order.
+//
+TEST(ChannelTest, MergeBasic)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 8;
+
+        int bufA[4], bufB[4];
+        coop::chan::Channel<int> chA(ctx, bufA, 4);
+        coop::chan::Channel<int> chB(ctx, bufB, 4);
+
+        auto merged = coop::chan::Merge(ctx, chA, chB);
+
+        // Producer A: even numbers
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i += 2)
+                chA.Send(i);
+            chA.Shutdown();
+        });
+
+        // Producer B: odd numbers
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 1; i < N; i += 2)
+                chB.Send(i);
+            chB.Shutdown();
+        });
+
+        int count = 0;
+        int value = 0;
+        while (merged.Chan().Recv(value))
+            count++;
+
+        EXPECT_EQ(count, N);
+    });
+}
+
+// When one source shuts down first, the merge continues draining the other.
+//
+TEST(ChannelTest, MergeOneSourceDiesEarly)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int NA = 3;
+        constexpr int NB = 7;
+
+        int bufA[4], bufB[4];
+        coop::chan::Channel<int> chA(ctx, bufA, 4);
+        coop::chan::Channel<int> chB(ctx, bufB, 4);
+
+        auto merged = coop::chan::Merge(ctx, chA, chB);
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < NA; i++) chA.Send(i);
+            chA.Shutdown();
+        });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < NB; i++) chB.Send(100 + i);
+            chB.Shutdown();
+        });
+
+        int count = 0;
+        int value = 0;
+        while (merged.Chan().Recv(value))
+            count++;
+
+        EXPECT_EQ(count, NA + NB);
+    });
+}
+
+// Merge composes with Pipe: chain a 2-stage pipeline on each source then merge.
+//
+TEST(ChannelTest, MergePipeComposition)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 5;
+
+        int bufA[4], bufB[4];
+        coop::chan::Channel<int> chA(ctx, bufA, 4);
+        coop::chan::Channel<int> chB(ctx, bufB, 4);
+
+        // Pipe each source through a transform, then merge.
+        //
+        auto pipedA = coop::chan::Pipe(ctx, chA, [](int v) { return v * 2; });
+        auto pipedB = coop::chan::Pipe(ctx, chB, [](int v) { return v * 3; });
+
+        coop::chan::Channel<int>& pA = pipedA;
+        coop::chan::Channel<int>& pB = pipedB;
+        auto merged = coop::chan::Merge(ctx, pA, pB);
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++) chA.Send(i);
+            chA.Shutdown();
+        });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++) chB.Send(i);
+            chB.Shutdown();
+        });
+
+        int sum = 0;
+        int value = 0;
+        int count = 0;
+        while (merged.Chan().Recv(value))
+        {
+            sum += value;
+            count++;
+        }
+
+        // A produces: 0,2,4,6,8 (sum=20); B produces: 0,3,6,9,12 (sum=30)
+        //
+        EXPECT_EQ(count, 2 * N);
+        EXPECT_EQ(sum, 50);
+    });
+}
+
+// Stop() before sources shut down: output channel shuts down, Recv returns false.
+//
+TEST(ChannelTest, MergeStopEarly)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int bufA[64], bufB[64];
+        coop::chan::Channel<int> chA(ctx, bufA, 64);
+        coop::chan::Channel<int> chB(ctx, bufB, 64);
+
+        auto merged = coop::chan::Merge(ctx, chA, chB);
+
+        coop::Context::Handle hA, hB;
+        ctx->GetCooperator()->Spawn([&](coop::Context*) { int i = 0; while (chA.Send(i++)) {} }, &hA);
+        ctx->GetCooperator()->Spawn([&](coop::Context*) { int i = 0; while (chB.Send(i++)) {} }, &hB);
+
+        // Consume a couple of items then stop.
+        //
+        int value = 0;
+        EXPECT_TRUE(merged.Chan().Recv(value));
+        EXPECT_TRUE(merged.Chan().Recv(value));
+
+        merged.Stop();
+
+        // Channel drains buffered items before returning false on shutdown;
+        // loop to completion then verify closed.
+        //
+        while (merged.Chan().Recv(value)) {}
+        EXPECT_FALSE(merged.Chan().Recv(value));
+
+        chA.Shutdown();
+        chB.Shutdown();
+        hA.Kill();
+        hB.Kill();
+    });
+}
+
+// Chained merge: 3 sources combined as Merge(Merge(a,b), c).
+//
+TEST(ChannelTest, MergeChained)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 4;
+
+        int bA[4], bB[4], bC[4];
+        coop::chan::Channel<int> chA(ctx, bA, 4);
+        coop::chan::Channel<int> chB(ctx, bB, 4);
+        coop::chan::Channel<int> chC(ctx, bC, 4);
+
+        auto m1 = coop::chan::Merge(ctx, chA, chB);
+        coop::chan::Channel<int>& m1ch = m1;
+        auto m2 = coop::chan::Merge(ctx, m1ch, chC);
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++) chA.Send(i);
+            chA.Shutdown();
+        });
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++) chB.Send(i);
+            chB.Shutdown();
+        });
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++) chC.Send(i);
+            chC.Shutdown();
+        });
+
+        int count = 0;
+        int value = 0;
+        while (m2.Chan().Recv(value))
+            count++;
+
+        EXPECT_EQ(count, 3 * N);
     });
 }

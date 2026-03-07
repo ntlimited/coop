@@ -7,7 +7,8 @@ namespace coop
 struct Context;
 struct Cooperator;
 
-namespace io { struct Uring; }
+namespace io    { struct Uring;    }
+namespace perf  { struct Counters; }
 
 // This lets code use thread locals to get the context that is running instead of passing it around.
 // I know, thread locals, right? Ultimately, the register for them exists whether we like it or not,
@@ -26,6 +27,8 @@ bool IsShuttingDown();
 // Self() -> Context -> Cooperator round-trip.
 //
 Cooperator* GetCooperator();
+
+perf::Counters& GetPerfCounters();
 
 io::Uring* GetUring();
 

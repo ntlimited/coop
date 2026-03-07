@@ -40,6 +40,13 @@ enum class Counter : uint32_t
     PollCycle,          // Uring::Poll() invocations
     PollSubmit,         // Uring::Poll() calls that actually submitted SQEs
     PollCqe,            // individual CQEs processed
+    ChanSend,           // channel item sent (fast or blocking path)
+    ChanSendBlock,      // channel send entered blocking path (channel full)
+    ChanRecv,           // channel item received (fast or blocking path)
+    ChanRecvBlock,      // channel recv entered blocking path (channel empty)
+    PassageRecvFast,    // Passage::Recv phase 1: ring pop succeeded immediately
+    PassageRecvYield,   // Passage::Recv phase 2: yield loop iteration
+    PassageRecvWait,    // Passage::Recv phase 3: CoordinateWithKill entered
     COUNT
 };
 
@@ -59,6 +66,13 @@ inline const char* CounterName(Counter c)
         "poll_cycle",
         "poll_submit",
         "poll_cqe",
+        "chan_send",
+        "chan_send_block",
+        "chan_recv",
+        "chan_recv_block",
+        "passage_recv_fast",
+        "passage_recv_yield",
+        "passage_recv_wait",
     };
     static_assert(sizeof(s_names) / sizeof(s_names[0]) == static_cast<size_t>(Counter::COUNT));
     auto idx = static_cast<size_t>(c);

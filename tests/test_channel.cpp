@@ -6,6 +6,7 @@
 #include "coop/chan/select.h"
 #include "coop/self.h"
 #include "coop/chan/ticker.h"
+#include "coop/chan/pipe.h"
 #include "test_helpers.h"
 
 TEST(ChannelTest, SendRecv)
@@ -961,5 +962,191 @@ TEST(ChannelTest, TickerDestroyWithoutStop)
             ticker.Chan().Recv();
         }
         // If we reach here without hanging, the test passes.
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Pipe tests
+// ---------------------------------------------------------------------------
+
+// Pipe transforms every item from the source channel.
+//
+TEST(ChannelTest, PipeBasicTransform)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 10;
+
+        int buf[4];
+        coop::chan::Channel<int> src(ctx, buf, 4);
+
+        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v * 2; });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++)
+                src.Send(i);
+            src.Shutdown();
+        });
+
+        int received = 0;
+        int value = 0;
+        while (pipe.Chan().Recv(value))
+        {
+            EXPECT_EQ(value, received * 2);
+            received++;
+        }
+
+        EXPECT_EQ(received, N);
+    });
+}
+
+// Source shutdown propagates: when the source shuts down, Recv on the pipe output
+// returns false after all transformed items have been consumed.
+//
+TEST(ChannelTest, PipeSourceShutdownPropagates)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 5;
+
+        int buf[4];
+        coop::chan::Channel<int> src(ctx, buf, 4);
+
+        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v + 100; });
+
+        // Send N items then shut down
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++)
+                src.Send(i);
+            src.Shutdown();
+        });
+
+        int count = 0;
+        int value = 0;
+        while (pipe.Chan().Recv(value))
+            count++;
+
+        EXPECT_EQ(count, N);
+        // After the loop, the pipe output channel is shut down.
+    });
+}
+
+// Pipe composes: a PipeHandle implicitly converts to Channel<Out>& so it can be passed
+// directly as the source to another Pipe stage.
+//
+TEST(ChannelTest, PipeChained)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 8;
+
+        int buf[4];
+        coop::chan::Channel<int> src(ctx, buf, 4);
+
+        // Stage 1: int → int (*2)
+        //
+        auto stage1 = coop::chan::Pipe(ctx, src, [](int v) { return v * 2; });
+
+        // Stage 2: int → std::string (via implicit Channel<int>& conversion of stage1)
+        //
+        coop::chan::Channel<int>& stage1Ch = stage1;
+        auto stage2 = coop::chan::Pipe(ctx, stage1Ch,
+            [](int v) { return std::to_string(v); });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++)
+                src.Send(i);
+            src.Shutdown();
+        });
+
+        int count = 0;
+        std::string s;
+        while (stage2.Chan().Recv(s))
+        {
+            EXPECT_EQ(s, std::to_string(count * 2));
+            count++;
+        }
+
+        EXPECT_EQ(count, N);
+    });
+}
+
+// Stop() before the source shuts down: the pipe output channel shuts down, and
+// subsequent Recv returns false.
+//
+TEST(ChannelTest, PipeStopEarly)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        // Large buffer so the producer never blocks waiting for the pipe.
+        //
+        int buf[64];
+        coop::chan::Channel<int> src(ctx, buf, 64);
+
+        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v; });
+
+        // Producer runs indefinitely until killed.
+        //
+        coop::Context::Handle producerHandle;
+        ctx->GetCooperator()->Spawn([&](coop::Context* producer)
+        {
+            int i = 0;
+            while (src.Send(i++)) {}
+        }, &producerHandle);
+
+        // Consume a couple of items then stop the pipe.
+        //
+        int value = 0;
+        EXPECT_TRUE(pipe.Chan().Recv(value));
+        EXPECT_TRUE(pipe.Chan().Recv(value));
+
+        pipe.Stop();
+
+        // After Stop(), Recv must return false (channel is shut down).
+        //
+        EXPECT_FALSE(pipe.Chan().Recv(value));
+
+        // Clean up the producer.
+        //
+        src.Shutdown();
+        producerHandle.Kill();
+    });
+}
+
+// PipeHandle composes with Select via its implicit Channel<Out>& conversion.
+//
+TEST(ChannelTest, PipeSelectComposition)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int N = 5;
+
+        int buf[4];
+        coop::chan::Channel<int> src(ctx, buf, 4);
+
+        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v * 3; });
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < N; i++)
+                src.Send(i);
+            src.Shutdown();
+        });
+
+        int count = 0;
+        int value = 0;
+        while (coop::chan::SelectWithKill(ctx,
+            coop::chan::On(pipe.Chan(), [&](int v)
+            {
+                EXPECT_EQ(v, count * 3);
+                count++;
+            })
+        )) {}
+
+        EXPECT_EQ(count, N);
     });
 }

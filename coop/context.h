@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "coordinator.h"
+#include "epoch/epoch.h"
 #include "signal.h"
 #include "channel.h"
 #include "detail/embedded_list.h"
@@ -176,6 +177,13 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         size_t samples;
     } m_statistics;
     int64_t m_lastRdtsc;
+
+    // Per-context epoch participation: traversal pin (Guard-managed) and application pin
+    // (transaction-managed). Both default to Epoch::Unpinned() (zero). Written and read only
+    // on the owning cooperator thread; the cooperator's m_epochWatermark atomic is the sole
+    // cross-thread visibility boundary.
+    //
+    epoch::State m_epochState{};
 
     // Bump heap watermark — grows upward from just past the Launchable/lambda at segment bottom.
     // Set by Spawn/Launch after placing the initial object. BumpAlloc advances it; BumpFree

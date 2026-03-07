@@ -6,10 +6,6 @@ namespace coop
 namespace epoch
 {
 
-// File-scope ContextVar — registers during static initialization, before any Context exists.
-//
-static ContextVar<State> s_state;
-
 static __thread Manager* t_manager{nullptr};
 
 Manager* GetManager()
@@ -20,11 +16,6 @@ Manager* GetManager()
 void SetManager(Manager* mgr)
 {
     t_manager = mgr;
-}
-
-ContextVar<State>& GetContextState()
-{
-    return s_state;
 }
 
 // ---- Manager ----
@@ -58,14 +49,14 @@ void Manager::PublishWatermark()
 
     m_cooperator->VisitContexts([&](Context* ctx) -> bool
     {
-        auto* state = s_state.Get(ctx);
-        if (!state->traversal.IsUnpinned() && state->traversal < safe)
+        epoch::State& state = ctx->m_epochState;
+        if (!state.traversal.IsUnpinned() && state.traversal < safe)
         {
-            safe = state->traversal;
+            safe = state.traversal;
         }
-        if (!state->application.IsUnpinned() && state->application < safe)
+        if (!state.application.IsUnpinned() && state.application < safe)
         {
-            safe = state->application;
+            safe = state.application;
         }
         return true;
     });
@@ -87,7 +78,7 @@ Epoch Manager::Enter()
 
 Epoch Manager::Enter(Context* ctx)
 {
-    s_state.Get(ctx)->traversal = m_current;
+    ctx->m_epochState.traversal = m_current;
     PublishWatermark();
     return m_current;
 }
@@ -100,7 +91,7 @@ void Manager::Exit()
 
 void Manager::Exit(Context* ctx)
 {
-    s_state.Get(ctx)->traversal = Epoch::Unpinned();
+    ctx->m_epochState.traversal = Epoch::Unpinned();
     PublishWatermark();
 }
 
@@ -114,7 +105,7 @@ void Manager::Pin(Context* ctx, Epoch epoch)
 {
     assert(!epoch.IsUnpinned() && "pin epoch must be non-zero");
     assert(epoch <= m_current && "cannot pin at a future epoch");
-    s_state.Get(ctx)->application = epoch;
+    ctx->m_epochState.application = epoch;
     PublishWatermark();
 }
 
@@ -126,7 +117,7 @@ void Manager::Unpin()
 
 void Manager::Unpin(Context* ctx)
 {
-    s_state.Get(ctx)->application = Epoch::Unpinned();
+    ctx->m_epochState.application = Epoch::Unpinned();
     PublishWatermark();
 }
 

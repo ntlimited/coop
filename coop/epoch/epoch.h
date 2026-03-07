@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "coop/context_var.h"
+#include "coop/self.h"
 
 namespace coop
 {
@@ -242,11 +242,6 @@ private:
 //
 Manager* GetManager();
 void SetManager(Manager* mgr);
-
-// Access the per-context epoch state. Public for debugging and cross-cooperator safe epoch
-// computation.
-//
-ContextVar<State>& GetContextState();
 
 } // end namespace coop::epoch
 } // end namespace coop

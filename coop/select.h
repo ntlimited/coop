@@ -158,6 +158,77 @@ struct SendCase<void, OnSent, OnShutdown>
 };
 
 // ---------------------------------------------------------------------------
+// TimeoutCase — pseudo-case produced by Timeout(); must be the last argument
+// to Select / SelectWithKill. The timeout callback is optional.
+//
+//   Select(ctx,
+//       On(ch, [&](int v) { use(v); }),
+//       Timeout(50ms, [&]{ timedOut = true; })
+//   );
+//
+// Select returns false when the timeout fires (same as shutdown); use the
+// callback to distinguish.
+// ---------------------------------------------------------------------------
+
+struct NoTimeout
+{
+    void operator()() const {}
+};
+
+template<typename OnTimeout>
+struct TimeoutCase
+{
+    time::Interval interval;
+    OnTimeout      onTimeout;
+
+    void Fire() { onTimeout(); }
+};
+
+template<typename OnTimeout>
+auto Timeout(time::Interval interval, OnTimeout&& onTimeout)
+    -> TimeoutCase<std::decay_t<OnTimeout>>
+{
+    return { interval, std::forward<OnTimeout>(onTimeout) };
+}
+
+inline auto Timeout(time::Interval interval)
+    -> TimeoutCase<NoTimeout>
+{
+    return { interval, NoTimeout{} };
+}
+
+template<typename T> struct IsTimeoutCase : std::false_type {};
+template<typename F> struct IsTimeoutCase<TimeoutCase<F>> : std::true_type {};
+
+// ---------------------------------------------------------------------------
+// detail helpers for Select with timeout
+// ---------------------------------------------------------------------------
+
+namespace detail
+{
+
+// Build a tuple of (cases[Is].Coord()..., interval) for the first N real cases.
+//
+template<size_t... Is, typename CaseTuple>
+auto CoordArgsWithTimeout(CaseTuple& cases, std::index_sequence<Is...>, time::Interval t)
+{
+    return std::make_tuple(std::get<Is>(cases).Coord()..., t);
+}
+
+// Dispatch CoordinationResult to the matching case among indices Is.
+//
+template<size_t... Is, typename CaseTuple>
+bool DispatchCases(CoordinationResult result, CaseTuple& cases, std::index_sequence<Is...>)
+{
+    bool ok = false;
+    ((result == std::get<Is>(cases).Coord()
+        ? (ok = std::get<Is>(cases).Fire(), true) : false) || ...);
+    return ok;
+}
+
+} // end detail
+
+// ---------------------------------------------------------------------------
 // On — create a recv case (shutdown callback is optional)
 // ---------------------------------------------------------------------------
 
@@ -237,6 +308,10 @@ auto OnSend(Channel<void>& ch, OnSent&& onSent, OnShutdown&& onShutdown)
 
 // ---------------------------------------------------------------------------
 // Select — block until one case fires
+//
+// If the last argument is a TimeoutCase (produced by Timeout()), CoordinateWith
+// is called with the interval appended; the timeout fires if no channel case
+// completes within the deadline.
 // ---------------------------------------------------------------------------
 
 template<typename... Cases>
@@ -245,17 +320,40 @@ bool Select(Context* ctx, Cases&&... cases)
     return std::apply(
         [ctx](auto&&... cs)
         {
-            auto result = CoordinateWith(ctx, cs.Coord()...);
-            bool ok = false;
-            ((result == cs.Coord() ? (ok = cs.Fire(), true) : false) || ...);
-            return ok;
+            constexpr bool hasTimeout = IsTimeoutCase<
+                std::decay_t<detail::LastType<decltype(cs)...>>>::value;
+
+            if constexpr (hasTimeout)
+            {
+                constexpr size_t N = sizeof...(cs);
+                static_assert(N > 1, "Select: Timeout requires at least one channel case.");
+
+                auto caseTuple = std::forward_as_tuple(cs...);
+                auto& tc      = std::get<N - 1>(caseTuple);
+
+                auto coordArgs = detail::CoordArgsWithTimeout(
+                    caseTuple, std::make_index_sequence<N - 1>{}, tc.interval);
+
+                auto result = std::apply(
+                    [ctx](auto... args) { return CoordinateWith(ctx, args...); }, coordArgs);
+
+                if (result.TimedOut()) { tc.Fire(); return false; }
+                return detail::DispatchCases(result, caseTuple, std::make_index_sequence<N - 1>{});
+            }
+            else
+            {
+                auto result = CoordinateWith(ctx, cs.Coord()...);
+                bool ok = false;
+                ((result == cs.Coord() ? (ok = cs.Fire(), true) : false) || ...);
+                return ok;
+            }
         },
         std::forward_as_tuple(std::forward<Cases>(cases)...)
     );
 }
 
 // ---------------------------------------------------------------------------
-// SelectWithKill — kill-aware Select
+// SelectWithKill — kill-aware Select; also supports Timeout as last argument
 // ---------------------------------------------------------------------------
 
 template<typename... Cases>
@@ -264,11 +362,35 @@ bool SelectWithKill(Context* ctx, Cases&&... cases)
     return std::apply(
         [ctx](auto&&... cs)
         {
-            auto result = CoordinateWithKill(ctx, cs.Coord()...);
-            if (result.Killed()) return false;
-            bool ok = false;
-            ((result == cs.Coord() ? (ok = cs.Fire(), true) : false) || ...);
-            return ok;
+            constexpr bool hasTimeout = IsTimeoutCase<
+                std::decay_t<detail::LastType<decltype(cs)...>>>::value;
+
+            if constexpr (hasTimeout)
+            {
+                constexpr size_t N = sizeof...(cs);
+                static_assert(N > 1, "SelectWithKill: Timeout requires at least one channel case.");
+
+                auto caseTuple = std::forward_as_tuple(cs...);
+                auto& tc      = std::get<N - 1>(caseTuple);
+
+                auto coordArgs = detail::CoordArgsWithTimeout(
+                    caseTuple, std::make_index_sequence<N - 1>{}, tc.interval);
+
+                auto result = std::apply(
+                    [ctx](auto... args) { return CoordinateWithKill(ctx, args...); }, coordArgs);
+
+                if (result.Killed())  return false;
+                if (result.TimedOut()) { tc.Fire(); return false; }
+                return detail::DispatchCases(result, caseTuple, std::make_index_sequence<N - 1>{});
+            }
+            else
+            {
+                auto result = CoordinateWithKill(ctx, cs.Coord()...);
+                if (result.Killed()) return false;
+                bool ok = false;
+                ((result == cs.Coord() ? (ok = cs.Fire(), true) : false) || ...);
+                return ok;
+            }
         },
         std::forward_as_tuple(std::forward<Cases>(cases)...)
     );

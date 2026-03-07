@@ -654,6 +654,91 @@ TEST(ChannelTest, SelectSendShutdown)
     });
 }
 
+// Timeout case fires when no channel delivers within the deadline.
+//
+TEST(ChannelTest, SelectTimeout)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf[4];
+        coop::Channel<int> ch(ctx, buf, 4);
+
+        bool timedOut = false;
+        int received = -1;
+
+        // Nothing will send — timeout should fire.
+        //
+        bool ok = coop::Select(ctx,
+            coop::On(ch, [&](int v) { received = v; }),
+            coop::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
+        );
+
+        EXPECT_FALSE(ok);
+        EXPECT_TRUE(timedOut);
+        EXPECT_EQ(received, -1);
+
+        ch.Shutdown();
+    });
+}
+
+// Timeout does not fire when a channel delivers before the deadline.
+//
+TEST(ChannelTest, SelectTimeoutNotFired)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf[4];
+        coop::Channel<int> ch(ctx, buf, 4);
+
+        bool timedOut = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch.Send(99);
+        });
+
+        bool ok = coop::Select(ctx,
+            coop::On(ch, [&](int v) { EXPECT_EQ(v, 99); }),
+            coop::Timeout(std::chrono::milliseconds(5000), [&]{ timedOut = true; })
+        );
+
+        EXPECT_TRUE(ok);
+        EXPECT_FALSE(timedOut);
+
+        ch.Shutdown();
+    });
+}
+
+// Timeout works with mixed recv+send cases.
+//
+TEST(ChannelTest, SelectTimeoutMixed)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int recvBuf[4], sendBuf[1];
+        coop::Channel<int> recvCh(ctx, recvBuf, 4);
+        coop::Channel<int> sendCh(ctx, sendBuf, 1);
+
+        // Fill sendCh so its send case must wait.
+        //
+        EXPECT_TRUE(sendCh.TrySend(0));
+
+        bool timedOut = false;
+
+        bool ok = coop::Select(ctx,
+            coop::On(recvCh, [&](int) {}),
+            coop::OnSend(sendCh, 42),
+            coop::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
+        );
+
+        EXPECT_FALSE(ok);
+        EXPECT_TRUE(timedOut);
+
+        recvCh.Shutdown();
+        sendCh.Shutdown();
+    });
+}
+
 // SelectAny — receive from whichever of N same-typed channels fires, without
 // caring which one it was. Loop exits when the fired channel shuts down.
 //

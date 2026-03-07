@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <memory>
+
 #include "coop/channel.h"
 #include "coop/select.h"
 #include "coop/self.h"
@@ -471,6 +473,89 @@ TEST(ChannelTest, FixedChannel)
         while (ch.Recv(v)) sum += v;
 
         EXPECT_EQ(sum, 6);  // 0+1+2+3
+    });
+}
+
+// Move-only types: send and receive unique_ptr through a channel.
+//
+TEST(ChannelTest, MoveOnlyType)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::FixedChannel<std::unique_ptr<int>, 4> ch(ctx);
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch.Send(std::make_unique<int>(42));
+            ch.Send(std::make_unique<int>(100));
+            ch.Shutdown();
+        });
+
+        std::unique_ptr<int> v;
+
+        EXPECT_TRUE(ch.Recv(v));
+        EXPECT_EQ(*v, 42);
+
+        EXPECT_TRUE(ch.Recv(v));
+        EXPECT_EQ(*v, 100);
+
+        EXPECT_FALSE(ch.Recv(v));  // shutdown
+    });
+}
+
+// Move-only type through blocking Send (channel full when sender starts).
+//
+TEST(ChannelTest, MoveOnlyTypeBlocking)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::FixedChannel<std::unique_ptr<int>, 1> ch(ctx);
+
+        // Fill the channel.
+        //
+        ch.TrySend(std::make_unique<int>(1));
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            // Blocks until the receiver drains, then sends via the blocking path.
+            //
+            ch.Send(std::make_unique<int>(2));
+            ch.Shutdown();
+        });
+
+        std::unique_ptr<int> v;
+
+        EXPECT_TRUE(ch.Recv(v));
+        EXPECT_EQ(*v, 1);
+
+        EXPECT_TRUE(ch.Recv(v));
+        EXPECT_EQ(*v, 2);
+
+        EXPECT_FALSE(ch.Recv(v));  // shutdown
+    });
+}
+
+// Move-only type through Select (RecvCase::Fire default-constructs T then moves via RecvAcquired).
+//
+TEST(ChannelTest, MoveOnlyTypeSelect)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::FixedChannel<std::unique_ptr<int>, 4> ch(ctx);
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch.Send(std::make_unique<int>(42));
+            ch.Shutdown();
+        });
+
+        int received = -1;
+        bool ok = coop::Select(ctx,
+            coop::On(ch, [&](std::unique_ptr<int> v){ received = *v; })
+        );
+
+        EXPECT_TRUE(ok);
+        EXPECT_EQ(received, 42);
     });
 }
 

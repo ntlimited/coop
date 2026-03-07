@@ -1,5 +1,7 @@
 #pragma once
 
+#include <utility>
+
 #include "coordinator.h"
 #include "self.h"
 
@@ -306,7 +308,7 @@ struct RecvChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
-        value = Base::m_buffer[Base::m_head++];
+        value = std::move(Base::m_buffer[Base::m_head++]);
         if (Base::m_head == Base::m_capacity)
         {
             Base::m_head = 0;
@@ -328,7 +330,7 @@ struct SendChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
-        [[maybe_unused]] bool sent = SendImpl(value);
+        [[maybe_unused]] bool sent = SendImpl(std::move(value));
         assert(sent);
         Context* ctx = Self();
 
@@ -351,12 +353,29 @@ struct SendChannel : virtual TypedBaseChannel<T>
     //
     bool Send(T value)
     {
-        if (TrySend(value))
+        // Fast path: cannot call TrySend(value) here because for move-only T, TrySend takes
+        // its argument by value (consuming it), and we need the value preserved if the channel
+        // is full so the blocking path can send it. Inline the fast path instead.
+        //
+        if (!Base::IsShutdown() && !Base::IsFull())
         {
+            [[maybe_unused]] bool sent = SendImpl(std::move(value));
+            assert(sent);
+            Context* ctx = Self();
+
+            if (Base::IsFull())
+            {
+                Base::m_send.Acquire(ctx);
+            }
+
+            if (Base::m_recv.IsHeld())
+            {
+                Base::m_recv.Release(ctx);
+            }
             return true;
         }
 
-        // Blocking codepath: note that IsShutdown() can get flipped while we were coordinating
+        // Blocking path: note that IsShutdown() can get flipped while we were coordinating
         //
         Context* ctx = Self();
         Base::m_send.Acquire(ctx);
@@ -366,7 +385,7 @@ struct SendChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
-        [[maybe_unused]] bool sent = SendImpl(value);
+        [[maybe_unused]] bool sent = SendImpl(std::move(value));
         assert(sent);
 
         // If there is space, let go of the coordinator so that the preconditions still stand. This
@@ -437,7 +456,7 @@ struct SendChannel : virtual TypedBaseChannel<T>
             return false;
         }
 
-        [[maybe_unused]] bool ok = SendImpl(value);
+        [[maybe_unused]] bool ok = SendImpl(std::move(value));
         assert(ok);
 
         if (!Base::IsFull())
@@ -456,7 +475,7 @@ struct SendChannel : virtual TypedBaseChannel<T>
         {
             return false;
         }
-        Base::m_buffer[Base::m_tail++] = value;
+        Base::m_buffer[Base::m_tail++] = std::move(value);
         if (Base::m_tail == Base::m_capacity)
         {
             Base::m_tail = 0;

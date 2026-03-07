@@ -6,7 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include "coop/cooperator.h"
-#include "coop/channel.h"
+#include "coop/chan/channel.h"
 #include "coop/launchable.h"
 #include "coop/thread.h"
 #include "coop/time/sleep.h"

@@ -2,8 +2,8 @@
 
 #include <utility>
 
-#include "channel.h"
-#include "coordinate_with.h"
+#include "coop/chan/channel.h"
+#include "coop/coordinate_with.h"
 
 // Select across channels using CoordinateWith under the hood.
 //

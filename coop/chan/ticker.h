@@ -1,6 +1,6 @@
 #pragma once
 
-#include "coop/channel.h"
+#include "coop/chan/channel.h"
 #include "coop/coordinate_with.h"
 #include "coop/cooperator.h"
 #include "coop/cooperator.hpp"

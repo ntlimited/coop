@@ -2,10 +2,10 @@
 
 #include <memory>
 
-#include "coop/channel.h"
-#include "coop/select.h"
+#include "coop/chan/channel.h"
+#include "coop/chan/select.h"
 #include "coop/self.h"
-#include "coop/ticker.h"
+#include "coop/chan/ticker.h"
 #include "test_helpers.h"
 
 TEST(ChannelTest, SendRecv)

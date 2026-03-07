@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "coop/channel.h"
+#include "coop/chan/channel.h"
 #include "coop/cooperator.h"
 #include "coop/self.h"
 #include "coop/thread.h"

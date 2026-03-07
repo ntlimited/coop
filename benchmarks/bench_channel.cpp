@@ -1,6 +1,6 @@
 #include <benchmark/benchmark.h>
 
-#include "coop/channel.h"
+#include "coop/chan/channel.h"
 #include "coop/context.h"
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"

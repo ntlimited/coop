@@ -2,8 +2,8 @@
 
 #include <utility>
 
-#include "coordinator.h"
-#include "self.h"
+#include "coop/coordinator.h"
+#include "coop/self.h"
 
 // This is a pretty close facsimile of golang's channel implementation and is meant to be a second
 // order coordination primitive on top of the Coordinator.

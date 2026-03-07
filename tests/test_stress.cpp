@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "coop/channel.h"
+#include "coop/chan/channel.h"
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"
 #include "coop/context.h"

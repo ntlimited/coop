@@ -1509,7 +1509,7 @@ TEST(PassageTest, BasicSendRecv)
         for (int i = 0; i < N; i++)
         {
             int v;
-            ASSERT_TRUE(passage.Chan().Recv(v));
+            ASSERT_TRUE(passage.Recv(v));
             sum += v;
         }
 
@@ -1546,7 +1546,7 @@ TEST(PassageTest, MultipleProducers)
         while (received < TOTAL)
         {
             int v;
-            ASSERT_TRUE(passage.Chan().Recv(v));
+            ASSERT_TRUE(passage.Recv(v));
             received++;
         }
 
@@ -1572,8 +1572,8 @@ TEST(PassageTest, BackpressureRingFull)
         // Drain so the consumer loop terminates cleanly.
         //
         int v;
-        EXPECT_TRUE(passage.Chan().Recv(v)); EXPECT_EQ(v, 1);
-        EXPECT_TRUE(passage.Chan().Recv(v)); EXPECT_EQ(v, 2);
+        EXPECT_TRUE(passage.Recv(v)); EXPECT_EQ(v, 1);
+        EXPECT_TRUE(passage.Recv(v)); EXPECT_EQ(v, 2);
     });
 }
 
@@ -1597,46 +1597,16 @@ TEST(PassageTest, ShutdownDrainsInternalChannel)
         for (int i = 0; i < N; i++)
         {
             int v;
-            ASSERT_TRUE(passage.Chan().Recv(v));
+            ASSERT_TRUE(passage.Recv(v));
         }
 
         sender.join();
         passage.Shutdown();
 
-        // Internal channel is shut down — next Recv returns false.
+        // Ring is drained and shut down — next Recv returns false.
         //
         int v;
-        EXPECT_FALSE(passage.Chan().Recv(v));
-    });
-}
-
-// Passage composes with Pipe: items cross the thread boundary then are transformed.
-//
-TEST(PassageTest, PipeComposition)
-{
-    test::RunInCooperator([](coop::Context* ctx)
-    {
-        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
-        auto doubled = coop::chan::Pipe(ctx, passage.Chan(),
-            [](int v) { return v * 2; });
-
-        constexpr int N = 5;
-        std::thread sender([&]
-        {
-            for (int i = 0; i < N; i++)
-                while (!passage.Send(i)) {}
-        });
-
-        int sum = 0;
-        for (int i = 0; i < N; i++)
-        {
-            int v;
-            ASSERT_TRUE(doubled.Chan().Recv(v));
-            sum += v;
-        }
-
-        sender.join();
-        EXPECT_EQ(sum, (0 + 1 + 2 + 3 + 4) * 2);  // 20
+        EXPECT_FALSE(passage.Recv(v));
     });
 }
 

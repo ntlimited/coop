@@ -201,6 +201,46 @@ template<typename T> struct IsTimeoutCase : std::false_type {};
 template<typename F> struct IsTimeoutCase<TimeoutCase<F>> : std::true_type {};
 
 // ---------------------------------------------------------------------------
+// DefaultCase — pseudo-case produced by Default(); must be the last argument
+// to Select / SelectWithKill. If no channel case is immediately ready
+// (TryAcquire on every coordinator fails), the default callback is called and
+// Select returns false without blocking.
+//
+//   Select(ctx,
+//       On(ch, [&](int v) { use(v); }),
+//       Default([&]{ /* nothing ready */ })
+//   );
+// ---------------------------------------------------------------------------
+
+struct NoDefault
+{
+    void operator()() const {}
+};
+
+template<typename OnDefault>
+struct DefaultCase
+{
+    OnDefault onDefault;
+    void Fire() { onDefault(); }
+};
+
+template<typename OnDefault>
+auto Default(OnDefault&& onDefault)
+    -> DefaultCase<std::decay_t<OnDefault>>
+{
+    return { std::forward<OnDefault>(onDefault) };
+}
+
+inline auto Default()
+    -> DefaultCase<NoDefault>
+{
+    return { NoDefault{} };
+}
+
+template<typename T> struct IsDefaultCase : std::false_type {};
+template<typename F> struct IsDefaultCase<DefaultCase<F>> : std::true_type {};
+
+// ---------------------------------------------------------------------------
 // detail helpers for Select with timeout
 // ---------------------------------------------------------------------------
 
@@ -224,6 +264,17 @@ bool DispatchCases(CoordinationResult result, CaseTuple& cases, std::index_seque
     ((result == std::get<Is>(cases).Coord()
         ? (ok = std::get<Is>(cases).Fire(), true) : false) || ...);
     return ok;
+}
+
+// Non-blocking: TryAcquire each coordinator in order; fire the first that succeeds.
+// Sets fired=true and ok=Fire() result if any case was dispatched.
+//
+template<size_t... Is, typename CaseTuple>
+void TryDispatchCases(Context* ctx, bool& fired, bool& ok, CaseTuple& cases,
+                      std::index_sequence<Is...>)
+{
+    ((std::get<Is>(cases).Coord()->TryAcquire(ctx)
+        ? (fired = true, ok = std::get<Is>(cases).Fire(), true) : false) || ...);
 }
 
 } // end detail
@@ -320,10 +371,25 @@ bool Select(Context* ctx, Cases&&... cases)
     return std::apply(
         [ctx](auto&&... cs)
         {
-            constexpr bool hasTimeout = IsTimeoutCase<
-                std::decay_t<detail::LastType<decltype(cs)...>>>::value;
+            using LastCase = std::decay_t<detail::LastType<decltype(cs)...>>;
+            constexpr bool hasDefault = IsDefaultCase<LastCase>::value;
+            constexpr bool hasTimeout = IsTimeoutCase<LastCase>::value;
 
-            if constexpr (hasTimeout)
+            if constexpr (hasDefault)
+            {
+                constexpr size_t N = sizeof...(cs);
+                static_assert(N > 1, "Select: Default requires at least one channel case.");
+
+                auto caseTuple = std::forward_as_tuple(cs...);
+                auto& dc      = std::get<N - 1>(caseTuple);
+
+                bool fired = false, ok = false;
+                detail::TryDispatchCases(ctx, fired, ok, caseTuple,
+                                         std::make_index_sequence<N - 1>{});
+                if (!fired) { dc.Fire(); }
+                return ok;
+            }
+            else if constexpr (hasTimeout)
             {
                 constexpr size_t N = sizeof...(cs);
                 static_assert(N > 1, "Select: Timeout requires at least one channel case.");
@@ -362,13 +428,32 @@ bool SelectWithKill(Context* ctx, Cases&&... cases)
     return std::apply(
         [ctx](auto&&... cs)
         {
-            constexpr bool hasTimeout = IsTimeoutCase<
-                std::decay_t<detail::LastType<decltype(cs)...>>>::value;
+            using LastCase = std::decay_t<detail::LastType<decltype(cs)...>>;
+            constexpr bool hasDefault = IsDefaultCase<LastCase>::value;
+            constexpr bool hasTimeout = IsTimeoutCase<LastCase>::value;
 
-            if constexpr (hasTimeout)
+            if constexpr (hasDefault)
             {
                 constexpr size_t N = sizeof...(cs);
-                static_assert(N > 1, "SelectWithKill: Timeout requires at least one channel case.");
+                static_assert(N > 1,
+                    "SelectWithKill: Default requires at least one channel case.");
+
+                if (ctx->IsKilled()) return false;
+
+                auto caseTuple = std::forward_as_tuple(cs...);
+                auto& dc      = std::get<N - 1>(caseTuple);
+
+                bool fired = false, ok = false;
+                detail::TryDispatchCases(ctx, fired, ok, caseTuple,
+                                         std::make_index_sequence<N - 1>{});
+                if (!fired) { dc.Fire(); }
+                return ok;
+            }
+            else if constexpr (hasTimeout)
+            {
+                constexpr size_t N = sizeof...(cs);
+                static_assert(N > 1,
+                    "SelectWithKill: Timeout requires at least one channel case.");
 
                 auto caseTuple = std::forward_as_tuple(cs...);
                 auto& tc      = std::get<N - 1>(caseTuple);
@@ -379,7 +464,7 @@ bool SelectWithKill(Context* ctx, Cases&&... cases)
                 auto result = std::apply(
                     [ctx](auto... args) { return CoordinateWithKill(ctx, args...); }, coordArgs);
 
-                if (result.Killed())  return false;
+                if (result.Killed())   return false;
                 if (result.TimedOut()) { tc.Fire(); return false; }
                 return detail::DispatchCases(result, caseTuple, std::make_index_sequence<N - 1>{});
             }

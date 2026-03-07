@@ -739,6 +739,47 @@ TEST(ChannelTest, SelectSendShutdown)
     });
 }
 
+// Default fires immediately when no channel is ready; fires no case when data is available.
+//
+TEST(ChannelTest, SelectDefault)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buf[4];
+        coop::Channel<int> ch(ctx, buf, 4);
+
+        bool defaultFired = false;
+        int received = -1;
+
+        // Channel empty — default fires.
+        //
+        bool ok = coop::Select(ctx,
+            coop::On(ch, [&](int v){ received = v; }),
+            coop::Default([&]{ defaultFired = true; })
+        );
+
+        EXPECT_FALSE(ok);
+        EXPECT_TRUE(defaultFired);
+        EXPECT_EQ(received, -1);
+
+        // Channel has data — recv case fires, default does not.
+        //
+        ch.TrySend(42);
+        defaultFired = false;
+
+        ok = coop::Select(ctx,
+            coop::On(ch, [&](int v){ received = v; }),
+            coop::Default([&]{ defaultFired = true; })
+        );
+
+        EXPECT_TRUE(ok);
+        EXPECT_FALSE(defaultFired);
+        EXPECT_EQ(received, 42);
+
+        ch.Shutdown();
+    });
+}
+
 // Timeout case fires when no channel delivers within the deadline.
 //
 TEST(ChannelTest, SelectTimeout)

@@ -5,3 +5,5 @@ compile_commands.json
 io/ssl
 *.swp
 benchmarks/results/
+benchmarks/reports/runs/*.json
+benchmarks/reports/runs/*.md

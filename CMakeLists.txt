@@ -148,6 +148,7 @@ add_executable(coop_tests
     tests/test_alloc.cpp
     tests/test_topology.cpp
     tests/test_epoch.cpp
+    tests/test_coop_var.cpp
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 include(GoogleTest)

@@ -38,10 +38,20 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 {
     assert(m_submitFd >= 0);
     memcpy(m_name, config.name, sizeof(m_name));
+
+    auto& registry = detail::CooperatorVarRegistry::Instance();
+    assert(registry.TotalSize() <= LOCAL_STORAGE_SIZE
+           && "CooperatorVar registrations exceed LOCAL_STORAGE_SIZE");
+    registry.ConstructAll(m_localStorage);
 }
 
 Cooperator::~Cooperator()
 {
+    // Destruct cooperator-vars before cooperator's own members. This ensures var destructors
+    // can safely reference cooperator infrastructure (epoch manager, uring, etc.).
+    //
+    detail::CooperatorVarRegistry::Instance().DestructAll(m_localStorage);
+
     if (m_submitFd >= 0)
     {
         close(m_submitFd);

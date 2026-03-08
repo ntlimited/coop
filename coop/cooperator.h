@@ -9,6 +9,7 @@
 #include "context.h"
 #include "epoch/epoch.h"
 #include "cooperator_configuration.h"
+#include "cooperator_var.h"
 #include "spawn_configuration.h"
 #include "stack_pool.h"
 #include "perf/counters.h"
@@ -39,6 +40,8 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 {
     using RegistryList = EmbeddedList<Cooperator, int, COOPERATOR_LIST_REGISTRY>;
     thread_local static Cooperator* thread_cooperator;
+
+    static constexpr size_t LOCAL_STORAGE_SIZE = 4096;
 
     Cooperator(CooperatorConfiguration const& config = s_defaultCooperatorConfiguration);
     ~Cooperator();
@@ -281,10 +284,20 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     friend struct Context;
     friend struct epoch::Manager;
     friend void ::CoopContextEntry(::coop::Context*);
+
+    template<typename T>
+    friend struct CooperatorVar;
+
     Context::AllContextsList    m_contexts;
     Context::ContextStateList   m_yielded;
     Context::ContextStateList   m_blocked;
     Context::ContextStateList   m_zombie;
+
+    // Per-cooperator extensible storage for higher layers without
+    // coupling the scheduler to those subsystems. Offsets are assigned at static init via
+    // CooperatorVarRegistry; access is thread-local cooperator + constant offset.
+    //
+    alignas(64) char m_localStorage[LOCAL_STORAGE_SIZE];
 
     static std::atomic<bool> s_registryShutdown;
     static std::mutex        s_registryMutex;

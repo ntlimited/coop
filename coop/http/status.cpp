@@ -10,6 +10,7 @@
 #include "coop/cooperator.h"
 #include "coop/context.h"
 #include "coop/detail/scheduler_state.h"
+#include "coop/epoch/epoch.h"
 #include "coop/perf/counters.h"
 #include "coop/perf/patch.h"
 #include "coop/perf/sampler.h"
@@ -264,10 +265,35 @@ void SerializePerfCounters(JsonWriter& w, Cooperator* co)
     w.EndObject();
 }
 
+// Parse a comma-separated family string (e.g. "scheduler,scan,txn") into a Family bitmask.
+//
+perf::Family ParseFamilies(const char* data, size_t len)
+{
+    perf::Family result{};
+    const char* p = data;
+    const char* end = data + len;
+    while (p < end)
+    {
+        const char* comma = static_cast<const char*>(memchr(p, ',', end - p));
+        size_t tok = (comma ? comma : end) - p;
+        std::string_view name(p, tok);
+        for (size_t i = 0; i < perf::kFamilyCount; i++)
+        {
+            if (name == perf::FamilyName(perf::s_allFamilies[i]))
+            {
+                result = result | perf::s_allFamilies[i];
+                break;
+            }
+        }
+        p += tok + 1;
+    }
+    return result;
+}
+
 std::string GeneratePerfJson(Cooperator* co)
 {
     std::string out;
-    out.reserve(1024);
+    out.reserve(2048);
     JsonWriter w(out);
 
     w.BeginObject();
@@ -280,6 +306,26 @@ std::string GeneratePerfJson(Cooperator* co)
 
     w.Key("probeCount");
     w.UInt(perf::ProbeCount());
+
+    perf::Family enabled = perf::EnabledFamilies();
+
+    w.Key("enabledFamilies");
+    w.UInt(static_cast<uint64_t>(enabled));
+
+    w.Key("families");
+    w.BeginObject();
+    for (size_t i = 0; i < perf::kFamilyCount; i++)
+    {
+        perf::Family f = perf::s_allFamilies[i];
+        w.Key(perf::FamilyName(f));
+        w.BeginObject();
+        w.Key("bit");
+        w.UInt(static_cast<uint64_t>(f));
+        w.Key("enabled");
+        w.Bool(perf::HasFamily(enabled, f));
+        w.EndObject();
+    }
+    w.EndObject();
 
     w.Key("counters");
     w.BeginObject();
@@ -309,13 +355,33 @@ void HandlePerf(ConnectionBase& conn)
 
 void HandlePerfEnable(ConnectionBase& conn)
 {
-    perf::Enable();
+    perf::Family families = perf::Family::All;
+    while (auto* name = conn.NextArgName())
+    {
+        if (name == std::string_view("families"))
+        {
+            if (auto* chunk = conn.ReadArgValue())
+                families = ParseFamilies(
+                    static_cast<const char*>(chunk->data), chunk->size);
+        }
+    }
+    perf::Enable(families);
     conn.Send(200, "application/json", "{\"ok\":true}");
 }
 
 void HandlePerfDisable(ConnectionBase& conn)
 {
-    perf::Disable();
+    perf::Family families = perf::Family::All;
+    while (auto* name = conn.NextArgName())
+    {
+        if (name == std::string_view("families"))
+        {
+            if (auto* chunk = conn.ReadArgValue())
+                families = ParseFamilies(
+                    static_cast<const char*>(chunk->data), chunk->size);
+        }
+    }
+    perf::Disable(families);
     conn.Send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -663,6 +729,91 @@ void HandleCooperatorsPerf(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
+// ---- Epoch API ----
+
+void HandleEpoch(ConnectionBase& conn)
+{
+    auto* mgr = epoch::GetManager();
+    if (!mgr)
+    {
+        conn.Send(200, "application/json", "{\"error\":\"no epoch manager\"}");
+        return;
+    }
+
+    std::string out;
+    out.reserve(512);
+    JsonWriter w(out);
+
+    w.BeginObject();
+
+    uint64_t current = mgr->Current().Value();
+    epoch::Epoch safe = mgr->SafeEpoch();
+    uint64_t safeVal = safe.Value();
+
+    w.Key("current");
+    w.UInt(current);
+    w.Key("safe");
+    w.UInt(safeVal);
+    w.Key("lag");
+    w.UInt(safe.IsAlive() ? 0 : current - safeVal);
+    w.Key("pendingRetire");
+    w.UInt(mgr->PendingCount());
+
+    auto snap = mgr->SnapshotPins();
+    w.Key("pins");
+    w.BeginObject();
+    w.Key("traversal");
+    w.UInt(snap.traversalPins);
+    w.Key("application");
+    w.UInt(snap.applicationPins);
+    w.EndObject();
+
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
+void HandleEpochAll(ConnectionBase& conn)
+{
+    auto* localMgr = epoch::GetManager();
+
+    std::string out;
+    out.reserve(2048);
+    JsonWriter w(out);
+
+    w.BeginObject();
+
+    // Global safe epoch is the minimum across all cooperator watermarks.
+    //
+    w.Key("globalSafe");
+    if (localMgr)
+    {
+        epoch::Epoch safe = localMgr->SafeEpoch();
+        w.UInt(safe.Value());
+    }
+    else
+    {
+        w.UInt(0);
+    }
+
+    w.Key("cooperators");
+    w.BeginArray();
+
+    Cooperator::VisitRegistry([&](Cooperator* co) -> bool
+    {
+        w.BeginObject();
+        w.Key("name");
+        w.String(co->GetName());
+        w.Key("watermark");
+        w.UInt(co->GetEpochWatermark().Value());
+        w.EndObject();
+        return true;
+    });
+
+    w.EndArray();
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
 Route s_statusRoutes[] = {
     {"/api/status",         HandleStatus},
     {"/api/perf",           HandlePerf},
@@ -675,6 +826,8 @@ Route s_statusRoutes[] = {
     {"/api/sampler/symbolize", HandleSymbolize},
     {"/api/cooperators",       HandleCooperators},
     {"/api/cooperators/perf",  HandleCooperatorsPerf},
+    {"/api/epoch",             HandleEpoch},
+    {"/api/epoch/all",         HandleEpochAll},
 };
 
 static constexpr int STATUS_ROUTE_COUNT = sizeof(s_statusRoutes) / sizeof(s_statusRoutes[0]);

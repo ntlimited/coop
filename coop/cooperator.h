@@ -160,6 +160,13 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     epoch::Manager& GetEpochManager() { return m_epochMgr; }
 
+    // Read the epoch watermark. Safe to call cross-thread (atomic load).
+    //
+    epoch::Epoch GetEpochWatermark() const
+    {
+        return m_epochWatermark.load(std::memory_order_acquire);
+    }
+
     const char* GetName() const { return m_name; }
 
     // Visit all registered cooperators under the registry lock. The callback receives each

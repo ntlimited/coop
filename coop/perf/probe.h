@@ -4,7 +4,7 @@
 
 // COOP_PERF_INC(counters, id)
 //
-// Increment a performance counter. Expands differently based on COOP_PERF_MODE:
+// Increment a performance counter by 1. Expands differently based on COOP_PERF_MODE:
 //
 //   Mode 0 (DISABLED):   Nothing. Zero cost.
 //   Mode 1 (ALWAYS_ON):  Direct increment. ~1ns (L1 cache hit).
@@ -14,8 +14,14 @@
 //                         falls through. Probe sites are recorded in the "coop_perf_sites"
 //                         ELF section for the patching engine to find.
 //
+// COOP_PERF_ADD(counters, id, n)
+//
+// Add n to a performance counter. Same mode behavior as COOP_PERF_INC but increments by
+// an arbitrary amount. Used for batch counters like DrainReclaimed.
+//
 // Usage:
 //   COOP_PERF_INC(m_perf, perf::Counter::ContextResume);
+//   COOP_PERF_ADD(m_perf, perf::Counter::DrainReclaimed, freedCount);
 //
 
 #if COOP_PERF_MODE == 0
@@ -23,12 +29,14 @@
 // Disabled — zero overhead, zero code generation.
 //
 #define COOP_PERF_INC(counters, id) ((void)0)
+#define COOP_PERF_ADD(counters, id, n) ((void)0)
 
 #elif COOP_PERF_MODE == 1
 
 // Always-on — direct increment.
 //
 #define COOP_PERF_INC(counters, id) (counters).Inc(id)
+#define COOP_PERF_ADD(counters, id, n) (counters).IncBy(id, n)
 
 #elif COOP_PERF_MODE == 2
 
@@ -55,6 +63,21 @@
         ".popsection\n"                                                                     \
         : : [cid] "i" (static_cast<uint32_t>(id)) : : __perf_skip);                        \
     (counters).Inc(id);                                                                     \
+    __perf_skip: ;                                                                          \
+} while(0)
+
+#define COOP_PERF_ADD(counters, id, n) do {                                                 \
+    __label__ __perf_skip;                                                                  \
+    asm goto(                                                                               \
+        "1: jmp %l[__perf_skip]\n"                                                          \
+        ".pushsection coop_perf_sites, \"aw\"\n"                                            \
+        ".balign 16\n"                                                                      \
+        ".quad 1b\n"                                                                        \
+        ".long %c[cid]\n"                                                                   \
+        ".long 0\n"                                                                         \
+        ".popsection\n"                                                                     \
+        : : [cid] "i" (static_cast<uint32_t>(id)) : : __perf_skip);                        \
+    (counters).IncBy(id, n);                                                                \
     __perf_skip: ;                                                                          \
 } while(0)
 

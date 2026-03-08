@@ -1,5 +1,6 @@
 #include "epoch.h"
 #include "coop/cooperator.h"
+#include "coop/perf/probe.h"
 
 namespace coop
 {
@@ -67,6 +68,8 @@ void Manager::PublishWatermark()
 Epoch Manager::Advance()
 {
     m_current = m_current.Next();
+    COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),
+        perf::Counter::EpochAdvance);
     return m_current;
 }
 
@@ -107,6 +110,8 @@ void Manager::Pin(Context* ctx, Epoch epoch)
     assert(epoch <= m_current && "cannot pin at a future epoch");
     ctx->m_epochState.application = epoch;
     PublishWatermark();
+    COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),
+        perf::Counter::EpochPin);
 }
 
 void Manager::Unpin()
@@ -119,6 +124,8 @@ void Manager::Unpin(Context* ctx)
 {
     ctx->m_epochState.application = Epoch::Unpinned();
     PublishWatermark();
+    COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),
+        perf::Counter::EpochUnpin);
 }
 
 void Manager::Retire(RetireEntry* entry)
@@ -137,6 +144,33 @@ void Manager::Retire(RetireEntry* entry)
     }
     m_retireTail = entry;
     m_retireCount++;
+}
+
+Manager::PinSnapshot Manager::SnapshotPins()
+{
+    PinSnapshot snap{};
+    snap.oldestTraversal = Epoch::Alive();
+    snap.oldestApplication = Epoch::Alive();
+
+    m_cooperator->VisitContexts([&](Context* ctx) -> bool
+    {
+        epoch::State& state = ctx->m_epochState;
+        if (!state.traversal.IsUnpinned())
+        {
+            snap.traversalPins++;
+            if (state.traversal < snap.oldestTraversal)
+                snap.oldestTraversal = state.traversal;
+        }
+        if (!state.application.IsUnpinned())
+        {
+            snap.applicationPins++;
+            if (state.application < snap.oldestApplication)
+                snap.oldestApplication = state.application;
+        }
+        return true;
+    });
+
+    return snap;
 }
 
 Epoch Manager::SafeEpoch()

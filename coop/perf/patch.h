@@ -9,25 +9,29 @@ namespace perf
 
 #if COOP_PERF_MODE == 2
 
-// Enable all performance probes. Patches JMP instructions at probe sites to NOPs so counter
-// increments fall through. Safe to call from any cooperator thread — patching is a series of
-// atomic 2-byte writes visible after the next icache sync (guaranteed on x86 by the next
-// taken branch or serializing instruction).
+// Enable performance probes for the given families. Patches JMP instructions at matching
+// probe sites to NOPs so counter increments fall through. Only patches sites whose enabled
+// state actually changes, so toggling one family doesn't re-patch the others.
 //
-// Cooperative scheduling gives us an advantage: between context switches, only the cooperator
-// thread executes, so probe sites are not being executed concurrently during patching.
-//
-void Enable();
+void Enable(Family families = Family::All);
 
-// Disable all performance probes. Restores original JMP instructions at probe sites.
+// Disable performance probes for the given families. Restores original JMP instructions.
 //
-void Disable();
+void Disable(Family families = Family::All);
 
-// Toggle probes on/off.
+// Set exactly this family mask — enable families in the mask, disable families not in it.
+//
+void SetFamilies(Family families);
+
+// Toggle all probes on/off.
 //
 void Toggle();
 
-// Returns true if probes are currently enabled.
+// Returns the currently enabled family bitmask.
+//
+Family EnabledFamilies();
+
+// Returns true if any probes are currently enabled.
 //
 bool IsEnabled();
 
@@ -39,9 +43,11 @@ size_t ProbeCount();
 
 // Stubs for non-dynamic modes.
 //
-inline void Enable() {}
-inline void Disable() {}
+inline void Enable(Family = Family::All) {}
+inline void Disable(Family = Family::All) {}
+inline void SetFamilies(Family) {}
 inline void Toggle() {}
+inline Family EnabledFamilies() { return COOP_PERF_MODE == 1 ? Family::All : Family{}; }
 inline bool IsEnabled() { return COOP_PERF_MODE == 1; }
 inline size_t ProbeCount() { return 0; }
 

@@ -51,7 +51,7 @@ extern "C"
 static ProbeSite* s_sites = nullptr;
 static size_t     s_siteCount = 0;
 static bool       s_initialized = false;
-static bool       s_enabled = false;
+static Family     s_enabledFamilies{};
 
 // Patch `len` bytes at `addr`. Makes the containing page(s) writable, writes, restores.
 //
@@ -129,45 +129,95 @@ static void InitSites()
 
 } // end anonymous namespace
 
-void Enable()
+void Enable(Family families)
 {
     InitSites();
-    if (s_enabled) return;
+    Family target = s_enabledFamilies | families;
 
     for (size_t i = 0; i < s_siteCount; i++)
     {
         auto& site = s_sites[i];
-        const uint8_t* nop = (site.origLen == 2) ? s_nop2 : s_nop5;
-        PatchBytes(site.addr, nop, site.origLen);
+        Counter c = static_cast<Counter>(site.counterId);
+        Family f = CounterFamily(c);
+        bool wasEnabled = HasFamily(s_enabledFamilies, f);
+        bool wantEnabled = HasFamily(target, f);
+
+        if (!wasEnabled && wantEnabled)
+        {
+            const uint8_t* nop = (site.origLen == 2) ? s_nop2 : s_nop5;
+            PatchBytes(site.addr, nop, site.origLen);
+        }
     }
 
-    s_enabled = true;
-    SPDLOG_INFO("perf: enabled {} probe sites", s_siteCount);
+    s_enabledFamilies = target;
+    SPDLOG_INFO("perf: enabled families 0x{:x} (now 0x{:x})",
+                static_cast<uint64_t>(families), static_cast<uint64_t>(s_enabledFamilies));
 }
 
-void Disable()
+void Disable(Family families)
 {
-    if (!s_enabled) return;
+    Family target = s_enabledFamilies & ~families;
 
     for (size_t i = 0; i < s_siteCount; i++)
     {
         auto& site = s_sites[i];
-        PatchBytes(site.addr, site.origBytes, site.origLen);
+        Counter c = static_cast<Counter>(site.counterId);
+        Family f = CounterFamily(c);
+        bool wasEnabled = HasFamily(s_enabledFamilies, f);
+        bool wantEnabled = HasFamily(target, f);
+
+        if (wasEnabled && !wantEnabled)
+        {
+            PatchBytes(site.addr, site.origBytes, site.origLen);
+        }
     }
 
-    s_enabled = false;
-    SPDLOG_INFO("perf: disabled {} probe sites", s_siteCount);
+    s_enabledFamilies = target;
+    SPDLOG_INFO("perf: disabled families 0x{:x} (now 0x{:x})",
+                static_cast<uint64_t>(families), static_cast<uint64_t>(s_enabledFamilies));
+}
+
+void SetFamilies(Family families)
+{
+    InitSites();
+
+    for (size_t i = 0; i < s_siteCount; i++)
+    {
+        auto& site = s_sites[i];
+        Counter c = static_cast<Counter>(site.counterId);
+        Family f = CounterFamily(c);
+        bool wasEnabled = HasFamily(s_enabledFamilies, f);
+        bool wantEnabled = HasFamily(families, f);
+
+        if (!wasEnabled && wantEnabled)
+        {
+            const uint8_t* nop = (site.origLen == 2) ? s_nop2 : s_nop5;
+            PatchBytes(site.addr, nop, site.origLen);
+        }
+        else if (wasEnabled && !wantEnabled)
+        {
+            PatchBytes(site.addr, site.origBytes, site.origLen);
+        }
+    }
+
+    s_enabledFamilies = families;
+    SPDLOG_INFO("perf: set families to 0x{:x}", static_cast<uint64_t>(families));
 }
 
 void Toggle()
 {
-    if (s_enabled) Disable();
+    if (s_enabledFamilies != Family{}) Disable();
     else Enable();
+}
+
+Family EnabledFamilies()
+{
+    return s_enabledFamilies;
 }
 
 bool IsEnabled()
 {
-    return s_enabled;
+    return s_enabledFamilies != Family{};
 }
 
 size_t ProbeCount()

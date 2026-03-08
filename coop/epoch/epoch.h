@@ -33,6 +33,8 @@ struct Epoch
     bool IsUnpinned() const { return m_value == 0; }
     bool IsAlive()    const { return m_value == UINT64_MAX; }
 
+    uint64_t Value() const { return m_value; }
+
     Epoch Next() const { return Epoch{m_value + 1}; }
 
     auto operator<=>(Epoch const&) const = default;
@@ -171,6 +173,21 @@ struct Manager
     // Number of entries awaiting reclamation.
     //
     size_t PendingCount() const { return m_retireCount; }
+
+    // ---- Observability ----
+
+    // Snapshot of pin state across all contexts on this cooperator. O(contexts) walk.
+    // Read-only observation — does not publish or modify anything.
+    //
+    struct PinSnapshot
+    {
+        size_t traversalPins;       // contexts with active traversal pin
+        size_t applicationPins;     // contexts with active application pin
+        Epoch  oldestTraversal;     // minimum traversal epoch (Alive if none)
+        Epoch  oldestApplication;   // minimum application epoch (Alive if none)
+    };
+
+    PinSnapshot SnapshotPins();
 
 private:
     // Recompute the minimum pinned epoch across all contexts on m_cooperator and publish

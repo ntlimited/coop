@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Detect whether coop is the top-level project or included as a subdirectory
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(COOP_STANDALONE TRUE)
+else()
+    set(COOP_STANDALONE FALSE)
+endif()
+
 # Code coverage instrumentation (use with build/coverage)
 option(COOP_COVERAGE "Build with gcov coverage instrumentation" OFF)
 if(COOP_COVERAGE)
@@ -30,7 +37,7 @@ FetchContent_MakeAvailable(spdlog)
 #
 file(GLOB COOP_CHAN_SOURCES coop/chan/*.cpp)
 add_library(coop_chan OBJECT ${COOP_CHAN_SOURCES})
-target_include_directories(coop_chan PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(coop_chan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(coop_chan PRIVATE -Wcpp -fno-omit-frame-pointer)
 
 # Collect remaining library sources (exclude coop/chan/ — handled by coop_chan above)
@@ -46,7 +53,7 @@ file(GLOB_RECURSE COOP_SOURCES
 list(FILTER COOP_SOURCES EXCLUDE REGEX ".*/coop/chan/.*")
 
 add_library(coop STATIC ${COOP_SOURCES} $<TARGET_OBJECTS:coop_chan>)
-target_include_directories(coop PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(coop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer -msse4.2)
 
 # Compile out trace/debug logging in release builds — eliminates ~1% overhead from runtime
@@ -72,11 +79,15 @@ find_library(URING_LIB uring REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
 target_link_libraries(coop PUBLIC ${URING_LIB} OpenSSL::SSL OpenSSL::Crypto spdlog::spdlog dl)
 
+# ---------------------------------------------------------------------------
+# Everything below is only built when coop is the top-level project
+# ---------------------------------------------------------------------------
+if(COOP_STANDALONE)
+
 # Executables
 add_executable(echo_server examples/echo_server.cpp)
 target_link_libraries(echo_server PRIVATE coop)
 target_link_options(echo_server PRIVATE -rdynamic)
-
 
 add_executable(echo_client examples/echo_client.cpp)
 target_link_libraries(echo_client PRIVATE coop)
@@ -110,7 +121,7 @@ file(GLOB_RECURSE STATIC_FILES coop/http/static/*)
 add_custom_target(static-files ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin/static
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${CMAKE_SOURCE_DIR}/coop/http/static
+        ${CMAKE_CURRENT_SOURCE_DIR}/coop/http/static
         ${CMAKE_BINARY_DIR}/bin/static
     DEPENDS ${STATIC_FILES}
     COMMENT "Copying static files to build output"
@@ -181,3 +192,5 @@ target_link_options(bench_client PRIVATE -rdynamic)
 add_executable(diag_ktls benchmarks/diag_ktls.cpp)
 target_link_libraries(diag_ktls PRIVATE coop)
 add_dependencies(diag_ktls test-certs)
+
+endif() # COOP_STANDALONE

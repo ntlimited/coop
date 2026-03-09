@@ -213,8 +213,9 @@ data path dispatch.
 Three compile-time modes via `COOP_PERF_MODE`: 0=disabled (default, zero overhead), 1=always-on
 (direct increment, ~1ns), 2=dynamic (`asm goto` NOP/JMP binary patching, toggled at runtime).
 Per-cooperator counters (no atomics — single-threaded). Probes in scheduler, io_uring, and
-context lifecycle. See `coop/perf/CLAUDE.md` for the counter table, patching engine internals,
-and instructions for adding new probes.
+context lifecycle. Extensible by consumers via X-macro `.def` files. See `coop/perf/CLAUDE.md`
+for the counter table, patching engine internals, extension mechanism, and instructions for
+adding new probes.
 
 **Multi-cooperator observability**: Cooperators can be named via `CooperatorConfiguration::name`.
 A global registry (`Cooperator::VisitRegistry`) enumerates all live cooperators. The status

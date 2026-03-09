@@ -39,7 +39,7 @@ changes needed. Patching only touches sites whose enabled state actually changes
 |-------------|------|-----------------------------------------------------------------------|
 | `Scheduler` | 0x01 | SchedulerLoop, ContextResume/Yield/Block/Spawn/Exit                   |
 | `IO`        | 0x02 | IoSubmit, IoComplete, PollCycle/Submit/Cqe                            |
-| `Epoch`     | 0x20 | EpochAdvance/Pin/Unpin, DrainCycles/Reclaimed                         |
+| `Epoch`     | 0x04 | EpochAdvance/Pin/Unpin, DrainCycles/Reclaimed                         |
 
 API: `Enable(Family::Scheduler | Family::IO)`, `Disable(Family::IO)`,
 `SetFamilies(Family::Scheduler)`, `EnabledFamilies()`.
@@ -147,12 +147,104 @@ burst sampling cycles and renders a 2-level flame graph (contexts → functions)
 Executables that want useful symbol resolution need `-rdynamic` link flag (exports symbols to
 the dynamic symbol table for `dladdr()`).
 
-## Adding New Probes
+## Adding New Probes (within coop)
 
-1. Add the counter to the `Counter` enum in `counters.h` (before `COUNT`)
+1. Add the counter to the `Counter` enum in `counters.h` (before the user-defined block)
 2. Add the name string to `CounterName()` in the same position
 3. Add a case in `CounterFamily()` mapping the counter to its family
 4. Insert `COOP_PERF_INC(counters_ref, perf::Counter::NewCounter)` at the probe site
 5. The counters reference is typically `m_perf` (cooperator member) accessed via
    `GetPerfCounters()`, or `coop::GetCooperator()->GetPerfCounters()` for code
-   that doesn't have a direct cooperator pointer (e.g.)
+   that doesn't have a direct cooperator pointer
+
+## Extension Mechanism (for coop consumers)
+
+Consumers that embed coop as a submodule can define their own counters and families via
+X-macro `.def` files. This gives extension counters full parity with coop-native ones:
+compile-time enum IDs (mode 2 compatible), per-family selective enable/disable, automatic
+integration with the status API and observability endpoints.
+
+### Setup
+
+Define two compile definitions pointing to `.def` file paths:
+
+```cmake
+# In the consumer's CMakeLists.txt:
+target_compile_definitions(coop PUBLIC
+    COOP_PERF_USER_FAMILIES="${CMAKE_CURRENT_SOURCE_DIR}/perf/my_families.def"
+    COOP_PERF_USER_COUNTERS="${CMAKE_CURRENT_SOURCE_DIR}/perf/my_counters.def"
+)
+```
+
+Both defines are optional — you can add counters to existing coop families without defining
+new families, or define new families without adding counters (unusual but valid).
+
+### Families file format
+
+Each line uses the `COOP_PERF_FAMILY(name, bit, display)` X-macro:
+- `name` — C++ identifier, becomes `Family::name`
+- `bit` — bit index in the `uint64_t` bitmask. Coop reserves bits 0-15; use 16+
+- `display` — string literal for `FamilyName()` and the status API
+
+```cpp
+// my_families.def
+COOP_PERF_FAMILY(Scan, 16, "scan")
+COOP_PERF_FAMILY(DML,  17, "dml")
+COOP_PERF_FAMILY(Txn,  18, "txn")
+```
+
+### Counters file format
+
+Each line uses the `COOP_PERF_COUNTER(name, family, display)` X-macro:
+- `name` — C++ identifier, becomes `Counter::name`
+- `family` — must match a `Family::` enum value (coop-native or user-defined)
+- `display` — string literal for `CounterName()` and the status API
+
+```cpp
+// my_counters.def
+COOP_PERF_COUNTER(TuplesScanned,       Scan, "tuples_scanned")
+COOP_PERF_COUNTER(TuplesReturned,      Scan, "tuples_returned")
+COOP_PERF_COUNTER(TuplesInserted,      DML,  "tuples_inserted")
+COOP_PERF_COUNTER(TuplesDeleted,       DML,  "tuples_deleted")
+COOP_PERF_COUNTER(TxnBegin,            Txn,  "txn_begin")
+COOP_PERF_COUNTER(TxnCommit,           Txn,  "txn_commit")
+```
+
+### Usage in consumer code
+
+Extension counters work identically to coop-native counters:
+
+```cpp
+#include "coop/perf/probe.h"
+
+// In hot path code:
+COOP_PERF_INC(coop::GetCooperator()->GetPerfCounters(), coop::perf::Counter::TuplesScanned);
+
+// Family-level control:
+coop::perf::Enable(coop::perf::Family::Scan | coop::perf::Family::Txn);
+coop::perf::Disable(coop::perf::Family::DML);
+```
+
+### What it expands to
+
+`counters.h` includes each `.def` file at six points, redefining the X-macro each time to
+extract the right field:
+
+1. `Counter` enum — `COOP_PERF_COUNTER(name, ...) → name,`
+2. `CounterName()` array — `COOP_PERF_COUNTER(..., display) → display,`
+3. `CounterFamily()` switch — `COOP_PERF_COUNTER(name, family, ...) → case Counter::name: return Family::family;`
+4. `Family` enum — `COOP_PERF_FAMILY(name, bit, ...) → name = 1ULL << bit,`
+5. `FamilyName()` switch — `COOP_PERF_FAMILY(name, ..., display) → case Family::name: return display;`
+6. `s_allFamilies[]` array — `COOP_PERF_FAMILY(name, ...) → Family::name,`
+
+The `Counters::values[]` array, mode 2 ELF section probes, patching engine, and status API
+all adapt automatically — no changes needed outside the `.def` files.
+
+### Design constraints
+
+- **One extension layer**: only one set of `.def` files can be active. This matches the
+  typical deployment model (one application embedding coop as a submodule).
+- **Rebuild required**: changing `.def` files requires rebuilding coop. Natural since the
+  consumer controls the build.
+- **Mode 2 compatible**: extension counter IDs are enum values (compile-time constants), so
+  `asm goto` immediate operands work. All three modes have full parity.

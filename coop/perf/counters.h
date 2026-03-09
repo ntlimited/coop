@@ -13,6 +13,12 @@
 //                  enabled at runtime, the JMP is patched to NOPs and the increment
 //                  falls through. Toggle on/off without recompiling.
 //
+// Extension mechanism:
+//
+//   Consumers of coop can define additional counters and families via X-macro .def files.
+//   Set COOP_PERF_USER_COUNTERS and/or COOP_PERF_USER_FAMILIES as compile definitions
+//   pointing to the .def file paths. See coop/perf/CLAUDE.md for details.
+//
 
 #ifndef COOP_PERF_MODE
 #define COOP_PERF_MODE 0
@@ -54,6 +60,14 @@ enum class Counter : uint32_t
     DrainCycles,        // reclamation attempts
     DrainReclaimed,     // nodes actually freed
 
+    // ---- User-defined counters (via COOP_PERF_USER_COUNTERS .def file) ----
+    //
+#ifdef COOP_PERF_USER_COUNTERS
+#define COOP_PERF_COUNTER(name, family, display) name,
+#include COOP_PERF_USER_COUNTERS
+#undef COOP_PERF_COUNTER
+#endif
+
     COUNT
 };
 
@@ -81,6 +95,12 @@ inline const char* CounterName(Counter c)
         "epoch_unpin",
         "drain_cycles",
         "drain_reclaimed",
+        // User-defined
+#ifdef COOP_PERF_USER_COUNTERS
+#define COOP_PERF_COUNTER(name, family, display) display,
+#include COOP_PERF_USER_COUNTERS
+#undef COOP_PERF_COUNTER
+#endif
     };
     static_assert(sizeof(s_names) / sizeof(s_names[0]) == static_cast<size_t>(Counter::COUNT));
     auto idx = static_cast<size_t>(c);
@@ -95,8 +115,17 @@ inline const char* CounterName(Counter c)
 
 enum class Family : uint64_t
 {
+    // Coop-reserved families (bits 0-15). User-defined families should use bits 16+.
+    //
     Scheduler = 1ULL << 0,
-    IO        = 1ULL << 1,    Epoch     = 1ULL << 2,
+    IO        = 1ULL << 1,
+    Epoch     = 1ULL << 2,
+
+#ifdef COOP_PERF_USER_FAMILIES
+#define COOP_PERF_FAMILY(name, bit, display) name = 1ULL << bit,
+#include COOP_PERF_USER_FAMILIES
+#undef COOP_PERF_FAMILY
+#endif
 
     All       = ~0ULL,
 };
@@ -149,6 +178,12 @@ inline constexpr Family CounterFamily(Counter c)
         case Counter::DrainReclaimed:
             return Family::Epoch;
 
+#ifdef COOP_PERF_USER_COUNTERS
+#define COOP_PERF_COUNTER(name, family, display) case Counter::name: return Family::family;
+#include COOP_PERF_USER_COUNTERS
+#undef COOP_PERF_COUNTER
+#endif
+
         default:
             return Family::All;
     }
@@ -161,7 +196,13 @@ inline const char* FamilyName(Family f)
     switch (f)
     {
         case Family::Scheduler: return "scheduler";
-        case Family::IO:        return "io";        case Family::Epoch:     return "epoch";
+        case Family::IO:        return "io";
+        case Family::Epoch:     return "epoch";
+#ifdef COOP_PERF_USER_FAMILIES
+#define COOP_PERF_FAMILY(name, bit, display) case Family::name: return display;
+#include COOP_PERF_USER_FAMILIES
+#undef COOP_PERF_FAMILY
+#endif
         default:                return nullptr;
     }
 }
@@ -170,7 +211,13 @@ inline const char* FamilyName(Family f)
 //
 inline constexpr Family s_allFamilies[] = {
     Family::Scheduler,
-    Family::IO,    Family::Epoch,
+    Family::IO,
+    Family::Epoch,
+#ifdef COOP_PERF_USER_FAMILIES
+#define COOP_PERF_FAMILY(name, bit, display) Family::name,
+#include COOP_PERF_USER_FAMILIES
+#undef COOP_PERF_FAMILY
+#endif
 };
 
 inline constexpr size_t kFamilyCount = sizeof(s_allFamilies) / sizeof(s_allFamilies[0]);

@@ -10,13 +10,17 @@ struct Context;
 } // end namespace coop
 
 // Assembly-level context switch primitive. Saves callee-saved registers on the current stack,
-// stores RSP to *from_sp, loads to_sp as new RSP, restores registers, and returns `result` to
-// the resumed call site.
+// stores the stack pointer to *from_sp, loads to_sp as the new stack pointer, restores
+// registers, and returns `result` to the resumed call site.
+//
+// x86-64: saves rbp, rbx, r12-r15; swaps RSP.
+// aarch64: saves x19-x28, x29 (fp), x30 (lr); swaps SP.
 //
 extern "C" int ContextSwitch(void** from_sp, void* to_sp, int result);
 
 // Assembly trampoline — first code a new context executes after ContextSwitch restores its
-// initial frame. Reads Context* from r12 and tail-calls CoopContextEntry.
+// initial frame. Reads Context* from a callee-saved register (x86-64: r12, aarch64: x19)
+// and tail-calls CoopContextEntry.
 //
 extern "C" void _context_trampoline();
 

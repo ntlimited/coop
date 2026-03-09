@@ -34,10 +34,16 @@ struct ProbeSite
     uint32_t counterId;
 };
 
+#if defined(__x86_64__)
 // Canonical NOP encodings for x86-64.
 //
 static const uint8_t s_nop2[] = {0x66, 0x90};                          // xchg ax,ax
 static const uint8_t s_nop5[] = {0x0f, 0x1f, 0x44, 0x00, 0x00};       // nopl 0(%rax,%rax,1)
+#elif defined(__aarch64__)
+// AArch64 NOP encoding — all instructions are 4 bytes.
+//
+static const uint8_t s_nop4[] = {0x1f, 0x20, 0x03, 0xd5};             // nop (0xD503201F LE)
+#endif
 
 // Linker-generated symbols bounding the coop_perf_sites section. Weak so that binaries
 // with no probe sites (mode 0/1 builds) still link cleanly.
@@ -54,6 +60,7 @@ static bool       s_initialized = false;
 static Family     s_enabledFamilies{};
 
 // Patch `len` bytes at `addr`. Makes the containing page(s) writable, writes, restores.
+// On aarch64, flushes the instruction cache after patching (icache is not coherent with dcache).
 //
 static void PatchBytes(uint8_t* addr, const uint8_t* bytes, size_t len)
 {
@@ -64,6 +71,13 @@ static void PatchBytes(uint8_t* addr, const uint8_t* bytes, size_t len)
     mprotect(reinterpret_cast<void*>(pageStart), pageLen, PROT_READ | PROT_WRITE | PROT_EXEC);
     memcpy(addr, bytes, len);
     mprotect(reinterpret_cast<void*>(pageStart), pageLen, PROT_READ | PROT_EXEC);
+
+#if defined(__aarch64__)
+    // AArch64 has non-coherent icache — must explicitly flush after code patching.
+    //
+    __builtin___clear_cache(reinterpret_cast<char*>(addr),
+                            reinterpret_cast<char*>(addr + len));
+#endif
 }
 
 static void InitSites()
@@ -97,6 +111,7 @@ static void InitSites()
         site.addr = addr;
         site.counterId = entry->counterId;
 
+#if defined(__x86_64__)
         // Detect JMP instruction encoding.
         //
         if (addr[0] == 0xEB)
@@ -119,6 +134,25 @@ static void InitSites()
                         addr[0], static_cast<void*>(addr));
             continue;
         }
+#elif defined(__aarch64__)
+        // AArch64: all instructions are 4 bytes. Detect unconditional branch (B).
+        // B encoding: 0x14000000 | imm26 — top 6 bits are 000101.
+        //
+        {
+            uint32_t insn;
+            memcpy(&insn, addr, 4);
+            if ((insn >> 26) == 0x05)
+            {
+                site.origLen = 4;
+            }
+            else
+            {
+                SPDLOG_WARN("perf: unexpected insn 0x{:08x} at probe site {:p}, skipping",
+                            insn, static_cast<void*>(addr));
+                continue;
+            }
+        }
+#endif
 
         memcpy(site.origBytes, addr, site.origLen);
         s_sites[s_siteCount++] = site;
@@ -144,7 +178,11 @@ void Enable(Family families)
 
         if (!wasEnabled && wantEnabled)
         {
+#if defined(__x86_64__)
             const uint8_t* nop = (site.origLen == 2) ? s_nop2 : s_nop5;
+#elif defined(__aarch64__)
+            const uint8_t* nop = s_nop4;
+#endif
             PatchBytes(site.addr, nop, site.origLen);
         }
     }
@@ -191,7 +229,11 @@ void SetFamilies(Family families)
 
         if (!wasEnabled && wantEnabled)
         {
+#if defined(__x86_64__)
             const uint8_t* nop = (site.origLen == 2) ? s_nop2 : s_nop5;
+#elif defined(__aarch64__)
+            const uint8_t* nop = s_nop4;
+#endif
             PatchBytes(site.addr, nop, site.origLen);
         }
         else if (wasEnabled && !wantEnabled)

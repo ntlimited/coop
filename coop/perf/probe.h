@@ -40,10 +40,10 @@
 
 #elif COOP_PERF_MODE == 2
 
-// Dynamic — patchable JMP/NOP site with section-registered probe.
+// Dynamic — patchable branch/NOP site with section-registered probe.
 //
-// Default state: JMP over the increment (disabled, ~0 cost).
-// Enabled state: JMP patched to NOPs, falls through to increment.
+// Default state: branch over the increment (disabled, ~0 cost).
+// Enabled state: branch patched to NOP, falls through to increment.
 //
 // The section entry records the probe site address and counter ID so the patching engine
 // can find and toggle all sites.
@@ -51,6 +51,11 @@
 // __label__ creates a block-scoped label so multiple COOP_PERF_INC invocations in the same
 // function don't collide.
 //
+// x86-64: uses JMP rel8/rel32 (2 or 5 bytes), patched to NOP.
+// aarch64: uses B (4 bytes), patched to NOP. Instruction cache flush required after patching.
+//
+#if defined(__x86_64__)
+
 #define COOP_PERF_INC(counters, id) do {                                                    \
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
@@ -80,6 +85,42 @@
     (counters).IncBy(id, n);                                                                \
     __perf_skip: ;                                                                          \
 } while(0)
+
+#elif defined(__aarch64__)
+
+#define COOP_PERF_INC(counters, id) do {                                                    \
+    __label__ __perf_skip;                                                                  \
+    asm goto(                                                                               \
+        "1: b %l[__perf_skip]\n"                                                            \
+        ".pushsection coop_perf_sites, \"aw\"\n"                                            \
+        ".balign 16\n"                                                                      \
+        ".quad 1b\n"                                                                        \
+        ".long %c[cid]\n"                                                                   \
+        ".long 0\n"                                                                         \
+        ".popsection\n"                                                                     \
+        : : [cid] "i" (static_cast<uint32_t>(id)) : : __perf_skip);                        \
+    (counters).Inc(id);                                                                     \
+    __perf_skip: ;                                                                          \
+} while(0)
+
+#define COOP_PERF_ADD(counters, id, n) do {                                                 \
+    __label__ __perf_skip;                                                                  \
+    asm goto(                                                                               \
+        "1: b %l[__perf_skip]\n"                                                            \
+        ".pushsection coop_perf_sites, \"aw\"\n"                                            \
+        ".balign 16\n"                                                                      \
+        ".quad 1b\n"                                                                        \
+        ".long %c[cid]\n"                                                                   \
+        ".long 0\n"                                                                         \
+        ".popsection\n"                                                                     \
+        : : [cid] "i" (static_cast<uint32_t>(id)) : : __perf_skip);                        \
+    (counters).IncBy(id, n);                                                                \
+    __perf_skip: ;                                                                          \
+} while(0)
+
+#else
+#error "COOP_PERF_MODE 2 requires x86-64 or aarch64"
+#endif
 
 #else
 #error "COOP_PERF_MODE must be 0, 1, or 2"

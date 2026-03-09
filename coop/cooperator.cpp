@@ -710,6 +710,7 @@ void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 
 
 int64_t Cooperator::rdtsc() const
 {
+#if defined(__x86_64__)
     uint32_t hi, lo;
 // cpuid forces a partial barrier preventing reordering, but we don't use rdtsc in a way that
 // remotely cares about that.
@@ -720,6 +721,13 @@ int64_t Cooperator::rdtsc() const
 #endif
     __asm__ __volatile__("rdtsc" : "=a"(lo),"=d"(hi));
     return static_cast<int64_t>((uint64_t)hi << 32 | lo);
+#elif defined(__aarch64__)
+    uint64_t val;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+    return static_cast<int64_t>(val);
+#else
+#error "Unsupported architecture for rdtsc"
+#endif
 }
 
 thread_local Cooperator* Cooperator::thread_cooperator;

@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+
+#if defined(__x86_64__)
 
 // ContextInit prepares a fresh stack so that ContextSwitch can "resume" into it for the first
 // time. The layout mirrors what ContextSwitch would have pushed had the context previously
@@ -45,3 +48,46 @@ void* ContextInit(void* stack_top, coop::Context* ctx)
 
     return static_cast<void*>(sp);
 }
+
+#elif defined(__aarch64__)
+
+// ContextInit prepares a fresh stack so that ContextSwitch can "resume" into it for the first
+// time. The layout mirrors what ContextSwitch would have saved via stp instructions:
+//
+//   96-byte save area (sp offsets):
+//     +0:  x29 (fp)  = 0               ← frame chain terminator
+//     +8:  x30 (lr)  = _context_trampoline  ← ret branches here
+//     +16: x19       = ctx             ← trampoline reads this as Context*
+//     +24: x20       = 0
+//     +32: x21       = 0
+//     +40: x22       = 0
+//     +48: x23       = 0
+//     +56: x24       = 0
+//     +64: x25       = 0
+//     +72: x26       = 0
+//     +80: x27       = 0
+//     +88: x28       = 0
+//
+// After ContextSwitch restores registers via ldp and executes `ret`, x19 holds Context*,
+// x30 holds _context_trampoline (so ret branches there), and control transfers to
+// _context_trampoline which tail-calls CoopContextEntry.
+//
+void* ContextInit(void* stack_top, coop::Context* ctx)
+{
+    auto* sp = static_cast<uintptr_t*>(stack_top);
+
+    // Allocate 96 bytes (12 registers × 8 bytes) matching ContextSwitch's save area
+    //
+    sp -= 12;
+    memset(sp, 0, 96);
+
+    sp[0] = 0;                                                  // x29 (fp) — frame terminator
+    sp[1] = reinterpret_cast<uintptr_t>(_context_trampoline);   // x30 (lr)
+    sp[2] = reinterpret_cast<uintptr_t>(ctx);                   // x19 = Context*
+
+    return static_cast<void*>(sp);
+}
+
+#else
+#error "Unsupported architecture — ContextInit requires x86-64 or aarch64"
+#endif

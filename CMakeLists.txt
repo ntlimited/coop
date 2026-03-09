@@ -54,7 +54,11 @@ list(FILTER COOP_SOURCES EXCLUDE REGEX ".*/coop/chan/.*")
 
 add_library(coop STATIC ${COOP_SOURCES} $<TARGET_OBJECTS:coop_chan>)
 target_include_directories(coop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer -msse4.2)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+    target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer -msse4.2)
+else()
+    target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer)
+endif()
 
 # Compile out trace/debug logging in release builds — eliminates ~1% overhead from runtime
 # level checks in the IO hot path (spdlog::trace calls on every Submit/Complete/Poll).

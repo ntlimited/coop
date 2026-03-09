@@ -40,9 +40,17 @@ static struct sigaction    g_prevAction;
 
 static inline uint64_t rdtsc()
 {
+#if defined(__x86_64__)
     uint32_t lo, hi;
     asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return (static_cast<uint64_t>(hi) << 32) | lo;
+#elif defined(__aarch64__)
+    uint64_t val;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+#error "Unsupported architecture for rdtsc"
+#endif
 }
 
 // SIGPROF handler — must be async-signal-safe.
@@ -60,7 +68,11 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
     }
 
     auto* u = static_cast<ucontext_t*>(uctx);
+#if defined(__x86_64__)
     uintptr_t pc = u->uc_mcontext.gregs[REG_RIP];
+#elif defined(__aarch64__)
+    uintptr_t pc = u->uc_mcontext.pc;
+#endif
     uint64_t ts = rdtsc();
 
     // Always record RIP — cheap (one register read + atomic bump).
@@ -98,19 +110,24 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
             s.frames[0] = pc;
             int depth = 1;
 
-            uintptr_t rbp = u->uc_mcontext.gregs[REG_RBP];
-            uintptr_t rsp = u->uc_mcontext.gregs[REG_RSP];
+#if defined(__x86_64__)
+            uintptr_t fp = u->uc_mcontext.gregs[REG_RBP];
+            uintptr_t sp = u->uc_mcontext.gregs[REG_RSP];
+#elif defined(__aarch64__)
+            uintptr_t fp = u->uc_mcontext.regs[29];    // x29 = frame pointer
+            uintptr_t sp = u->uc_mcontext.sp;
+#endif
 
-            while (depth < MAX_STACK_DEPTH && rbp > rsp && (rbp & 7) == 0)
+            while (depth < MAX_STACK_DEPTH && fp > sp && (fp & 7) == 0)
             {
-                auto* frame = reinterpret_cast<uintptr_t*>(rbp);
+                auto* frame = reinterpret_cast<uintptr_t*>(fp);
                 uintptr_t retAddr = frame[1];
                 if (retAddr == 0) break;
                 s.frames[depth++] = retAddr;
 
-                uintptr_t nextRbp = frame[0];
-                if (nextRbp <= rbp) break; // must increase (unwinding toward stack base)
-                rbp = nextRbp;
+                uintptr_t nextFp = frame[0];
+                if (nextFp <= fp) break; // must increase (unwinding toward stack base)
+                fp = nextFp;
             }
 
             s.depth = static_cast<uint8_t>(depth);

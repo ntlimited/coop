@@ -1578,6 +1578,60 @@ TEST(PassageTest, BackpressureRingFull)
     });
 }
 
+// TryRecv and Drain provide non-blocking single and batch recv APIs.
+//
+TEST(PassageTest, TryRecvAndDrain)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int, 8> passage(ctx, ctx->GetCooperator());
+
+        for (int i = 0; i < 5; i++)
+            EXPECT_TRUE(passage.Send(i));
+
+        int v = -1;
+        EXPECT_TRUE(passage.TryRecv(v));
+        EXPECT_EQ(v, 0);
+
+        int out[8]{};
+        size_t n = passage.Drain(out, 8);
+        EXPECT_EQ(n, 4u);
+        EXPECT_EQ(out[0], 1);
+        EXPECT_EQ(out[1], 2);
+        EXPECT_EQ(out[2], 3);
+        EXPECT_EQ(out[3], 4);
+
+        EXPECT_FALSE(passage.TryRecv(v));
+        EXPECT_EQ(passage.Drain(out, 8), 0u);
+    });
+}
+
+// Recv tuning parameters should be configurable at construction.
+//
+TEST(PassageTest, CustomRecvTuning)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int>::RecvTuning tuning;
+        tuning.yieldThreshold = 0;
+        tuning.timeoutInitialUs = 5;
+        tuning.timeoutMaxUs = 20;
+        tuning.timeoutBackoff = 2;
+
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator(), tuning);
+
+        std::thread sender([&]
+        {
+            while (!passage.Send(7)) {}
+        });
+
+        int v = 0;
+        ASSERT_TRUE(passage.Recv(v));
+        EXPECT_EQ(v, 7);
+        sender.join();
+    });
+}
+
 // After Shutdown(), Recv() returns false once the ring is drained.
 //
 TEST(PassageTest, ShutdownDrainsInternalChannel)
@@ -1608,6 +1662,26 @@ TEST(PassageTest, ShutdownDrainsInternalChannel)
         //
         int v;
         EXPECT_FALSE(passage.Recv(v));
+    });
+}
+
+// Shutdown is thread-safe and should wake a blocked receiver when called from
+// an external thread.
+//
+TEST(PassageTest, ShutdownFromExternalThread)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
+
+        std::thread killer([&]
+        {
+            passage.Shutdown();
+        });
+
+        int v = 0;
+        EXPECT_FALSE(passage.Recv(v));
+        killer.join();
     });
 }
 
@@ -1649,10 +1723,8 @@ TEST(PassageTest, SendFailsWhenTargetShuttingDown)
 {
     test::RunInCooperator([](coop::Context* ctx)
     {
-        coop::Cooperator target;
-        target.Shutdown();
-
-        coop::chan::Passage<int> passage(ctx, &target);
+        ctx->GetCooperator()->Shutdown();
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
 
         EXPECT_FALSE(passage.Send(1));
         int v = 0;

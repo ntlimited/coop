@@ -6,6 +6,7 @@
 #include <semaphore>
 
 #include "detail/embedded_list.h"
+#include "detail/memory_order.h"
 #include "context.h"
 #include "epoch/epoch.h"
 #include "cooperator_configuration.h"
@@ -148,7 +149,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     bool IsShuttingDown() const
     {
-        return m_shutdown.load(std::memory_order_relaxed);
+        return m_shutdown.load(detail::kLoadFlag);
     }
 
     io::Uring* GetUring()

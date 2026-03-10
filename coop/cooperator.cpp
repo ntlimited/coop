@@ -11,6 +11,7 @@
 #include "cooperator.h"
 #include "context_var.h"
 #include "detail/context_switch.h"
+#include "detail/memory_order.h"
 #include "io/descriptor.h"
 #include "io/read.h"
 #include "launchable.h"
@@ -66,7 +67,7 @@ Cooperator::~Cooperator()
 
 void Cooperator::Shutdown()
 {
-    m_shutdown.store(true, std::memory_order_relaxed);
+    m_shutdown.store(true, detail::kStoreFlag);
     WakeCooperator();
 }
 
@@ -76,7 +77,7 @@ void Cooperator::ShutdownAll()
     // beat us to the lock will have registered and be visible in the list; any Launch() that
     // follows will see the flag under the lock and shut itself down.
     //
-    s_registryShutdown.store(true, std::memory_order_relaxed);
+    s_registryShutdown.store(true, detail::kStoreFlag);
 
     std::lock_guard<std::mutex> lock(s_registryMutex);
     s_registry.Visit([](Cooperator* co) -> bool
@@ -90,7 +91,7 @@ void Cooperator::ResetGlobalShutdown()
 {
     std::lock_guard<std::mutex> lock(s_registryMutex);
     assert(s_registry.IsEmpty());
-    s_registryShutdown.store(false, std::memory_order_relaxed);
+    s_registryShutdown.store(false, detail::kStoreFlag);
 }
 
 bool Cooperator::Submit(
@@ -228,7 +229,7 @@ void Cooperator::Launch()
 {
     {
         std::lock_guard<std::mutex> lock(s_registryMutex);
-        if (s_registryShutdown.load(std::memory_order_relaxed))
+        if (s_registryShutdown.load(detail::kLoadFlag))
         {
             Shutdown();
             return;
@@ -303,7 +304,7 @@ void Cooperator::Launch()
 
     bool shutdownKillDone = false;
 
-    while (!m_yielded.IsEmpty() || !m_shutdown.load(std::memory_order_relaxed)
+    while (!m_yielded.IsEmpty() || !m_shutdown.load(detail::kLoadFlag)
                                  || !shutdownKillDone
                                  || m_uring.PendingOps() > 0)
     {
@@ -311,7 +312,7 @@ void Cooperator::Launch()
         // thread so they can exit naturally. This only needs to happen once; killed contexts
         // will check IsKilled() when resumed and return.
         //
-        if (m_shutdown.load(std::memory_order_relaxed) && !shutdownKillDone)
+        if (m_shutdown.load(detail::kLoadFlag) && !shutdownKillDone)
         {
             shutdownKillDone = true;
             DrainSubmissions();
@@ -349,7 +350,7 @@ void Cooperator::Launch()
                 continue;
             }
 
-            if (m_shutdown.load(std::memory_order_relaxed))
+            if (m_shutdown.load(detail::kLoadFlag))
             {
                 continue;
             }

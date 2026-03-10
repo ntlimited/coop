@@ -46,6 +46,17 @@ benchmarks/     - Benchmark code to evaluate performance of the library and of a
 ### Error Handling
 - Errors should bubble up using a checked-return pattern
 
+### Cross-Architecture (x86-64 / aarch64)
+- coop targets both x86-64 and aarch64. Both must build and pass all tests
+- **Memory ordering**: x86-64 TSO makes `relaxed` safe for flag-style atomics; aarch64's weak
+  model does not. Use `detail::kStoreFlag` / `detail::kLoadFlag` from
+  `coop/detail/memory_order.h` for cross-thread flag variables (shutdown, submission signals).
+  Use explicit `acquire`/`release` for data-publishing patterns (epoch watermarks, skip list
+  pointers)
+- **Arch-conditional intrinsics**: any new SSE/AVX usage must have an aarch64 path
+- **Build flags**: x86-64 uses `-msse4.2`; aarch64 uses `-march=armv8.2-a+crc` (Graviton2+
+  baseline, enables LSE atomics). Set in `CMakeLists.txt`
+
 ## Architecture Notes
 
 The library revolves around `Cooperator` and `Context` instances. The latter provide the stacks

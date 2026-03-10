@@ -1,5 +1,6 @@
 #include "uring.h"
 
+#include <cstdlib>
 #include <unistd.h>
 #include <spdlog/spdlog.h>
 
@@ -83,35 +84,44 @@ void Uring::Init()
     }
 
     int ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
-    if (ret == -EINVAL && (flags & IORING_SETUP_DEFER_TASKRUN))
+    if (ret < 0 && (flags & IORING_SETUP_DEFER_TASKRUN))
     {
         // DEFER_TASKRUN requires kernel 6.1+. Fall back to COOP_TASKRUN.
         //
         flags &= ~IORING_SETUP_DEFER_TASKRUN;
         flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
-        spdlog::warn("uring init: DEFER_TASKRUN not supported, falling back to COOP_TASKRUN");
+        spdlog::warn("uring init: DEFER_TASKRUN failed ret={}, falling back to COOP_TASKRUN", ret);
         memset(&params, 0, sizeof(params));
         params.flags = flags;
         ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
     }
-    if (ret == -EINVAL && (flags & IORING_SETUP_SINGLE_ISSUER))
+    if (ret < 0 && (flags & IORING_SETUP_SINGLE_ISSUER))
     {
-        // SINGLE_ISSUER requires kernel 6.0+. Retry without it but keep user-requested flags.
+        // Retry without SINGLE_ISSUER but keep user-requested taskrun/defer flags.
         //
         flags &= ~IORING_SETUP_SINGLE_ISSUER;
-        spdlog::warn("uring init: SINGLE_ISSUER not supported, retrying with flags {:#x}", flags);
+        spdlog::warn("uring init: SINGLE_ISSUER path failed ret={}, retrying with flags {:#x}",
+            ret, flags);
         memset(&params, 0, sizeof(params));
         params.flags = flags;
         ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
     }
-    if (ret == -EINVAL && flags != 0)
+    if (ret < 0 && flags != 0)
     {
-        spdlog::warn("uring init with flags {:#x} failed, retrying without", flags);
+        spdlog::warn("uring init with flags {:#x} failed ret={}, retrying without flags",
+            flags, ret);
         memset(&params, 0, sizeof(params));
         ret = io_uring_queue_init_params(m_config.entries, &m_ring, &params);
     }
+    if (ret != 0)
+    {
+        // Fail fast in all build modes. Continuing with an uninitialized ring
+        // turns into null dereferences later (for example in GetSqe()).
+        //
+        spdlog::critical("uring init failed ret={} requested_flags={:#x}", ret, flags);
+        std::abort();
+    }
     assert(ret == 0);
-    std::ignore = ret;
 
     spdlog::info("uring init flags={:#x}", m_ring.flags);
 
@@ -140,6 +150,12 @@ int Uring::Submit()
 
 struct io_uring_sqe* Uring::GetSqe()
 {
+    if (!m_ring.sq.khead)
+    {
+        spdlog::critical("GetSqe called before successful uring init");
+        std::abort();
+    }
+
     auto* sqe = io_uring_get_sqe(&m_ring);
     if (!sqe)
     {

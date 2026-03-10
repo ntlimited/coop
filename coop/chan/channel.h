@@ -411,14 +411,21 @@ struct SendChannel : virtual TypedBaseChannel<T>
                 }
             }
 
+            // Track empty→non-empty transition. Only release m_recv on that transition to
+            // avoid spuriously releasing a receiver's legitimately-held m_recv on subsequent
+            // iterations. Release m_recv BEFORE acquiring m_send so that when a single
+            // SendImpl fills the channel (e.g. cap=1), a blocked receiver is woken before the
+            // sender blocks — otherwise both sides deadlock.
+            //
+            bool wasEmpty = Base::IsEmpty();
             [[maybe_unused]] bool ok = SendImpl(data[i]);
             assert(ok);
 
+            if (wasEmpty && Base::m_recv.IsHeld())
+                Base::m_recv.Release(ctx, i == count - 1);
+
             if (Base::IsFull())
                 Base::m_send.Acquire(ctx);
-
-            if (Base::m_recv.IsHeld())
-                Base::m_recv.Release(ctx, i == count - 1);
         }
 
         return true;

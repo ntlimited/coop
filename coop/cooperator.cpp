@@ -433,7 +433,16 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
     // CQE processing from the cooperator loop), we just move the context to the yielded list.
     //
     assert(!schedule || m_scheduled);
-    assert(ctx->m_state == SchedulerState::BLOCKED);
+
+    // In MultiCoordinator scenarios, two coordinators can fire before the consumer runs its
+    // cleanup pass. The first Release already moved the context out of BLOCKED; the second
+    // arrives here with the context in YIELDED or RUNNING. Silently ignore — the
+    // MultiCoordinator cleanup will Release the extra coordinator when the consumer runs.
+    //
+    if (ctx->m_state != SchedulerState::BLOCKED)
+    {
+        return;
+    }
 
     m_blocked.Remove(ctx);
 

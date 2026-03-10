@@ -1,98 +1,82 @@
-# coop: cooperative multitasking framework
+# coop
 
-## Background
+`coop` is a C++20 cooperative multitasking runtime with an `io_uring`-first IO layer.
+It is designed for low-latency services that want synchronous-looking code without OS-thread-per-task overhead.
 
-There are two general manners in which cooperator multitasking can occur with 'synchronous' coding
-patterns. Transformative, non-stack based approaches which effectively map code blocks into structs,
-state machines, and callbacks (usually as a native language feature such as with C++20's coroutine
-system) or stack-based approaches that effectively run as userspace schedulers by manipulating
-"thread" state manually.
+## Quick Start
 
-This library is the latter, both because the former already exists in C++, and because the latter
-frankly lends itself to many interesting coding patterns due to the stack-based allocation patterns
-that are inherently fun to build.
+Prerequisites:
+- CMake 3.16+
+- C++20 compiler
+- `liburing`
+- OpenSSL 3.x
 
-## Coding Patterns
+Build and run tests (debug):
 
-The most significant pieces of the framework are `coop::Coordinator` and the `Coop::EmbeddedList`
-template. These allow building extremely efficient data structures to manage state across tasks,
-without dynamic allocation (modulo of course the stacks themselves). The `coop::Coordinator` _is_
-effectively the system as far as a lot of code goes, alongside its `coop::Coordinated` sibling.
-These are the hooks into the blocking/unblocking of tasks within the scheduler.
+```bash
+cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/debug -j
+./build/debug/bin/coop_tests
+```
 
-### Coordinators, Kills, and Timeouts
+Build and run tests (release):
 
-`Coordinator` instances are an extremely efficient and low level building block, but almost-as-low-
-level functionality exists to incorporate them into both kill state and timeout aware conditions.
-`CoordinateWith` allows composing blocking functionality that waits for any of a given set of
-`Coordinator`s to be taken, and automatically includes the current `Context`'s kill state as well
-as a condition to return. An optional `Interval` may be passed as the final argument to embed an
-additional timeout condition.
+```bash
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
+cmake --build build/release -j
+./build/release/bin/coop_tests
+```
 
-### Handles
+Run a focused test set:
 
-`Coordinator` instances are a very strong building block, but for higher level interfaces `Handle`
-types are the preferred idiom. These wrap a `Coordinator` and essentially are used to build the
-higher level semantics for whatever task is at hand - see `time::Handle` and `io::Handle`
+```bash
+./build/debug/bin/coop_tests --gtest_filter='IoTest.*:ShutdownTest.*'
+```
 
-### Blocking vs non-blocking APIs.
+## Repository Map
 
-While the point of cooperative multitasking is that we get to have nice blocking APIs that are
-both cheap and friendly to use, practically speaking we still want the ability to line up
-several things and then wait afterwards. It is encouraged to provide a low-level "setup" API
-that takes a `Coordinator` or package-appropriate `Handle` type and then offer a wrapped,
-blocking version for those who don't care. `coop/io/connect.h` is a decent example of this.
+- `coop/`: runtime implementation (scheduler, context lifecycle, IO, HTTP, perf)
+- `tests/`: gtest coverage
+- `benchmarks/`: benchmark suite
+- `examples/`: sample applications
+- `DESIGN_IDIOMS.md`: design and API principles
+- `CLAUDE.md`: detailed architecture guide
+- `AGENTS.md`: fast Codex-focused operating guide
 
-### Task trees and killing tasks
+## Core Concepts
 
-Tasks are spawned with an inherent parent/child relationship so that we have some facscimile of a
-workable guarantee such that when a task is spawned it can trust that things it relied on existing
-at spawn time continue to exist.
+- `Cooperator`: per-thread scheduler for `Context` instances.
+- `Context`: stackful execution unit with parent/child lifecycle.
+- `Coordinator`: synchronization primitive used for blocking/unblocking contexts.
+- `io::Uring`: `io_uring` wrapper used by cooperative IO operations.
+- `io::Handle`: operation handle used by async IO entry points.
 
-Tasks also can be killed, which is recursive - killing a task kills all its children. It is
-considered wise to make APIs kill-check-aware e.g. using `CoordinateWithKill` and other such APIs.
-The stuff that makes this work properly is fairly nontrivial but it's pretty well debugged in its
-current form at least.
+## Reading Order
 
-### Thread locals
+For non-trivial changes, this order keeps ramp-up fast:
 
-For obvious reasons, thread locals are shunned _other than_ the two requisite thread local of the
-`Cooperator` itself (the userspace scheduler). There is unfortunately not a strongly opinionated
-enough way of writing APIs that operate on "the current task" and probably we should just defer to
-always pulling it off the thread local (e.g. `coop::Self()`) but that's a problem for another day.
+1. `AGENTS.md`
+2. `CLAUDE.md`
+3. `coop/CLAUDE.md`
+4. component docs (`coop/io/CLAUDE.md`, `coop/http/CLAUDE.md`, `coop/perf/CLAUDE.md`, `tests/CLAUDE.md`)
+5. `DESIGN_IDIOMS.md`
 
-## Important building blocks
+## Troubleshooting
 
-### io
+### `uring init failed ...`
 
-The `coop::io` package contains both an `io_uring` driven bridge to kernelspace operations, and
-the functionality for the IO operations that make up the bulk of its value. Because of the very
-fundamental need for this in all but the most trivial of applications, APIs strive to be close to
-the native nix-isms that developers are familiar with.
+`coop` now fails fast when `io_uring` initialization fails. Common causes:
+- kernel too old for requested flags
+- sandbox/seccomp restrictions
+- missing privileges for specific modes (for example SQPOLL)
 
-#### ssl
+When this happens, run on a host or container with `io_uring` enabled and less restrictive syscall policy.
 
-`coop::io::ssl` contains OpenSSL-integrated constructs for trivially using transport layer security
-in application powered by coop.
+### Test selection while iterating
 
-### time
+Use targeted `--gtest_filter` runs for fast loops, then run the full suite before merging.
 
-The `coop::time` package includes functionality for doing things related to time in a manner which
-uses the `Cooperator` scheduler vs actual thread blocking. This can be useful directly in some
-circumstances - e.g. for `coop::time::Sleep` - but realistically should usually be used via
-`CoordinateWith` in composition with other functionality.
+## Standalone vs Subdirectory
 
-## Awful shitty TODOs
-
-### Compiler friendliness and stack hacks
-
-There's a few ways that the compiler can make itself too helpful and generate code that our inline
-assembly stack-jumping can invalidate. Probably there are better ways to tell gcc/llvm to be aware
-and avoid this but it's not my personal forte.
-
-Setting up stack guard pages is not that hard but I also didn't do that yet.
-
-### Stack traces
-
-Making stack traces work here is going to be un-fun and not something I was scared enough to try
-and chew off.
+When `coop` is used as a standalone project (`cmake -S . -B ...`), tests, benchmarks, and examples are built.
+When included as a subdirectory, only the `coop` library target is built by default.

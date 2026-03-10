@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <utility>
@@ -52,7 +53,8 @@
 //   A Send racing with Shutdown may still enqueue and be delivered.
 //
 // Thread-safety: Send() is safe to call from any thread concurrently.
-//   Recv() and Shutdown() must be called from the receiver cooperator's context only.
+//   Recv()/TryRecv()/Drain() must be called from the receiver cooperator's context.
+//   Shutdown() is thread-safe.
 //
 // Requirement: T must be default-constructible and move-assignable.
 // Note: Passage is non-copyable and non-movable.
@@ -164,14 +166,33 @@ struct Passage
     Passage(const Passage&) = delete;
     Passage(Passage&&)      = delete;
 
+    struct RecvTuning
+    {
+        int     yieldThreshold{8};
+        int64_t timeoutInitialUs{10};
+        int64_t timeoutMaxUs{10000};
+        int     timeoutBackoff{4};
+    };
+
     // ctx:    the receiver cooperator's current context (for internal channel init).
     // target: the cooperator that runs the consumer — drain submissions are posted here.
     //         Typically: ctx->GetCooperator().
     //
-    explicit Passage(Context* ctx, Cooperator* target)
+    explicit Passage(Context* ctx, Cooperator* target, RecvTuning tuning = {})
     : m_state(std::make_shared<State>(ctx))
     , m_target(target)
-    {}
+    , m_tuning(tuning)
+    , m_recvTimeoutUs(tuning.timeoutInitialUs)
+    {
+        assert(ctx && "Passage: ctx must be non-null");
+        assert(target && "Passage: target must be non-null");
+        assert(ctx->GetCooperator() == target
+               && "Passage: ctx must belong to target cooperator");
+        assert(m_tuning.yieldThreshold >= 0);
+        assert(m_tuning.timeoutInitialUs > 0);
+        assert(m_tuning.timeoutMaxUs >= m_tuning.timeoutInitialUs);
+        assert(m_tuning.timeoutBackoff >= 2);
+    }
 
     ~Passage() { Shutdown(); }
 
@@ -179,6 +200,16 @@ struct Passage
     // Returns false if the Passage is shut down or the external ring is full.
     //
     bool Send(T value);
+
+    // Receiver-only, non-blocking pop. Returns false if no item is currently
+    // available (empty ring or producer has claimed but not committed a slot).
+    //
+    bool TryRecv(T& value);
+
+    // Receiver-only, non-blocking batch pop. Drains up to maxCount items into
+    // out[] and returns the number drained.
+    //
+    size_t Drain(T* out, size_t maxCount);
 
     // Receive one item from the Passage on the receiver cooperator. Returns false when
     // the Passage is shut down and the ring is empty. Uses an adaptive three-phase
@@ -190,7 +221,7 @@ struct Passage
 
     // Shuts down the Passage. Idempotent. Items already in the ring are still delivered
     // by Recv(). Send() calls after shutdown return false; sends racing with shutdown
-    // may still be delivered. Must be called from the receiver cooperator's context.
+    // may still be delivered. Thread-safe.
     //
     void Shutdown();
 
@@ -207,12 +238,57 @@ struct Passage
 
     std::shared_ptr<State>  m_state;
     Cooperator*             m_target;
+    RecvTuning              m_tuning;
 
     // Adaptive recv state — receiver cooperator only, not shared.
     //
     int     m_recvDryCount{0};
-    int64_t m_recvTimeoutUs{10};
+    int64_t m_recvTimeoutUs{0};
+
+    bool SubmitWake(bool releaseOnEmpty);
 };
+
+// ---------------------------------------------------------------------------
+// Passage::SubmitWake
+// ---------------------------------------------------------------------------
+
+template<typename T, size_t N>
+bool Passage<T, N>::SubmitWake(bool releaseOnEmpty)
+{
+    auto state = m_state;
+
+    bool expected = false;
+    if (!state->m_wakePending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+    {
+        return true;  // wake already queued/in-flight
+    }
+
+    bool submitted = m_target->Submit([state, releaseOnEmpty](Context* ctx)
+    {
+        state->m_wakePending.store(false, std::memory_order_seq_cst);
+
+        // Release on explicit wake requests, non-empty ring, or shutdown.
+        // The shutdown branch closes the case where a shutdown races with an
+        // already in-flight wake submission.
+        //
+        if ((releaseOnEmpty
+             || state->m_shutdown.load(std::memory_order_acquire)
+             || !state->m_ring.IsEmpty())
+            && state->m_recv.IsHeld())
+        {
+            state->m_recv.Release(ctx);
+        }
+    });
+
+    if (!submitted)
+    {
+        state->m_wakePending.store(false, std::memory_order_seq_cst);
+        return false;
+    }
+
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Passage::Send
@@ -238,52 +314,76 @@ bool Passage<T, N>::Send(T value)
     if (!state->m_ring.Push(std::move(value)))
         return false;  // ring full
 
-    // Submit at most one wake at a time. If m_wakePending is already set the in-flight
-    // wake lambda will see the item and release m_recv. The CAS ensures exactly one wake
-    // lambda is queued at a time — no drain loop, no intermediate channel.
+    // Submit failure can happen if target enters shutdown between push and submit.
+    // Mark shutdown so future sends fail fast.
     //
-    bool expected = false;
-    if (state->m_wakePending.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel))
+    if (!SubmitWake(false))
     {
-        // Capture shared_ptr by value: State outlives the Passage handle if this lambda
-        // is still queued in Submit when the Passage is destroyed.
-        //
-        bool submitted = m_target->Submit([state](Context* ctx)
-        {
-            // Clear m_wakePending first (seq_cst) so any producer that pushes after this
-            // point sees false and submits a fresh wake — no lost wakeup possible.
-            //
-            state->m_wakePending.store(false, std::memory_order_seq_cst);
-
-            // Release m_recv to unblock the consumer. The consumer pops from the ring
-            // directly — no forwarding step. Only release if m_recv is held (i.e. the
-            // consumer is blocking or the ring is empty per invariant).
-            //
-            if (!state->m_ring.IsEmpty() && state->m_recv.IsHeld())
-                state->m_recv.Release(ctx);
-        });
-
-        // Submit can fail if the target cooperator entered shutdown after we pushed.
-        // Clear m_wakePending and transition to shutdown so future sends fail fast.
-        //
-        if (!submitted)
-        {
-            state->m_wakePending.store(false, std::memory_order_seq_cst);
-            state->m_shutdown.store(true, std::memory_order_release);
-            return false;
-        }
-    }
-    else if (m_target->IsShuttingDown())
-    {
-        // A wake is already in flight, but the receiver is shutting down.
-        // Stop accepting further sends.
-        //
         state->m_shutdown.store(true, std::memory_order_release);
         return false;
     }
 
+    // Push succeeded and wake is queued/in-flight. If shutdown starts now,
+    // prevent additional sends; this item may still be delivered.
+    //
+    if (m_target->IsShuttingDown())
+    {
+        state->m_shutdown.store(true, std::memory_order_release);
+    }
+
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Passage::TryRecv
+// ---------------------------------------------------------------------------
+
+template<typename T, size_t N>
+bool Passage<T, N>::TryRecv(T& value)
+{
+    assert(Cooperator::thread_cooperator == m_target
+           && "Passage::TryRecv must run on the target cooperator");
+    Context* ctx = Self();
+
+    if (!m_state->m_ring.Pop(value))
+        return false;
+
+    m_recvDryCount  = 0;
+    m_recvTimeoutUs = m_tuning.timeoutInitialUs;
+
+    if (m_state->m_ring.IsEmpty() && !m_state->m_recv.IsHeld())
+        m_state->m_recv.Acquire(ctx);
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Passage::Drain
+// ---------------------------------------------------------------------------
+
+template<typename T, size_t N>
+size_t Passage<T, N>::Drain(T* out, size_t maxCount)
+{
+    assert(Cooperator::thread_cooperator == m_target
+           && "Passage::Drain must run on the target cooperator");
+    if (!out || maxCount == 0) return 0;
+
+    Context* ctx = Self();
+    size_t n = 0;
+
+    while (n < maxCount && m_state->m_ring.Pop(out[n]))
+        n++;
+
+    if (n == 0)
+        return 0;
+
+    m_recvDryCount  = 0;
+    m_recvTimeoutUs = m_tuning.timeoutInitialUs;
+
+    if (m_state->m_ring.IsEmpty() && !m_state->m_recv.IsHeld())
+        m_state->m_recv.Acquire(ctx);
+
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +409,8 @@ bool Passage<T, N>::Send(T value)
 template<typename T, size_t N>
 bool Passage<T, N>::Recv(T& value)
 {
-    static constexpr int     kYieldThreshold   = 8;
-    static constexpr int64_t kTimeoutInitialUs = 10;
-    static constexpr int64_t kTimeoutMaxUs     = 10000;
+    assert(Cooperator::thread_cooperator == m_target
+           && "Passage::Recv must run on the target cooperator");
 
     Context* ctx = Self();
 
@@ -319,20 +418,8 @@ bool Passage<T, N>::Recv(T& value)
     {
         // Phase 1: fast path — pop directly from the MPSC ring.
         //
-        if (m_state->m_ring.Pop(value))
-        {
-            m_recvDryCount  = 0;
-            m_recvTimeoutUs = kTimeoutInitialUs;
-
-            // Maintain the invariant: held ↔ ring empty. Before this pop the ring was
-            // non-empty → m_recv was not held. If ring is now empty, re-acquire (fast:
-            // not held → Acquire returns immediately without blocking).
-            //
-            if (m_state->m_ring.IsEmpty() && !m_state->m_recv.IsHeld())
-                m_state->m_recv.Acquire(ctx);
-
+        if (TryRecv(value))
             return true;
-        }
 
         if (m_state->m_shutdown.load(std::memory_order_acquire))
         {
@@ -353,7 +440,7 @@ bool Passage<T, N>::Recv(T& value)
         // Phase 2: yield, giving the cooperator a chance to process the wake Submit
         // CQE — which releases m_recv — before committing to a timeout SQE.
         //
-        if (m_recvDryCount < kYieldThreshold)
+        if (m_recvDryCount < m_tuning.yieldThreshold)
         {
             m_recvDryCount++;
             Yield();
@@ -375,7 +462,7 @@ bool Passage<T, N>::Recv(T& value)
         {
             // m_recv acquired — wake lambda confirmed ring has items. Pop directly.
             //
-            m_recvTimeoutUs = kTimeoutInitialUs;
+            m_recvTimeoutUs = m_tuning.timeoutInitialUs;
 
             if (!m_state->m_ring.Pop(value))
             {
@@ -396,7 +483,9 @@ bool Passage<T, N>::Recv(T& value)
 
         // Timed out: grow adaptively and retry.
         //
-        m_recvTimeoutUs = std::min(m_recvTimeoutUs * 4, kTimeoutMaxUs);
+        m_recvTimeoutUs = std::min(
+            m_recvTimeoutUs * static_cast<int64_t>(m_tuning.timeoutBackoff),
+            m_tuning.timeoutMaxUs);
     }
 }
 
@@ -407,13 +496,22 @@ bool Passage<T, N>::Recv(T& value)
 template<typename T, size_t N>
 void Passage<T, N>::Shutdown()
 {
-    m_state->m_shutdown.store(true, std::memory_order_release);
+    auto state = m_state;
+    if (state->m_shutdown.exchange(true, std::memory_order_acq_rel))
+        return;
 
-    // Wake any consumer blocked on m_recv so it can observe the shutdown.
+    // On the target cooperator, release directly. Otherwise submit a wake
+    // lambda to release on the target thread.
     //
-    Context* ctx = Self();
-    if (m_state->m_recv.IsHeld())
-        m_state->m_recv.Release(ctx);
+    if (Cooperator::thread_cooperator == m_target)
+    {
+        Context* ctx = Self();
+        if (state->m_recv.IsHeld())
+            state->m_recv.Release(ctx);
+        return;
+    }
+
+    (void)SubmitWake(true);
 }
 
 } // namespace chan

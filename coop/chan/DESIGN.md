@@ -11,6 +11,7 @@
 | `Ticker` | Emits ticks at a fixed interval using `CoordinateWithKill` + timeout. |
 | `Select` | `CoordinateWith` across multiple channel `m_recv` coordinators; completes the winning recv. |
 | `Passage<T,N>` | MPSC bridge from external threads to a single receiver cooperator. See below. |
+| `SpscPassage<T,N>` | SPSC bridge with the same API; optimized for exactly one producer thread. |
 
 ---
 
@@ -102,6 +103,17 @@ rarely reached. The adaptive timeout (`m_recvTimeoutUs`) stays at its initial va
 
 The benchmark is therefore a pessimistic case. Under real workloads the yield loop
 is the common path, not overhead.
+
+## SpscPassage
+
+`SpscPassage<T,N>` reuses the same wake/coordinator flow and API as `Passage<T,N>`,
+but swaps in a single-producer/single-consumer ring:
+
+- Producer side removes CAS on `m_tail` (single writer).
+- Consumer behavior and shutdown semantics are identical to `Passage`.
+- In debug builds, push asserts if multiple producer threads attempt to use the ring.
+
+Use `SpscPassage` when producer cardinality is known to be one; use `Passage` for MPSC.
 
 ### Benchmark interpretation
 

@@ -514,6 +514,57 @@ static void BM_Passage_Throughput(benchmark::State& state)
 BENCHMARK(BM_Passage_Throughput)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
 
 // ---------------------------------------------------------------------------
+// BM_SpscPassage_Throughput — single producer specialized ring
+// ---------------------------------------------------------------------------
+
+static void BM_SpscPassage_Throughput(benchmark::State& state)
+{
+    RunBenchmark(state, [](coop::Context* ctx, benchmark::State& state)
+    {
+        const int cap = static_cast<int>(state.range(0));
+        (void)cap;
+
+        constexpr size_t RING = 256;
+        const int BATCH = static_cast<int>(state.range(0));
+
+        coop::chan::SpscPassage<int, RING> passage(ctx, ctx->GetCooperator());
+
+        std::atomic<bool> stop{false};
+
+        std::thread sender([&]
+        {
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                for (int i = 0; i < BATCH; i++)
+                {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    while (!passage.Send(i) && !stop.load(std::memory_order_relaxed)) {}
+                }
+            }
+        });
+
+        int64_t totalItems = 0;
+        for (auto _ : state)
+        {
+            for (int i = 0; i < BATCH; i++)
+            {
+                int v;
+                passage.Recv(v);
+                benchmark::DoNotOptimize(v);
+            }
+            totalItems += BATCH;
+        }
+
+        stop.store(true, std::memory_order_release);
+        passage.Shutdown();
+        sender.join();
+
+        state.SetItemsProcessed(totalItems);
+    });
+}
+BENCHMARK(BM_SpscPassage_Throughput)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
+
+// ---------------------------------------------------------------------------
 // BM_Passage_NProducers — throughput vs producer count (fixed BATCH)
 // ---------------------------------------------------------------------------
 

@@ -455,10 +455,10 @@ BENCHMARK(BM_Channel_Pipeline_Depth)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->A
 // BM_Passage_Throughput: one external thread sends into a Passage<int,N>; one cooperator
 // context receives from Chan(). Directly comparable to BM_Channel_Throughput which uses
 // two cooperator contexts on the same thread. The gap between them is the cost of the
-// mutex, atomic CAS, heap-allocated drain submission, and cross-thread wakeup (eventfd).
+// cross-thread wake path (Submit/eventfd/io_uring) plus producer-side atomic CAS.
 //
 // BM_Passage_NProducers: N external threads send concurrently into a single Passage.
-// Measures how the mutex contention on the ring buffer scales with producer count.
+// Measures how the MPSC producer hot path scales with producer count.
 //
 
 static void BM_Passage_Throughput(benchmark::State& state)

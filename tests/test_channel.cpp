@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <memory>
 #include <thread>
 
@@ -1577,7 +1578,7 @@ TEST(PassageTest, BackpressureRingFull)
     });
 }
 
-// After Shutdown(), Chan().Recv() returns false once internal channel is drained.
+// After Shutdown(), Recv() returns false once the ring is drained.
 //
 TEST(PassageTest, ShutdownDrainsInternalChannel)
 {
@@ -1606,6 +1607,55 @@ TEST(PassageTest, ShutdownDrainsInternalChannel)
         // Ring is drained and shut down — next Recv returns false.
         //
         int v;
+        EXPECT_FALSE(passage.Recv(v));
+    });
+}
+
+// Send racing with Shutdown may either enqueue or fail. If enqueued, the value
+// is still delivered before Recv() returns false.
+//
+TEST(PassageTest, SendRaceWithShutdown)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<int> passage(ctx, ctx->GetCooperator());
+
+        std::atomic<bool> go{false};
+        std::atomic<int> sendOk{-1};
+
+        std::thread sender([&]
+        {
+            while (!go.load(std::memory_order_acquire)) {}
+            sendOk.store(passage.Send(42) ? 1 : 0, std::memory_order_release);
+        });
+
+        go.store(true, std::memory_order_release);
+        passage.Shutdown();
+        sender.join();
+
+        int v = 0;
+        if (sendOk.load(std::memory_order_acquire) == 1)
+        {
+            ASSERT_TRUE(passage.Recv(v));
+            EXPECT_EQ(v, 42);
+        }
+        EXPECT_FALSE(passage.Recv(v));
+    });
+}
+
+// Target cooperator shutdown should make Send fail fast.
+//
+TEST(PassageTest, SendFailsWhenTargetShuttingDown)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Cooperator target;
+        target.Shutdown();
+
+        coop::chan::Passage<int> passage(ctx, &target);
+
+        EXPECT_FALSE(passage.Send(1));
+        int v = 0;
         EXPECT_FALSE(passage.Recv(v));
     });
 }

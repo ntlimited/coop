@@ -1784,3 +1784,76 @@ TEST(PassageTest, AdaptiveRecvShutdown)
         EXPECT_FALSE(result);
     });
 }
+
+// ---------------------------------------------------------------------------
+// SpscPassage tests
+// ---------------------------------------------------------------------------
+
+TEST(SpscPassageTest, BasicSendRecv)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::SpscPassage<int> passage(ctx, ctx->GetCooperator());
+
+        constexpr int N = 10;
+        std::thread sender([&]
+        {
+            for (int i = 0; i < N; i++)
+                EXPECT_TRUE(passage.Send(i));
+        });
+
+        int sum = 0;
+        for (int i = 0; i < N; i++)
+        {
+            int v = 0;
+            ASSERT_TRUE(passage.Recv(v));
+            sum += v;
+        }
+
+        sender.join();
+        EXPECT_EQ(sum, 45);
+    });
+}
+
+TEST(SpscPassageTest, TryRecvAndDrain)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::SpscPassage<int, 8> passage(ctx, ctx->GetCooperator());
+
+        for (int i = 0; i < 5; i++)
+            EXPECT_TRUE(passage.Send(i));
+
+        int v = -1;
+        EXPECT_TRUE(passage.TryRecv(v));
+        EXPECT_EQ(v, 0);
+
+        int out[8]{};
+        const size_t n = passage.Drain(out, 8);
+        EXPECT_EQ(n, 4u);
+        EXPECT_EQ(out[0], 1);
+        EXPECT_EQ(out[1], 2);
+        EXPECT_EQ(out[2], 3);
+        EXPECT_EQ(out[3], 4);
+
+        EXPECT_FALSE(passage.TryRecv(v));
+        EXPECT_EQ(passage.Drain(out, 8), 0u);
+    });
+}
+
+TEST(SpscPassageTest, ShutdownFromExternalThread)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::SpscPassage<int> passage(ctx, ctx->GetCooperator());
+
+        std::thread killer([&]
+        {
+            passage.Shutdown();
+        });
+
+        int v = 0;
+        EXPECT_FALSE(passage.Recv(v));
+        killer.join();
+    });
+}

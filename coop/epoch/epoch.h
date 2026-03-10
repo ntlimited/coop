@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -170,6 +171,12 @@ struct Manager
     //
     size_t Reclaim();
 
+    // Reclaim all retired entries with retiredAt < the given boundary epoch. Used by
+    // Bedrock-managed cooperators where the boundary is computed externally rather than
+    // via SafeEpoch().
+    //
+    size_t Reclaim(Epoch boundary);
+
     // Number of entries awaiting reclamation.
     //
     size_t PendingCount() const { return m_retireCount; }
@@ -191,8 +198,8 @@ struct Manager
 
 private:
     // Recompute the minimum pinned epoch across all contexts on m_cooperator and publish
-    // it to m_cooperator->m_epochWatermark. Called after every pin/unpin so that remote
-    // cooperators' SafeEpoch() always sees an up-to-date value.
+    // it. When m_externalWatermark is set, publishes there (Bedrock model). Otherwise
+    // publishes to m_cooperator->m_epochWatermark (standalone model, e.g. tests).
     //
     void PublishWatermark();
 
@@ -202,6 +209,20 @@ private:
     // Cooperator::thread_cooperator. Used to publish the watermark and to scan contexts.
     //
     Cooperator* m_cooperator;
+
+    // External watermark target. When non-null, PublishWatermark writes here instead of
+    // m_cooperator->m_epochWatermark. Set by Bedrock at cooperator creation time via
+    // SetExternalWatermark(). Null means standalone mode (existing behavior).
+    //
+    std::atomic<Epoch>* m_externalWatermark{nullptr};
+
+public:
+    // Set the external watermark publication target. Called by Bedrock before the
+    // cooperator's run loop starts. Pass nullptr to revert to standalone mode.
+    //
+    void SetExternalWatermark(std::atomic<Epoch>* wm) { m_externalWatermark = wm; }
+
+private:
 
     // FIFO retire queue: append at tail, consume from head. Entries are naturally
     // ordered by epoch since retirement always stamps the current epoch.

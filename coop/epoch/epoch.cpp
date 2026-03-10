@@ -36,9 +36,14 @@ Manager::Manager(Cooperator* co)
 
 Manager::~Manager()
 {
-    // Reset the watermark so other cooperators' SafeEpoch() doesn't block on a dead manager.
+    // Reset both watermarks so SafeEpoch() doesn't block on a dead manager.
     //
     m_cooperator->m_epochWatermark.store(Epoch::Alive(), std::memory_order_release);
+
+    if (m_externalWatermark)
+    {
+        m_externalWatermark->store(Epoch::Alive(), std::memory_order_release);
+    }
 }
 
 void Manager::PublishWatermark()
@@ -62,7 +67,17 @@ void Manager::PublishWatermark()
         return true;
     });
 
+    // Always write to m_epochWatermark so SafeEpoch() (which reads m_epochWatermark
+    // via the cooperator registry) returns correct values even in mixed mode. Without
+    // this, a no-arg Reclaim() on a Bedrock-managed cooperator would see Alive() for
+    // all Bedrock-managed watermarks and reclaim everything — use-after-free.
+    //
     m_cooperator->m_epochWatermark.store(safe, std::memory_order_release);
+
+    if (m_externalWatermark)
+    {
+        m_externalWatermark->store(safe, std::memory_order_release);
+    }
 }
 
 Epoch Manager::Advance()
@@ -198,9 +213,14 @@ Epoch Manager::SafeEpoch()
 size_t Manager::Reclaim()
 {
     Epoch safe = SafeEpoch();
+    return Reclaim(safe);
+}
+
+size_t Manager::Reclaim(Epoch boundary)
+{
     size_t reclaimed = 0;
 
-    while (m_retireHead && m_retireHead->m_retiredAt < safe)
+    while (m_retireHead && m_retireHead->m_retiredAt < boundary)
     {
         auto* entry = m_retireHead;
         m_retireHead = entry->m_next;

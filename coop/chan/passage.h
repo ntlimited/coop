@@ -49,6 +49,7 @@
 //
 // Shutdown: ~Passage() calls Shutdown(). After shutdown, Send() returns false. Recv()
 //   delivers any items remaining in the ring, then returns false. Shutdown() is idempotent.
+//   A Send racing with Shutdown may still enqueue and be delivered.
 //
 // Thread-safety: Send() is safe to call from any thread concurrently.
 //   Recv() and Shutdown() must be called from the receiver cooperator's context only.
@@ -188,8 +189,8 @@ struct Passage
     bool Recv(T& value);
 
     // Shuts down the Passage. Idempotent. Items already in the ring are still delivered
-    // by Recv(); items pushed after Shutdown() is called are dropped. Must be called
-    // from the receiver cooperator's context.
+    // by Recv(). Send() calls after shutdown return false; sends racing with shutdown
+    // may still be delivered. Must be called from the receiver cooperator's context.
     //
     void Shutdown();
 
@@ -220,10 +221,21 @@ struct Passage
 template<typename T, size_t N>
 bool Passage<T, N>::Send(T value)
 {
-    if (m_state->m_shutdown.load(std::memory_order_relaxed))
+    auto state = m_state;
+
+    if (state->m_shutdown.load(std::memory_order_acquire))
         return false;
 
-    if (!m_state->m_ring.Push(std::move(value)))
+    // If the receiver cooperator is shutting down, stop accepting sends. Mark the
+    // passage shut down as well so receiver-side Recv exits once drained.
+    //
+    if (m_target->IsShuttingDown())
+    {
+        state->m_shutdown.store(true, std::memory_order_release);
+        return false;
+    }
+
+    if (!state->m_ring.Push(std::move(value)))
         return false;  // ring full
 
     // Submit at most one wake at a time. If m_wakePending is already set the in-flight
@@ -231,14 +243,13 @@ bool Passage<T, N>::Send(T value)
     // lambda is queued at a time — no drain loop, no intermediate channel.
     //
     bool expected = false;
-    if (m_state->m_wakePending.compare_exchange_strong(
+    if (state->m_wakePending.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel))
     {
         // Capture shared_ptr by value: State outlives the Passage handle if this lambda
         // is still queued in Submit when the Passage is destroyed.
         //
-        auto state = m_state;
-        m_target->Submit([state](Context* ctx)
+        bool submitted = m_target->Submit([state](Context* ctx)
         {
             // Clear m_wakePending first (seq_cst) so any producer that pushes after this
             // point sees false and submits a fresh wake — no lost wakeup possible.
@@ -252,6 +263,24 @@ bool Passage<T, N>::Send(T value)
             if (!state->m_ring.IsEmpty() && state->m_recv.IsHeld())
                 state->m_recv.Release(ctx);
         });
+
+        // Submit can fail if the target cooperator entered shutdown after we pushed.
+        // Clear m_wakePending and transition to shutdown so future sends fail fast.
+        //
+        if (!submitted)
+        {
+            state->m_wakePending.store(false, std::memory_order_seq_cst);
+            state->m_shutdown.store(true, std::memory_order_release);
+            return false;
+        }
+    }
+    else if (m_target->IsShuttingDown())
+    {
+        // A wake is already in flight, but the receiver is shutting down.
+        // Stop accepting further sends.
+        //
+        state->m_shutdown.store(true, std::memory_order_release);
+        return false;
     }
 
     return true;

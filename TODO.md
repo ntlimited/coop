@@ -1,9 +1,16 @@
-# Probably important things
-* Context allocation pooling; given that the size of a context stack can be set at runtime, we
-  would likely need to enforce only (a) pooling allocations of that size and (b) having a config.
-  Almost certainly guard pages should also be part of this; we can imagine applications with big,
-  hairy tasks that need extra protection but also massive numbers of smaller tasks with well
-  bounded behaviors that do not.
+# TODO
 
-# Not so important but would be interesting
-* OpenTelemetry support
+## High Priority
+
+- Improve stack allocation pooling configurability for variable stack sizes.
+- Add optional guard-page controls for large stack configurations.
+
+## Medium Priority
+
+- Improve compiler-facing safety around stack-switching assumptions.
+- Clarify and document supported compiler behaviors for context switch paths.
+
+## Nice to Have
+
+- Better stack-trace support for cooperative contexts.
+- OpenTelemetry integration points for runtime metrics.

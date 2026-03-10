@@ -96,6 +96,9 @@ Epoch Manager::Enter()
 
 Epoch Manager::Enter(Context* ctx)
 {
+    assert(ctx != nullptr && "epoch::Manager::Enter requires a non-null context");
+    assert(ctx->m_epochState.traversal.IsUnpinned()
+           && "traversal epoch already pinned; nested Guard/Enter is not allowed");
     ctx->m_epochState.traversal = m_current;
     PublishWatermark();
     return m_current;
@@ -109,6 +112,9 @@ void Manager::Exit()
 
 void Manager::Exit(Context* ctx)
 {
+    assert(ctx != nullptr && "epoch::Manager::Exit requires a non-null context");
+    assert(!ctx->m_epochState.traversal.IsUnpinned()
+           && "traversal epoch already unpinned; mismatched Exit/Guard lifetime");
     ctx->m_epochState.traversal = Epoch::Unpinned();
     PublishWatermark();
 }
@@ -121,8 +127,11 @@ void Manager::Pin(Epoch epoch)
 
 void Manager::Pin(Context* ctx, Epoch epoch)
 {
+    assert(ctx != nullptr && "epoch::Manager::Pin requires a non-null context");
     assert(!epoch.IsUnpinned() && "pin epoch must be non-zero");
     assert(epoch <= m_current && "cannot pin at a future epoch");
+    assert(ctx->m_epochState.application.IsUnpinned()
+           && "application epoch already pinned; missing Unpin before Pin");
     ctx->m_epochState.application = epoch;
     PublishWatermark();
     COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),
@@ -137,6 +146,9 @@ void Manager::Unpin()
 
 void Manager::Unpin(Context* ctx)
 {
+    assert(ctx != nullptr && "epoch::Manager::Unpin requires a non-null context");
+    assert(!ctx->m_epochState.application.IsUnpinned()
+           && "application epoch already unpinned; mismatched Unpin");
     ctx->m_epochState.application = Epoch::Unpinned();
     PublishWatermark();
     COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),

@@ -161,6 +161,30 @@ TEST(ShutdownTest, SubmitDrainsDuringShutdown)
     EXPECT_FALSE(cooperator.Submit([](coop::Context*, void*) {}, nullptr));
 }
 
+TEST(ShutdownTest, SubmitSyncReturnsFalseWhenSpawnFails)
+{
+    coop::Cooperator cooperator;
+    coop::Thread t(&cooperator);
+
+    // 64 PiB exceeds practical userspace VA on supported targets; Spawn must fail.
+    //
+    coop::SpawnConfiguration impossible = {
+        .priority = 0,
+        .stackSize = (static_cast<size_t>(1) << 56),
+    };
+
+    auto start = std::chrono::steady_clock::now();
+    bool ok = cooperator.SubmitSync([](coop::Context*) {}, impossible);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_FALSE(ok);
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+        1000);
+
+    cooperator.Shutdown();
+}
+
 // Create 3 cooperators on separate threads, call ShutdownAll(), verify all exit cleanly.
 //
 TEST(ShutdownTest, ShutdownAllMultipleCooperators)

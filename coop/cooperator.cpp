@@ -152,15 +152,35 @@ void Cooperator::DrainSubmissions()
 void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
 {
     auto* completion = entry->m_completion;
-    Spawn(entry->m_config, [entry, completion](Context* ctx)
+    auto* completionOk = entry->m_completionOk;
+    bool spawned = Spawn(entry->m_config, [entry, completion, completionOk](Context* ctx)
     {
         entry->m_invoke(entry, ctx);
         entry->m_destroy(entry);
+        if (completionOk)
+        {
+            *completionOk = true;
+        }
         if (completion)
         {
             completion->release();
         }
     });
+
+    if (!spawned)
+    {
+        // Spawn can fail during shutdown or allocation pressure; complete the submission
+        // bookkeeping here so SubmitSync callers do not block forever.
+        if (completionOk)
+        {
+            *completionOk = false;
+        }
+        if (completion)
+        {
+            completion->release();
+        }
+        entry->m_destroy(entry);
+    }
 }
 
 void Cooperator::DrainRemainingSubmissions()
@@ -173,6 +193,10 @@ void Cooperator::DrainRemainingSubmissions()
     {
         auto* entry = head;
         head = head->m_next;
+        if (entry->m_completionOk)
+        {
+            *entry->m_completionOk = false;
+        }
         if (entry->m_completion)
         {
             entry->m_completion->release();

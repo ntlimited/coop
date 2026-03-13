@@ -41,6 +41,19 @@ void LaunchCleanup(Context* ctx)
 template<typename Fn>
 bool Cooperator::Spawn(Fn const& fn, Context::Handle* handle /* = nullptr */)
 {
+    // Inherit the parent context's config when no explicit config is given.
+    // This ensures child contexts get the same stack size as their parent,
+    // preventing small-stack children from being allocated at virtual addresses
+    // that overlap with a parent's freed large-stack range.
+    //
+    if (m_scheduled)
+    {
+        SpawnConfiguration inherited = {
+            .priority = m_scheduled->m_priority,
+            .stackSize = m_scheduled->m_segment.Size()
+        };
+        return Spawn(inherited, fn, handle);
+    }
     return Spawn(s_defaultConfiguration, fn, handle);
 }
 

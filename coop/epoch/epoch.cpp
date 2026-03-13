@@ -155,6 +155,15 @@ void Manager::Unpin(Context* ctx)
         perf::Counter::EpochUnpin);
 }
 
+void Manager::TryUnpin()
+{
+    assert(t_manager == this && "epoch::Manager not set for this cooperator; was bootstrap skipped?");
+    Context* ctx = Self();
+    if (!ctx || ctx->m_epochState.application.IsUnpinned())
+        return;
+    Unpin(ctx);
+}
+
 void Manager::Retire(RetireEntry* entry)
 {
     assert(t_manager == this && "epoch::Manager not set for this cooperator; was bootstrap skipped?");

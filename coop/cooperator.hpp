@@ -185,15 +185,17 @@ bool Cooperator::SubmitSync(Fn&& fn, SpawnConfiguration const& config)
     }
 
     std::binary_semaphore done(0);
+    bool completionOk = false;
 
     using DecayFn = std::decay_t<Fn>;
     auto* entry = new TypedSubmission<DecayFn>(std::forward<Fn>(fn), config);
     entry->m_completion = &done;
+    entry->m_completionOk = &completionOk;
     PushSubmission(entry);
     WakeCooperator();
 
     done.acquire();
-    return true;
+    return completionOk;
 }
 
 // Free-function convenience wrappers that forward to the thread-local cooperator.

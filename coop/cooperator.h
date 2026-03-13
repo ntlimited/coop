@@ -111,8 +111,8 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     bool Submit(Fn&& fn, SpawnConfiguration const& config = s_defaultConfiguration);
 
     // SubmitSync queues work and blocks the calling thread until the spawned context completes.
-    // The caller's lambda lifetime is guaranteed (caller is blocked). Returns false without
-    // blocking if the cooperator is shutting down.
+    // The caller's lambda lifetime is guaranteed (caller is blocked). Returns false if the
+    // cooperator is shutting down before enqueue, or if queued work cannot be spawned and run.
     //
     template<typename Fn>
     bool SubmitSync(Fn&& fn, SpawnConfiguration const& config = s_defaultConfiguration);
@@ -221,6 +221,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         void (*m_destroy)(SubmissionEntry*);
         SpawnConfiguration m_config;
         std::binary_semaphore* m_completion{nullptr};
+        bool* m_completionOk{nullptr};
     };
 
   private:

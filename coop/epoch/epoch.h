@@ -150,6 +150,12 @@ struct Manager
     void Unpin();
     void Unpin(Context* ctx);
 
+    // Unpin the calling context's application slot if it is currently pinned.
+    // No-op if the slot is already unpinned (e.g. in multi-context dispatch where
+    // Begin and Commit run on different cooperator contexts).
+    //
+    void TryUnpin();
+
     // ---- Retirement ----
 
     // Retire an entry for later reclamation. Sets retiredAt to the current epoch and

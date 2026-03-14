@@ -339,7 +339,7 @@ auto OnSend(SendChannel<T>& ch, T value, OnSent&& onSent, OnShutdown&& onShutdow
              std::forward<OnShutdown>(onShutdown) };
 }
 
-auto OnSend(Channel<void>& ch)
+inline auto OnSend(Channel<void>& ch)
     -> SendCase<void, NoSent, NoShutdown>
 {
     return { ch, NoSent{}, NoShutdown{} };

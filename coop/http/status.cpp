@@ -151,7 +151,7 @@ void SerializeContext(JsonWriter& w, Context* ctx)
     w.BeginObject();
 
     w.Key("name");
-    w.String(ctx->GetName());
+    w.String(ctx->GetName() ? ctx->GetName() : "(unnamed)");
 
     w.Key("state");
     w.String(StateString(ctx->m_state));

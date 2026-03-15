@@ -309,7 +309,7 @@ bool BasicPassage<T, N, Ring>::SubmitWake(bool releaseOnEmpty)
         return true;  // wake already queued/in-flight
     }
 
-    bool submitted = m_target->Submit([state, releaseOnEmpty](Context* ctx)
+    auto wakeFn = [state, releaseOnEmpty](Context* ctx)
     {
         state->m_wakePending.store(false, std::memory_order_seq_cst);
 
@@ -322,7 +322,11 @@ bool BasicPassage<T, N, Ring>::SubmitWake(bool releaseOnEmpty)
         {
             state->m_recv.Release(ctx);
         }
-    });
+    };
+
+    bool submitted = Cooperator::thread_cooperator
+        ? m_target->Cooperate(std::move(wakeFn))
+        : m_target->Submit(std::move(wakeFn));
 
     if (!submitted)
     {

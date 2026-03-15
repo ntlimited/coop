@@ -4,6 +4,7 @@
 
 #include "context.h"
 #include "context_var.h"
+#include "cooperate.h"
 #include "detail/scheduler_state.h"
 #include "self.h"
 
@@ -160,6 +161,48 @@ struct TypedSubmission : Cooperator::SubmissionEntry
         };
     }
 };
+
+template<typename Fn>
+bool Cooperator::Cooperate(Fn&& fn, CooperateHandle* handle,
+                           SpawnConfiguration const& config)
+{
+    assert(thread_cooperator
+           && "Cooperate is for cross-cooperator dispatch; use Submit from external threads");
+
+    // Self-cooperator fast path: spawn inline, signal immediately.
+    //
+    if (this == thread_cooperator)
+    {
+        using DecayFn = std::decay_t<Fn>;
+        bool spawned = Spawn(config, DecayFn(std::forward<Fn>(fn)));
+        if (handle)
+        {
+            handle->m_spawnOk = spawned;
+            handle->m_signal.Notify(thread_cooperator->Scheduled(), false);
+        }
+        return spawned;
+    }
+
+    if (m_shutdown.load(std::memory_order_relaxed))
+        return false;
+
+    using DecayFn = std::decay_t<Fn>;
+    auto* entry = new TypedSubmission<DecayFn>(std::forward<Fn>(fn), config);
+
+    if (handle)
+    {
+        // Tag-bit encoding: bit 0 of m_completion distinguishes Cooperate from SubmitSync.
+        // m_completionOk is reinterpreted as the caller's Cooperator*.
+        //
+        entry->m_completion = reinterpret_cast<std::binary_semaphore*>(
+            reinterpret_cast<uintptr_t>(handle) | 1);
+        entry->m_completionOk = reinterpret_cast<bool*>(thread_cooperator);
+    }
+
+    PushSubmission(entry);
+    WakeCooperator();
+    return true;
+}
 
 template<typename Fn>
 bool Cooperator::Submit(Fn&& fn, SpawnConfiguration const& config)

@@ -72,6 +72,15 @@ struct ConnectionBase
     virtual bool KeepAlive() const = 0;
     virtual io::Descriptor& GetDescriptor() = 0;
     virtual Cooperator* GetCooperator() = 0;
+
+    // Protocol upgrade support. LeftoverData/Size return unconsumed bytes in the recv buffer
+    // (data already recv'd past the HTTP headers). SendRawBytes flushes the send buffer and
+    // sends arbitrary bytes through the transport — used for the 101 Switching Protocols
+    // response which doesn't follow standard HTTP response formatting.
+    //
+    virtual const char* LeftoverData() = 0;
+    virtual size_t LeftoverSize() = 0;
+    virtual bool SendRawBytes(const void* data, size_t size) = 0;
 };
 
 // ConnectionImpl<Derived> is the CRTP parser implementation. All parser state lives here; buffer
@@ -112,6 +121,16 @@ struct ConnectionImpl : ConnectionBase
     bool KeepAlive() const override { return m_keepAlive && !m_clientClose; }
     io::Descriptor& GetDescriptor() override { return m_desc; }
     Cooperator* GetCooperator() override { return m_co; }
+
+    const char* LeftoverData() override
+    {
+        return static_cast<Derived*>(this)->m_buf + m_parsePos;
+    }
+    size_t LeftoverSize() override
+    {
+        return m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
+    }
+    bool SendRawBytes(const void* data, size_t size) override;
 
   private:
     // Buffer access via CRTP — resolved to compile-time offset, no pointer indirection

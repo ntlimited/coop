@@ -1,3 +1,4 @@
+#include <functional>
 #include <mutex>
 #include <new>
 #include <pthread.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 
 #include "cooperator.h"
+#include "cooperate.h"
 #include "context_var.h"
 #include "detail/context_switch.h"
 #include "detail/memory_order.h"
@@ -151,6 +153,40 @@ void Cooperator::DrainSubmissions()
 
 void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
 {
+    bool isCooperate = (reinterpret_cast<uintptr_t>(entry->m_completion) & 1) != 0;
+
+    if (isCooperate)
+    {
+        auto* handle = reinterpret_cast<CooperateHandle*>(
+            reinterpret_cast<uintptr_t>(entry->m_completion) & ~uintptr_t(1));
+        auto* callerCoop = reinterpret_cast<Cooperator*>(entry->m_completionOk);
+
+        bool spawned = Spawn(entry->m_config, [entry](Context* ctx)
+        {
+            entry->m_invoke(entry, ctx);
+            entry->m_destroy(entry);
+        });
+        if (!spawned)
+            entry->m_destroy(entry);
+
+        if (handle && callerCoop)
+        {
+            handle->m_spawnOk = spawned;
+
+            // Push completion notification back to caller's cooperator so Signal::Notify
+            // runs in the caller's thread (Signal is local to that cooperator).
+            //
+            auto* notifEntry = new TypedSubmission<std::function<void(Context*)>>(
+                [handle](Context* ctx)
+                {
+                    handle->m_signal.Notify(ctx, false);
+                }, s_defaultConfiguration);
+            callerCoop->PushSubmission(notifEntry);
+            callerCoop->WakeCooperator();
+        }
+        return;
+    }
+
     auto* completion = entry->m_completion;
     auto* completionOk = entry->m_completionOk;
     bool spawned = Spawn(entry->m_config, [entry, completion, completionOk](Context* ctx)
@@ -193,6 +229,30 @@ void Cooperator::DrainRemainingSubmissions()
     {
         auto* entry = head;
         head = head->m_next;
+
+        bool isCooperate = (reinterpret_cast<uintptr_t>(entry->m_completion) & 1) != 0;
+        if (isCooperate)
+        {
+            auto* handle = reinterpret_cast<CooperateHandle*>(
+                reinterpret_cast<uintptr_t>(entry->m_completion) & ~uintptr_t(1));
+            auto* callerCoop = reinterpret_cast<Cooperator*>(entry->m_completionOk);
+
+            if (handle && callerCoop)
+            {
+                handle->m_spawnOk = false;
+                auto* notifEntry = new TypedSubmission<std::function<void(Context*)>>(
+                    [handle](Context* ctx)
+                    {
+                        handle->m_signal.Notify(ctx, false);
+                    }, s_defaultConfiguration);
+                callerCoop->PushSubmission(notifEntry);
+                callerCoop->WakeCooperator();
+            }
+
+            entry->m_destroy(entry);
+            continue;
+        }
+
         if (entry->m_completionOk)
         {
             *entry->m_completionOk = false;

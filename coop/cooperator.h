@@ -32,6 +32,7 @@ enum class SchedulerJumpResult
 };
 
 struct Launchable;
+struct CooperateHandle;
 
 static constexpr int COOPERATOR_LIST_REGISTRY = 0;
 
@@ -102,6 +103,21 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         Context::Handle* h = nullptr;
         return Launch<T>(s_defaultConfiguration, h, std::forward<Args&&>(args)...);
     }
+
+    // Cooperate dispatches work from a cooperative context onto this (possibly different)
+    // cooperator. If a CooperateHandle is provided, the handle's signal fires once the target
+    // cooperator has attempted to spawn the work — check handle->m_spawnOk for success.
+    // The handle does NOT signal work completion; that is the caller's responsibility.
+    //
+    // Returns false immediately if the target is shutting down (handle is NOT signaled in
+    // this case). Returns true if the submission was enqueued (handle will be signaled).
+    //
+    // Must be called from a cooperative context (assert on thread_cooperator).
+    // For external-thread dispatch, use Submit.
+    //
+    template<typename Fn>
+    bool Cooperate(Fn&& fn, CooperateHandle* handle = nullptr,
+                   SpawnConfiguration const& config = s_defaultConfiguration);
 
     // Submit queues work from an external thread onto this cooperator. The cooperator wakes via
     // eventfd and spawns a context to execute the lambda. Fire-and-forget — the lambda is

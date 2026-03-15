@@ -1090,6 +1090,17 @@ bool ConnectionImpl<Derived>::Sendfile(int fileFd, off_t offset, size_t count)
 }
 
 // -------------------------------------------------------------------------------------
+// SendRawBytes — for protocol upgrade (101 Switching Protocols)
+// -------------------------------------------------------------------------------------
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::SendRawBytes(const void* data, size_t size)
+{
+    if (!Flush()) return false;
+    return SendRaw(data, size);
+}
+
+// -------------------------------------------------------------------------------------
 // Explicit template instantiations for known transport types
 // -------------------------------------------------------------------------------------
 

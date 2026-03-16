@@ -18,6 +18,7 @@ Descriptor::Descriptor(int fd, Uring* ring /* = GetUring() */)
 : m_ring(ring)
 , m_fd(fd)
 , m_registeredIndex(-1)
+, m_owned(true)
 {
     assert(m_ring);
     SPDLOG_DEBUG("descriptor create fd={}", m_fd);
@@ -28,11 +29,23 @@ Descriptor::Descriptor(Registered, int fd, Uring* ring /* = GetUring() */)
 : m_ring(ring)
 , m_fd(fd)
 , m_registeredIndex(-1)
+, m_owned(true)
 {
     assert(m_ring);
     SPDLOG_DEBUG("descriptor create registered fd={}", m_fd);
     m_ring->m_descriptors.Push(this);
     m_ring->Register(this);
+}
+
+Descriptor::Descriptor(Borrowed, int fd, Uring* ring /* = GetUring() */)
+: m_ring(ring)
+, m_fd(fd)
+, m_registeredIndex(-1)
+, m_owned(false)
+{
+    assert(m_ring);
+    SPDLOG_DEBUG("descriptor create borrowed fd={}", m_fd);
+    m_ring->m_descriptors.Push(this);
 }
 
 Descriptor::~Descriptor()
@@ -41,7 +54,7 @@ Descriptor::~Descriptor()
     {
         m_ring->Unregister(this);
     }
-    if (m_fd >= 0)
+    if (m_owned && m_fd >= 0)
     {
         int fd = m_fd;
         int result = Close();
@@ -55,7 +68,7 @@ Descriptor::~Descriptor()
 
 int Descriptor::Close()
 {
-    if (m_fd < 0)
+    if (!m_owned || m_fd < 0)
     {
         return 0;
     }
@@ -63,6 +76,13 @@ int Descriptor::Close()
     int result = io::Close(*this);
     m_fd = -1;
     return result;
+}
+
+int Descriptor::Release()
+{
+    int fd = m_fd;
+    m_fd = -1;
+    return fd;
 }
 
 } // end namespace io

@@ -17,6 +17,12 @@ struct Uring;
 struct Registered {};
 inline constexpr Registered registered;
 
+// Tag type for wrapping a descriptor without taking ownership. The fd will not be closed on
+// destruction. Use when the fd lifetime is managed elsewhere (e.g. by the containing object).
+//
+struct Borrowed {};
+inline constexpr Borrowed borrowed;
+
 // A Descriptor (as in "file descriptor") is our wrapper for file/socket operations. We mirror its
 // usage with being a largely passive set of state that is passed into methods which actually do the
 // work (see operations.h)
@@ -25,10 +31,16 @@ struct Descriptor : EmbeddedListHookups<Descriptor>
 {
     Descriptor(int fd, Uring* ring = GetUring());
     Descriptor(Registered, int fd, Uring* ring = GetUring());
+    Descriptor(Borrowed, int fd, Uring* ring = GetUring());
 
     ~Descriptor();
 
     int Close();
+
+    // Release ownership of the fd without closing it. Returns the fd value. After this call the
+    // descriptor is empty (m_fd == -1) and the destructor will not close.
+    //
+    int Release();
 
     // TODO lock down the guts
     //
@@ -42,6 +54,7 @@ struct Descriptor : EmbeddedListHookups<Descriptor>
     int             m_registeredIndex;
 
     int             m_result;
+    bool            m_owned;
 
     friend struct Handle;
     EmbeddedList<Handle> m_handles;

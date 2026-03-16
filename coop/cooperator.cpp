@@ -354,7 +354,7 @@ void Cooperator::Launch()
     {
         ctx->SetName("SubmissionDrainer");
 
-        io::Descriptor desc(m_submitFd);
+        io::Descriptor desc(io::borrowed, m_submitFd);
 
         while (!ctx->IsKilled())
         {
@@ -363,10 +363,6 @@ void Cooperator::Launch()
             if (ctx->IsKilled()) break;
             DrainSubmissions();
         }
-
-        // Prevent double-close — the cooperator destructor owns the fd.
-        //
-        desc.m_fd = -1;
     });
 
     // Check COOP_PERF=1 env var to enable dynamic perf probes at startup (mode 2 only).

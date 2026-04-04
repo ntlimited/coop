@@ -31,11 +31,12 @@ TryAcquire calls. Only if all fail does it hook up and block. This eliminates
 `AddAsBlocked`/`RemoveAsBlocked` on the uncontended fast path (~60% of cycles previously).
 
 **CoordinateWithKill fast path**: for the common case of a single `Coordinator*` argument
-(the IO hot path — `Handle::Wait`), `CoordinateWithKill` has a `constexpr if` specialization
-that checks `IsKilled()` then `TryAcquire()` before falling through to the full
+(for example explicit async-handle accept loops), `CoordinateWithKill` has a `constexpr if`
+specialization that checks `IsKilled()` then `TryAcquire()` before falling through to the full
 `CoordinateWith` path. This avoids constructing a 2-arg `MultiCoordinator` (kill signal +
-coordinator) on every uncontended IO wait. Safety: cooperative scheduling means nothing changes
-between the two checks; if TryAcquire fails, the full multiplexed path handles it correctly.
+coordinator) on every uncontended explicit kill-aware wait. Safety: cooperative scheduling means
+nothing changes between the two checks; if TryAcquire fails, the full multiplexed path handles it
+correctly.
 
 ## Scheduler Internals (`cooperator.cpp`)
 
@@ -47,9 +48,9 @@ The cooperator loop in `Cooperator::Launch()`:
 while (has yielded contexts OR not shutdown OR shutdown kill not done):
     1. If shutdown requested and kill not done: drain submissions, spawn kill context
     2. If yielded list empty:
-       a. Poll io_uring + drain submissions (may move blocked -> yielded)
-       b. If blocked/pending IO exist: keep spinning
-       c. If truly idle and not shutdown: WaitForSubmission() blocks on eventfd
+       a. Poll io_uring + opportunistically drain submissions
+       b. If still no runnable contexts: WaitAndPoll() blocks until the next CQE
+          (ordinary IO completion or the submission-drainer eventfd read)
     3. Drain submissions, then pop up to 16 yielded contexts, Resume each one:
        - After each Resume returns (context yielded/blocked/exited): poll io_uring
        - Break early if m_hasSubmissions is set (atomic flag, no syscall)
@@ -58,16 +59,17 @@ while (has yielded contexts OR not shutdown OR shutdown kill not done):
 ```
 
 **Submission system**: eventfd-based. External threads push `SubmissionEntry` nodes to an
-intrusive FIFO (mutex-protected), then `write()` to the eventfd. The cooperator checks
-`m_hasSubmissions` (atomic flag, zero cost on miss) and drains the list by spawning contexts.
-`WaitForSubmission()` uses `poll()` on the eventfd when the cooperator is truly idle.
+intrusive FIFO (mutex-protected), then `write()` to the eventfd. A dedicated submission-drainer
+context keeps a blocking eventfd read in flight through io_uring, so cross-thread submits wake
+the scheduler as an ordinary CQE. The scheduler also opportunistically checks `m_hasSubmissions`
+and drains the list directly on scheduler iterations.
 
 **Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and writes to the eventfd.
 The loop spawns a temporary kill context that visits all live contexts and fires their kill
 signals (`schedule=false` -> moved to yielded, not immediately switched to). Handlers that
-loop (accept loops, read loops) check `IsKilled()` and break. Handlers that want kill-aware
-IO use `CoordinateWithKill` explicitly. Handle destructors run Cancel + Flash during stack
-unwind, draining in-flight IO.
+loop (accept loops, read loops) must use an explicit wake path — generated blocking `*Kill`
+wrappers, explicit `CoordinateWithKill` composition, timeouts, or a socket shutdown guard.
+Handle destructors run Cancel + Flash during stack unwind, draining in-flight IO.
 
 **Important**: the loop condition includes `!shutdownKillDone` (guarantees the kill logic runs
 even when all contexts are blocked) and `m_uring.PendingOps() > 0` (keeps the loop alive to

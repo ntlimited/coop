@@ -70,7 +70,7 @@ Connection::Connection(Context& ctx, Descriptor& desc, SocketBio)
     m_rbio = nullptr;
     m_wbio = nullptr;
 
-    // The socket must be non-blocking for cooperative handshake via io::Poll.
+    // The socket must be non-blocking for cooperative handshake via readiness waits.
     //
     int flags = fcntl(desc.m_fd, F_GETFL, 0);
     fcntl(desc.m_fd, F_SETFL, flags | O_NONBLOCK);
@@ -103,7 +103,7 @@ Connection::~Connection()
 //
 // Returns 0 on success, negative on I/O error.
 //
-int Connection::FlushWrite()
+int Connection::FlushWrite(bool killAware)
 {
     while (BIO_ctrl_pending(m_wbio) > 0)
     {
@@ -117,7 +117,9 @@ int Connection::FlushWrite()
         int at = 0;
         while (at < n)
         {
-            int sent = io::Send(m_desc, &m_buffer[at], n - at);
+            int sent = killAware
+                ? io::SendKill(m_desc, &m_buffer[at], n - at)
+                : io::Send(m_desc, &m_buffer[at], n - at);
             if (sent <= 0)
             {
                 spdlog::warn("ssl flush_write fd={} send failed={}", m_desc.m_fd, sent);
@@ -134,9 +136,11 @@ int Connection::FlushWrite()
 //
 // Returns bytes fed on success, 0 on clean disconnect, negative on error.
 //
-int Connection::FeedRead()
+int Connection::FeedRead(bool killAware)
 {
-    int n = io::Recv(m_desc, m_buffer, m_bufferSize);
+    int n = killAware
+        ? io::RecvKill(m_desc, m_buffer, m_bufferSize)
+        : io::Recv(m_desc, m_buffer, m_bufferSize);
     if (n <= 0)
     {
         SPDLOG_TRACE("ssl feed_read fd={} recv={}", m_desc.m_fd, n);
@@ -155,19 +159,28 @@ int Connection::Handshake()
 {
     if (m_buffer == nullptr)
     {
-        return HandshakeSocketBio();
+        return HandshakeSocketBio(false);
     }
-    return HandshakeMemoryBio();
+    return HandshakeMemoryBio(false);
 }
 
-// Drive the socket BIO handshake cooperatively using io::Poll. OpenSSL operates on the real fd,
-// so WANT_READ/WANT_WRITE mean "the socket isn't ready" — we wait for readability/writability
-// via io_uring poll, then retry.
+int Connection::HandshakeKill()
+{
+    if (m_buffer == nullptr)
+    {
+        return HandshakeSocketBio(true);
+    }
+    return HandshakeMemoryBio(true);
+}
+
+// Drive the socket BIO handshake cooperatively using readiness waits. OpenSSL operates on the real
+// fd, so WANT_READ/WANT_WRITE mean "the socket isn't ready" — we wait for
+// readability/writability via io_uring poll, then retry.
 //
 // After successful handshake, probes for kTLS activation. If the kernel accepted the cipher
 // state, subsequent Send/Recv bypass OpenSSL entirely.
 //
-int Connection::HandshakeSocketBio()
+int Connection::HandshakeSocketBio(bool killAware)
 {
     SPDLOG_DEBUG("ssl socket-bio handshake start fd={}", m_desc.m_fd);
     for (;;)
@@ -190,7 +203,7 @@ int Connection::HandshakeSocketBio()
         case SSL_ERROR_WANT_READ:
         {
             SPDLOG_TRACE("ssl socket-bio handshake fd={} WANT_READ", m_desc.m_fd);
-            int r = io::Poll(m_desc, POLLIN);
+            int r = killAware ? io::PollKill(m_desc, POLLIN) : io::Poll(m_desc, POLLIN);
             if (r < 0)
             {
                 spdlog::warn("ssl socket-bio handshake fd={} poll failed={}", m_desc.m_fd, r);
@@ -202,7 +215,7 @@ int Connection::HandshakeSocketBio()
         case SSL_ERROR_WANT_WRITE:
         {
             SPDLOG_TRACE("ssl socket-bio handshake fd={} WANT_WRITE", m_desc.m_fd);
-            int r = io::Poll(m_desc, POLLOUT);
+            int r = killAware ? io::PollKill(m_desc, POLLOUT) : io::Poll(m_desc, POLLOUT);
             if (r < 0)
             {
                 spdlog::warn("ssl socket-bio handshake fd={} poll failed={}", m_desc.m_fd, r);
@@ -225,7 +238,7 @@ int Connection::HandshakeSocketBio()
 // This is naturally cooperative because io::Send and io::Recv yield the Context while waiting
 // for uring completions, so other Contexts run during the handshake's network round-trips.
 //
-int Connection::HandshakeMemoryBio()
+int Connection::HandshakeMemoryBio(bool killAware)
 {
     SPDLOG_DEBUG("ssl handshake start fd={}", m_desc.m_fd);
     for (;;)
@@ -236,7 +249,7 @@ int Connection::HandshakeMemoryBio()
             // Handshake complete. Flush any final output (e.g. Finished message).
             //
             SPDLOG_DEBUG("ssl handshake complete fd={}", m_desc.m_fd);
-            return FlushWrite();
+            return FlushWrite(killAware);
         }
 
         int err = SSL_get_error(m_ssl, ret);
@@ -244,7 +257,7 @@ int Connection::HandshakeMemoryBio()
         {
         case SSL_ERROR_WANT_WRITE:
             SPDLOG_TRACE("ssl handshake fd={} WANT_WRITE", m_desc.m_fd);
-            if (FlushWrite() < 0)
+            if (FlushWrite(killAware) < 0)
             {
                 return -1;
             }
@@ -254,11 +267,11 @@ int Connection::HandshakeMemoryBio()
             // Flush first — the handshake may have produced output before asking for input.
             //
             SPDLOG_TRACE("ssl handshake fd={} WANT_READ", m_desc.m_fd);
-            if (FlushWrite() < 0)
+            if (FlushWrite(killAware) < 0)
             {
                 return -1;
             }
-            if (FeedRead() <= 0)
+            if (FeedRead(killAware) <= 0)
             {
                 return -1;
             }

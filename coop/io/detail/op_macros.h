@@ -22,7 +22,9 @@
     bool name(Handle& handle ARGS(COOP_IO_ARG_DECL));                                  \
     bool name(Handle& handle ARGS(COOP_IO_ARG_DEF), time::Interval timeout);           \
     int name(Descriptor& desc ARGS(COOP_IO_ARG_DECL));                                 \
-    int name(Descriptor& desc ARGS(COOP_IO_ARG_DEF), time::Interval timeout);
+    int name(Descriptor& desc ARGS(COOP_IO_ARG_DEF), time::Interval timeout);          \
+    int name##Kill(Descriptor& desc ARGS(COOP_IO_ARG_DECL));                           \
+    int name##Kill(Descriptor& desc ARGS(COOP_IO_ARG_DEF), time::Interval timeout);
 
 // Individual implementation macros, exposed for operations that only need a subset.
 //
@@ -81,6 +83,35 @@
         return result;                                                                   \
     }
 
+#define COOP_IO_BLOCKING_KILL_IMPL(name, ARGS)                                           \
+    int name##Kill(Descriptor& desc ARGS(COOP_IO_ARG_DEF))                              \
+    {                                                                                    \
+        Coordinator coord;                                                               \
+        Handle handle(Self(), desc, &coord);                                             \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD)))                                         \
+        {                                                                                \
+            return -EAGAIN;                                                              \
+        }                                                                                \
+        return handle.WaitKill();                                                        \
+    }
+
+#define COOP_IO_BLOCKING_TIMEOUT_KILL_IMPL(name, ARGS)                                   \
+    int name##Kill(Descriptor& desc ARGS(COOP_IO_ARG_DEF), time::Interval timeout)      \
+    {                                                                                    \
+        Coordinator coord;                                                               \
+        Handle handle(Self(), desc, &coord);                                             \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD), timeout))                                \
+        {                                                                                \
+            return -EAGAIN;                                                              \
+        }                                                                                \
+        int result = handle.WaitKill();                                                  \
+        if (handle.TimedOut())                                                           \
+        {                                                                                \
+            return -ETIMEDOUT;                                                           \
+        }                                                                                \
+        return result;                                                                   \
+    }
+
 // Blocking variants with a nonblocking fast path. Before constructing a Handle and going
 // through io_uring, try the operation directly with a nonblocking syscall. If it succeeds
 // (or fails with a hard error), return immediately — avoiding Coordinator/Handle/SQE/CQE
@@ -125,13 +156,52 @@
         return result;                                                                   \
     }
 
+#define COOP_IO_BLOCKING_FASTPATH_KILL_IMPL(name, try_fn, ARGS)                          \
+    int name##Kill(Descriptor& desc ARGS(COOP_IO_ARG_DEF))                              \
+    {                                                                                    \
+        int ret = try_fn(desc.m_fd ARGS(COOP_IO_ARG_FWD));                              \
+        if (ret >= 0) return ret;                                                        \
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -errno;                      \
+                                                                                         \
+        Coordinator coord;                                                               \
+        Handle handle(Self(), desc, &coord);                                             \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD)))                                         \
+        {                                                                                \
+            return -EAGAIN;                                                              \
+        }                                                                                \
+        return handle.WaitKill();                                                        \
+    }
+
+#define COOP_IO_BLOCKING_TIMEOUT_FASTPATH_KILL_IMPL(name, try_fn, ARGS)                  \
+    int name##Kill(Descriptor& desc ARGS(COOP_IO_ARG_DEF), time::Interval timeout)      \
+    {                                                                                    \
+        int ret = try_fn(desc.m_fd ARGS(COOP_IO_ARG_FWD));                              \
+        if (ret >= 0) return ret;                                                        \
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -errno;                      \
+                                                                                         \
+        Coordinator coord;                                                               \
+        Handle handle(Self(), desc, &coord);                                             \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD), timeout))                                \
+        {                                                                                \
+            return -EAGAIN;                                                              \
+        }                                                                                \
+        int result = handle.WaitKill();                                                  \
+        if (handle.TimedOut())                                                           \
+        {                                                                                \
+            return -ETIMEDOUT;                                                           \
+        }                                                                                \
+        return result;                                                                   \
+    }
+
 // Generate all 4 implementations for a standard IO operation.
 //
 #define COOP_IO_IMPLEMENTATIONS(name, prep_fn, ARGS)                                     \
     COOP_IO_ASYNC_IMPL(name, prep_fn, ARGS)                                              \
     COOP_IO_ASYNC_TIMEOUT_IMPL(name, prep_fn, ARGS)                                      \
     COOP_IO_BLOCKING_IMPL(name, ARGS)                                                    \
-    COOP_IO_BLOCKING_TIMEOUT_IMPL(name, ARGS)
+    COOP_IO_BLOCKING_TIMEOUT_IMPL(name, ARGS)                                            \
+    COOP_IO_BLOCKING_KILL_IMPL(name, ARGS)                                               \
+    COOP_IO_BLOCKING_TIMEOUT_KILL_IMPL(name, ARGS)
 
 // Generate all 4 implementations with nonblocking fast path on blocking variants.
 //
@@ -139,7 +209,9 @@
     COOP_IO_ASYNC_IMPL(name, prep_fn, ARGS)                                              \
     COOP_IO_ASYNC_TIMEOUT_IMPL(name, prep_fn, ARGS)                                      \
     COOP_IO_BLOCKING_FASTPATH_IMPL(name, try_fn, ARGS)                                   \
-    COOP_IO_BLOCKING_TIMEOUT_FASTPATH_IMPL(name, try_fn, ARGS)
+    COOP_IO_BLOCKING_TIMEOUT_FASTPATH_IMPL(name, try_fn, ARGS)                           \
+    COOP_IO_BLOCKING_FASTPATH_KILL_IMPL(name, try_fn, ARGS)                              \
+    COOP_IO_BLOCKING_TIMEOUT_FASTPATH_KILL_IMPL(name, try_fn, ARGS)
 
 // -------------------------------------------------------------------------------------
 // Uring-level operations (AT_FDCWD pattern)
@@ -161,7 +233,9 @@
     bool name(Handle& handle ARGS(COOP_IO_ARG_DECL));                                   \
     bool name(Handle& handle ARGS(COOP_IO_ARG_DEF), time::Interval timeout);            \
     int name(COOP_IO_NO_LEAD(ARGS(COOP_IO_ARG_DECL)));                                  \
-    int name(COOP_IO_NO_LEAD(ARGS(COOP_IO_ARG_DEF)), time::Interval timeout);
+    int name(COOP_IO_NO_LEAD(ARGS(COOP_IO_ARG_DEF)), time::Interval timeout);           \
+    int name##Kill(COOP_IO_NO_LEAD(ARGS(COOP_IO_ARG_DECL)));                            \
+    int name##Kill(COOP_IO_NO_LEAD(ARGS(COOP_IO_ARG_DEF)), time::Interval timeout);
 
 #define COOP_IO_URING_ASYNC_IMPL(name, prep_fn, ARGS)                                    \
     bool name(Handle& handle ARGS(COOP_IO_ARG_DEF))                                      \
@@ -220,10 +294,43 @@
         return result;                                                                    \
     }
 
+#define COOP_IO_URING_BLOCKING_KILL_IMPL(name, ARGS)                                      \
+    int name##Kill(COOP_IO_NO_LEAD(ARGS(COOP_IO_ARG_DEF)))                               \
+    {                                                                                     \
+        auto* ring = GetUring();                                                          \
+        Coordinator coord;                                                                \
+        Handle handle(Self(), ring, &coord);                                              \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD)))                                          \
+        {                                                                                 \
+            return -EAGAIN;                                                               \
+        }                                                                                 \
+        return handle.WaitKill();                                                         \
+    }
+
+#define COOP_IO_URING_BLOCKING_TIMEOUT_KILL_IMPL(name, ARGS)                              \
+    int name##Kill(COOP_IO_NO_LEAD(ARGS(COOP_IO_ARG_DEF)), time::Interval timeout)       \
+    {                                                                                     \
+        auto* ring = GetUring();                                                          \
+        Coordinator coord;                                                                \
+        Handle handle(Self(), ring, &coord);                                              \
+        if (!name(handle ARGS(COOP_IO_ARG_FWD), timeout))                                 \
+        {                                                                                 \
+            return -EAGAIN;                                                               \
+        }                                                                                 \
+        int result = handle.WaitKill();                                                   \
+        if (handle.TimedOut())                                                            \
+        {                                                                                 \
+            return -ETIMEDOUT;                                                            \
+        }                                                                                 \
+        return result;                                                                    \
+    }
+
 // Generate all 4 implementations for a uring-level IO operation.
 //
 #define COOP_IO_URING_IMPLEMENTATIONS(name, prep_fn, ARGS)                                \
     COOP_IO_URING_ASYNC_IMPL(name, prep_fn, ARGS)                                        \
     COOP_IO_URING_ASYNC_TIMEOUT_IMPL(name, prep_fn, ARGS)                                \
     COOP_IO_URING_BLOCKING_IMPL(name, ARGS)                                              \
-    COOP_IO_URING_BLOCKING_TIMEOUT_IMPL(name, ARGS)
+    COOP_IO_URING_BLOCKING_TIMEOUT_IMPL(name, ARGS)                                      \
+    COOP_IO_URING_BLOCKING_KILL_IMPL(name, ARGS)                                         \
+    COOP_IO_URING_BLOCKING_TIMEOUT_KILL_IMPL(name, ARGS)

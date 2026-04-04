@@ -18,5 +18,9 @@ struct Descriptor;
 //
 int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len);
 
+// Kill-aware variant of Splice. Returns -ECANCELED when kill wins while waiting for readiness.
+//
+int SpliceKill(Descriptor& in, Descriptor& out, int pipefd[2], size_t len);
+
 } // end namespace coop::io
 } // end namespace coop

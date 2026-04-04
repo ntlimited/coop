@@ -19,11 +19,11 @@ namespace io
 namespace ssl
 {
 
-// kTLS RX recv — read() directly, kernel handles decryption. Falls back to io::Poll when
+// kTLS RX recv — read() directly, kernel handles decryption. Falls back to readiness waits when
 // no data available (EAGAIN). First call typically returns EAGAIN (receiver called before
 // sender), but if data is already buffered, returns immediately without uring.
 //
-static int RecvKtls(Connection& conn, void* buf, size_t size)
+static int RecvKtls(Connection& conn, void* buf, size_t size, bool killAware)
 {
     SPDLOG_TRACE("ssl ktls recv fd={} maxsize={}", conn.m_desc.m_fd, size);
     for (;;)
@@ -39,7 +39,7 @@ static int RecvKtls(Connection& conn, void* buf, size_t size)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
             SPDLOG_TRACE("ssl ktls recv fd={} EAGAIN", conn.m_desc.m_fd);
-            int r = io::Poll(conn.m_desc, POLLIN);
+            int r = killAware ? io::PollKill(conn.m_desc, POLLIN) : io::Poll(conn.m_desc, POLLIN);
             if (r < 0) return -1;
             continue;
         }
@@ -49,10 +49,10 @@ static int RecvKtls(Connection& conn, void* buf, size_t size)
     }
 }
 
-// Socket BIO recv — SSL_read operates on the real fd, io::Poll for cooperative waiting.
+// Socket BIO recv — SSL_read operates on the real fd, readiness waits for cooperative waiting.
 // Used when kTLS didn't activate but the connection uses a socket BIO.
 //
-static int RecvSocketBio(Connection& conn, void* buf, size_t size)
+static int RecvSocketBio(Connection& conn, void* buf, size_t size, bool killAware)
 {
     SPDLOG_TRACE("ssl socket-bio recv fd={} maxsize={}", conn.m_desc.m_fd, size);
     for (;;)
@@ -70,7 +70,7 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size)
         case SSL_ERROR_WANT_READ:
         {
             SPDLOG_TRACE("ssl socket-bio recv fd={} WANT_READ", conn.m_desc.m_fd);
-            int r = io::Poll(conn.m_desc, POLLIN);
+            int r = killAware ? io::PollKill(conn.m_desc, POLLIN) : io::Poll(conn.m_desc, POLLIN);
             if (r < 0) return -1;
             break;
         }
@@ -80,7 +80,7 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size)
             // Renegotiation
             //
             SPDLOG_TRACE("ssl socket-bio recv fd={} WANT_WRITE", conn.m_desc.m_fd);
-            int r = io::Poll(conn.m_desc, POLLOUT);
+            int r = killAware ? io::PollKill(conn.m_desc, POLLOUT) : io::Poll(conn.m_desc, POLLOUT);
             if (r < 0) return -1;
             break;
         }
@@ -97,26 +97,26 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size)
 
 // Receive plaintext data from a TLS connection. Dispatches based on connection mode:
 //
-//   kTLS RX:     read() directly, kernel decrypts + io::Poll on EAGAIN
-//   Socket BIO:  SSL_read on real fd + io::Poll for cooperative waiting
+//   kTLS RX:     read() directly, kernel decrypts + readiness waits on EAGAIN
+//   Socket BIO:  SSL_read on real fd + readiness waits
 //   Memory BIO:  FeedRead -> rbio -> SSL_read (existing path)
 //
 // Returns bytes read on success, negative on error, 0 on clean shutdown.
 //
-int Recv(Connection& conn, void* buf, size_t size)
+int RecvImpl(Connection& conn, void* buf, size_t size, bool killAware)
 {
     // kTLS RX: kernel handles decryption, read() directly
     //
     if (conn.m_ktlsRx)
     {
-        return RecvKtls(conn, buf, size);
+        return RecvKtls(conn, buf, size, killAware);
     }
 
-    // Socket BIO without kTLS: SSL_read on real fd + io::Poll
+    // Socket BIO without kTLS: SSL_read on real fd + readiness waits
     //
     if (conn.m_buffer == nullptr)
     {
-        return RecvSocketBio(conn, buf, size);
+        return RecvSocketBio(conn, buf, size, killAware);
     }
 
     // Memory BIO: existing path
@@ -136,11 +136,11 @@ int Recv(Connection& conn, void* buf, size_t size)
         {
         case SSL_ERROR_WANT_READ:
             SPDLOG_TRACE("ssl recv fd={} WANT_READ", conn.m_desc.m_fd);
-            if (conn.FlushWrite() < 0)
+            if (conn.FlushWrite(killAware) < 0)
             {
                 return -1;
             }
-            if (conn.FeedRead() <= 0)
+            if (conn.FeedRead(killAware) <= 0)
             {
                 return -1;
             }
@@ -150,7 +150,7 @@ int Recv(Connection& conn, void* buf, size_t size)
             // Can happen during TLS renegotiation.
             //
             SPDLOG_TRACE("ssl recv fd={} WANT_WRITE", conn.m_desc.m_fd);
-            if (conn.FlushWrite() < 0)
+            if (conn.FlushWrite(killAware) < 0)
             {
                 return -1;
             }
@@ -164,6 +164,16 @@ int Recv(Connection& conn, void* buf, size_t size)
             return -1;
         }
     }
+}
+
+int Recv(Connection& conn, void* buf, size_t size)
+{
+    return RecvImpl(conn, buf, size, false);
+}
+
+int RecvKill(Connection& conn, void* buf, size_t size)
+{
+    return RecvImpl(conn, buf, size, true);
 }
 
 } // end namespace coop::io::ssl

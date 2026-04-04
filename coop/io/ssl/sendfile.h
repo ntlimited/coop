@@ -25,6 +25,8 @@ int Sendfile(Connection& conn, int in_fd, off_t offset, size_t count);
 // Loop Sendfile until all `count` bytes are sent.
 //
 int SendfileAll(Connection& conn, int in_fd, off_t offset, size_t count);
+int SendfileKill(Connection& conn, int in_fd, off_t offset, size_t count);
+int SendfileAllKill(Connection& conn, int in_fd, off_t offset, size_t count);
 
 } // end namespace coop::io::ssl
 } // end namespace coop::io

@@ -14,7 +14,16 @@ namespace coop
 namespace io
 {
 
-int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count)
+static int WaitForSendfileWritable(Descriptor& desc, bool killAware)
+{
+    if (killAware)
+    {
+        return PollKill(desc, POLLOUT);
+    }
+    return Poll(desc, POLLOUT);
+}
+
+static int SendfileImpl(Descriptor& desc, int in_fd, off_t offset, size_t count, bool killAware)
 {
     SPDLOG_TRACE("sendfile fd={} in_fd={} offset={} count={}", desc.m_fd, in_fd, offset, count);
     for (;;)
@@ -30,7 +39,8 @@ int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
             SPDLOG_TRACE("sendfile fd={} EAGAIN", desc.m_fd);
-            int r = Poll(desc, POLLOUT);
+            int r = WaitForSendfileWritable(desc, killAware);
+            if (r == -ECANCELED) return -ECANCELED;
             if (r < 0) return -1;
             continue;
         }
@@ -40,16 +50,38 @@ int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count)
     }
 }
 
-int SendfileAll(Descriptor& desc, int in_fd, off_t offset, size_t count)
+int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count)
+{
+    return SendfileImpl(desc, in_fd, offset, count, false);
+}
+
+int SendfileKill(Descriptor& desc, int in_fd, off_t offset, size_t count)
+{
+    return SendfileImpl(desc, in_fd, offset, count, true);
+}
+
+static int SendfileAllImpl(Descriptor& desc, int in_fd, off_t offset, size_t count, bool killAware)
 {
     size_t total = 0;
     while (total < count)
     {
-        int sent = Sendfile(desc, in_fd, offset + (off_t)total, count - total);
+        int sent = killAware
+            ? SendfileKill(desc, in_fd, offset + (off_t)total, count - total)
+            : Sendfile(desc, in_fd, offset + (off_t)total, count - total);
         if (sent <= 0) return sent;
         total += sent;
     }
     return (int)count;
+}
+
+int SendfileAll(Descriptor& desc, int in_fd, off_t offset, size_t count)
+{
+    return SendfileAllImpl(desc, in_fd, offset, count, false);
+}
+
+int SendfileAllKill(Descriptor& desc, int in_fd, off_t offset, size_t count)
+{
+    return SendfileAllImpl(desc, in_fd, offset, count, true);
 }
 
 } // end namespace coop::io

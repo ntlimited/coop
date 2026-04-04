@@ -29,9 +29,10 @@ struct SocketBio {};
 //   Plaintext out:  SSL_write() -> wbio (memory) -> FlushWrite() -> io::Send -> uring -> kernel
 //   Plaintext in:   kernel -> uring -> io::Recv -> FeedRead() -> rbio (memory) -> SSL_read()
 //
-// **Socket BIO mode** (SocketBio tag): OpenSSL operates on the real fd. Handshake uses io::Poll
-// for cooperative waiting. If kTLS activates, Send/Recv bypass OpenSSL on the data path entirely.
-// Falls back to SSL_write/SSL_read + io::Poll if kTLS doesn't activate.
+// **Socket BIO mode** (SocketBio tag): OpenSSL operates on the real fd. Handshake uses socket
+// readiness waits, and explicit kill-aware variants are available for callers that want prompt
+// cancellation. If kTLS activates, Send/Recv bypass OpenSSL on the data path entirely. Falls back
+// to SSL_write/SSL_read + readiness waits if kTLS doesn't activate.
 //
 struct Connection
 {
@@ -57,6 +58,7 @@ struct Connection
     // on the BIO mode. Returns 0 on success, negative on error.
     //
     int Handshake();
+    int HandshakeKill();
 
     SSL*         m_ssl;
     Descriptor&  m_desc;
@@ -69,29 +71,35 @@ struct Connection
 
   private:
     friend int Send(Connection&, const void*, size_t);
+    friend int SendKill(Connection&, const void*, size_t);
     friend int SendAll(Connection&, const void*, size_t);
+    friend int SendAllKill(Connection&, const void*, size_t);
+    friend int SendImpl(Connection&, const void*, size_t, bool);
     friend int Recv(Connection&, void*, size_t);
+    friend int RecvKill(Connection&, void*, size_t);
+    friend int RecvImpl(Connection&, void*, size_t, bool);
 
-    // Socket BIO handshake — drives SSL_do_handshake with io::Poll for cooperative waiting.
-    // After completion, probes for kTLS activation and sets m_ktlsTx/m_ktlsRx.
+    // Socket BIO handshake — drives SSL_do_handshake with readiness waits. The kill-aware public
+    // variant routes through the same implementation with kill-aware waits enabled. After
+    // completion, probes for kTLS activation and sets m_ktlsTx/m_ktlsRx.
     //
-    int HandshakeSocketBio();
+    int HandshakeSocketBio(bool killAware);
 
     // Memory BIO handshake — drives SSL_do_handshake via FlushWrite/FeedRead.
     //
-    int HandshakeMemoryBio();
+    int HandshakeMemoryBio(bool killAware);
 
     // Push any pending encrypted data from OpenSSL's write BIO out through the descriptor. Called
     // after any SSL operation that may produce output (handshake steps, SSL_write, shutdown).
     // Memory BIO mode only.
     //
-    int FlushWrite();
+    int FlushWrite(bool killAware = false);
 
     // Pull encrypted data from the descriptor into OpenSSL's read BIO. Called when an SSL operation
     // returns SSL_ERROR_WANT_READ, meaning it needs more ciphertext to proceed.
     // Memory BIO mode only.
     //
-    int FeedRead();
+    int FeedRead(bool killAware = false);
 
     BIO* m_rbio;
     BIO* m_wbio;

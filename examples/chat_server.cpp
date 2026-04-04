@@ -96,6 +96,7 @@ struct ChatHandler : coop::Launchable
     , m_registry(registry)
     , m_outbound(ctx, m_outboundBuffer, OUTBOUND_BUFFER_SLOTS)
     , m_stream(m_fd)
+    , m_shutdownGuard(ctx, m_fd)
     {
         ctx->SetName("ChatClient");
     }
@@ -179,6 +180,7 @@ struct ChatHandler : coop::Launchable
     Message                     m_outboundBuffer[OUTBOUND_BUFFER_SLOTS];
     coop::chan::Channel<Message>      m_outbound;
     coop::io::PlaintextStream   m_stream;
+    coop::io::ShutdownOnKillGuard m_shutdownGuard;
 };
 
 int BindAndListen(int port)
@@ -226,7 +228,7 @@ void SpawningTask(coop::Context* ctx, void*)
 
         while (!acceptCtx->IsKilled())
         {
-            int fd = coop::io::Accept(desc);
+            int fd = coop::io::AcceptKill(desc);
             if (fd < 0)
             {
                 break;

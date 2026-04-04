@@ -19,11 +19,11 @@ namespace io
 namespace ssl
 {
 
-// kTLS TX send — write() directly, kernel handles encryption. Falls back to io::Poll when
+// kTLS TX send — write() directly, kernel handles encryption. Falls back to readiness waits when
 // the socket buffer is full (EAGAIN). Avoids uring for the common case where the write
 // succeeds immediately, matching the synchronous-when-possible pattern of SendSocketBio.
 //
-static int SendKtls(Connection& conn, const void* buf, size_t size)
+static int SendKtls(Connection& conn, const void* buf, size_t size, bool killAware)
 {
     SPDLOG_TRACE("ssl ktls send fd={} size={}", conn.m_desc.m_fd, size);
     for (;;)
@@ -39,7 +39,7 @@ static int SendKtls(Connection& conn, const void* buf, size_t size)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
             SPDLOG_TRACE("ssl ktls send fd={} EAGAIN", conn.m_desc.m_fd);
-            int r = io::Poll(conn.m_desc, POLLOUT);
+            int r = killAware ? io::PollKill(conn.m_desc, POLLOUT) : io::Poll(conn.m_desc, POLLOUT);
             if (r < 0) return -1;
             continue;
         }
@@ -49,10 +49,10 @@ static int SendKtls(Connection& conn, const void* buf, size_t size)
     }
 }
 
-// Socket BIO send — SSL_write operates on the real fd, io::Poll for cooperative waiting.
+// Socket BIO send — SSL_write operates on the real fd, readiness waits for cooperative waiting.
 // Used when kTLS didn't activate but the connection uses a socket BIO.
 //
-static int SendSocketBio(Connection& conn, const void* buf, size_t size)
+static int SendSocketBio(Connection& conn, const void* buf, size_t size, bool killAware)
 {
     SPDLOG_TRACE("ssl socket-bio send fd={} size={}", conn.m_desc.m_fd, size);
     for (;;)
@@ -70,7 +70,7 @@ static int SendSocketBio(Connection& conn, const void* buf, size_t size)
         case SSL_ERROR_WANT_WRITE:
         {
             SPDLOG_TRACE("ssl socket-bio send fd={} WANT_WRITE", conn.m_desc.m_fd);
-            int r = io::Poll(conn.m_desc, POLLOUT);
+            int r = killAware ? io::PollKill(conn.m_desc, POLLOUT) : io::Poll(conn.m_desc, POLLOUT);
             if (r < 0) return -1;
             break;
         }
@@ -80,7 +80,7 @@ static int SendSocketBio(Connection& conn, const void* buf, size_t size)
             // Renegotiation
             //
             SPDLOG_TRACE("ssl socket-bio send fd={} WANT_READ", conn.m_desc.m_fd);
-            int r = io::Poll(conn.m_desc, POLLIN);
+            int r = killAware ? io::PollKill(conn.m_desc, POLLIN) : io::Poll(conn.m_desc, POLLIN);
             if (r < 0) return -1;
             break;
         }
@@ -97,26 +97,26 @@ static int SendSocketBio(Connection& conn, const void* buf, size_t size)
 
 // Send plaintext data over a TLS connection. Dispatches based on connection mode:
 //
-//   kTLS TX:     write() directly, kernel encrypts + io::Poll on EAGAIN
-//   Socket BIO:  SSL_write on real fd + io::Poll for cooperative waiting
+//   kTLS TX:     write() directly, kernel encrypts + readiness waits on EAGAIN
+//   Socket BIO:  SSL_write on real fd + readiness waits
 //   Memory BIO:  SSL_write -> wbio -> FlushWrite -> io::Send (existing path)
 //
 // Returns bytes written on success, negative on error, 0 on clean shutdown.
 //
-int Send(Connection& conn, const void* buf, size_t size)
+int SendImpl(Connection& conn, const void* buf, size_t size, bool killAware)
 {
     // kTLS TX: kernel handles encryption, write() directly
     //
     if (conn.m_ktlsTx)
     {
-        return SendKtls(conn, buf, size);
+        return SendKtls(conn, buf, size, killAware);
     }
 
-    // Socket BIO without kTLS: SSL_write on real fd + io::Poll
+    // Socket BIO without kTLS: SSL_write on real fd + readiness waits
     //
     if (conn.m_buffer == nullptr)
     {
-        return SendSocketBio(conn, buf, size);
+        return SendSocketBio(conn, buf, size, killAware);
     }
 
     // Memory BIO: existing path
@@ -130,7 +130,7 @@ int Send(Connection& conn, const void* buf, size_t size)
             // Plaintext was encrypted. Push the ciphertext out.
             //
             SPDLOG_TRACE("ssl send fd={} written={}", conn.m_desc.m_fd, ret);
-            if (conn.FlushWrite() < 0)
+            if (conn.FlushWrite(killAware) < 0)
             {
                 return -1;
             }
@@ -142,7 +142,7 @@ int Send(Connection& conn, const void* buf, size_t size)
         {
         case SSL_ERROR_WANT_WRITE:
             SPDLOG_TRACE("ssl send fd={} WANT_WRITE", conn.m_desc.m_fd);
-            if (conn.FlushWrite() < 0)
+            if (conn.FlushWrite(killAware) < 0)
             {
                 return -1;
             }
@@ -152,11 +152,11 @@ int Send(Connection& conn, const void* buf, size_t size)
             // Can happen during TLS renegotiation.
             //
             SPDLOG_TRACE("ssl send fd={} WANT_READ", conn.m_desc.m_fd);
-            if (conn.FlushWrite() < 0)
+            if (conn.FlushWrite(killAware) < 0)
             {
                 return -1;
             }
-            if (conn.FeedRead() <= 0)
+            if (conn.FeedRead(killAware) <= 0)
             {
                 return -1;
             }
@@ -172,12 +172,24 @@ int Send(Connection& conn, const void* buf, size_t size)
     }
 }
 
-int SendAll(Connection& conn, const void* buf, size_t size)
+int Send(Connection& conn, const void* buf, size_t size)
+{
+    return SendImpl(conn, buf, size, false);
+}
+
+int SendKill(Connection& conn, const void* buf, size_t size)
+{
+    return SendImpl(conn, buf, size, true);
+}
+
+static int SendAllImpl(Connection& conn, const void* buf, size_t size, bool killAware)
 {
     size_t offset = 0;
     while (offset < size)
     {
-        int sent = Send(conn, (const char*)buf + offset, size - offset);
+        int sent = killAware
+            ? SendKill(conn, (const char*)buf + offset, size - offset)
+            : Send(conn, (const char*)buf + offset, size - offset);
         if (sent <= 0)
         {
             return sent;
@@ -185,6 +197,16 @@ int SendAll(Connection& conn, const void* buf, size_t size)
         offset += sent;
     }
     return (int)size;
+}
+
+int SendAll(Connection& conn, const void* buf, size_t size)
+{
+    return SendAllImpl(conn, buf, size, false);
+}
+
+int SendAllKill(Connection& conn, const void* buf, size_t size)
+{
+    return SendAllImpl(conn, buf, size, true);
 }
 
 } // end namespace coop::io::ssl

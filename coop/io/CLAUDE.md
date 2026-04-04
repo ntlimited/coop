@@ -19,11 +19,12 @@ userdata): untagged -> `Complete()`, tagged -> `OnSecondaryComplete()`. Both cal
 which decrements `m_pendingCqes`; when it hits 0, pops from descriptor list and calls
 `m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator).
 
-**Blocking pattern** (`Wait()`): calls `CoordinateWith(ctx, m_coord)` which blocks until the
-Handle's coordinator is released (IO completes). Returns `m_result`. Not kill-aware — blocking
-IO continues to completion regardless of kill state, allowing post-kill cleanup IO. Callers
-that want kill-aware IO use `CoordinateWithKill` explicitly with async handles. `Result()`
-provides non-blocking access to the cached result (asserts all CQEs are drained).
+**Blocking pattern** (`Wait()` / `WaitKill()`): `Wait()` calls `CoordinateWith(ctx, m_coord)`
+which blocks until the Handle's coordinator is released (IO completes). It is intentionally not
+kill-aware, allowing post-kill cleanup IO. `WaitKill()` uses `CoordinateWithKill` instead and
+returns `-ECANCELED` when kill wins. The operation macros generate both plain blocking wrappers
+(`Recv`, `Accept`, ...) and kill-aware blocking wrappers (`RecvKill`, `AcceptKill`, ...).
+`Result()` provides non-blocking access to the cached result (asserts all CQEs are drained).
 
 **Encapsulation**: Handle fields are private. Internal access from IO operation macros and
 implementation files goes through `detail::HandleExtension` (friend struct), which exposes
@@ -118,28 +119,49 @@ direct syscall with appropriate nonblocking flags (e.g. `MSG_DONTWAIT` for socke
 use `COOP_IO_IMPLEMENTATIONS_FASTPATH`. The Try function signature must match
 `int try_fn(int fd, ...args...)` using standard syscall return conventions.
 
+Both macro families now also generate a kill-aware blocking family named `*Kill` (`RecvKill`,
+`PollKill`, `AcceptKill`, etc.). These wrappers preserve the default blocking API while making
+kill sensitivity explicit and uniform across the operation surface.
+
+## Socket Shutdown Guard (`shutdown_on_kill.h`)
+
+`ShutdownOnKillGuard` is the amortized alternative for tight socket loops that do not want to
+plumb `*Kill` through every call. It spawns one detached watcher per guarded descriptor; the
+watcher waits on the owning context's kill signal and then issues `Shutdown(desc, SHUT_RDWR)` to
+wake plain blocking socket IO. This is intentionally a socket-level wake strategy, not a generic
+replacement for per-call kill-aware IO.
+
 ## Sendfile (`sendfile.h`)
 
 Sends file data directly to a socket via the `sendfile()` syscall — zero userspace copies. Uses
-`io::Poll` fallback on EAGAIN (socket must be non-blocking).
+`io::Poll` fallback on EAGAIN (socket must be non-blocking). `SendfileKill` /
+`SendfileAllKill` are the explicit kill-aware siblings for loops that want prompt cancellation
+without a socket-level shutdown guard.
 ```cpp
 int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count);
 int SendfileAll(Descriptor& desc, int in_fd, off_t offset, size_t count);
+int SendfileKill(Descriptor& desc, int in_fd, off_t offset, size_t count);
+int SendfileAllKill(Descriptor& desc, int in_fd, off_t offset, size_t count);
 ```
 The SSL layer provides `ssl::Sendfile` / `ssl::SendfileAll` which dispatch to `io::Sendfile` for
 kTLS connections (kernel encrypts file data in-flight, zero copies) and fall back to pread+Send for
-non-kTLS connections. The HTTP server uses `io::SendfileAll` for static file serving, eliminating
-the previous 65KB staging buffer and multiple string copies.
+non-kTLS connections. Both layers now also expose explicit `*Kill` variants. The HTTP server keeps
+the cheap default send paths and relies on `ShutdownOnKillGuard` in its connection handlers to wake
+promptly during shutdown.
 
 ## Splice (`splice.h`)
 
 Moves data between two sockets via a kernel pipe — zero userspace copies. Uses `io::Poll` for
-cooperative waiting on both sides. The caller manages the pipe (create with
-`pipe2(pipefd, O_NONBLOCK)`, reuse across calls). Both sockets must be non-blocking.
+cooperative waiting on both sides. `SpliceKill` is the explicit kill-aware sibling for loops that
+want per-call cancellation rather than a socket-level shutdown guard. The caller manages the pipe
+(`pipe2(pipefd, O_NONBLOCK)`, reuse across calls). Both sockets must be non-blocking.
 ```cpp
 int pipefd[2];
 pipe2(pipefd, O_NONBLOCK);
 int n = io::Splice(in, out, pipefd, 65536);  // up to 65KB per call
+int k = io::SpliceKill(in, out, pipefd, 65536);
 ```
 The TCP proxy uses this for bidirectional relay — data moves between client and upstream sockets
-entirely in-kernel without entering userspace.
+entirely in-kernel without entering userspace. The example now pairs plain `Splice` with
+`ShutdownOnKillGuard` to keep the hot relay loop on the cheap blocking path while still waking
+promptly on kill.

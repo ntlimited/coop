@@ -1,7 +1,10 @@
 #include "shutdown.h"
 
 #include <cassert>
+#include <cerrno>
 #include <csignal>
+#include <cstdint>
+#include <sys/eventfd.h>
 #include <thread>
 #include <unistd.h>
 
@@ -10,31 +13,50 @@
 namespace coop
 {
 
-static int g_shutdownPipe[2];
+static int g_shutdownFd = -1;
 
 static void SignalHandler(int)
 {
     // write() is async-signal-safe
     //
-    char x = 'x';
-    write(g_shutdownPipe[1], &x, 1);
+    uint64_t one = 1;
+    [[maybe_unused]] ssize_t n = write(g_shutdownFd, &one, sizeof(one));
 }
 
 static void ShutdownWatcher()
 {
-    char buf;
-    read(g_shutdownPipe[0], &buf, 1);
+    uint64_t count = 0;
+    while (read(g_shutdownFd, &count, sizeof(count)) < 0 && errno == EINTR)
+    {
+    }
     Cooperator::ShutdownAll();
 }
 
 void InstallShutdownHandler()
 {
-    int ret = pipe(g_shutdownPipe);
+    if (g_shutdownFd >= 0)
+    {
+        return;
+    }
+
+    g_shutdownFd = eventfd(0, EFD_CLOEXEC);
+    assert(g_shutdownFd >= 0);
+
+    struct sigaction sa{};
+    sa.sa_handler = SignalHandler;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+
+    int ret = sigaction(SIGINT, &sa, nullptr);
+    assert(ret == 0);
+    ret = sigaction(SIGTERM, &sa, nullptr);
     assert(ret == 0);
 
-    signal(SIGINT, SignalHandler);
-    signal(SIGTERM, SignalHandler);
-    signal(SIGPIPE, SIG_IGN);
+    struct sigaction ignore{};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    ret = sigaction(SIGPIPE, &ignore, nullptr);
+    assert(ret == 0);
 
     std::thread watcher(ShutdownWatcher);
     watcher.detach();

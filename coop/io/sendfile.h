@@ -21,5 +21,10 @@ int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count);
 //
 int SendfileAll(Descriptor& desc, int in_fd, off_t offset, size_t count);
 
+// Kill-aware variants. Return -ECANCELED when kill wins while waiting for socket writability.
+//
+int SendfileKill(Descriptor& desc, int in_fd, off_t offset, size_t count);
+int SendfileAllKill(Descriptor& desc, int in_fd, off_t offset, size_t count);
+
 } // end namespace coop::io
 } // end namespace coop

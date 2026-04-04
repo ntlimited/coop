@@ -171,6 +171,26 @@ int Handle::Wait()
     return m_result;
 }
 
+int Handle::WaitKill()
+{
+    // Same fast path as Wait(): submit pending SQEs and consume any CQEs that are already ready.
+    //
+    m_ring->Poll();
+    if (m_pendingCqes == 0)
+    {
+        return m_result;
+    }
+
+    auto result = CoordinateWithKill(m_context, m_coord);
+    if (result.Killed())
+    {
+        return -ECANCELED;
+    }
+
+    m_coord->Release(m_context, false);
+    return m_result;
+}
+
 int Handle::Result() const
 {
     assert(m_pendingCqes == 0);

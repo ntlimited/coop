@@ -19,4 +19,6 @@
 ## Design Guidance
 
 - `DESIGN_IDIOMS.md`: API and performance design principles
+- `blocking_io_shutdown_01.md`: blocking-IO shutdown contract and the explicit
+  kill-aware composition pattern for coop-owned loops
 - `TODO.md`: prioritized follow-up work

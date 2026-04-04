@@ -28,6 +28,7 @@
 //
 //   ssl::Send(connection, buf, size)  — encrypt and send plaintext
 //   ssl::Recv(connection, buf, size)  — receive and decrypt ciphertext
+//   ssl::SendKill / ssl::RecvKill     — explicit kill-aware siblings
 //
 // Usage (memory BIO):
 //

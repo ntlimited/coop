@@ -348,7 +348,8 @@ void Cooperator::Launch()
 
     // Spawn a detached context that reads the eventfd and drains cross-thread submissions.
     // The eventfd is just another fd with a normal io_uring read — no special-case CQE handling
-    // in Poll(). The context owns the fd via io::Descriptor.
+    // in Poll(). This keeps a CQE-producing wake source in flight even when no user contexts are
+    // runnable, so WaitAndPoll() can sleep on submissions instead of spinning.
     //
     Spawn([this](Context* ctx)
     {
@@ -388,6 +389,11 @@ void Cooperator::Launch()
                                  || !shutdownKillDone
                                  || m_uring.PendingOps() > 0)
     {
+        if (m_hasSubmissions.load(std::memory_order_acquire))
+        {
+            DrainSubmissions();
+        }
+
         // When shutdown is requested, kill all live contexts from within the cooperator's
         // thread so they can exit naturally. This only needs to happen once; killed contexts
         // will check IsKilled() when resumed and return.
@@ -418,15 +424,23 @@ void Cooperator::Launch()
         {
             m_uring.Poll();
 
+            if (m_hasSubmissions.load(std::memory_order_acquire))
+            {
+                DrainSubmissions();
+            }
+
             if (!m_yielded.IsEmpty())
             {
                 continue;
             }
 
-            // Blocked contexts or pending IO — keep spinning for completions.
+            // No runnable contexts. Sleep in io_uring until the next CQE instead of spinning.
+            // The submission drainer's eventfd read is an ordinary in-flight uring op, so
+            // cross-thread Submit() also wakes this path via CQE delivery.
             //
             if (!m_blocked.IsEmpty() || m_uring.PendingOps() > 0)
             {
+                m_uring.WaitAndPoll();
                 continue;
             }
 
@@ -434,12 +448,6 @@ void Cooperator::Launch()
             {
                 continue;
             }
-
-            // Truly idle — block until a CQE arrives. The submission drainer's pending
-            // io::Read on the eventfd will wake this when a cross-thread Submit arrives.
-            //
-            m_uring.WaitAndPoll();
-            continue;
         }
 
         int remainingIterations = 16;
@@ -451,6 +459,15 @@ void Cooperator::Launch()
             auto* ctx = m_yielded.Pop();
             Resume(ctx);
             m_uring.Poll();
+
+            if (m_hasSubmissions.load(std::memory_order_acquire))
+            {
+                DrainSubmissions();
+                if (!m_yielded.IsEmpty())
+                {
+                    break;
+                }
+            }
         }
     }
 

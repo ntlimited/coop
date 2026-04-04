@@ -57,6 +57,7 @@ struct EchoHandler : Launchable
     , m_fd(fd)
     , m_plaintextStream(std::in_place, m_fd)
     , m_stream(&*m_plaintextStream)
+    , m_shutdownGuard(ctx, m_fd)
     {
         ctx->SetName("ConnectionHandler");
     }
@@ -69,6 +70,7 @@ struct EchoHandler : Launchable
     , m_conn(std::in_place, *sslCtx, m_fd, m_tlsBuffer, sizeof(m_tlsBuffer))
     , m_secureStream(std::in_place, *m_conn)
     , m_stream(&*m_secureStream)
+    , m_shutdownGuard(ctx, m_fd)
     {
         ctx->SetName("TLSConnectionHandler");
     }
@@ -81,6 +83,7 @@ struct EchoHandler : Launchable
     , m_conn(std::in_place, *sslCtx, m_fd, io::ssl::SocketBio{})
     , m_secureStream(std::in_place, *m_conn)
     , m_stream(&*m_secureStream)
+    , m_shutdownGuard(ctx, m_fd)
     {
         ctx->SetName("kTLSConnectionHandler");
     }
@@ -89,7 +92,7 @@ struct EchoHandler : Launchable
     {
         if (m_conn)
         {
-            if (m_conn->Handshake() < 0)
+            if (m_conn->HandshakeKill() < 0)
             {
                 spdlog::warn("tls handshake failed fd={}", m_fd.m_fd);
                 return;
@@ -105,6 +108,7 @@ struct EchoHandler : Launchable
     std::optional<io::ssl::Connection>   m_conn;
     std::optional<io::ssl::SecureStream> m_secureStream;
     io::Stream*                          m_stream;
+    io::ShutdownOnKillGuard              m_shutdownGuard;
 };
 
 int bind_and_listen(int port)

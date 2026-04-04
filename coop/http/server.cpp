@@ -145,6 +145,7 @@ struct HttpConnection : Launchable
                    time::Interval timeout)
     : Launchable(ctx)
     , m_fd(fd)
+    , m_shutdownGuard(ctx, m_fd)
     , m_co(co)
     , m_routes(routes)
     , m_routeCount(routeCount)
@@ -176,6 +177,7 @@ struct HttpConnection : Launchable
     }
 
     io::Descriptor      m_fd;
+    io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
     const Route*        m_routes;
     int                 m_routeCount;
@@ -196,6 +198,7 @@ struct HttpTlsConnection : Launchable
                       time::Interval timeout)
     : Launchable(ctx)
     , m_fd(fd)
+    , m_shutdownGuard(ctx, m_fd)
     , m_co(co)
     , m_routes(routes)
     , m_routeCount(routeCount)
@@ -220,7 +223,7 @@ struct HttpTlsConnection : Launchable
     {
         char sslBuf[io::ssl::Connection::BUFFER_SIZE];
         io::ssl::Connection sslConn(m_sslCtx, m_fd, sslBuf, sizeof(sslBuf));
-        if (sslConn.Handshake() != 0) return;
+        if (sslConn.HandshakeKill() != 0) return;
 
         using Conn = Connection<TlsTransport>;
         TlsTransport transport(sslConn, m_fd);
@@ -241,6 +244,7 @@ struct HttpTlsConnection : Launchable
     }
 
     io::Descriptor      m_fd;
+    io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
     const Route*        m_routes;
     int                 m_routeCount;
@@ -287,7 +291,7 @@ void RunServer(
 
     while (!ctx->IsKilled())
     {
-        int fd = io::Accept(desc);
+        int fd = io::AcceptKill(desc);
         if (fd < 0)
         {
             break;
@@ -336,7 +340,7 @@ void RunTlsServer(
 
     while (!ctx->IsKilled())
     {
-        int fd = io::Accept(desc);
+        int fd = io::AcceptKill(desc);
         if (fd < 0)
         {
             break;

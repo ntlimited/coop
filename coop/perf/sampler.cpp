@@ -79,7 +79,7 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
     //
     size_t pcIdx = g_head.fetch_add(1, std::memory_order_relaxed) & RING_MASK;
     g_ring[pcIdx] = {pc, ctx, co, ts};
-    g_total.fetch_add(1, std::memory_order_relaxed);
+    g_total.fetch_add(1, std::memory_order_release);
 
     // In stack mode, subsample backtrace() every Nth signal. The DWARF unwinder is expensive
     // and pollutes the icache/dcache, so we limit its frequency while keeping full-rate PC data.
@@ -134,7 +134,7 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
             s.context = ctx;
             s.cooperator = co;
             s.timestamp = ts;
-            g_stackTotal.fetch_add(1, std::memory_order_relaxed);
+            g_stackTotal.fetch_add(1, std::memory_order_release);
         }
     }
 
@@ -205,14 +205,13 @@ int SamplingHz()
 
 size_t ReadSamples(Sample* out, size_t maxSamples)
 {
-    size_t head = g_head.load(std::memory_order_acquire);
-    size_t total = g_total.load(std::memory_order_relaxed);
+    size_t total = g_total.load(std::memory_order_acquire);
 
     size_t available = total < RING_CAPACITY ? total : RING_CAPACITY;
     size_t count = available < maxSamples ? available : maxSamples;
     if (count == 0) return 0;
 
-    size_t start = head - available;
+    size_t start = total - available;
     for (size_t i = 0; i < count; i++)
     {
         out[i] = g_ring[(start + i) & RING_MASK];
@@ -222,14 +221,13 @@ size_t ReadSamples(Sample* out, size_t maxSamples)
 
 size_t ReadStackSamples(StackSample* out, size_t maxSamples)
 {
-    size_t head = g_stackHead.load(std::memory_order_acquire);
-    size_t total = g_stackTotal.load(std::memory_order_relaxed);
+    size_t total = g_stackTotal.load(std::memory_order_acquire);
 
     size_t available = total < STACK_RING_CAPACITY ? total : STACK_RING_CAPACITY;
     size_t count = available < maxSamples ? available : maxSamples;
     if (count == 0) return 0;
 
-    size_t start = head - available;
+    size_t start = total - available;
     for (size_t i = 0; i < count; i++)
     {
         out[i] = g_stackRing[(start + i) & STACK_RING_MASK];

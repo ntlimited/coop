@@ -14,8 +14,10 @@ namespace ssl
 struct Connection;
 
 int Send(Connection& conn, const void* buf, size_t size);
+int SendKill(Connection& conn, const void* buf, size_t size);
 
 int SendAll(Connection& conn, const void* buf, size_t size);
+int SendAllKill(Connection& conn, const void* buf, size_t size);
 
 } // end namespace coop::io::ssl
 } // end namespace coop::io

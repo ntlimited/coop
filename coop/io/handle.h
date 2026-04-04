@@ -91,9 +91,16 @@ struct Handle : EmbeddedListHookups<Handle>
     ~Handle();
 
     // Block until the operation completes. Uses CoordinateWith on the Handle's coordinator.
-    // Not kill-aware — callers that need kill sensitivity use CoordinateWithKill explicitly.
+    // Not kill-aware — callers that need kill sensitivity use WaitKill() or the generated
+    // blocking *Kill wrappers.
     //
     int Wait();
+
+    // Kill-aware variant of Wait(). Blocks until the operation completes or the owning context
+    // is killed. Returns -ECANCELED on kill; the Handle destructor cancels and drains the
+    // in-flight operation if it did not complete first.
+    //
+    int WaitKill();
 
     // Return the cached result. Only valid after all CQEs have been accounted for (asserts
     // m_pendingCqes == 0).

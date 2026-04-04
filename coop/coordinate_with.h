@@ -244,8 +244,8 @@ CoordinationResult CoordinateWithKill(Context* ctx, Args... args)
 {
     // Fast path for the common case: single Coordinator*, not killed, uncontended.
     // Bypasses MultiCoordinator construction entirely — avoids 2 Coordinated objects,
-    // 2 array stores, and the TryAcquire loop overhead. This is the IO hot path
-    // (Handle::Wait calls CoordinateWithKill with a single Coordinator*).
+    // 2 array stores, and the TryAcquire loop overhead. This is the explicit kill-aware
+    // IO hot path used by Handle::WaitKill and callsites that compose async handles directly.
     //
     // Safety: scheduling is cooperative, so nothing can change between IsKilled() and
     // TryAcquire(). If TryAcquire succeeds we never blocked, so the kill signal never

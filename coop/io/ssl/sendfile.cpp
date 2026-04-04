@@ -16,13 +16,15 @@ namespace io
 namespace ssl
 {
 
-int Sendfile(Connection& conn, int in_fd, off_t offset, size_t count)
+static int SendfileImpl(Connection& conn, int in_fd, off_t offset, size_t count, bool killAware)
 {
     // kTLS TX: kernel handles encryption, sendfile() directly — zero copies
     //
     if (conn.m_ktlsTx)
     {
-        return io::Sendfile(conn.m_desc, in_fd, offset, count);
+        return killAware
+            ? io::SendfileKill(conn.m_desc, in_fd, offset, count)
+            : io::Sendfile(conn.m_desc, in_fd, offset, count);
     }
 
     // Non-kTLS fallback: read from file, encrypt via SSL, send
@@ -37,16 +39,28 @@ int Sendfile(Connection& conn, int in_fd, off_t offset, size_t count)
     }
     if (n == 0) return 0;
 
-    return ssl::Send(conn, buf, n);
+    return killAware ? ssl::SendKill(conn, buf, n) : ssl::Send(conn, buf, n);
 }
 
-int SendfileAll(Connection& conn, int in_fd, off_t offset, size_t count)
+int Sendfile(Connection& conn, int in_fd, off_t offset, size_t count)
+{
+    return SendfileImpl(conn, in_fd, offset, count, false);
+}
+
+int SendfileKill(Connection& conn, int in_fd, off_t offset, size_t count)
+{
+    return SendfileImpl(conn, in_fd, offset, count, true);
+}
+
+static int SendfileAllImpl(Connection& conn, int in_fd, off_t offset, size_t count, bool killAware)
 {
     // kTLS TX: kernel handles encryption, sendfile() directly — zero copies
     //
     if (conn.m_ktlsTx)
     {
-        return io::SendfileAll(conn.m_desc, in_fd, offset, count);
+        return killAware
+            ? io::SendfileAllKill(conn.m_desc, in_fd, offset, count)
+            : io::SendfileAll(conn.m_desc, in_fd, offset, count);
     }
 
     // Non-kTLS fallback: read from file in chunks, encrypt and send each
@@ -65,11 +79,21 @@ int SendfileAll(Connection& conn, int in_fd, off_t offset, size_t count)
         }
         if (n == 0) return total > 0 ? (int)total : 0;
 
-        int sent = ssl::SendAll(conn, buf, n);
+        int sent = killAware ? ssl::SendAllKill(conn, buf, n) : ssl::SendAll(conn, buf, n);
         if (sent <= 0) return sent;
         total += n;
     }
     return (int)count;
+}
+
+int SendfileAll(Connection& conn, int in_fd, off_t offset, size_t count)
+{
+    return SendfileAllImpl(conn, in_fd, offset, count, false);
+}
+
+int SendfileAllKill(Connection& conn, int in_fd, off_t offset, size_t count)
+{
+    return SendfileAllImpl(conn, in_fd, offset, count, true);
 }
 
 } // end namespace coop::io::ssl

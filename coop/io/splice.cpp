@@ -14,7 +14,16 @@ namespace coop
 namespace io
 {
 
-int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
+static int WaitForSpliceReady(Descriptor& desc, unsigned mask, bool killAware)
+{
+    if (killAware)
+    {
+        return PollKill(desc, mask);
+    }
+    return Poll(desc, mask);
+}
+
+static int SpliceImpl(Descriptor& in, Descriptor& out, int pipefd[2], size_t len, bool killAware)
 {
     SPDLOG_TRACE("splice in={} out={} len={}", in.m_fd, out.m_fd, len);
 
@@ -31,7 +40,8 @@ int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
             SPDLOG_TRACE("splice in={} EAGAIN", in.m_fd);
-            int r = Poll(in, POLLIN);
+            int r = WaitForSpliceReady(in, POLLIN, killAware);
+            if (r == -ECANCELED) return -ECANCELED;
             if (r < 0) return -1;
             continue;
         }
@@ -56,7 +66,8 @@ int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
             SPDLOG_TRACE("splice out={} EAGAIN", out.m_fd);
-            int r = Poll(out, POLLOUT);
+            int r = WaitForSpliceReady(out, POLLOUT, killAware);
+            if (r == -ECANCELED) return -ECANCELED;
             if (r < 0) return -1;
             continue;
         }
@@ -67,6 +78,16 @@ int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
 
     SPDLOG_TRACE("splice in={} out={} transferred={}", in.m_fd, out.m_fd, n);
     return (int)n;
+}
+
+int Splice(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
+{
+    return SpliceImpl(in, out, pipefd, len, false);
+}
+
+int SpliceKill(Descriptor& in, Descriptor& out, int pipefd[2], size_t len)
+{
+    return SpliceImpl(in, out, pipefd, len, true);
 }
 
 } // end namespace coop::io

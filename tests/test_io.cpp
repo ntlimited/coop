@@ -3,22 +3,27 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
 
 #include "coop/coordinator.h"
+#include "coop/coordinate_with.h"
 #include "coop/self.h"
 
+#include "coop/io/accept.h"
 #include "coop/io/connect.h"
 #include "coop/io/descriptor.h"
 #include "coop/io/handle.h"
+#include "coop/io/poll.h"
 #include "coop/io/recv.h"
 #include "coop/io/resolve.h"
 #include "coop/io/send.h"
 #include "coop/io/sendfile.h"
 #include "coop/io/splice.h"
+#include "coop/io/shutdown_on_kill.h"
 
 #include "coop/time/interval.h"
 
@@ -44,6 +49,36 @@ struct SocketPair
     {
         if (fds[0] >= 0) close(fds[0]);
         if (fds[1] >= 0) close(fds[1]);
+    }
+};
+
+struct ListeningSocket
+{
+    int fd{-1};
+
+    ListeningSocket()
+    {
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        assert(fd >= 0);
+
+        int on = 1;
+        int ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        assert(ret == 0);
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+
+        ret = bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+        assert(ret == 0);
+        ret = listen(fd, 8);
+        assert(ret == 0);
+    }
+
+    ~ListeningSocket()
+    {
+        if (fd >= 0) close(fd);
     }
 };
 
@@ -165,6 +200,207 @@ TEST(IoTest, RAIICancelOnDestroy)
     });
 }
 
+TEST(IoTest, AsyncAcceptCanBeKilledWithoutInboundConnection)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ListeningSocket listener;
+        auto* uring = coop::GetUring();
+
+        coop::Coordinator ready;
+        ready.TryAcquire(ctx);
+
+        coop::Context::Handle childHandle;
+        bool killed = false;
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::io::Descriptor desc(coop::io::borrowed, listener.fd, uring);
+            coop::Coordinator coord;
+            coop::io::Handle handle(child, desc, &coord);
+
+            bool ok = coop::io::Accept(handle);
+            ASSERT_TRUE(ok);
+
+            ready.Release(child, false);
+
+            auto result = coop::CoordinateWithKill(child, &coord);
+            killed = result.Killed();
+            if (!result.Killed())
+            {
+                coord.Release(child, false);
+                int acceptedFd = handle.Result();
+                if (acceptedFd >= 0)
+                {
+                    ::close(acceptedFd);
+                }
+            }
+            done = true;
+        }, &childHandle);
+
+        ready.Acquire(ctx);
+        ready.Release(ctx, false);
+
+        childHandle.Kill();
+        while (!done)
+        {
+            ctx->Yield(true);
+        }
+
+        EXPECT_TRUE(killed);
+    });
+}
+
+TEST(IoTest, WaitKillCancelsBlockedRecv)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor reader(sp.fds[0], uring);
+
+        coop::Coordinator ready;
+        ready.TryAcquire(ctx);
+
+        coop::Context::Handle childHandle;
+        int result = 0;
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::Coordinator coord;
+            coop::io::Handle handle(child, reader, &coord);
+
+            char buf[64] = {};
+            bool ok = coop::io::Recv(handle, buf, sizeof(buf));
+            ASSERT_TRUE(ok);
+
+            ready.Release(child, false);
+
+            result = handle.WaitKill();
+            done = true;
+        }, &childHandle);
+
+        ready.Acquire(ctx);
+        ready.Release(ctx, false);
+
+        childHandle.Kill();
+        while (!done)
+        {
+            ctx->Yield(true);
+        }
+
+        EXPECT_EQ(result, -ECANCELED);
+    });
+}
+
+TEST(IoTest, RecvKillReturnsCanceledWithoutInboundData)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::Coordinator ready;
+        ready.TryAcquire(ctx);
+
+        coop::Context::Handle childHandle;
+        int result = 0;
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::io::Descriptor reader(sp.fds[0], uring);
+            char buf[64] = {};
+            ready.Release(child, false);
+            result = coop::io::RecvKill(reader, buf, sizeof(buf));
+            done = true;
+        }, &childHandle);
+
+        ready.Acquire(ctx);
+        ready.Release(ctx, false);
+
+        childHandle.Kill();
+        while (!done)
+        {
+            ctx->Yield(true);
+        }
+
+        EXPECT_EQ(result, -ECANCELED);
+    });
+}
+
+TEST(IoTest, PollKillReturnsCanceledWithoutReadiness)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::Coordinator ready;
+        ready.TryAcquire(ctx);
+
+        coop::Context::Handle childHandle;
+        int result = 0;
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::io::Descriptor reader(sp.fds[0], uring);
+            ready.Release(child, false);
+            result = coop::io::PollKill(reader, POLLIN);
+            done = true;
+        }, &childHandle);
+
+        ready.Acquire(ctx);
+        ready.Release(ctx, false);
+
+        childHandle.Kill();
+        while (!done)
+        {
+            ctx->Yield(true);
+        }
+
+        EXPECT_EQ(result, -ECANCELED);
+    });
+}
+
+TEST(IoTest, ShutdownOnKillGuardWakesBlockingRecv)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::Coordinator ready;
+        ready.TryAcquire(ctx);
+
+        coop::Context::Handle childHandle;
+        int result = 1;
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::io::Descriptor reader(sp.fds[0], uring);
+            coop::io::ShutdownOnKillGuard shutdownGuard(child, reader);
+
+            char buf[64] = {};
+            ready.Release(child, false);
+            result = coop::io::Recv(reader, buf, sizeof(buf));
+            done = true;
+        }, &childHandle);
+
+        ready.Acquire(ctx);
+        ready.Release(ctx, false);
+
+        childHandle.Kill();
+        while (!done)
+        {
+            ctx->Yield(true);
+        }
+
+        EXPECT_LE(result, 0);
+    });
+}
+
 // -------------------------------------------------------------------------------------
 // Sendfile tests
 // -------------------------------------------------------------------------------------
@@ -245,6 +481,77 @@ TEST(IoTest, SendfilePartialOffset)
         int received = coop::io::Recv(reader, buf, sizeof(buf));
         ASSERT_EQ(received, 5);
         EXPECT_EQ(memcmp(buf, "DEFGH", 5), 0);
+    });
+}
+
+TEST(IoTest, SendfileAllKillReturnsCanceledWhenOutputNotWritable)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        fcntl(sp.fds[1], F_SETFL, fcntl(sp.fds[1], F_GETFL) | O_NONBLOCK);
+
+        int sndbuf = 4096;
+        int ret = setsockopt(sp.fds[1], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        ASSERT_EQ(ret, 0);
+
+        char fill[1024];
+        memset(fill, 'x', sizeof(fill));
+        for (;;)
+        {
+            ssize_t n = ::send(sp.fds[1], fill, sizeof(fill), MSG_DONTWAIT);
+            if (n > 0)
+            {
+                continue;
+            }
+
+            ASSERT_EQ(n, -1);
+            ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+            break;
+        }
+
+        char tmpPath[] = "/tmp/coop_sendfile_kill_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+        unlink(tmpPath);
+
+        static constexpr size_t kFileSize = 1 << 20;
+        char fileChunk[4096];
+        memset(fileChunk, 's', sizeof(fileChunk));
+        for (size_t written = 0; written < kFileSize; written += sizeof(fileChunk))
+        {
+            [[maybe_unused]] ssize_t w = ::write(fileFd, fileChunk, sizeof(fileChunk));
+            assert(w == (ssize_t)sizeof(fileChunk));
+        }
+
+        coop::Coordinator ready;
+        ready.TryAcquire(ctx);
+
+        coop::Context::Handle childHandle;
+        int result = 0;
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::io::Descriptor writer(sp.fds[1], uring);
+            ready.Release(child, false);
+            result = coop::io::SendfileAllKill(writer, fileFd, 0, kFileSize);
+            done = true;
+        }, &childHandle);
+
+        ready.Acquire(ctx);
+        ready.Release(ctx, false);
+
+        childHandle.Kill();
+        while (!done)
+        {
+            ctx->Yield(true);
+        }
+
+        ::close(fileFd);
+        EXPECT_EQ(result, -ECANCELED);
     });
 }
 
@@ -329,6 +636,50 @@ TEST(IoTest, SpliceEOF)
 
         close(pipefd[0]);
         close(pipefd[1]);
+    });
+}
+
+TEST(IoTest, SpliceKillReturnsCanceledWhileWaitingForInput)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp, sp2;
+        auto* uring = coop::GetUring();
+        coop::Coordinator ready;
+        ready.TryAcquire(ctx);
+
+        fcntl(sp.fds[0], F_SETFL, fcntl(sp.fds[0], F_GETFL) | O_NONBLOCK);
+        fcntl(sp2.fds[1], F_SETFL, fcntl(sp2.fds[1], F_GETFL) | O_NONBLOCK);
+
+        coop::Context::Handle childHandle;
+        int result = 0;
+        bool done = false;
+
+        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::io::Descriptor in(sp.fds[0], uring);
+            coop::io::Descriptor out(sp2.fds[1], uring);
+            int pipefd[2];
+            ASSERT_EQ(pipe2(pipefd, O_NONBLOCK), 0);
+
+            ready.Release(child, false);
+            result = coop::io::SpliceKill(in, out, pipefd, 65536);
+
+            close(pipefd[0]);
+            close(pipefd[1]);
+            done = true;
+        }, &childHandle);
+
+        ready.Acquire(ctx);
+        ready.Release(ctx, false);
+
+        childHandle.Kill();
+        while (!done)
+        {
+            ctx->Yield(true);
+        }
+
+        EXPECT_EQ(result, -ECANCELED);
     });
 }
 

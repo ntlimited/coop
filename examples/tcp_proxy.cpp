@@ -53,13 +53,15 @@ struct ProxyHandler : coop::Launchable
             return;
         }
 
+        auto* ctx = GetContext();
         spdlog::info("proxy: connected fd={} -> upstream fd={}", m_client.m_fd, upstream.m_fd);
+        coop::io::ShutdownOnKillGuard parentClientShutdown(ctx, m_client);
+        coop::io::ShutdownOnKillGuard parentUpstreamShutdown(ctx, upstream);
 
         // Flag set by the child relay when it exits, so the parent knows to half-close
         //
         bool childDone = false;
 
-        auto* ctx = GetContext();
         coop::Context::Handle childHandle;
 
         auto* upstreamPtr = &upstream;
@@ -71,6 +73,8 @@ struct ProxyHandler : coop::Launchable
         coop::Spawn([=](coop::Context* childCtx)
         {
             childCtx->SetName("ClientToUpstream");
+            coop::io::ShutdownOnKillGuard childClientShutdown(childCtx, *clientPtr);
+            coop::io::ShutdownOnKillGuard childUpstreamShutdown(childCtx, *upstreamPtr);
             int pipefd[2];
             pipe2(pipefd, O_NONBLOCK);
 
@@ -113,6 +117,10 @@ struct ProxyHandler : coop::Launchable
         if (childHandle)
         {
             childHandle.Kill();
+            while (!childDone)
+            {
+                ctx->Yield(true);
+            }
         }
     }
 
@@ -171,7 +179,7 @@ void SpawningTask(coop::Context* ctx, void* arg)
 
         while (!acceptCtx->IsKilled())
         {
-            int fd = coop::io::Accept(desc);
+            int fd = coop::io::AcceptKill(desc);
             if (fd < 0)
             {
                 break;

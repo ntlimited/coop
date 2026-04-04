@@ -13,6 +13,7 @@
 #include "sendfile.h"
 #include "splice.h"
 #include "stream.h"
+#include "shutdown_on_kill.h"
 #include "writev.h"
 
 // coop::io offers a very direct abstraction for blocking i/o and its user facing unit is the

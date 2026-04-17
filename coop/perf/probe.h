@@ -60,7 +60,7 @@
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: jmp %l[__perf_skip]\n"                                                          \
-        ".pushsection coop_perf_sites, \"aw\"\n"                                            \
+        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \
@@ -75,7 +75,7 @@
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: jmp %l[__perf_skip]\n"                                                          \
-        ".pushsection coop_perf_sites, \"aw\"\n"                                            \
+        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \
@@ -92,7 +92,7 @@
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: b %l[__perf_skip]\n"                                                            \
-        ".pushsection coop_perf_sites, \"aw\"\n"                                            \
+        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \
@@ -107,7 +107,7 @@
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: b %l[__perf_skip]\n"                                                            \
-        ".pushsection coop_perf_sites, \"aw\"\n"                                            \
+        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \

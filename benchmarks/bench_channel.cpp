@@ -1,6 +1,7 @@
 #include <benchmark/benchmark.h>
 
 #include <atomic>
+#include <functional>
 #include <thread>
 
 #include "coop/chan/channel.h"

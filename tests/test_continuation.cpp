@@ -88,10 +88,11 @@ TEST(ContinuationTest, VoidContinuation)
     });
 }
 
-// Dropping a continuation that already fired (without awaiting) is safe — the uncollected
-// result is discarded.
+// Firing is deferred to the cooperator loop's drain, so a continuation dropped while still
+// pending (Release enqueued it, but the frame exits before the loop drains it) is cancelled, not
+// fired. The wait-list node is node-based, so the dtor safely unlinks it from the pending queue.
 //
-TEST(ContinuationTest, FiredButNotAwaitedDrops)
+TEST(ContinuationTest, DropWhilePendingCancels)
 {
     test::RunInCooperator([](Context* a)
     {
@@ -100,15 +101,44 @@ TEST(ContinuationTest, FiredButNotAwaitedDrops)
 
         bool ran = false;
         {
-            auto c = coord.Continue([&](Coordinator*)
-            {
-                ran = true;
-                return 99;
-            });
-            // Fire it inline (same context holds and releases), then drop without Await().
-            //
-            coord.Release(a, /*schedule=*/false);
-        }
-        EXPECT_TRUE(ran);
+            auto c = coord.Continue([&](Coordinator*) { ran = true; return 0; });
+            coord.Release(a, /*schedule=*/false);   // enqueues; does not fire synchronously
+        }                                           // dropped while pending -> cancelled
+
+        a->Yield(true);                             // let the loop drain -- nothing should fire
+        EXPECT_FALSE(ran);
+    });
+}
+
+// A coordinator may carry both a continuation and a blocked context. Each Release services the
+// head in FIFO order; a fired continuation leaves the coordinator unheld (no ownership handoff),
+// so the context behind it is serviced on a subsequent acquire/release.
+//
+TEST(ContinuationTest, MixedContextAndContinuationWaiters)
+{
+    test::RunInCooperator([](Context* a)
+    {
+        Coordinator coord;
+        coord.Acquire(a);                                   // a holds it
+
+        bool contRan = false;
+        auto c = coord.Continue([&](Coordinator*) { contRan = true; return 0; });
+
+        bool ctxWoke = false;
+        a->GetCooperator()->Spawn([&](Context* b)
+        {
+            coord.Acquire(b);                               // blocks behind the continuation
+            ctxWoke = true;
+        });
+        a->Yield(true);                                     // let b run and block on coord
+
+        coord.Release(a, /*schedule=*/false);               // fires continuation (head)
+        a->Yield(true);                                     // drain -> continuation runs
+        EXPECT_TRUE(contRan);
+        EXPECT_FALSE(ctxWoke);                              // b still blocked: no handoff
+
+        coord.Acquire(a);                                   // coord was left unheld
+        coord.Release(a, /*schedule=*/true);                // now wake b
+        EXPECT_TRUE(ctxWoke);
     });
 }

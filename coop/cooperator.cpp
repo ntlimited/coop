@@ -387,6 +387,7 @@ void Cooperator::Launch()
 
     while (!m_yielded.IsEmpty() || !m_shutdown.load(detail::kLoadFlag)
                                  || !shutdownKillDone
+                                 || !m_pendingContinuations.IsEmpty()
                                  || m_uring.PendingOps() > 0)
     {
         if (m_hasSubmissions.load(std::memory_order_acquire))
@@ -423,6 +424,11 @@ void Cooperator::Launch()
         if (m_yielded.IsEmpty())
         {
             m_uring.Poll();
+
+            // Fire continuations queued by this poll's CQEs (and any earlier release) before we
+            // consider blocking — they are runnable work, and they may wake contexts.
+            //
+            DrainContinuations();
 
             if (m_hasSubmissions.load(std::memory_order_acquire))
             {
@@ -468,6 +474,12 @@ void Cooperator::Launch()
                     break;
                 }
             }
+
+            // Drain after this iteration's poll/resume (the consistent rule: fire continuations
+            // after every poll). DrainContinuations empties the queue, so a burst still fires
+            // back-to-back; this just keeps latency bounded within a busy resume batch.
+            //
+            DrainContinuations();
         }
     }
 
@@ -572,6 +584,35 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
 
     auto ret = ContextSwitch(&prev->m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
+}
+
+void Cooperator::WakeWaiter(Coordinated* waiter, const bool schedule)
+{
+    waiter->Satisfy();
+
+    // A continuation is queued to fire from the loop drain (no context switch, no current
+    // context required). A context waiter is unblocked as before.
+    //
+    if (waiter->IsContinuation())
+    {
+        m_pendingContinuations.Push(waiter);
+    }
+    else
+    {
+        Unblock(waiter->GetContext(), schedule);
+    }
+}
+
+void Cooperator::DrainContinuations()
+{
+    // Iterative, not recursive: a continuation whose body wakes another continuation pushes it
+    // back onto this queue, which this same loop picks up — so native stack depth stays bounded
+    // no matter how deep the continuation chain is.
+    //
+    while (auto* waiter = m_pendingContinuations.Pop())
+    {
+        waiter->GetContinuation()->Resume();
+    }
 }
 
 void Cooperator::SanityCheck()

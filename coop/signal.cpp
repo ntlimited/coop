@@ -1,6 +1,7 @@
 #include "signal.h"
 
 #include "context.h"
+#include "cooperator.h"
 
 namespace coop
 {
@@ -37,10 +38,12 @@ void Signal::Notify(Context* ctx, bool schedule /* = true */)
     Coordinated::List local;
     local.Steal(m_coord.m_blocking);
 
+    // Route every waiter through the cooperator's shared dispatch so continuation waiters are
+    // honored here too (Notify previously assumed every waiter was a context).
+    //
     while (auto* ord = local.Pop())
     {
-        ord->Satisfy();
-        ctx->Unblock(ord->GetContext(), schedule);
+        Cooperator::thread_cooperator->WakeWaiter(ord, schedule);
     }
 }
 

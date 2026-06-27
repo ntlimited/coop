@@ -19,7 +19,7 @@ struct Signal;
 //
 struct Continuation
 {
-    virtual void Resume(Coordinator*) = 0;
+    virtual void Resume() = 0;
     virtual ~Continuation() = default;
 };
 
@@ -72,6 +72,7 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
     friend struct Coordinator;
     friend struct CoordinatorExtension;
     friend struct Signal;
+    friend struct Cooperator;
 
     static constexpr uintptr_t kContinuationTag = 1;
 

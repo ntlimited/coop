@@ -3,6 +3,7 @@
 #include "coordinator.h"
 
 #include "context.h"
+#include "cooperator.h"
 
 namespace coop
 {
@@ -73,24 +74,20 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
         return;
     }
 
-    // Mark the coordinated instance as having been satisfied by gaining the lock now
-    // that we've popped it from the list
+    // A context waiter takes ownership — the coordinator stays held until it releases. A
+    // continuation does not own anything; the coordinator stays released and the continuation
+    // is queued to run from the cooperator loop's drain.
     //
-    next->Satisfy();
-
-    // A continuation waiter runs to completion here as a function call on the releasing
-    // cooperator — no context switch, no ownership transfer. The coordinator stays released.
-    //
-    if (next->IsContinuation())
+    if (!next->IsContinuation())
     {
-        next->GetContinuation()->Resume(this);
-        return;
+        m_held = true;
     }
 
-    // Hand the coordinator to the next waiter (it stays held) and make that context runnable.
+    // Waking is routed through the cooperator (not the releasing context), so it works whether
+    // Release is driven by a context or by the cooperator loop (e.g. a CQE / a continuation's
+    // latch release). This is the single dispatch every wake site shares.
     //
-    m_held = true;
-    ctx->Unblock(next->GetContext(), schedule);
+    Cooperator::thread_cooperator->WakeWaiter(next, schedule);
 }
 
 void Coordinator::AddAsBlocked(Coordinated* c)

@@ -77,6 +77,16 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
     // that we've popped it from the list
     //
     next->Satisfy();
+
+    // A continuation waiter runs to completion here as a function call on the releasing
+    // cooperator — no context switch, no ownership transfer. The coordinator stays released.
+    //
+    if (next->IsContinuation())
+    {
+        next->GetContinuation()->Resume(this);
+        return;
+    }
+
     m_heldBy = next->GetContext();
 
     ctx->Unblock(m_heldBy, schedule);

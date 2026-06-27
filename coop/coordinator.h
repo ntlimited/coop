@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "detail/embedded_list.h"
 
 namespace coop
@@ -10,22 +12,40 @@ struct Context;
 struct CoordinatorExtension;
 struct Signal;
 
-// Coordinated is the link between a blocked Context and the Coordinator it is waiting on. Each
-// instance sits on a Coordinator's wait list and tracks whether the coordination was satisfied
-// (i.e. the context was granted ownership).
+// Continuation is a stackless, run-to-completion unit that can wait on a Coordinator in place
+// of a blocked Context. When the coordinator is Released, Resume runs as a function call (no
+// context switch) on the releasing cooperator. Continuations are single-cooperator: registered,
+// fired, and cancelled on one cooperator. See continuation.h for the lambda helper.
+//
+struct Continuation
+{
+    virtual void Resume(Coordinator*) = 0;
+    virtual ~Continuation() = default;
+};
+
+// Coordinated is the link between a waiter and the Coordinator it is waiting on. Each instance
+// sits on a Coordinator's wait list and tracks whether the coordination was satisfied. The
+// waiter is either a blocked Context (woken on Release) or a Continuation (Resumed on Release);
+// the two are distinguished by a tag bit in the stored pointer (both are aligned).
 //
 struct Coordinated : EmbeddedListHookups<Coordinated>
 {
     using List = EmbeddedList<Coordinated>;
 
     Coordinated(Context* ctx)
-    : m_context(ctx)
+    : m_waiter(reinterpret_cast<uintptr_t>(ctx))
+    , m_satisfied(false)
+    {
+    }
+
+    Coordinated(Continuation* cont)
+    : m_waiter(reinterpret_cast<uintptr_t>(cont) | kContinuationTag)
     , m_satisfied(false)
     {
     }
 
     Coordinated()
-    : m_context(nullptr)
+    : m_waiter(0)
     , m_satisfied(false)
     {
     }
@@ -43,10 +63,17 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
         return m_satisfied;
     }
 
+    bool IsContinuation() const
+    {
+        return (m_waiter & kContinuationTag) != 0;
+    }
+
   private:
     friend struct Coordinator;
     friend struct CoordinatorExtension;
     friend struct Signal;
+
+    static constexpr uintptr_t kContinuationTag = 1;
 
     void Satisfy()
     {
@@ -60,15 +87,20 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
 
     void SetContext(Context* ctx)
     {
-        m_context = ctx;
+        m_waiter = reinterpret_cast<uintptr_t>(ctx);
     }
 
     Context* GetContext()
     {
-        return m_context;
+        return reinterpret_cast<Context*>(m_waiter & ~kContinuationTag);
     }
 
-    Context*    m_context;
+    Continuation* GetContinuation()
+    {
+        return reinterpret_cast<Continuation*>(m_waiter & ~kContinuationTag);
+    }
+
+    uintptr_t   m_waiter;
     bool        m_satisfied;
 };
 
@@ -115,6 +147,14 @@ struct Coordinator
     // the unblocked context to yield.
     //
     void Release(Context*, const bool schedule = true);
+
+    // Register a stackless continuation to run when this coordinator is next Released, instead
+    // of blocking a context on it. Returns a ContinuationImpl owned by the caller's frame
+    // (constructed in place — guaranteed copy elision); call Await() to block until it fires and
+    // collect its result, or Cancel() to detach it. Defined in continuation.h.
+    //
+    template<typename Fn>
+    auto Continue(Fn&& fn);
 
     // The lack of move and copy semantics make this true
     //

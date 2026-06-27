@@ -189,6 +189,7 @@ add_executable(coop_benchmarks
     benchmarks/bench_channel.cpp
     benchmarks/bench_coordinator.cpp
     benchmarks/bench_continuation.cpp
+    benchmarks/bench_fanout.cpp
     benchmarks/bench_io.cpp
     benchmarks/bench_pthread.cpp
     benchmarks/bench_io_baseline.cpp

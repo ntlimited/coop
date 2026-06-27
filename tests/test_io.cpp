@@ -9,9 +9,11 @@
 
 #include <gtest/gtest.h>
 
+#include "coop/continuation.h"
 #include "coop/coordinator.h"
 #include "coop/coordinate_with.h"
 #include "coop/self.h"
+#include "coop/signal.h"
 
 #include "coop/io/accept.h"
 #include "coop/io/connect.h"
@@ -169,6 +171,81 @@ TEST(IoTest, CancelPendingRecv)
 
         int result = handle.Wait();
         EXPECT_EQ(result, -ECANCELED);
+    });
+}
+
+// A continuation registered on a Handle's coordinator fires straight from the io_uring CQE: the
+// completion runs Finalize -> coord.Release(ctx, false), which drains the continuation as a
+// function call (no extra context). This is the async IO decomposition the continuation work is
+// for -- register the next stage on the completion instead of parking a context to await it.
+//
+TEST(IoTest, ContinuationFiresFromCqe)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor reader(sp.fds[0], uring);
+
+        coop::Coordinator coord;
+        coop::io::Handle handle(ctx, reader, &coord);
+
+        char buf[64] = {};
+        ASSERT_TRUE(coop::io::Recv(handle, buf, sizeof(buf)));
+
+        bool fired = false;
+        auto c = coord.Continue([&](coop::Coordinator*)
+        {
+            fired = true;
+            return handle.Result();
+        });
+
+        // Drive the recv to completion from the peer end.
+        //
+        const char msg[] = "hello";
+        ASSERT_EQ(::write(sp.fds[1], msg, sizeof(msg)), (ssize_t)sizeof(msg));
+
+        // Await parks this context; the loop polls uring, the CQE runs Finalize -> Release ->
+        // the continuation drains and fires -> the completion latch wakes us with the result.
+        //
+        int n = c.Await();
+        EXPECT_TRUE(fired);
+        EXPECT_EQ(n, (int)sizeof(msg));
+        EXPECT_STREQ(buf, "hello");
+    });
+}
+
+// Same path with a detached (self-owning) continuation: it fires from the CQE drain, self-frees,
+// and signals completion. No awaiter is parked on the IO at all -- the high-fan-out shape.
+//
+TEST(IoTest, DetachedContinuationFiresFromCqe)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor reader(sp.fds[0], uring);
+
+        coop::Coordinator coord;
+        coop::io::Handle handle(ctx, reader, &coord);
+
+        char buf[64] = {};
+        ASSERT_TRUE(coop::io::Recv(handle, buf, sizeof(buf)));
+
+        coop::Signal done(ctx);
+        int received = -1;
+        coord.ContinueDetached([&](coop::Coordinator*)
+        {
+            received = handle.Result();
+            done.Notify(nullptr, /*schedule=*/false);   // wake the test from the drain
+        });
+
+        const char msg[] = "world";
+        ASSERT_EQ(::write(sp.fds[1], msg, sizeof(msg)), (ssize_t)sizeof(msg));
+
+        done.Wait(ctx);                                 // until the detached continuation fires
+        EXPECT_EQ(received, (int)sizeof(msg));
+        EXPECT_STREQ(buf, "world");
     });
 }
 

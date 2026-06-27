@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 
 #include "detail/embedded_list.h"
@@ -11,6 +12,17 @@ struct Coordinator;
 struct Context;
 struct CoordinatorExtension;
 struct Signal;
+
+namespace detail
+{
+    // Defined in coordinator.cpp. True when the current thread's cooperator is tearing down. Used
+    // only by the debug leak assert in ~Coordinator, to allow the one accepted case where a
+    // coordinator dies with a non-kill-aware waiter still queued: cooperator teardown deliberately
+    // abandons such waiters (the process is ending). Forward-declared as a free function so this
+    // header need not pull in cooperator.h (which includes it).
+    //
+    bool CooperatorIsShuttingDown();
+}
 
 // Continuation is a stackless, run-to-completion unit that can wait on a Coordinator in place
 // of a blocked Context. When the coordinator is Released, Resume runs as a function call (no
@@ -127,6 +139,19 @@ struct Coordinator
     Coordinator(Context*)
     : m_held(true)
     {
+    }
+
+    // A coordinator destroyed with waiters still queued leaks them: a blocked context, or a
+    // registered continuation, that will now never be serviced. Catch it at the bug site rather
+    // than later, when the orphaned node dangles. The one accepted exception is cooperator
+    // teardown, where a non-kill-aware waiter is deliberately abandoned (the process is ending) —
+    // the shutdown guard permits that. Debug-only: the whole body compiles out under NDEBUG,
+    // leaving a trivial destructor on the hot path.
+    //
+    ~Coordinator()
+    {
+        assert((m_blocking.IsEmpty() || detail::CooperatorIsShuttingDown())
+               && "coordinator destroyed with waiters still queued");
     }
 
     bool IsHeld() const;

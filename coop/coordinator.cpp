@@ -8,6 +8,15 @@
 namespace coop
 {
 
+namespace detail
+{
+bool CooperatorIsShuttingDown()
+{
+    auto* co = Cooperator::thread_cooperator;
+    return co != nullptr && co->IsShuttingDown();
+}
+}
+
 Coordinator::Coordinator()
 : m_held(false)
 {

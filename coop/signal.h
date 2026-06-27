@@ -24,7 +24,7 @@ namespace detail
 //
 // This is the mechanism behind context kill signals. CoordinateWith is the sole consumer of
 // the internal coordinator — it handles cleanup to prevent re-arming after MultiCoordinator's
-// TryAcquire sets m_heldBy.
+// TryAcquire sets the held flag.
 //
 struct Signal
 {
@@ -56,9 +56,9 @@ struct Signal
     Coordinator* AsCoordinator() { return &m_coord; }
 
     // Reset internal coordinator after MultiCoordinator consumes it via TryAcquire. Without this,
-    // TryAcquire re-arms m_heldBy and future uses would deadlock.
+    // TryAcquire re-arms the held flag and future uses would deadlock.
     //
-    void ResetCoordinator() { m_coord.m_heldBy = nullptr; }
+    void ResetCoordinator() { m_coord.m_held = false; }
 
     bool m_signaled;
     Coordinator m_coord;

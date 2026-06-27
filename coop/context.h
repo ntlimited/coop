@@ -136,6 +136,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     friend struct Coordinator;
     friend struct CoordinatorExtension;
     friend struct Signal;
+    friend struct CompletionLatch;
 
     // Enter the block caused by the given coordinator
     //

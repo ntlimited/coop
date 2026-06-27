@@ -177,6 +177,11 @@ struct Coordinator
     void AddAsBlocked(Coordinated*);
     void RemoveAsBlocked(Coordinated*);
 
+    // Out-of-line wake of a popped waiter. Kept off Release's body so the uncontended
+    // (empty wait list) fast path sets up no frame for the wake it never reaches.
+    //
+    void ReleaseToNext(Coordinated* next, const bool schedule);
+
   private:
     bool m_held;
     Coordinated::List m_blocking;

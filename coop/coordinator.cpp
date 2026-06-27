@@ -74,6 +74,11 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
         return;
     }
 
+    ReleaseToNext(next, schedule);
+}
+
+[[gnu::noinline]] void Coordinator::ReleaseToNext(Coordinated* next, const bool schedule)
+{
     // A context waiter takes ownership — the coordinator stays held until it releases. A
     // continuation does not own anything; the coordinator stays released and the continuation
     // is queued to run from the cooperator loop's drain.

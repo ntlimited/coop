@@ -130,4 +130,45 @@ auto Coordinator::Continue(Fn&& fn)
     return ContinuationImpl<std::decay_t<Fn>>(this, std::forward<Fn>(fn));
 }
 
+// Detached (hoisted) continuation: owns itself rather than living on a caller frame, so there is
+// no parked context awaiting it — the high-fan-out win. Registered on a coordinator at creation,
+// it fires once from the loop drain, runs fn to completion, and frees itself. fn is terminal
+// (no result is collected); to continue a pipeline it registers the next detached continuation.
+//
+// Lifetime is owner-managed, exactly like a blocked context: whoever registers it must guarantee
+// it fires or is cancelled before the coordinator dies (for IO, the Handle does this). This first
+// cut heap-allocates per continuation — already far cheaper than a parked stack at fan-out; a
+// per-cooperator pool (single-cooperator, no atomics) is the follow-on.
+//
+template<typename Fn>
+struct DetachedContinuationImpl final : Continuation
+{
+    DetachedContinuationImpl(Coordinator* coord, Fn fn)
+    : m_coordinated(static_cast<Continuation*>(this))
+    , m_coord(coord)
+    , m_fn(std::move(fn))
+    {
+        CoordinatorExtension().AddAsBlocked(coord, &m_coordinated);
+    }
+
+    void Resume() final
+    {
+        m_fn(m_coord);
+        delete this;            // self-free once fired (its node was already popped by the drain)
+    }
+
+  private:
+    Coordinated  m_coordinated;
+    Coordinator* m_coord;
+    Fn           m_fn;
+};
+
+template<typename Fn>
+void Coordinator::ContinueDetached(Fn&& fn)
+{
+    // The continuation owns itself; the runtime frees it when it fires (Resume -> delete this).
+    //
+    new DetachedContinuationImpl<std::decay_t<Fn>>(this, std::forward<Fn>(fn));
+}
+
 } // end namespace coop

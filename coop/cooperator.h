@@ -8,6 +8,7 @@
 #include "detail/embedded_list.h"
 #include "detail/memory_order.h"
 #include "context.h"
+#include "coordinator.h"
 #include "epoch/epoch.h"
 #include "cooperator_configuration.h"
 #include "cooperator_var.h"
@@ -152,6 +153,19 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     void Block(Context* ctx);
 
     void Unblock(Context* ctx, const bool schedule);
+
+    // Shared wake dispatch for a Coordinated waiter, used by every site that wakes one
+    // (Coordinator::Release, Signal::Notify): a continuation waiter is queued to fire from the
+    // loop's drain (DrainContinuations); a context waiter is Unblock'd. Routing all wakes here is
+    // what makes continuations work with any coordinator-backed primitive, not just one.
+    //
+    void WakeWaiter(Coordinated* waiter, const bool schedule);
+
+    // Run all queued continuations to completion as function calls (no context switch). Drained
+    // by the cooperator loop after polling; iterative, so a continuation that queues another is
+    // flattened rather than recursing on the native stack.
+    //
+    void DrainContinuations();
 
     void Shutdown();
 
@@ -309,6 +323,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     Context::AllContextsList    m_contexts;
     Context::ContextStateList   m_yielded;
     Context::ContextStateList   m_blocked;
+    Coordinated::List           m_pendingContinuations;
     Context::ContextStateList   m_zombie;
 
     // Per-cooperator extensible storage for higher layers without

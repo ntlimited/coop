@@ -62,21 +62,23 @@ struct ContinuationImpl final : Continuation
         Cancel();
     }
 
-    void Resume(Coordinator* coord) final
+    void Resume() final
     {
+        // Runs from the cooperator loop's continuation drain — there is no current context, so
+        // m_coord (the coordinator this fired on) is passed to fn, and the latch wake is
+        // context-free (routed through the cooperator, schedule=false).
+        //
         if constexpr (kVoid)
         {
-            m_fn(coord);
+            m_fn(m_coord);
         }
         else
         {
-            new (&m_storage) Stored(m_fn(coord));
+            new (&m_storage) Stored(m_fn(m_coord));
         }
         m_fired = true;
 
-        // Wake the awaiter (if any) without an immediate switch — keep Resume a function call.
-        //
-        m_completed.Release(Self(), /*schedule=*/false);
+        m_completed.Release(nullptr, /*schedule=*/false);
     }
 
     // Detach an unfired continuation from its coordinator so it will never fire. No-op once

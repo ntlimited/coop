@@ -54,13 +54,28 @@
 // x86-64: uses JMP rel8/rel32 (2 or 5 bytes), patched to NOP.
 // aarch64: uses B (4 bytes), patched to NOP. Instruction cache flush required after patching.
 //
+// The probe-site metadata section is SHF_LINK_ORDER ("o") on GCC, tied to the probe text
+// (the asm-goto label %l[__perf_skip]) so entries are ordered with — and dropped alongside —
+// the code they describe under --gc-sections. clang's integrated assembler rejects a
+// temporary/local label as a SHF_LINK_ORDER target, so clang emits a plain (non-link-order)
+// section. The patching engine discovers sites via __start/__stop_coop_perf_sites and reads
+// each entry's stored address, so the only property clang forgoes is the --gc-sections
+// coupling that drops entries for eliminated functions (coop does not build with
+// --gc-sections). Both compilers' sections are internally consistent within a build.
+//
+#if defined(__clang__)
+#define COOP_PERF_SITES_PUSH ".pushsection coop_perf_sites, \"aw\", @progbits\n"
+#else
+#define COOP_PERF_SITES_PUSH ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"
+#endif
+
 #if defined(__x86_64__)
 
 #define COOP_PERF_INC(counters, id) do {                                                    \
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: jmp %l[__perf_skip]\n"                                                          \
-        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
+        COOP_PERF_SITES_PUSH                                                                \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \
@@ -75,7 +90,7 @@
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: jmp %l[__perf_skip]\n"                                                          \
-        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
+        COOP_PERF_SITES_PUSH                                                                \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \
@@ -92,7 +107,7 @@
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: b %l[__perf_skip]\n"                                                            \
-        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
+        COOP_PERF_SITES_PUSH                                                                \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \
@@ -107,7 +122,7 @@
     __label__ __perf_skip;                                                                  \
     asm goto(                                                                               \
         "1: b %l[__perf_skip]\n"                                                            \
-        ".pushsection coop_perf_sites, \"awo\", @progbits, %l[__perf_skip]\n"                   \
+        COOP_PERF_SITES_PUSH                                                                \
         ".balign 16\n"                                                                      \
         ".quad 1b\n"                                                                        \
         ".long %c[cid]\n"                                                                   \

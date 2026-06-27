@@ -19,6 +19,49 @@ namespace detail
     struct Void {};
 }
 
+// Single-waiter, one-shot completion latch. A continuation has at most one awaiter (the context
+// that called Await), so where a Coordinator carries a FIFO wait list this needs only a single
+// slot — no list push/pop, no held/release bookkeeping. Single-cooperator, so no synchronization:
+// Fire (from the loop drain) and Wait (from the awaiter) never overlap. Cheaper than embedding a
+// full Coordinator purely to signal completion.
+//
+struct CompletionLatch
+{
+    bool Fired() const
+    {
+        return m_fired;
+    }
+
+    // Mark complete and wake the parked awaiter, if any. Runs from the cooperator loop's drain
+    // (no current context), so the wake is schedule=false: move the awaiter to yielded.
+    //
+    void Fire()
+    {
+        m_fired = true;
+        if (m_awaiter)
+        {
+            Cooperator::thread_cooperator->Unblock(m_awaiter, /*schedule=*/false);
+            m_awaiter = nullptr;
+        }
+    }
+
+    // Park the calling context until Fire(). Returns immediately if already fired.
+    //
+    void Wait(Context* ctx)
+    {
+        if (m_fired)
+        {
+            return;
+        }
+        m_awaiter = ctx;
+        ctx->Block();
+    }
+
+  private:
+    Context* m_awaiter = nullptr;
+    bool     m_fired = false;
+};
+
 // Lambda-backed continuation. Registered on a Coordinator via Coordinator::Continue; when that
 // coordinator is Released, Resume runs `fn` to completion as a function call (no context switch)
 // on the releasing cooperator. The caller frame owns this object (it carries intrusive wait-list
@@ -37,7 +80,6 @@ struct ContinuationImpl final : Continuation
 
     ContinuationImpl(Coordinator* coord, Fn fn)
     : m_coordinated(static_cast<Continuation*>(this))
-    , m_completed(Self())            // held by the registrant until the continuation fires
     , m_coord(coord)
     , m_fn(std::move(fn))
     {
@@ -52,11 +94,11 @@ struct ContinuationImpl final : Continuation
 
     ~ContinuationImpl() final
     {
-        if (m_completed.TryAcquire(Self()))   // latch released ⇒ already fired ⇒ drop the result
+        if (m_latch.Fired())                  // already fired ⇒ drop the (uncollected) result
         {
             if constexpr (!kVoid)
             {
-                if (m_fired) Stored_ptr()->~Stored();
+                Stored_ptr()->~Stored();
             }
             return;
         }
@@ -67,7 +109,7 @@ struct ContinuationImpl final : Continuation
     {
         // Runs from the cooperator loop's continuation drain — there is no current context, so
         // m_coord (the coordinator this fired on) is passed to fn, and the latch wake is
-        // context-free (routed through the cooperator, schedule=false).
+        // context-free (Fire routes through the cooperator, schedule=false).
         //
         if constexpr (kVoid)
         {
@@ -77,9 +119,8 @@ struct ContinuationImpl final : Continuation
         {
             new (&m_storage) Stored(m_fn(m_coord));
         }
-        m_fired = true;
 
-        m_completed.Release(nullptr, /*schedule=*/false);
+        m_latch.Fire();
     }
 
     // Detach an unfired continuation from its coordinator so it will never fire. No-op once
@@ -87,7 +128,7 @@ struct ContinuationImpl final : Continuation
     //
     bool Cancel()
     {
-        if (m_fired || m_cancelled)
+        if (m_latch.Fired() || m_cancelled)
         {
             return false;
         }
@@ -100,7 +141,7 @@ struct ContinuationImpl final : Continuation
     //
     Result Await()
     {
-        m_completed.Flash(Self());
+        m_latch.Wait(Self());
         if constexpr (!kVoid)
         {
             return std::move(*Stored_ptr());
@@ -114,10 +155,9 @@ struct ContinuationImpl final : Continuation
     }
 
     Coordinated     m_coordinated;
-    Coordinator     m_completed;
+    CompletionLatch m_latch;
     Coordinator*    m_coord;
     Fn              m_fn;
-    bool            m_fired = false;
     bool            m_cancelled = false;
     alignas(Stored) unsigned char m_storage[sizeof(Stored)];
 };

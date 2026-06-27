@@ -27,6 +27,14 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG        v1.15.0
 )
+# spdlog's bundled fmt does not compile under clang's stricter consteval checking
+# (clang-21). Switch spdlog to std::format on clang, which clang ships. GCC keeps the
+# bundled fmt (GCC 11 has no std::format). coop's log call sites use only std::format-
+# compatible specifiers ({}, {:x}, {:p} on void*).
+#
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(SPDLOG_USE_STD_FORMAT ON CACHE BOOL "clang: use std::format instead of bundled fmt" FORCE)
+endif()
 FetchContent_MakeAvailable(spdlog)
 
 # coop/chan — channel toolkit (compiled separately, folded into libcoop.a)
@@ -71,7 +79,8 @@ endif()
 
 # Performance counter mode: 0=disabled, 1=always-on, 2=dynamic (NOP/JMP patching)
 # Default: always-on in debug (useful diagnostics, negligible cost), dynamic in release
-# (zero overhead when off, togglable at runtime for observability).
+# (zero overhead when off, togglable at runtime for observability). Both GCC and clang
+# support all modes (see the compiler-conditional probe asm in coop/perf/probe.h).
 #
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(COOP_PERF_MODE "1" CACHE STRING "Performance counter mode: 0=disabled, 1=always-on, 2=dynamic")

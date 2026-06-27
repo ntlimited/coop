@@ -1,3 +1,5 @@
+#include <memory>
+
 #include <gtest/gtest.h>
 
 #include "coop/continuation.h"
@@ -140,5 +142,53 @@ TEST(ContinuationTest, MixedContextAndContinuationWaiters)
         coord.Acquire(a);                                   // coord was left unheld
         coord.Release(a, /*schedule=*/true);                // now wake b
         EXPECT_TRUE(ctxWoke);
+    });
+}
+
+// A detached continuation owns itself: it fires once from the loop drain and frees itself (no
+// awaiter, no parked context). The captured shared_ptr's use-count returning to 1 proves the
+// continuation object (which held a copy of fn) was deleted.
+//
+TEST(ContinuationTest, DetachedFiresAndFrees)
+{
+    test::RunInCooperator([](Context* a)
+    {
+        Coordinator coord;
+        coord.Acquire(a);
+
+        auto token = std::make_shared<int>(0);
+        coord.ContinueDetached([token](Coordinator*) { *token = 42; });
+        EXPECT_EQ(token.use_count(), 2);    // the detached continuation holds a copy of fn
+
+        coord.Release(a, /*schedule=*/false);
+        a->Yield(true);                     // drain -> fire -> delete this
+
+        EXPECT_EQ(*token, 42);
+        EXPECT_EQ(token.use_count(), 1);    // continuation freed itself
+    });
+}
+
+// A detached pipeline: stage 1 registers and releases stage 2; the loop's iterative drain runs
+// both with no parked context anywhere.
+//
+TEST(ContinuationTest, DetachedChain)
+{
+    test::RunInCooperator([](Context* a)
+    {
+        Coordinator c1, c2;
+        c1.Acquire(a);
+        c2.Acquire(a);
+
+        int stage = 0;
+        c1.ContinueDetached([&](Coordinator*)
+        {
+            stage = 1;
+            c2.ContinueDetached([&](Coordinator*) { stage = 2; });
+            c2.Release(nullptr, /*schedule=*/false);   // enqueue stage 2; the drain loop fires it
+        });
+
+        c1.Release(a, /*schedule=*/false);
+        a->Yield(true);
+        EXPECT_EQ(stage, 2);
     });
 }

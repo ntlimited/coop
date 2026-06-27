@@ -163,6 +163,13 @@ struct Coordinator
     template<typename Fn>
     auto Continue(Fn&& fn);
 
+    // Register a self-owning (detached) continuation: no awaiter, no parked context. It fires
+    // once from the loop drain and frees itself; fn is terminal. Lifetime is owner-managed (fire
+    // or cancel before the coordinator dies). Defined in continuation.h.
+    //
+    template<typename Fn>
+    void ContinueDetached(Fn&& fn);
+
     // The lack of move and copy semantics make this true
     //
     bool operator==(Coordinator* other) const

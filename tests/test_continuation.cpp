@@ -195,18 +195,23 @@ TEST(ContinuationTest, DetachedChain)
 
 #ifndef NDEBUG
 // Red calibration for the ~Coordinator leak assert (the green case is
-// ShutdownTest.ShutdownWithBlockedContexts, where a waiter at teardown is tolerated). Outside
-// shutdown, destroying a coordinator with a waiter still queued — here a detached continuation
-// that is never fired or cancelled — trips the debug assert. No cooperator is running, so the
-// shutdown guard is false and the assert fires.
+// ShutdownTest.ShutdownWithBlockedContexts, where a waiter at teardown is tolerated). On a live,
+// not-shutting-down cooperator, destroying a coordinator with a waiter still queued — here a
+// detached continuation that is never fired or cancelled — trips the debug assert. The cooperator
+// must be running so the shutdown guard reads false and the pooled allocation has a thread to bind.
 //
 TEST(ContinuationDeathTest, LeakedWaiterTripsAssert)
 {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     EXPECT_DEATH(
         {
-            Coordinator coord;
-            coord.ContinueDetached([](Coordinator*) {});
+            coop::Cooperator co;
+            coop::Thread t(&co);
+            co.SubmitSync([](coop::Context*)
+            {
+                Coordinator coord;
+                coord.ContinueDetached([](Coordinator*) {});
+            });                              // coord destructs while live -> assert fires
         },
         "waiters still queued");
 }

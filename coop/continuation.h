@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "coordinator.h"
+#include "cooperator.h"
 #include "detail/coordinator_extension.h"
 #include "self.h"
 
@@ -143,6 +144,20 @@ auto Coordinator::Continue(Fn&& fn)
 template<typename Fn>
 struct DetachedContinuationImpl final : Continuation
 {
+    // Allocated from the owning cooperator's per-thread continuation pool rather than the general
+    // heap. DetachedContinuationImpl is final, so `delete this` in Resume sees the static type and
+    // calls the sized operator delete — the pool needs the size to pick the right class.
+    //
+    static void* operator new(std::size_t n)
+    {
+        return Cooperator::thread_cooperator->AllocateContinuation(n);
+    }
+
+    static void operator delete(void* p, std::size_t n)
+    {
+        Cooperator::thread_cooperator->FreeContinuation(p, n);
+    }
+
     DetachedContinuationImpl(Coordinator* coord, Fn fn)
     : m_coordinated(static_cast<Continuation*>(this))
     , m_coord(coord)

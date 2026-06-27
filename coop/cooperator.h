@@ -8,6 +8,7 @@
 #include "detail/embedded_list.h"
 #include "detail/memory_order.h"
 #include "context.h"
+#include "continuation_pool.h"
 #include "coordinator.h"
 #include "epoch/epoch.h"
 #include "cooperator_configuration.h"
@@ -167,6 +168,20 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     //
     void DrainContinuations();
 
+    // Backing store for detached continuations (Coordinator::ContinueDetached). Allocated, fired,
+    // and freed on this cooperator's thread, so the pool needs no synchronization. Routed through
+    // DetachedContinuationImpl's operator new/delete.
+    //
+    void* AllocateContinuation(size_t n)
+    {
+        return m_continuationPool.Allocate(n);
+    }
+
+    void FreeContinuation(void* p, size_t n)
+    {
+        m_continuationPool.Free(p, n);
+    }
+
     void Shutdown();
 
     static void ShutdownAll();
@@ -324,6 +339,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     Context::ContextStateList   m_yielded;
     Context::ContextStateList   m_blocked;
     Coordinated::List           m_pendingContinuations;
+    ContinuationPool            m_continuationPool;
     Context::ContextStateList   m_zombie;
 
     // Per-cooperator extensible storage for higher layers without

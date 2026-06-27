@@ -25,11 +25,6 @@ struct CoordinatorExtension
         c->RemoveAsBlocked(ord);
     }
 
-    bool HeldBy(Coordinator* c, Context* ctx)
-    {
-        return c->HeldBy(ctx);
-    }
-
     void SetContext(Coordinated* c, Context* ctx)
     {
         c->SetContext(ctx);

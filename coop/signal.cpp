@@ -28,7 +28,7 @@ void Signal::Wait(Context* ctx)
 void Signal::Notify(Context* ctx, bool schedule /* = true */)
 {
     m_signaled = true;
-    m_coord.m_heldBy = nullptr;
+    m_coord.m_held = false;
 
     // Steal the blocking list into a local before unblocking anyone. When schedule=true,
     // Unblock context-switches to the waiter immediately; if that waiter exits, the context

@@ -119,10 +119,12 @@ struct Coordinator
     //
     Coordinator();
 
-    // Start out held
+    // Start out held. The context argument is vestigial — a coordinator tracks only whether it
+    // is held, not by whom; ownership (for a mutex, deadlock detection, etc.) belongs to a type
+    // layered on top, not the base coordination primitive.
     //
-    Coordinator(Context* ctx)
-    : m_heldBy(ctx)
+    Coordinator(Context*)
+    : m_held(true)
     {
     }
 
@@ -132,7 +134,11 @@ struct Coordinator
     // analogue. For multi-coordinator and timeout behaviors, see the CoordinateWith functionality
     // in coordinate_with.h.
     //
-    bool TryAcquire(Context*);
+    // TryAcquire takes no owner — it only marks the coordinator held — so it is callable from a
+    // continuation (which has no context). Acquire still takes the calling context because it may
+    // need to block it.
+    //
+    bool TryAcquire(Context* = nullptr);
 
     void Acquire(Context*);
 
@@ -169,10 +175,9 @@ struct Coordinator
 
     void AddAsBlocked(Coordinated*);
     void RemoveAsBlocked(Coordinated*);
-    bool HeldBy(Context* ctx);
 
   private:
-    Context* m_heldBy;
+    bool m_held;
     Coordinated::List m_blocking;
 };
 

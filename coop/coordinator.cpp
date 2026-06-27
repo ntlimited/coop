@@ -8,20 +8,20 @@ namespace coop
 {
 
 Coordinator::Coordinator()
-: m_heldBy(nullptr)
+: m_held(false)
 {
 }
 
 bool Coordinator::IsHeld() const
 {
-    return m_heldBy != nullptr;
+    return m_held;
 }
 
-bool Coordinator::TryAcquire(Context* ctx)
+bool Coordinator::TryAcquire(Context*)
 {
-    if (m_heldBy == nullptr)
+    if (!m_held)
     {
-        m_heldBy = ctx;
+        m_held = true;
         return true;
     }
 
@@ -30,9 +30,9 @@ bool Coordinator::TryAcquire(Context* ctx)
 
 void Coordinator::Acquire(Context* ctx)
 {
-    if (m_heldBy == nullptr)
+    if (!m_held)
     {
-        m_heldBy = ctx;
+        m_held = true;
         return;
     }
 
@@ -46,7 +46,7 @@ void Coordinator::Acquire(Context* ctx)
 
 void Coordinator::Flash(Context* ctx)
 {
-    if (!m_heldBy)
+    if (!m_held)
     {
         return;
     }
@@ -57,13 +57,13 @@ void Coordinator::Flash(Context* ctx)
 void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
 {
     // Allow no-op release when the coordinator is not held. This supports Signal::Notify which
-    // clears m_heldBy before MultiCoordinator cleanup can call Release.
+    // clears m_held before MultiCoordinator cleanup can call Release.
     //
-    if (!m_heldBy)
+    if (!m_held)
     {
         return;
     }
-    m_heldBy = nullptr;
+    m_held = false;
 
     // Pass control to the next in line blocked on the coordinator, if it exists.
     //
@@ -87,9 +87,10 @@ void Coordinator::Release(Context* ctx, const bool schedule /* = true */)
         return;
     }
 
-    m_heldBy = next->GetContext();
-
-    ctx->Unblock(m_heldBy, schedule);
+    // Hand the coordinator to the next waiter (it stays held) and make that context runnable.
+    //
+    m_held = true;
+    ctx->Unblock(next->GetContext(), schedule);
 }
 
 void Coordinator::AddAsBlocked(Coordinated* c)
@@ -101,11 +102,6 @@ void Coordinator::AddAsBlocked(Coordinated* c)
 void Coordinator::RemoveAsBlocked(Coordinated* c)
 {
     m_blocking.Remove(c);
-}
-
-bool Coordinator::HeldBy(Context* ctx)
-{
-    return m_heldBy == ctx;
 }
 
 } // end namespace coop

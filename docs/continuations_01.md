@@ -40,42 +40,51 @@ themselves.
 
 ## Continuations (the in-cooperator species)
 
-A Continuation waits on a `Coordinator` in place of a blocked `Context` — the wait-list node carries
-either a `Context*` or a `Continuation*`, distinguished by a tag bit. When the coordinator is
-Released, instead of waking a context (a full context switch), the continuation **Runs as a function
-call** on the releasing cooperator. "Migrate the closure, not the stack."
+A continuation waits on a `Coordinator` in place of a blocked `Context`. When the coordinator is
+released, instead of waking a parked context — a full context switch — the continuation **runs as a
+function call** on the cooperator that did the release. The slogan: migrate the closure, not the
+stack.
 
-**Loop-drained dispatch.** Firing is not inline at `Release`; the continuation is enqueued to a
-per-cooperator pending list that the scheduler drains after every io_uring poll. Draining to empty
-iteratively bounds native stack depth no matter how deep a continuation chain runs, batches bursts
-for icache locality, and — crucially — makes firing **context-free**, which is what lets a
-continuation fire straight from an io_uring CQE: `Handle::Finalize` already does
-`coord.Release(ctx, false)`, so a continuation registered on an IO handle's coordinator fires from
-the completion with zero added plumbing.
+The case this is built for is an **IO completion.** A pipeline stage's natural shape is "do a little
+work, issue an async operation, continue when it finishes." In a stackful world, "continue when it
+finishes" means a context is parked on that operation and woken — a context switch per stage and a
+16 KB stack held idle for the whole wait. We would rather the completion *itself* run the next stage,
+directly, as a callback: no parked stack, no switch. That is exactly what a continuation registered
+on the operation's coordinator does, and because coop's IO already signals completion by releasing
+that coordinator, the next stage fires straight off the io_uring completion with nothing added to the
+IO path. This is the reason continuations exist; everything below serves it.
+
+For a completion to run the next stage safely, firing must happen with **no current context** — a
+completion is handled by the cooperator's scheduler loop, not by any running context. So firing is
+not inline at `release`: the continuation is enqueued onto a per-cooperator pending list that the
+loop drains after it polls io_uring. That context-free drain is the load-bearing property. Draining
+iteratively to empty also bounds native stack depth no matter how long a continuation chain runs, and
+batches a burst of completions for instruction-cache locality — both fall out for free.
 
 **Two flavors, one spectrum:**
 
-- **Structured** (`coord.Continue(fn)`) — frame-hosted via guaranteed copy elision (zero heap),
-  with a single-waiter completion latch so the registrant can `Await()` a typed result in place. It
-  is RAII-safe: unfired ⇒ cancelled on scope exit, so it cannot leak. Keeps **one** parked context
-  (the awaiter) per in-flight pipeline.
-- **Detached** (`coord.ContinueDetached(fn)`) — pooled, self-freeing, no awaiter and **no parked
-  context**. `fn` is terminal; a pipeline continues by registering the next detached continuation.
-  This is the high-fan-out form.
+- **Structured** (`coord.Continue(fn)`) — frame-hosted via guaranteed copy elision (no heap), with a
+  single-waiter completion latch so the code that registered it can `Await()` a typed result in
+  place. RAII-safe: if it never fires it is cancelled on scope exit, so it cannot leak. Costs one
+  parked context — the awaiter — per in-flight pipeline.
+- **Detached** (`coord.ContinueDetached(fn)`) — pooled, self-freeing, with no awaiter and **no parked
+  context at all**. `fn` is terminal; a pipeline continues by registering the next detached
+  continuation. This is the high-fan-out form.
 
-**The completion latch.** A structured continuation has at most one awaiter, so signalling it does
-not need a full `Coordinator` (FIFO wait list, held/release bookkeeping). It uses a slim
-single-slot latch — a parked-context pointer plus a fired bit — which brought structured dispatch
-down to match the detached form (~8 ns) while keeping zero-alloc, RAII, and a returned result.
+**The completion latch.** A structured continuation has at most one awaiter, so the thing that signals
+"done" to that awaiter does not need a full `Coordinator` — no FIFO wait list, no held/release
+bookkeeping. It is a single slot: a parked-context pointer and a fired bit. That is why structured
+dispatch is as cheap as the detached form (~8 ns) without giving up the zero-heap, RAII, or returned
+result.
 
-**Allocation.** Detached continuations are backed by a per-cooperator free-list pool. Because they
-are single-cooperator (allocated, fired, and freed on one cooperator's thread), the pool needs no
-atomics; it eliminated the per-fire `malloc`/`free`.
+**Allocation.** Detached continuations come from a per-cooperator free-list. Because a continuation is
+allocated, fired, and freed on a single cooperator's thread, that pool needs no atomics and no
+`malloc` on the firing path.
 
-**Lifetime.** A continuation's lifetime is owner-managed, exactly like a blocked context: whoever
-registers it guarantees it fires or is cancelled before the coordinator dies (for IO, the Handle's
-fire-or-cancel teardown does this). A debug-only assert at coordinator destruction catches a leaked
-waiter at the bug site.
+**Lifetime.** A continuation is owner-managed, exactly like a blocked context: whoever registers it is
+responsible for it firing or being cancelled before the coordinator it waits on is destroyed (for IO,
+the Handle's teardown cancels in-flight work). A debug-only assert at coordinator destruction catches
+a leaked waiter at the bug site.
 
 ## Work-sharing (the cross-core species)
 
@@ -138,10 +147,17 @@ different starting point does well, and we took plenty (cross-thread allocator t
 sleep ideas, an escape hatch for blocking third-party code).
 
 With that said: on a *synthetic micro-benchmark* of irregular, IO-suspending, multi-core work, coop
-went from being outperformed to outperforming by a meaningful margin — and we believe the gap is
-**structural**, a consequence of the tradeoffs any runtime must make to support stackful work
-migration. The measured clustered makespan (6 cores, lower is better; 35 ms is the perfect-balance
-floor):
+came out ahead of the stackful model — and the *why* matters more than the margin, because it is not
+the flashy kind of result. We did not stumble onto a green-threading trick that suddenly beats other
+libraries. We followed coop's architecture to its logical conclusion, and that architecture happens
+to give a graceful **performance-for-complexity gradient**: stackful contexts for as long as their
+control flow is worth the cost, and — once you reach the point where even a cheap context switch is
+too much and you need a unit's dispatch down toward tens of nanoseconds — the stackless path as the
+*next step on the same road*, not a different library or a rewrite. A runtime that commits every unit
+to the stackful price (a stack each, ~1 µs to dispatch) has no cheap end of that gradient to step
+onto; walking ours far enough is what comes out ahead. The number below is a consequence of that
+gradient, not a margin we engineered for. The measured clustered makespan (6 cores, lower is better;
+35 ms is the perfect-balance floor):
 
 | approach | clustered makespan | of floor |
 |----------|--------------------|----------|

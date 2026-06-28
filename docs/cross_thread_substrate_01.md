@@ -6,8 +6,7 @@ in-tree against the covenants and calibration here.
 
 ## Where we are
 
-Single-cooperator continuations are done and proven end-to-end (see the continuation
-commit arc `032bd11..87fa7ea`):
+Single-cooperator continuations are done and proven end-to-end (see `continuations_01.md`):
 
 - Structured (frame-hosted, awaited) and detached (pooled, self-owning) continuations,
   ~8ns dispatch either way.

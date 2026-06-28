@@ -7,6 +7,7 @@
 
 #include "coop/cooperator.h"
 #include "coop/cooperator.hpp"
+#include "coop/coordinator.h"
 #include "coop/self.h"
 #include "coop/time/interval.h"
 #include "detail/shards.h"
@@ -19,13 +20,28 @@ namespace work
 
 class Grid;
 
-// What a cooperator's Cooperator::m_participation points to once it has joined a Grid: the grid and
-// this cooperator's shard index. Owned by the Grid (one per joined cooperator).
+// What a cooperator's Cooperator::m_participation points to once it has joined a Grid: the grid,
+// this cooperator's shard index, and the doorbell its own idle stealer parks on. Owned by the Grid
+// (one per joined cooperator).
+//
+// The doorbell exists because the only consumer of a shard is its own stealer, and that stealer
+// parks on an io_uring timer when idle. Without a wake, a cooperator that sheds locally and then
+// goes idle would not drain its own freshly-shed work until its stealer's next timer tick -- up to
+// the backed-off recheck cap. The doorbell closes that hole: a local Shed releases it, and because
+// the shedder and the stealer run on the same cooperator (same thread), the wake is a plain
+// same-thread Coordinator release with no atomics and no cross-thread signal.
+//
+// Held-state convention: the stealer "owns" the doorbell whenever it is not parked on it. Idle, it
+// blocks trying to re-acquire; a local Shed releases it to hand ownership back, waking the stealer.
+// A Shed that lands while the stealer is busy (not parked) simply leaves the doorbell released, so
+// the stealer's next idle pre-check picks it up without sleeping and re-takes ownership -- the
+// doorbell is a single-bit "work may be local, do not sleep" latch, not a count.
 //
 struct Participation
 {
-    Grid* grid  = nullptr;
-    int   shard = -1;
+    Grid*       grid  = nullptr;
+    int         shard = -1;
+    Coordinator doorbell;
 };
 
 // A Grid is the work-sharing domain: a set of cooperators that balance Ergs among themselves by
@@ -110,6 +126,14 @@ inline void Shed(Fn&& fn)
     if (work::Participation* p = co->m_participation)
     {
         p->grid->ShedErg(p->shard, work::MakeErg(std::forward<Fn>(fn)));
+
+        // Ring the doorbell so an idle local stealer drains this Erg on the next scheduler pass
+        // instead of waiting out its backed-off recheck timer. schedule=false: do not switch to
+        // the stealer mid-shed -- keep running so a burst of sheds stays on this context and the
+        // stealer picks the work up once we yield. Same cooperator, so this is an atomic-free
+        // same-thread release; the Context* argument is unused by Release.
+        //
+        p->doorbell.Release(Self(), /*schedule=*/false);
     }
     else
     {

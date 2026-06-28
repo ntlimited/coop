@@ -246,9 +246,48 @@ coast to the cap: that pickup waits up to ~`recheckMax`, then the successful ste
 back to aggressive. `10→200µs` is the recommended default — an order-of-magnitude cut in idle
 wakeups for a sub-percent makespan cost and a ~100µs worst-case cold pickup.
 
-This is the measured gate for the cross-thread steal-wake (#2). Backoff alone holds the sustained
-clustered tail with no wake protocol, so #2 is **not** needed for throughput/makespan workloads. The
-one case it does not cover is cold-pickup latency: a workload that is latency-sensitive *and* bursty
-after idle pays up to `recheckMax` on the first unit of a burst. That — and only that — is the
-measured case that justifies the ~2.3µs `MSG_RING` steal-wake, which would replace the cold-pickup
-wait with the OS thread-wake floor. Absent that requirement, the cap is the cheaper instrument.
+Cold pickup, though, is two different events wearing one name, and the cap only governs one of them.
+A backed-off stealer can have work appear in two ways: a **peer** sheds and this idle core must
+steal it, or **this same core** sheds onto its own shard and then idles. The second case needs no
+cross-thread anything — the shedder and the consumer are the same cooperator — and is closed
+directly by the local-shed self-wake below. What remains genuinely bounded by `recheckMax` is only
+the cross-cooperator case: an idle peer waking to steal. That — and only that — is the measured case
+that justifies the ~2.3µs `MSG_RING` cross-thread steal-wake (#2), which would replace the
+cross-cooperator cold-pickup wait with the OS thread-wake floor. Absent that requirement, the cap is
+the cheaper instrument for the cross-cooperator path.
+
+## Local-shed self-wake — the doorbell (Slice 3 completion)
+
+Adaptive backoff buys idle-wakeup savings with cold-pickup latency, and that bargain has a sharp
+edge for a workload that sheds onto its **own** cooperator and then goes idle. The only consumer of
+a shard is that shard's own stealer; when the stealer has parked on a backed-off timer, freshly shed
+local work sits in the deque until the timer fires — up to `recheckMax`. Pushing the cap higher to
+save more idle wakeups makes this strictly worse. The work and its consumer are on the same thread,
+so paying a steal-timer's latency to connect them is pure waste.
+
+The doorbell removes that wait. Each `Participation` carries a stable `Coordinator`; the idle stealer
+parks on it alongside the recheck timer (`CoordinateWithKill(doorbell, recheckTimer)`), and a local
+`Shed` releases it after pushing to the shard. Shedder and stealer are the same cooperator, so the
+release is a plain same-thread `Coordinator::Release` — no atomics, no `MSG_RING`, no cross-thread
+protocol, and nothing on the non-participant path (the release lives inside the `Shed` participation
+branch, so a cooperator that never joined a Grid is byte-for-byte unchanged). The doorbell is a
+single-bit latch, not a count: the stealer "owns" it whenever it is not parked, a `Shed` that lands
+while the stealer is busy simply leaves it released, and the stealer's next idle pre-check
+(`TryAcquire`) consumes that with one non-sleeping re-check rather than a spin. On a doorbell win the
+recheck timer is still in flight; the `io::Handle` destructor cancels and drains it.
+
+Measured on a single-cooperator grid (so the local stealer is the only possible consumer), shedding
+one Erg after the stealer has coasted to the `200µs` cap, 300 samples:
+
+| policy | local-shed-then-idle pickup (mean / p50 / max) | idle wakeups/s/core | clustered makespan (M=4, median) |
+|--------|----------------------------------------------:|--------------------:|---------------------------------:|
+| adaptive backoff, no doorbell | 174 µs / 177 µs / 203 µs | ~2.4k | ~1.15 ms |
+| adaptive backoff + doorbell   | **3.1 µs / 3.1 µs / 5.6 µs** | ~2.4k | ~1.15 ms |
+
+Local pickup drops from "wait out the backed-off timer" to one scheduler pass — a ~57× cut in the
+mean and, more to the point, a worst case (5.6µs) below what the *floor* `recheckMin` of 10µs could
+ever deliver. The other two axes are unmoved: idle wakeups are identical because the doorbell fires
+only on real local sheds (an idle grid sheds nothing), and clustered makespan is within noise
+(if anything tighter, because the burst's local shard drains promptly instead of stalling on a
+timer). Because local pickup no longer rides on `recheckMax`, the cap is now free to be pushed higher
+purely on the idle-wakeup/cross-cooperator-latency trade — the local hole it used to open is closed.

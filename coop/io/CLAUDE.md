@@ -192,3 +192,28 @@ The TCP proxy uses this for bidirectional relay — data moves between client an
 entirely in-kernel without entering userspace. The example now pairs plain `Splice` with
 `ShutdownOnKillGuard` to keep the hot relay loop on the cheap blocking path while still waking
 promptly on kill.
+
+## Buffer ring + multishot recv (`buffer_ring.h`, `armed_handle.{h,cpp}`)
+
+Opt-in. Classic recv is caller-owned: every recv pins a userspace buffer at submit time, so an armed
+keep-alive connection holds a recv buffer for its whole life even while idle. A provided buffer ring
+(`IORING_REGISTER_PBUF_RING`, 5.19+) inverts that — the kernel draws a buffer from a shared pool only
+when bytes land, so resident recv memory tracks in-flight depth, not connection count.
+
+- `BufferRing` registers/seeds a pbuf ring, decodes the kernel-selected buffer id from a recv CQE,
+  and batches buffer recycle (`Return` + `Publish`).
+- `ArmedHandle` is the multishot-aware sibling of `io::Handle` (a separate type because multishot
+  breaks Handle's one-shot count-to-zero release invariant, which the sacred destructor drain
+  depends on). It holds its coordinator across the whole CQE stream, surfaces one chunk per CQE to a
+  blocking `Next()` consumer, recycles buffers, re-arms on benign `!F_MORE`, and surfaces `-ENOBUFS`.
+  Its per-connection chunk queue is allocated lazily on the first delivered byte (idle connections
+  cost O(1), not O(pool)).
+- `Uring::Init` registers an optional default ring when `UringConfiguration::bufferRingEntries > 0`,
+  reachable via `GetBufferRing()`; the registration is the runtime feature probe (absent support →
+  warn + classic recv).
+
+Armed CQE callbacks must NOT call `io_uring_cqe_seen` — `Uring::Poll` owns the single batched
+`io_uring_cq_advance`. `Handle::Callback` routes armed-tagged userdata (bit 1) to
+`ArmedHandle::Dispatch`. See `docs/buffer_ring_multishot_01.md` for the design, the measured
+throughput/memory A/B (`benchmarks/bench_buffer_ring_throughput.cpp`), covenants, and the push/pull
+impedance with coop's pull consumers.

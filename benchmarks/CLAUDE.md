@@ -59,6 +59,21 @@ Filter: `--filter='BM_IO_'`
 | `BM_IO_Accept` / `BM_IO_Connect` | Connection establishment |
 | `BM_IO_Recv` / `BM_IO_Send` | Message throughput (async + blocking) |
 | `BM_IO_Read` / `BM_IO_ReadFile` | File I/O |
+### Work-sharing / FanOut
+Filter: `--filter='BM_FanOut_'`
+
+| Benchmark | Measures |
+|-----------|----------|
+| `BM_FanOut_AdvanceStage_Detached` / `_Context` | Per-stage advance unit cost: detached continuation vs parked context |
+| `BM_FanOut_Pool_Grid` | Clustered-imbalance makespan through `work::Grid` (work-stealing) |
+| `BM_FanOut_Pool_StaticShard` | Same workload, static shared-nothing baseline (no stealing) |
+
+`BM_FanOut_Pool` spawns one cooperator per core and times an end-to-end makespan, so it must run
+warm. Each cooperator wants a dedicated physical core; on a shared host set `POOL_PINCORES` to a
+clean cpu list (or `POOL_PINCORES=none` to leave placement to the scheduler) and wrap with
+`taskset` to dodge cores other tenants hold. `POOL_DEBUG=1` prints per-shard run counts and stealer
+park/pull totals to confirm balancing.
+
 ### HTTP
 Filter: `--filter='BM_HTTP_'`
 

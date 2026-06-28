@@ -58,6 +58,17 @@ struct Uring
     //
     int Poll();
 
+    // Process already-materialized CQEs without entering the kernel — no io_uring_submit and
+    // no get_events. The scheduler calls this between resumes within a batch so that SQEs armed
+    // by successive resumes accumulate into a single submit at the batch boundary, rather than
+    // one io_uring_enter per resume.
+    //
+    // Under COOP_TASKRUN completions only surface on an io_uring_enter, so mid-batch this only
+    // dispatches what a prior submit already delivered; the batch-boundary Poll() is what flushes
+    // the accumulated SQEs and harvests their task_work. Returns the number of CQEs dispatched.
+    //
+    int ReapOnly();
+
     // Block until at least one CQE is available. Submits pending SQEs first. Used by the
     // cooperator when all contexts are blocked on IO — replaces a tight spin with an efficient
     // kernel wait. Returns number of CQEs dispatched.

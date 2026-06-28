@@ -157,10 +157,18 @@ int Handle::Wait()
     // the yielded list. This is safe — cooperative scheduling means no context switch occurs
     // until we explicitly block or yield.
     //
-    m_ring->Poll();
-    if (m_pendingCqes == 0)
+    // Fast-path-armed ops skip the eager submit (see MarkFastPathArmed): a MSG_DONTWAIT syscall
+    // already returned EAGAIN, so there is no inline completion to catch and the eager submit
+    // would only cost a per-op io_uring_enter(). The SQE accumulates and flushes with the rest of
+    // the resume batch at the scheduler's batch-boundary Poll().
+    //
+    if (!m_deferEagerSubmit)
     {
-        return m_result;
+        m_ring->Poll();
+        if (m_pendingCqes == 0)
+        {
+            return m_result;
+        }
     }
 
     // Slow path: operation not yet complete, block until CQE arrives. The coordinator is
@@ -174,11 +182,15 @@ int Handle::Wait()
 int Handle::WaitKill()
 {
     // Same fast path as Wait(): submit pending SQEs and consume any CQEs that are already ready.
+    // A fast-path-armed op defers the eager submit to the batch boundary (see MarkFastPathArmed).
     //
-    m_ring->Poll();
-    if (m_pendingCqes == 0)
+    if (!m_deferEagerSubmit)
     {
-        return m_result;
+        m_ring->Poll();
+        if (m_pendingCqes == 0)
+        {
+            return m_result;
+        }
     }
 
     auto result = CoordinateWithKill(m_context, m_coord);

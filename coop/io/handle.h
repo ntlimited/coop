@@ -160,6 +160,12 @@ private:
     //
     void Finalize();
 
+    // Whether Wait()/WaitKill() should skip the eager submit and let the SQE accumulate for the
+    // scheduler's batch-boundary Poll(). True only for a fast-path-armed op (MarkFastPathArmed)
+    // when enough IO is in flight to amortize the deferred io_uring_enter() across a batch.
+    //
+    bool DeferSubmit() const;
+
     Uring*          m_ring;
     Descriptor*     m_descriptor;
     Coordinator*    m_coord;

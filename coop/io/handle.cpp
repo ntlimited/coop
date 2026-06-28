@@ -144,6 +144,28 @@ void Handle::Cancel()
     m_pendingCqes++;
 }
 
+// Minimum in-flight io_uring operations before a fast-path-armed op defers its submit. Below this
+// the flow is effectively serial and benefits from a prompt eager submit; above it there is enough
+// concurrency that folding the submit into the batch-boundary Poll() amortizes the io_uring_enter().
+//
+static constexpr int kDeferMinPendingOps = 8;
+
+bool Handle::DeferSubmit() const
+{
+    // Defer the eager submit only for a fast-path-armed op when enough IO is in flight that the
+    // deferred io_uring_enter() has a batch to amortize into. The flag guarantees the inline
+    // completion peek would be wasted (a MSG_DONTWAIT syscall already returned EAGAIN); the
+    // in-flight-ops threshold guarantees the deferral pays for itself.
+    //
+    // A serial flow keeps only a handful of ops in flight (its own pending recv, the partner's,
+    // the cross-thread submission drainer) and gains nothing from waiting for the batch boundary
+    // — it instead pays an extra scheduler traversal of latency before its sole SQE reaches the
+    // kernel. A concurrent server keeps many ops in flight, so the batch boundary flushes a real
+    // batch in one enter.
+    //
+    return m_deferEagerSubmit && m_ring->PendingOps() > kDeferMinPendingOps;
+}
+
 int Handle::Wait()
 {
     // Fast path: submit pending SQEs and check for immediate completion. With COOP_TASKRUN
@@ -157,12 +179,13 @@ int Handle::Wait()
     // the yielded list. This is safe — cooperative scheduling means no context switch occurs
     // until we explicitly block or yield.
     //
-    // Fast-path-armed ops skip the eager submit (see MarkFastPathArmed): a MSG_DONTWAIT syscall
-    // already returned EAGAIN, so there is no inline completion to catch and the eager submit
-    // would only cost a per-op io_uring_enter(). The SQE accumulates and flushes with the rest of
-    // the resume batch at the scheduler's batch-boundary Poll().
+    // Fast-path-armed ops can skip the eager submit (see MarkFastPathArmed): a MSG_DONTWAIT
+    // syscall already returned EAGAIN, so there is no inline completion to catch and the eager
+    // submit would only cost a per-op io_uring_enter(). The SQE then accumulates and flushes with
+    // the rest of the resume batch at the scheduler's batch-boundary Poll(). DeferSubmit() gates
+    // this on in-flight concurrency so a lone flow keeps its prompt eager submit.
     //
-    if (!m_deferEagerSubmit)
+    if (!DeferSubmit())
     {
         m_ring->Poll();
         if (m_pendingCqes == 0)
@@ -182,9 +205,10 @@ int Handle::Wait()
 int Handle::WaitKill()
 {
     // Same fast path as Wait(): submit pending SQEs and consume any CQEs that are already ready.
-    // A fast-path-armed op defers the eager submit to the batch boundary (see MarkFastPathArmed).
+    // A fast-path-armed op with a resume batch to amortize into defers the eager submit to the
+    // batch boundary (see MarkFastPathArmed / DeferSubmit).
     //
-    if (!m_deferEagerSubmit)
+    if (!DeferSubmit())
     {
         m_ring->Poll();
         if (m_pendingCqes == 0)

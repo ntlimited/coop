@@ -173,6 +173,7 @@ add_executable(coop_tests
     tests/test_channel.cpp
     tests/test_shutdown.cpp
     tests/test_io.cpp
+    tests/test_armed_handle.cpp
     tests/test_stress.cpp
     tests/test_http.cpp
     tests/test_perf.cpp
@@ -205,6 +206,9 @@ add_executable(coop_benchmarks
     benchmarks/bench_perf.cpp
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
+
+add_executable(bench_buffer_ring_throughput benchmarks/bench_buffer_ring_throughput.cpp)
+target_link_libraries(bench_buffer_ring_throughput PRIVATE coop)
 
 add_executable(bench_server benchmarks/bench_server.cpp)
 target_link_libraries(bench_server PRIVATE coop)

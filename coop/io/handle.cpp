@@ -6,6 +6,7 @@
 
 #include "handle.h"
 
+#include "armed_handle.h"
 #include "descriptor.h"
 #include "uring.h"
 
@@ -276,6 +277,18 @@ void Handle::OnSecondaryComplete(struct io_uring_cqe* cqe)
 void Handle::Callback(struct io_uring_cqe* cqe)
 {
     auto data = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
+
+    // Bit 1 (0x2) marks a multishot ArmedHandle CQE -- a distinct lifecycle that holds its
+    // coordinator across an unbounded CQE stream rather than the one-shot count-to-zero this
+    // Handle owns. Route it out before the one-shot decode. Bit 0 (0x1) then disambiguates within
+    // each species: linked-timeout/cancel for Handle, recv-vs-cancel-ack for ArmedHandle.
+    //
+    if (data & 0x2)
+    {
+        ArmedHandle::Dispatch(cqe, data);
+        return;
+    }
+
     auto* handle = reinterpret_cast<Handle*>(data & ~uintptr_t(0x7));
 
     if (data & 1)

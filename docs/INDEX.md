@@ -29,4 +29,8 @@
 - `timer_slack_01.md`: opt-in deadline quantization on the `Sleep` path — collapses
   per-timer kernel wakeups for a fan-out of concurrent sleeps, with the negative
   covenant that correctness deadlines stay exact
+- `buffer_ring_multishot_01.md`: provided buffer ring + multishot recv — decouples
+  resident recv memory from connection count for keep-alive fan-out and removes the
+  per-message recv submission, with measured throughput and memory and the honest
+  push/pull impedance between kernel-push completions and coop's pull consumers
 - `TODO.md`: prioritized follow-up work

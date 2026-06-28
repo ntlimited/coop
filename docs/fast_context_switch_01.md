@@ -75,6 +75,48 @@ The default path (fastpath off) is byte-for-byte unchanged; a non-participant pa
 It lands off by default. A change motivated by a peer comparison lands disabled until the win is
 proven across regimes (the project's standing methodology); the microbench is one regime.
 
+## 4. The IO governor — enter inline on pending work
+
+Lever 3's bound keeps io_uring from starving, but loosely: the loop's hot path reaps
+already-materialized CQEs without entering the kernel (`ReapOnly`), and the kernel-entering `Poll`
+runs only when the loop idles. A busy fastpath chain defers it, so under `COOP_TASKRUN` a queued SQE
+can sit unsubmitted (a timer never arms) and a task_work completion undelivered until the
+batch-boundary poll — `16 × budget` switches away, milliseconds under expensive-task load.
+
+The governor tightens this on the **yield** path: when work is pending, it enters the kernel inline.
+One `Poll()` submits queued SQEs **and** reaps completions in a single `io_uring_enter` — the enter
+runs task_work, materializing the completions the same call reaps, so the completion harvest rides the
+submit for free. Detection is asymmetric and cheap:
+
+- **Submissions are urgent** — an unsubmitted SQE is work that has not *started*. `HasPendingSubmissions`
+  is a field read, checked every switch.
+- **Completions are lazy** — the work already happened, and the submit-enter harvests them anyway — so
+  the CQ read (and the cross-thread submission flag) is sampled once every `kStride` switches
+  (power-of-two, bitmask-gated).
+
+After entering, the budget clamps to `ioPresentLimit` so a steady completion stream keeps polling
+promptly; `ioPresentLimit == 0` disables the governor (pure count budget). Measured: under
+expensive-task spinners, a timer wake's lateness drops from ~9.6 ms (count budget alone) to ~115 µs —
+tighter than the loop's own per-resume cadence — at zero quiet-ring cost.
+
+## 5. Block fastpath — direct-switch on self-block
+
+Lever 3 collapses the loop trampoline for *yields*; the same trampoline sits on the **block** path,
+and a contended `Coordinator`'s block/wake is the bulk of a cooperative lock or sleep's cost (~60%
+scheduler in profiling). A self-block, when another context is runnable, parks in the blocked list and
+switches straight into the next runnable, skipping the loop and `HandleCooperatorResumption`.
+
+The block fastpath does **not** poll inline, and the asymmetry is load-bearing. A self-block can be a
+teardown `Flash` whose own coordinator a completion would release; polling *before* the context is
+parked in the blocked list would deliver that wake to a context not yet on the list and lose it — a
+hang. The original loop registers the block first and only polls once control is back in the loop; the
+fastpath matches that ordering (register, switch, let the budget bring the loop and its poll back). A
+yielding context waits on nothing, so nothing can wake it mid-poll — which is why only the yield
+fastpath may poll inline.
+
+Measured (directYield on, single core): sleep/wake round-trip 81 → 35 ns (2.3×), contended Coordinator
+cycle 90 → 60 ns (1.5×).
+
 ## Covenants
 
 Negative-first — what these changes must not do.
@@ -89,6 +131,12 @@ Negative-first — what these changes must not do.
   `tests/test_direct_yield.cpp` pins this: spinners that do nothing but yield must not prevent a timer
   from firing or a killed in-flight `Recv` from tearing down. The test is red/green calibrated — with
   the bound defeated it hangs; with it in place the timer fires on time.
+
+- **Only the yield fastpath may poll inline.** The governor's inline `Poll()` is confined to the
+  direct-yield path, where the suspending context waits on nothing. The block fastpath registers the
+  context in the blocked list and switches **without** polling, because a self-block can be a teardown
+  drain whose wake a premature poll would deliver before the context is on the list — and lose,
+  hanging the teardown. Block registers first and lets the budget bring the loop's poll back.
 
 - **The default yield path must not change when the fastpath is off.** `directYield` defaults false;
   a cooperator that does not opt in runs the original trampoline-through-the-loop yield, unmodified.

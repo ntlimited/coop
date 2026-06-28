@@ -136,10 +136,17 @@ Two macro sets for generating the 4 standard operation variants:
 
 **Fast path trade-off**: saves ~500ns per operation when data is immediately available (skips
 Handle construction, Coordinator TryAcquire, SQE allocation, Poll, Finalize). Costs a wasted
-syscall when data is not available (EAGAIN). Currently used by Recv and Send. Under sustained
-concurrent load, recv often EAGAINs (request hasn't arrived yet), adding a syscall per request
-for no benefit. The fast path primarily helps latency in the pre-staged data case (keep-alive
-connections, buffered sends).
+EAGAIN syscall when data is not available. It helps when data is usually ready (keep-alive HTTP
+with pipelined requests, pre-staged/buffered sends) and hurts a strict request/response with
+negligible turnaround — a trivial-process ping-pong EAGAINs ~85% of recvs, a pure penalty.
+
+**The fast path is opt-in.** Plain `Recv`/`Send`/`SendAll` submit straight to io_uring; the
+speculative variants are `RecvFastpath` / `SendFastpath` / `SendAllFastpath`, so a call site reads
+honestly (no hidden nonblocking syscall behind a plain `Recv`). The HTTP transport
+(`http/transport.h`) opts in explicitly — keep-alive is exactly where it pays off, and it doubles
+as the demo. The earlier default-on orientation penalized the ping-pong case silently; the flip is
+behavior-neutral for the HTTP server (still on the fastpath) and ~6% faster for the echo facsimile
+(which only ever paid the wasted EAGAINs).
 
 **Adding fast path to new operations**: write a static inline `Try*` wrapper that calls the
 direct syscall with appropriate nonblocking flags (e.g. `MSG_DONTWAIT` for socket ops), then

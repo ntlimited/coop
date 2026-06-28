@@ -298,11 +298,16 @@ void Cooperator::DrainRemainingSubmissions()
 void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
 {
     // Charge elapsed time to the context that was running, then mark the cooperator's timestamp
-    // for its own accounting. This single rdtsc serves both purposes.
+    // for its own accounting. This single rdtsc serves both purposes. It is gated behind
+    // trackContextCycles because the rdtsc is the dominant per-resume cost and the ticks it feeds
+    // are observability only (see CooperatorConfiguration::trackContextCycles).
     //
-    auto now = rdtsc();
-    m_scheduled->m_statistics.ticks += now - m_scheduled->m_lastRdtsc;
-    m_lastRdtsc = now;
+    if (m_config.trackContextCycles)
+    {
+        auto now = rdtsc();
+        m_scheduled->m_statistics.ticks += now - m_scheduled->m_lastRdtsc;
+        m_lastRdtsc = now;
+    }
 
     switch (res)
     {
@@ -682,15 +687,18 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
 
     auto* prev = m_scheduled;
 
-    auto now = rdtsc();
-    prev->m_statistics.ticks += now - prev->m_lastRdtsc;
+    if (m_config.trackContextCycles)
+    {
+        auto now = rdtsc();
+        prev->m_statistics.ticks += now - prev->m_lastRdtsc;
+        ctx->m_lastRdtsc = now;
+    }
 
     prev->m_state = SchedulerState::YIELDED;
     m_yielded.Push(prev);
 
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
-    ctx->m_lastRdtsc = now;
 
     auto ret = ContextSwitch(&prev->m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
@@ -930,7 +938,7 @@ namespace coop
 void Cooperator::EnterContext(Context* ctx)
 {
     COOP_PERF_INC(m_perf, perf::Counter::ContextSpawn);
-    auto now = rdtsc();
+    int64_t now = m_config.trackContextCycles ? rdtsc() : 0;
 
     Context* lastCtx = m_scheduled;
     void** save_sp = lastCtx ? &lastCtx->m_sp : &m_sp;
@@ -938,12 +946,15 @@ void Cooperator::EnterContext(Context* ctx)
 
     if (lastCtx)
     {
-        lastCtx->m_statistics.ticks += now - lastCtx->m_lastRdtsc;
+        if (m_config.trackContextCycles)
+        {
+            lastCtx->m_statistics.ticks += now - lastCtx->m_lastRdtsc;
+        }
         lastCtx->m_state = SchedulerState::YIELDED;
         m_yielded.Push(lastCtx);
         m_scheduled = nullptr;
     }
-    else
+    else if (m_config.trackContextCycles)
     {
         m_ticks += now - m_lastRdtsc;
     }

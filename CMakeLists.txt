@@ -164,6 +164,7 @@ enable_testing()
 add_executable(coop_tests
     tests/test_coordinator.cpp
     tests/test_continuation.cpp
+    tests/test_work_deque.cpp
     tests/test_cooperate.cpp
     tests/test_spawn.cpp
     tests/test_signal.cpp

@@ -6,45 +6,36 @@
 
 #if defined(__x86_64__)
 
-// ContextInit prepares a fresh stack so that ContextSwitch can "resume" into it for the first
-// time. The layout mirrors what ContextSwitch would have pushed had the context previously
-// called ContextSwitch itself:
+// ContextInit prepares a fresh stack so that the switch core can "resume" into it for the first
+// time. The layout mirrors the minimal state the core leaves on a stack it switched away from:
+// only %rbp and a return address (the core saves nothing else — see context_switch.S).
 //
 //   stack_top (16-byte aligned by contract):
-//     [abort]                ← safety net return address
-//     [_context_trampoline]  ← ContextSwitch's `ret` jumps here
-//     [rbp = 0]
-//     [rbx = 0]
-//     [r12 = ctx]            ← trampoline reads this as Context*
-//     [r13 = 0]
-//     [r14 = 0]
-//     [r15 = 0]              ← returned as initial stack pointer
+//     [abort]                ← safety net: CoopContextEntry's notional return address
+//     [_context_trampoline]  ← the core's `ret` lands here
+//     [rbp = ctx]            ← popped into %rbp; trampoline reads it as Context*
+//                              (init_sp points here)
 //
-// After ContextSwitch pops the 6 registers and executes `ret`, r12 holds Context*, RSP is at
-// 8-mod-16 (correct x86-64 ABI alignment at function entry), and control transfers to
-// _context_trampoline which tail-calls CoopContextEntry.
+// After the core executes `popq %rbp` and `ret`, %rbp holds Context*, RSP is at 8-mod-16
+// (correct x86-64 ABI alignment at function entry — stack_top is 16-aligned and three 8-byte
+// slots leave RSP at stack_top-8 by the time CoopContextEntry runs), and control transfers to
+// _context_trampoline, which moves %rbp into rdi and tail-calls CoopContextEntry.
 //
 void* ContextInit(void* stack_top, coop::Context* ctx)
 {
     auto* sp = static_cast<uintptr_t*>(stack_top);
 
-    // Safety net: if the trampoline somehow returns, abort
+    // Safety net: if CoopContextEntry somehow returns, abort
     //
     *--sp = reinterpret_cast<uintptr_t>(abort);
 
-    // Return address for ContextSwitch's `ret` instruction
+    // Return address for the core's `ret` instruction
     //
     *--sp = reinterpret_cast<uintptr_t>(_context_trampoline);
 
-    // Callee-saved registers (order must match ContextSwitch's pop sequence: r15, r14, r13,
-    // r12, rbx, rbp — so we push in reverse: rbp first, r15 last)
+    // The only saved register the core restores: %rbp, carrying Context* into the trampoline
     //
-    *--sp = 0;                                          // rbp
-    *--sp = 0;                                          // rbx
-    *--sp = reinterpret_cast<uintptr_t>(ctx);           // r12 = Context*
-    *--sp = 0;                                          // r13
-    *--sp = 0;                                          // r14
-    *--sp = 0;                                          // r15
+    *--sp = reinterpret_cast<uintptr_t>(ctx);           // rbp = Context*
 
     return static_cast<void*>(sp);
 }

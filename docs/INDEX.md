@@ -21,6 +21,9 @@
 - `DESIGN_IDIOMS.md`: API and performance design principles
 - `blocking_io_shutdown_01.md`: blocking-IO shutdown contract and the explicit
   kill-aware composition pattern for coop-owned loops
-- `cross_thread_substrate_01.md`: sketch/RFC for the sharded work-stealing task
-  pool that continuation bodies shed morsels into (cross-core balancing)
+- `continuations_01.md`: the continuation primitive (stackless run-to-completion
+  units) and the performance argument for stackless work-stealing vs the fully-
+  stackful-fiber model
+- `cross_thread_substrate_01.md`: the sharded work-stealing substrate (Grid, deque,
+  covenants, calibration) that continuation bodies shed morsels into
 - `TODO.md`: prioritized follow-up work

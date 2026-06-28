@@ -59,6 +59,15 @@ struct CooperatorConfiguration
     // userspace deadline queue is opt-in (see TimerMode).
     //
     TimerMode timerMode = TimerMode::KernelPerTimer;
+
+    // Per-context CPU-cycle accounting. When set, every resume reads the timestamp counter and
+    // charges the elapsed cycles to the running context's m_statistics.ticks (surfaced by the
+    // status server's per-context view). It is pure observability — nothing on a scheduling or
+    // correctness path consumes ticks — and the rdtsc it requires is the single largest cost on
+    // the bare yield path, so it lands off by default. Turn it on only when the dashboard's
+    // cycle column is wanted.
+    //
+    bool trackContextCycles = false;
 };
 
 static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
@@ -66,6 +75,7 @@ static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
     .name = {},
     .cpuAffinity = -1,
     .timerMode = TimerMode::KernelPerTimer,
+    .trackContextCycles = false,
 };
 
 } // end namespace coop

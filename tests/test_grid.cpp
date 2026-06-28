@@ -73,3 +73,63 @@ TEST(GridTest, ShedBalancesAcrossCooperators)
     EXPECT_EQ(total, N) << "every shed Erg must run exactly once";
     EXPECT_GT(used, 1)  << "work-stealing must spread clustered Ergs across more than one cooperator";
 }
+
+// A caller-owned Erg (m_stealerOwned=false) shed via Shed(Erg*) -- the zero-allocation companion to
+// Shed(fn) -- must be run by the grid and NOT freed by the stealer: the caller keeps ownership so a
+// stable pipeline can re-shed the same object. We verify both the run and the no-free: the Erg sets
+// a sentinel during Run, and after shutdown the caller still reads its state (a freed object would
+// trip the debug guard pages). All Ergs are stack-resident in the test frame; none are allocated per
+// shed.
+//
+TEST(GridTest, ShedReusableErgNotFreed)
+{
+    struct OwnedErg final : work::Erg
+    {
+        std::atomic<int> runs{0};
+        OwnedErg() { m_stealerOwned = false; }
+        void Run() final { runs.fetch_add(1, std::memory_order_relaxed); }
+    };
+
+    const int M = 4, N = 400;
+    std::vector<Cooperator*> coops(M);
+    std::vector<Thread*> threads(M);
+    for (int m = 0; m < M; m++) { coops[m] = new Cooperator(); threads[m] = new Thread(coops[m]); }
+
+    work::Grid grid;
+    grid.Init(M);
+    for (int m = 0; m < M; m++) grid.Join(coops[m]);
+
+    std::vector<OwnedErg> ergs(N);
+    std::atomic<int> remaining{N};
+
+    coops[0]->Submit([&](Context*)
+    {
+        for (int i = 0; i < N; i++)
+        {
+            // Shed our own long-lived Erg; the stealer runs it without freeing it.
+            //
+            bool ok = Shed(&ergs[i]);
+            EXPECT_TRUE(ok) << "Shed(Erg*) must accept a caller-owned Erg on a participating cooperator";
+            (void)ok;
+        }
+    });
+
+    // Drain: each Erg runs exactly once; count completions by polling the per-Erg sentinel.
+    //
+    for (int spins = 0; spins < 200000; spins++)
+    {
+        int done = 0;
+        for (int i = 0; i < N; i++) if (ergs[i].runs.load(std::memory_order_relaxed) > 0) done++;
+        if (done == N) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    for (int m = 0; m < M; m++) coops[m]->Shutdown();
+    for (int m = 0; m < M; m++) { delete threads[m]; delete coops[m]; }
+
+    // The caller still owns every Erg (not freed by the stealer) and each ran exactly once.
+    //
+    for (int i = 0; i < N; i++)
+        EXPECT_EQ(ergs[i].runs.load(std::memory_order_relaxed), 1)
+            << "caller-owned Erg " << i << " must run exactly once and survive (not be freed)";
+}

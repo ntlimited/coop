@@ -82,8 +82,9 @@ class Grid
     void Join(Cooperator* co);
 
     // Owner of shard's cooperator only (the local stealer, or in-cooperator code that ran there).
+    // Returns false if the shard is full (the caller decides how to absorb the overflow).
     //
-    void ShedErg(int shard, Erg* e) { m_shards.Shed(shard, e); }
+    bool ShedErg(int shard, Erg* e) { return m_shards.Shed(shard, e); }
 
     // Stealer instrumentation, summed across all shards. Written only by the idle daemon stealers
     // (off the in-cooperator Shed hot path); meant to be read after quiescence. Parks counts idle
@@ -119,7 +120,12 @@ class Grid
 // on the Grid path, where the Erg runs on a shared stealer; the Spawn fallback gives fn its own
 // context and may block.
 //
+// Constrained off any pointer convertible to work::Erg* so a caller passing its own (reusable) Erg
+// subclass pointer binds the zero-allocation Shed(Erg*) overload below, not this allocating closure
+// path -- without the constraint the exact-match pointer would outrank the base-pointer overload.
+//
 template<typename Fn>
+    requires (!std::is_convertible_v<std::decay_t<Fn>, work::Erg*>)
 inline void Shed(Fn&& fn)
 {
     Cooperator* co = GetCooperator();
@@ -142,6 +148,27 @@ inline void Shed(Fn&& fn)
         //
         Spawn([f = std::forward<Fn>(fn)](Context*) mutable { f(); });
     }
+}
+
+// Shed an existing, caller-owned Erg -- the zero-allocation companion to Shed(fn). A stable pipeline
+// stage subclasses Erg once and re-sheds the same object each stage (typically from its async op's
+// completion continuation), so there is no per-stage malloc/free: the work item IS the long-lived
+// Erg, not a freshly allocated closure. The Erg must have m_stealerOwned=false so the stealer runs
+// it without freeing it.
+//
+// Only meaningful on a cooperator that has joined a Grid (a reusable Erg is a Grid concept); returns
+// false if this cooperator does not participate, or if its shard is full. Like Shed(int,Erg*) on the
+// Grid, this pushes to the caller's own shard, so it must run on the owning cooperator's thread --
+// which the in-cooperator re-shed (stealer Run or completion continuation) always does.
+//
+inline bool Shed(work::Erg* e)
+{
+    Cooperator* co = GetCooperator();
+    if (work::Participation* p = co->m_participation)
+    {
+        return p->grid->ShedErg(p->shard, e);
+    }
+    return false;
 }
 
 } // end namespace coop

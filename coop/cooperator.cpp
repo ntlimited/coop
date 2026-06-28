@@ -612,6 +612,41 @@ void Cooperator::Launch()
 
 void Cooperator::YieldFrom(Context* ctx)
 {
+    // Direct-yield fastpath: when another context is already runnable, switch straight into it
+    // instead of trampolining back through the cooperator loop (which would cost a second switch
+    // plus HandleCooperatorResumption). The yielding context takes the place the loop would have
+    // given it -- pushed onto the yielded list -- and the next runnable is resumed directly.
+    //
+    // The budget bounds how many direct switches happen before one falls back through the loop.
+    // The loop is the only place io_uring is polled, so the bound is what keeps CQE processing
+    // (and the Handle::Flash teardown barriers that depend on it) from starving: at most
+    // directYieldBudget switches separate two polls, no matter how tightly contexts yield.
+    //
+    if (m_config.directYield && m_directYieldsRemaining > 0 && !m_yielded.IsEmpty())
+    {
+        --m_directYieldsRemaining;
+
+        Context* next = m_yielded.Pop();
+
+        if (m_config.trackContextCycles)
+        {
+            auto now = rdtsc();
+            ctx->m_statistics.ticks += now - ctx->m_lastRdtsc;
+            next->m_lastRdtsc = now;
+        }
+
+        ctx->m_state = SchedulerState::YIELDED;
+        m_yielded.Push(ctx);
+
+        next->m_state = SchedulerState::RUNNING;
+        m_scheduled = next;
+
+        auto ret = ContextSwitch(&ctx->m_sp, next->m_sp,
+                                 static_cast<int>(SchedulerJumpResult::RESUMED));
+        assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
+        return;
+    }
+
     auto ret = ContextSwitch(&ctx->m_sp, m_sp, static_cast<int>(SchedulerJumpResult::YIELDED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
 }
@@ -625,6 +660,12 @@ void Cooperator::Resume(Context* ctx)
 
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
+
+    // A fresh resume from the loop means io_uring was just polled (the loop polls at every batch
+    // boundary and before idling), so the direct-yield budget refills here. The chain of direct
+    // yields the resumed context may start is then bounded until control returns to the loop.
+    //
+    m_directYieldsRemaining = m_config.directYieldBudget;
 
     COOP_PERF_INC(m_perf, perf::Counter::ContextResume);
     auto ret = ContextSwitch(&m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));

@@ -68,6 +68,26 @@ struct CooperatorConfiguration
     // cycle column is wanted.
     //
     bool trackContextCycles = false;
+
+    // Direct context-to-context yield. A plain Context::Yield normally trampolines through the
+    // cooperator loop -- two switches plus the loop's bookkeeping -- which is also where io_uring
+    // is polled. With this set, a yield that finds another runnable context switches straight into
+    // it (one switch), skipping the round trip. To keep io_uring responsive (CQE processing
+    // between resumes is what unblocks Handle::Flash teardown barriers), the chain of direct
+    // switches is bounded: after directYieldBudget of them control falls back through the loop,
+    // which polls. So poll latency is bounded by directYieldBudget switches regardless of how
+    // tightly contexts yield among themselves.
+    //
+    // Motivated by a peer stackful runtime's direct-switch yield; lands off by default until the
+    // win is proven across regimes (see the cross-thread-substrate methodology note).
+    //
+    bool directYield = false;
+
+    // Upper bound on consecutive direct yields before one falls back through the cooperator loop
+    // to poll io_uring. Smaller bounds poll latency more tightly at the cost of more frequent
+    // round trips; larger amortizes the round trip further. Only consulted when directYield is set.
+    //
+    int directYieldBudget = 64;
 };
 
 static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
@@ -76,6 +96,8 @@ static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
     .cpuAffinity = -1,
     .timerMode = TimerMode::KernelPerTimer,
     .trackContextCycles = false,
+    .directYield = false,
+    .directYieldBudget = 64,
 };
 
 } // end namespace coop

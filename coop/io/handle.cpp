@@ -154,18 +154,20 @@ static constexpr int kDeferMinPendingOps = 8;
 
 bool Handle::DeferSubmit() const
 {
-    // Defer the eager submit only for a fast-path-armed op when enough IO is in flight that the
-    // deferred io_uring_enter() has a batch to amortize into. The flag guarantees the inline
-    // completion peek would be wasted (a MSG_DONTWAIT syscall already returned EAGAIN); the
-    // in-flight-ops threshold guarantees the deferral pays for itself.
+    // Defer the eager submit when enough IO is in flight that the deferred io_uring_enter() has a
+    // batch to amortize into. Gated purely on in-flight depth -- the threshold is what decides it:
     //
     // A serial flow keeps only a handful of ops in flight (its own pending recv, the partner's,
     // the cross-thread submission drainer) and gains nothing from waiting for the batch boundary
     // — it instead pays an extra scheduler traversal of latency before its sole SQE reaches the
-    // kernel. A concurrent server keeps many ops in flight, so the batch boundary flushes a real
-    // batch in one enter.
+    // kernel, so it eager-submits to catch an inline completion. A concurrent server keeps many ops
+    // in flight, so deferring folds the submit into the loop's batch-boundary Poll() / WaitAndPoll
+    // submit_and_wait, flushing a real batch in one enter. On a fan-out echo server this batching is
+    // a large win (recvs and sends ride one enter instead of one each), provided the ops actually go
+    // through io_uring -- which is why it pairs with the io_uring-default Recv/Send (the nonblocking
+    // fastpath does its own inline syscall and never reaches here).
     //
-    return m_deferEagerSubmit && m_ring->PendingOps() > kDeferMinPendingOps;
+    return m_ring->PendingOps() > kDeferMinPendingOps;
 }
 
 int Handle::Wait()

@@ -4,7 +4,8 @@
 
 #include <gtest/gtest.h>
 
-#include "coop/work_pool.h"
+#include "coop/work/detail/shards.h"
+#include "coop/work/erg.h"
 
 using namespace coop;
 
@@ -12,11 +13,11 @@ using namespace coop;
 //
 TEST(WorkPoolTest, LocalShedPull)
 {
-    WorkPool<> pool;
+    work::detail::Shards<work::Erg*> pool;
     pool.Init(1);
     int runs = 0;
-    for (int i = 0; i < 16; i++) ASSERT_TRUE(pool.Shed(0, MakeTask([&] { runs++; })));
-    while (Task* t = pool.Pull(0)) RunTask(t);
+    for (int i = 0; i < 16; i++) ASSERT_TRUE(pool.Shed(0, work::MakeErg([&] { runs++; })));
+    while (work::Erg* t = pool.Pull(0)) work::RunErg(t);
     EXPECT_EQ(runs, 16);
 }
 
@@ -28,7 +29,7 @@ TEST(WorkPoolTest, StealBalancesClusteredSeed)
     const int M = 4, N = 4000;
     for (int rep = 0; rep < 10; rep++)
     {
-        WorkPool<> pool;
+        work::detail::Shards<work::Erg*> pool;
         pool.Init(M);
         std::vector<std::atomic<int>> ran(N);
         for (int i = 0; i < N; i++) ran[i].store(0, std::memory_order_relaxed);
@@ -44,7 +45,7 @@ TEST(WorkPoolTest, StealBalancesClusteredSeed)
                     //
                     for (int i = 0; i < N; i++)
                     {
-                        Task* t = MakeTask([&ran, i] { ran[i].fetch_add(1, std::memory_order_relaxed); });
+                        work::Erg* t = work::MakeErg([&ran, i] { ran[i].fetch_add(1, std::memory_order_relaxed); });
                         while (!pool.Shed(0, t)) { /* never full: N < CAP */ }
                     }
                     seeded.store(true, std::memory_order_release);
@@ -55,7 +56,7 @@ TEST(WorkPoolTest, StealBalancesClusteredSeed)
                 }
                 while (remaining.load(std::memory_order_acquire) > 0)
                 {
-                    if (Task* t = pool.Pull(w)) { RunTask(t); remaining.fetch_sub(1, std::memory_order_acq_rel); }
+                    if (work::Erg* t = pool.Pull(w)) { work::RunErg(t); remaining.fetch_sub(1, std::memory_order_acq_rel); }
                 }
             });
         for (auto& t : workers) t.join();

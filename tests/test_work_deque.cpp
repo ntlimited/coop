@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "coop/work_deque.h"
+#include "coop/work/detail/deque.h"
 
 using namespace coop;
 
@@ -126,7 +126,7 @@ static StressResult RunStress(int items, int thieves)
 //
 TEST(WorkDequeTest, OwnerLifo)
 {
-    WorkDeque<void*> dq;
+    work::detail::Deque<void*> dq;
     for (int i = 0; i < 8; i++) EXPECT_TRUE(dq.PushBottom(Item(i)));
     void* v;
     for (int i = 7; i >= 0; i--) { ASSERT_TRUE(dq.PopBottom(v)); EXPECT_EQ(Index(v), i); }
@@ -137,7 +137,7 @@ TEST(WorkDequeTest, OwnerLifo)
 //
 TEST(WorkDequeTest, StealFifo)
 {
-    WorkDeque<void*> dq;
+    work::detail::Deque<void*> dq;
     for (int i = 0; i < 8; i++) dq.PushBottom(Item(i));
     void* v;
     for (int i = 0; i < 8; i++) { ASSERT_TRUE(dq.Steal(v)); EXPECT_EQ(Index(v), i); }
@@ -148,7 +148,7 @@ TEST(WorkDequeTest, StealFifo)
 //
 TEST(WorkDequeTest, FullRejects)
 {
-    WorkDeque<void*, 4> dq;
+    work::detail::Deque<void*, 4> dq;
     for (int i = 0; i < 4; i++) EXPECT_TRUE(dq.PushBottom(Item(i)));
     EXPECT_FALSE(dq.PushBottom(Item(4)));
 }
@@ -159,7 +159,7 @@ TEST(WorkDequeTest, ConcurrentExactlyOnce)
 {
     for (int rep = 0; rep < 20; rep++)
     {
-        StressResult r = RunStress<WorkDeque<void*>>(200000, 3);
+        StressResult r = RunStress<work::detail::Deque<void*>>(200000, 3);
         ASSERT_FALSE(r.stalled) << "rep " << rep << ": under-count stall (lost item)";
         EXPECT_FALSE(r.anyZero) << "rep " << rep << ": an item was never consumed";
         EXPECT_FALSE(r.anyDup)  << "rep " << rep << ": an item was consumed twice";

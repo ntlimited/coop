@@ -127,40 +127,66 @@ stacks. And the per-pipeline advance cost stays flat where context-per-pipeline 
 pressure: a fan-out benchmark measured a 5.4× throughput advantage at 64 pipelines widening to 12.7×
 at 4096, as the contexts' working set blows the cache while the continuation nodes stay resident.
 
-### Stackless work-stealing vs. fully-stackful work-stealing
+### Stackless work-stealing vs. the fully-stackful model
 
-The architectural question: for irregular, IO-driven, high-fan-out work, is it better to migrate
-*stackful fibers* (the model fully-stackful work-stealing runtimes use) or to keep a cheap
-*stackless* unit in-cooperator and shed cheap *morsels* across cores?
+A word on framing first, because the numbers below are easy to be smug about and smugness here would
+be a mistake. We were glad to see a production-grade library appear in this space — built for an
+exceedingly similar problem (network-bound, high-fan-out services) from an entirely different
+foundational choice: stackful green-threads with work-stealing migration. We measured coop against it
+both to verify coop's strengths for what it was built for and to learn what a mature library from a
+different starting point does well, and we took plenty (cross-thread allocator techniques, timer and
+sleep ideas, an escape hatch for blocking third-party code).
 
-We measured a multi-core, IO-suspending workload: N concurrent pipelines, each alternating irregular
-compute with an io_uring timed sleep, on 6 cores. Under **clustered** load imbalance — the regime
-work-stealing exists to fix, where the heavy work piles onto one core — the comparison (makespan,
-lower is better; 35 ms is the perfect-balance compute floor):
+With that said: on a *synthetic micro-benchmark* of irregular, IO-suspending, multi-core work, coop
+went from being outperformed to outperforming by a meaningful margin — and we believe the gap is
+**structural**, a consequence of the tradeoffs any runtime must make to support stackful work
+migration. The measured clustered makespan (6 cores, lower is better; 35 ms is the perfect-balance
+floor):
 
 | approach | clustered makespan | of floor |
 |----------|--------------------|----------|
 | coop, static shared-nothing (no balancing) | ~150 ms | 23% |
 | stackful-fiber work-stealing | ~74 ms | 47% |
-| **coop work-stealing Grid (stackless Erg + morsel pull)** | **~44 ms** | **80%** |
+| **coop's stackless unit + morsel pull** | **~44 ms** | **80%** |
 
-Two findings:
+Then the obligatory humility. There is a Mike Tyson line — *everybody has a plan until they get
+punched in the mouth* — that applies with full force to anyone quoting their own synthetic benchmark,
+and doubly so when the comparison is a research-grade harness against production-deployed code that
+has actually met real load. These numbers say something real about the *architecture*; they do not
+claim coop would win a production bake-off, and we are not claiming it would.
 
-1. **Balancing is essential, and the cheap unit alone cannot substitute for it.** coop's
-   static-shard approach — even with the 31 ns unit — loses badly (~150 ms) when load clusters,
-   because no amount of unit-cheapness moves work off an overloaded core. This is *why* the
-   work-sharing substrate exists.
-2. **Given balancing, the stackless unit wins decisively.** The Grid reaches ~44 ms — 1.7× faster
-   than the stackful-fiber model and within ~25% of the compute floor — because it pays ~31 ns per
-   unit where the fiber model pays ~960 ns, *and* gets the rebalancing. The fully-stackful model
-   pays the full stack-migration cost to get balancing it could have had more cheaply.
+The structural point is what we stand behind. Two findings from the table:
 
-The bet, confirmed: **separate the two concerns.** A stackful runtime fuses the execution unit and
-the migratable thing into one object (the fiber), so every unit pays the stackful price to be
-*stealable*. coop separates them — the continuation is the cheap in-cooperator unit that never
-moves; balancing is a distinct layer that moves cheap morsels — so the unit stays cheap everywhere
-and you pay for migration only where load actually clusters. It also sidesteps the entire class of
-fiber thread-local-state migration hazards: nothing with a stack ever moves.
+1. **Balancing is essential, and a cheap unit alone cannot substitute for it.** coop's static-shard
+   approach — even with the 31 ns unit — loses badly (~150 ms) when load clusters, because no amount
+   of unit-cheapness moves work off an overloaded core. This is *why* the work-sharing layer exists.
+2. **Given balancing, separating the unit from the migratable object pays off.** A stackful runtime
+   fuses two things into one: the unit of execution and the thing work-stealing moves. So every unit
+   pays the full stackful price (a stack, ~1 µs to dispatch) to be *stealable* — even when nothing
+   needs stealing. coop separates them: the stackless unit is cheap (~31 ns) and never moves;
+   balancing is a distinct layer that ships cheap morsels across cores. You pay for migration only
+   where load actually clusters, and nothing with a stack ever moves — which also sidesteps the whole
+   class of stack-local-state migration hazards.
+
+### What this is (and is not)
+
+It is worth being blunt about the tradeoff. coop is **not** trying to win by being a better stackful
+green-threading library, and continuations are **not** a replacement for that model. coop's stackful
+`Context` idioms — ordinary sequential control flow that suspends with its stack intact — are the
+default, and they are *extremely* performant. The continuations here are a **stackless fastpath**:
+they translate a context switch into a callback on a queue.
+
+The value of that fastpath is bounded and specific. Stackful idioms carry you comfortably until you
+are chasing microsecond-level latency; *then, and only then,* does it become worth reaching for the
+Amdahl's-law junctures where a stack or a context switch is the dominant cost:
+
+1. **Extreme swappiness** — very high wake/yield frequency over trivial per-unit work, where the
+   context switch is most of the cost.
+2. **Load-balancing junctures** — where cheap, migratable morsels rebalance irregular work across
+   cores without moving a stack.
+
+Outside those regimes the right answer in coop is still a `Context`. The fastpath is a scalpel, not a
+new default.
 
 ## Where the numbers can still move
 

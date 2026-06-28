@@ -266,7 +266,7 @@ field and a byte-for-byte unchanged scheduler loop.
 
 Debug-only guard: suspending (Yield/Block) inside a Thunk asserts (`detail::ThunkScope` /
 `AssertNotInThunk`) — run-to-completion units must not stall their host context. Compiled out in
-release. See `docs/cross_thread_substrate_01.md` for the design, covenants, and the a stackful runtime comparison.
+release. See `docs/cross_thread_substrate_01.md` for the design, covenants, and the performance comparison.
 
 ### HTTP Server (`coop/http/`)
 Route table maps paths to handler functions that receive a `ConnectionBase&`:

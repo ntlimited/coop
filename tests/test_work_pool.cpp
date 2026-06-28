@@ -65,3 +65,81 @@ TEST(WorkPoolTest, StealBalancesClusteredSeed)
             ASSERT_EQ(ran[i].load(std::memory_order_relaxed), 1) << "rep " << rep << " task " << i;
     }
 }
+
+// A reusable (caller-owned) Erg re-sheds the SAME object each stage instead of allocating a fresh
+// morsel: the substrate's headline re-shedding pipeline with zero per-stage allocation. The
+// single-owner contract is that a reusable Erg is never resident in a shard and running at once --
+// here the re-shed happens only AFTER RunErg returns (the stage's work has retired), so the object
+// is idle when it re-enters a shard. Under real concurrent stealing every stage must run exactly
+// once, and no two stealers may run the same Erg concurrently. RunErg must not free it (it is
+// caller-owned), so the objects remain valid and the per-stage allocation count is zero.
+//
+TEST(WorkPoolTest, ReusableErgReshedSingleOwner)
+{
+    struct Stage final : work::Erg
+    {
+        work::detail::Shards<work::Erg*>* shards = nullptr;
+        int                               stages = 0;
+        int                               runs   = 0;
+        std::atomic<int>                  inRun{0};
+        std::atomic<bool>*                doubleRun = nullptr;
+
+        Stage() { m_stealerOwned = false; }   // caller-owned: the stealer must not free us
+
+        void Run() final
+        {
+            if (inRun.fetch_add(1, std::memory_order_acq_rel) != 0)
+                doubleRun->store(true, std::memory_order_relaxed);
+            ++runs;
+            --stages;
+            inRun.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    };
+
+    const int M = 4, N = 1500, K = 8;
+    for (int rep = 0; rep < 10; rep++)
+    {
+        work::detail::Shards<work::Erg*> pool;
+        pool.Init(M);
+        std::vector<Stage> stages(N);
+        std::atomic<int>   remaining{N};
+        std::atomic<bool>  doubleRun{false};
+        std::atomic<bool>  seeded{false};
+
+        std::vector<std::thread> workers;
+        for (int w = 0; w < M; w++)
+            workers.emplace_back([&, w] {
+                if (w == 0)
+                {
+                    for (int i = 0; i < N; i++)
+                    {
+                        stages[i].shards = &pool; stages[i].stages = K; stages[i].doubleRun = &doubleRun;
+                        while (!pool.Shed(0, &stages[i])) {}   // clustered seed on shard 0
+                    }
+                    seeded.store(true, std::memory_order_release);
+                }
+                else
+                {
+                    while (!seeded.load(std::memory_order_acquire)) std::this_thread::yield();
+                }
+                while (remaining.load(std::memory_order_acquire) > 0)
+                {
+                    work::Erg* e = pool.Pull(w);
+                    if (!e) continue;
+                    Stage* s = static_cast<Stage*>(e);
+                    work::RunErg(s);                           // runs, does NOT free (caller-owned)
+                    // Re-shed only now that Run() has retired -> the object is idle, single-owner holds.
+                    //
+                    if (s->stages > 0) { while (!pool.Shed(w, s)) {} }
+                    else remaining.fetch_sub(1, std::memory_order_acq_rel);
+                }
+            });
+        for (auto& t : workers) t.join();
+
+        ASSERT_FALSE(doubleRun.load()) << "two stealers ran the same reusable Erg concurrently (rep "
+                                       << rep << ")";
+        for (int i = 0; i < N; i++)
+            ASSERT_EQ(stages[i].runs, K) << "rep " << rep << " pipeline " << i
+                                         << " did not run every stage exactly once";
+    }
+}

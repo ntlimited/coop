@@ -105,7 +105,7 @@ struct ContinuationImpl final : Continuation
         Cancel();
     }
 
-    void Resume() final
+    void Run() final
     {
         // Runs from the cooperator loop's continuation drain — there is no current context, so
         // m_coord (the coordinator this fired on) is passed to fn, and the latch wake is
@@ -206,7 +206,7 @@ struct DetachedContinuationImpl final : Continuation
         CoordinatorExtension().AddAsBlocked(coord, &m_coordinated);
     }
 
-    void Resume() final
+    void Run() final
     {
         m_fn(m_coord);
         delete this;            // self-free once fired (its node was already popped by the drain)

@@ -611,7 +611,7 @@ void Cooperator::DrainContinuations()
     //
     while (auto* waiter = m_pendingContinuations.Pop())
     {
-        waiter->GetContinuation()->Resume();
+        waiter->GetContinuation()->Run();
     }
 }
 

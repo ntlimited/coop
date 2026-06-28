@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "detail/embedded_list.h"
+#include "thunk.h"
 
 namespace coop
 {
@@ -24,15 +25,14 @@ namespace detail
     bool CooperatorIsShuttingDown();
 }
 
-// Continuation is a stackless, run-to-completion unit that can wait on a Coordinator in place
-// of a blocked Context. When the coordinator is Released, Resume runs as a function call (no
-// context switch) on the releasing cooperator. Continuations are single-cooperator: registered,
-// fired, and cancelled on one cooperator. See continuation.h for the lambda helper.
+// Continuation is the in-cooperator Thunk species: a stackless, run-to-completion unit that can
+// wait on a Coordinator in place of a blocked Context. When the coordinator is Released, Run executes
+// as a function call (no context switch) on the releasing cooperator. Continuations are
+// single-cooperator -- registered, fired, and cancelled on one cooperator, never migrating -- which
+// is what keeps them atomic-free. See continuation.h for the lambda helper.
 //
-struct Continuation
+struct Continuation : Thunk
 {
-    virtual void Resume() = 0;
-    virtual ~Continuation() = default;
 };
 
 // Coordinated is the link between a waiter and the Coordinator it is waiting on. Each instance

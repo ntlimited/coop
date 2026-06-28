@@ -471,9 +471,10 @@ void Cooperator::Launch()
 
             // No context woke. Fire continuations queued by this poll's CQEs (and any earlier
             // release) before we consider blocking — they are runnable work, and they may wake
-            // contexts of their own.
+            // contexts of their own. Paced: a budget-truncated remainder rides the next iteration,
+            // which Polls first (the m_pendingContinuations guard below loops us back).
             //
-            DrainContinuations();
+            DrainContinuationsPaced();
 
             if (!m_yielded.IsEmpty())
             {
@@ -560,7 +561,7 @@ void Cooperator::Launch()
             //
             if (hadRunnable || m_yielded.IsEmpty())
             {
-                DrainContinuations();
+                DrainContinuationsPaced();
             }
         }
 
@@ -695,22 +696,38 @@ void Cooperator::WakeWaiter(Coordinated* waiter, const bool schedule)
 
 void Cooperator::DrainContinuations()
 {
-    // Iterative, not recursive: a continuation whose body wakes another continuation pushes it
-    // back onto this queue, which this same loop picks up — so native stack depth stays bounded
-    // no matter how deep the continuation chain is.
+    // Run the queue to empty. Iterative, not recursive: a continuation whose body wakes another
+    // continuation pushes it back onto this queue, which this same loop picks up — so native stack
+    // depth stays bounded no matter how deep the continuation chain is.
     //
-    // A synchronous re-shedding chain (each stage's successor always ready, never waiting on a CQE)
-    // would otherwise run this loop to the chain's natural end before the scheduler returns to Poll,
-    // starving the IO completions sitting in the CQ behind it. Two bounds tame that, see the field
-    // comments on m_drainPeekStride / m_drainBudget for the rationale:
+    // No budget or peek here, unlike the scheduler's paced drain. A caller invoking this directly
+    // expects the queue gone on return: it is about to tear down state the queued continuations
+    // capture (the coordinator they re-arm on, the counters they touch). Stopping at a budget would
+    // strand the remainder to fire later, after that state is freed — a use-after-free. Latency
+    // pacing is the scheduler's job (DrainContinuationsPaced), and only the scheduler's, because
+    // only it guarantees it will loop back and finish the queue before anything observes the gap.
+    //
+    while (auto* waiter = m_pendingContinuations.Pop())
+    {
+        detail::ThunkScope inThunk;                  // debug: forbid suspending inside the Run
+        waiter->GetContinuation()->Run();
+    }
+}
+
+void Cooperator::DrainContinuationsPaced()
+{
+    // Same iterative drain as DrainContinuations, but bounded so an always-ready synchronous chain
+    // cannot monopolize the loop and starve io_uring completion pickup. Two cooperating bounds, see
+    // the field comments on m_drainPeekStride / m_drainBudget for the rationale:
     //
     //   - The peek (m_drainPeekStride): every stride continuations, ask io_uring whether completions
     //     are actually pending (a userspace ring read, no syscall). Break the instant they are, so a
     //     waiting CQE is harvested within a stride. A quiet chain never trips it -- no spurious break.
     //   - The budget (m_drainBudget): a hard ceiling that backstops the peek and bounds stack depth.
     //
-    // On break the remainder stays queued; the loop iterates back to Poll and re-drains, so the chain
-    // still completes, interleaved with completion pickup.
+    // On break the remainder stays queued; the scheduler loop iterates back to Poll and re-drains,
+    // so the chain still completes, interleaved with completion pickup. This partial-drain behavior
+    // is safe only because the scheduler always comes back to finish it (see DrainContinuations).
     //
     uint32_t budget = m_drainBudget;
     uint32_t stride = m_drainPeekStride;

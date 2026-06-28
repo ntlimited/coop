@@ -35,7 +35,12 @@ inline Erg* MakeErg(Fn&& fn)
     return new ErgImpl<std::decay_t<Fn>>(std::forward<Fn>(fn));
 }
 
-inline void RunErg(Erg* e) { e->Run(); delete e; }
+inline void RunErg(Erg* e)
+{
+    coop::detail::ThunkScope inThunk;    // debug: forbid suspending inside the Erg's Run
+    e->Run();
+    delete e;
+}
 
 } // end namespace work
 } // end namespace coop

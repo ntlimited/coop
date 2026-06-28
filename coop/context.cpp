@@ -1,4 +1,5 @@
 #include "context.h"
+#include "thunk.h"
 #include "cooperator.h"
 #include "debug_borrow.h"
 
@@ -75,6 +76,7 @@ bool Context::Yield(const bool force /* = false */)
 
     assert(m_epochState.traversal.IsUnpinned()
            && "cannot Yield while traversal epoch is pinned");
+    detail::AssertNotInThunk();
     debug::AssertNoOutstandingBorrows(this);
 
     ++m_statistics.yields;
@@ -97,6 +99,7 @@ void Context::Detach()
 
 void Context::Block()
 {
+    detail::AssertNotInThunk();
     ++m_statistics.blocks;
     m_cooperator->Block(this);
 }

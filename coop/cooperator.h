@@ -182,6 +182,13 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         m_continuationPool.Free(p, n);
     }
 
+#ifndef NDEBUG
+    // Debug-only: set (via detail::ThunkScope) while a Thunk -- a Continuation or an Erg -- runs, so
+    // that suspending operations can assert at the misuse site. Compiled out in release. See thunk.h.
+    //
+    bool m_inThunk = false;
+#endif
+
     void Shutdown();
 
     static void ShutdownAll();

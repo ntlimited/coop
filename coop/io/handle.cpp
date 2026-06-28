@@ -213,13 +213,17 @@ void Handle::Finalize()
     m_coord->Release(m_context, false /* schedule */);
 }
 
+// Both completion handlers read cqe->res and then drop the CQE; neither depends on the kernel
+// reclaiming the slot mid-drain. CQ-head advancement is therefore not performed here — Uring::Poll
+// reaps a whole batch with a single io_uring_cq_advance(n) after the last callback returns,
+// collapsing what would be N per-CQE release stores to the kernel-visible head into one store.
+//
 void Handle::Complete(struct io_uring_cqe* cqe)
 {
     COOP_PERF_INC(m_context->GetCooperator()->GetPerfCounters(), perf::Counter::IoComplete);
     ++m_context->m_statistics.ioCompletes;
     m_result = cqe->res;
     SPDLOG_TRACE("handle complete result={}", m_result);
-    io_uring_cqe_seen(&m_ring->m_ring, cqe);
     Finalize();
 }
 
@@ -230,7 +234,6 @@ void Handle::OnSecondaryComplete(struct io_uring_cqe* cqe)
     {
         m_timedOut = true;
     }
-    io_uring_cqe_seen(&m_ring->m_ring, cqe);
     Finalize();
 }
 

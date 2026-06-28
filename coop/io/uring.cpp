@@ -234,10 +234,18 @@ int Uring::Poll()
         io_uring_get_events(&m_ring);
     }
 
+    // Reap the whole ready batch and advance the CQ head once. Each callback only reads cqe->res
+    // (see Handle::Complete) and never relies on the kernel reclaiming a slot mid-drain, so the
+    // per-CQE io_uring_cqe_seen the callbacks used to issue — a release store to the kernel-visible
+    // head per completion — collapses into a single io_uring_cq_advance(dispatched) here. On a
+    // fan-out burst this turns N head stores into one; on the common single-CQE Poll it is exactly
+    // one store either way, so there is no regression on the hot path.
+    //
     int dispatched = 0;
     struct io_uring_cqe* cqe;
+    unsigned head;
 
-    while (io_uring_peek_cqe(&m_ring, &cqe) == 0)
+    io_uring_for_each_cqe(&m_ring, head, cqe)
     {
         SPDLOG_TRACE("uring cqe result={}", cqe->res);
 
@@ -245,6 +253,8 @@ int Uring::Poll()
         Handle::Callback(cqe);
         dispatched++;
     }
+
+    io_uring_cq_advance(&m_ring, dispatched);
 
     return dispatched;
 }

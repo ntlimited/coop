@@ -343,25 +343,20 @@ int Uring::ReapOnly()
 
 int Uring::WaitAndPoll()
 {
-    // Flush any pending SQEs before blocking — they may produce the CQE we're about to wait for.
+    // Flush pending SQEs AND block for a completion in one io_uring_enter. The separate
+    // io_uring_submit() + io_uring_wait_cqe() this replaces cost two enters per idle poll; on a busy
+    // fan-out server the idle poll runs ~once per round-trip, so fusing them halves the wait-side
+    // enter rate -- and the per-syscall pthread-cancel overhead that rides every enter with it. With
+    // COOP_TASKRUN this enter also runs pending task_work, delivering deferred completions.
     //
-    if (m_pendingSqes > 0)
-    {
-        io_uring_submit(&m_ring);
-        m_pendingSqes = 0;
-    }
-
-    // Block until at least one CQE is available. With COOP_TASKRUN, this also processes any
-    // pending task_work (deferred completions).
-    //
-    struct io_uring_cqe* cqe;
-    int ret = io_uring_wait_cqe(&m_ring, &cqe);
+    int ret = io_uring_submit_and_wait(&m_ring, 1);
+    m_pendingSqes = 0;
     if (ret < 0)
     {
         return 0;
     }
 
-    // Process all available CQEs (the wait may have delivered multiple).
+    // Process all available CQEs the enter delivered (it may have reaped several).
     //
     return Poll();
 }

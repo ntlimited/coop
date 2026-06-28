@@ -515,6 +515,15 @@ void Cooperator::Launch()
 
             auto* ctx = m_yielded.Pop();
             Resume(ctx);
+
+            // Was anything already runnable going into this Poll? If not, and the Poll then wakes a
+            // context, that context is a fresh IO completion with nothing ahead of it -- and it
+            // should be resumed before the continuation backlog is re-drained, the same
+            // woken-context-first ordering the idle branch above uses. Re-draining a full budget of
+            // a synchronous chain here is exactly what strands a just-completed IO behind it: the
+            // resume-batch twin of the idle-branch completion-pickup tail.
+            //
+            bool hadRunnable = !m_yielded.IsEmpty();
             m_uring.Poll();
 
             if (m_hasSubmissions.load(std::memory_order_acquire))
@@ -526,11 +535,17 @@ void Cooperator::Launch()
                 }
             }
 
-            // Drain after this iteration's poll/resume (the consistent rule: fire continuations
-            // after every poll). DrainContinuations empties the queue, so a burst still fires
-            // back-to-back; this just keeps latency bounded within a busy resume batch.
+            // Fire continuations after this poll/resume -- but defer that drain for the lone-wake
+            // case just described, letting the loop circle back to resume the woken context first.
+            // Whenever a backlog already existed the drain proceeds as before, so a continuation
+            // chain is never starved by a steady stream of context wakes: the per-iteration drain
+            // still fires, bounded by the op budget. A deferred backlog is not dropped -- it rides a
+            // later iteration (or the idle branch) once the freshly woken context has had its turn.
             //
-            DrainContinuations();
+            if (hadRunnable || m_yielded.IsEmpty())
+            {
+                DrainContinuations();
+            }
         }
     }
 

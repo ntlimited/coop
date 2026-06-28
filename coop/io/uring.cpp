@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <spdlog/spdlog.h>
 
+#include "buffer_ring.h"
 #include "handle.h"
 
 #include "coop/context.h"
@@ -44,6 +45,18 @@ namespace coop
 
 namespace io
 {
+
+// Constructor and destructor live here, where BufferRing is complete, so the unique_ptr member
+// can be cleanly cleaned up (constructor exception path) and torn down (destructor unregister).
+//
+Uring::Uring(UringConfiguration const& config)
+: m_config(config)
+, m_registered(config.registeredSlots, -1)
+{
+    memset(&m_ring, 0, sizeof(m_ring));
+}
+
+Uring::~Uring() = default;
 
 void Uring::Init()
 {
@@ -157,6 +170,33 @@ void Uring::Init()
         {
             spdlog::warn("uring register_files failed ret={}", ret);
             m_registered.clear();
+        }
+    }
+
+    // Register the optional default provided buffer ring. The registration doubles as the runtime
+    // feature probe: on a kernel without pbuf-ring support (pre-5.19) io_uring_setup_buf_ring
+    // fails, and we warn and continue with no default ring -- classic recv is untouched -- exactly
+    // as the registered-ring-fd path above degrades. Entries must be a power of two; round up.
+    //
+    if (m_config.bufferRingEntries > 0)
+    {
+        uint32_t entries = 1;
+        while (entries < m_config.bufferRingEntries)
+        {
+            entries <<= 1;
+        }
+        auto ring = std::make_unique<BufferRing>(
+            m_config.bufferRingGroup, entries, m_config.bufferRingBufSize);
+        int err = ring->Register(*this);
+        if (err < 0)
+        {
+            spdlog::warn("uring buffer-ring register failed ret={}, using classic recv", err);
+        }
+        else
+        {
+            spdlog::info("uring buffer-ring registered group={} entries={} bufSize={}",
+                m_config.bufferRingGroup, entries, m_config.bufferRingBufSize);
+            m_bufferRing = std::move(ring);
         }
     }
 }

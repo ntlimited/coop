@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <liburing.h>
+#include <memory>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -20,6 +21,8 @@ struct Context;
 namespace io
 {
 
+struct BufferRing;
+
 // the coop::io::Uring serves as a wrapper around io_uring, as wrapped by liburing. It is not
 // expected that most developers will need to interact with the uring in any direct fashion:
 // instead, the
@@ -28,15 +31,20 @@ struct Uring
 {
     using DescriptorList = EmbeddedList<Descriptor>;
 
-    Uring(UringConfiguration const& config = s_defaultUringConfiguration)
-    : m_config(config)
-    , m_registered(config.registeredSlots, -1)
-    {
-        memset(&m_ring, 0, sizeof(m_ring));
-    }
+    // Constructor and destructor are both out-of-line so std::unique_ptr<BufferRing> can hold an
+    // incomplete type in this header; their definitions in uring.cpp see the full BufferRing (the
+    // constructor for exception-cleanup of the member, the destructor for its unregister-on-destroy).
+    //
+    Uring(UringConfiguration const& config = s_defaultUringConfiguration);
+    ~Uring();
 
     int PendingOps() const { return m_pendingOps; }
     int RingFd() const { return m_ring.ring_fd; }
+
+    // The default provided buffer ring registered by Init when UringConfiguration::bufferRingEntries
+    // is set and the kernel supports pbuf rings; nullptr otherwise (feature absent or not requested).
+    //
+    BufferRing* GetBufferRing() const { return m_bufferRing.get(); }
 
     // True when io_uring has completions waiting to be harvested -- either CQEs already sitting in
     // the completion ring, or, under COOP_TASKRUN, kernel task_work that will materialize CQEs on
@@ -106,6 +114,11 @@ struct Uring
     //
     std::vector<int> m_registered;
     UringConfiguration m_config;
+
+    // Optional default provided buffer ring, registered by Init when configured and supported.
+    // Held by pointer so its registration outlives Init and is torn down with the Uring.
+    //
+    std::unique_ptr<BufferRing> m_bufferRing;
 };
 
 } // end namespace io

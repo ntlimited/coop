@@ -3,6 +3,8 @@
 
 #include <cerrno>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "coop/coordinator.h"
 #include "coop/self.h"
@@ -19,7 +21,11 @@ namespace io
 
 static inline int TryRecv(int fd, void* buf, size_t size, int flags)
 {
-    return ::recv(fd, buf, size, flags | MSG_DONTWAIT);
+    // Raw syscall rather than ::recv(): glibc's recv() is a cancellation point and wraps every call
+    // in __pthread_{enable,disable}_asynccancel, which is pure overhead under coop's
+    // PTHREAD_CANCEL_DISABLE. See TrySend in send.cpp.
+    //
+    return (int)syscall(SYS_recvfrom, fd, buf, size, flags | MSG_DONTWAIT, nullptr, nullptr);
 }
 
 // Two recv flavors, same io_uring submission underneath. The plain Recv is the straightforward one;

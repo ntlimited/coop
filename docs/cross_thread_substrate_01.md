@@ -196,15 +196,49 @@ wrong.
 
 ## Calibration (red/green — the slice is not done until these hold)
 
-The `io_fanout` scoreboard (promoted into `benchmarks/` as the coop-only `BM_FanOut_Pool`
-family) is the instrument.
+The instrument is the `BM_FanOut_Pool` family in `benchmarks/bench_fanout_pool.cpp`. It runs M
+cooperators over N irregular IO pipelines -- each pipeline alternates a `BusyFor` compute morsel
+with an io_uring timed sleep -- and reports end-to-end makespan. The imbalance is clustered by
+construction: every pipeline originates on one shard. Two strategies run the *identical* workload
+so that only the movement policy differs:
 
-- **Green (CLOSED):** driven through the in-tree `work::Grid` (Erg pipeline stages re-shedding via
-  `Shed` from their timer continuation), clustered makespan is a stable **~44 ms (80% of the 35 ms
-  floor)** vs the stackful model's ~74 ms -- **1.7x** -- and ~43.5 ms on the mild workload vs ~65 ms. The
-  idle stealer's recheck interval bounds the worst-case rebalancing latency (default 10us keeps the
-  clustered case stable; 30us showed an occasional outlier). A cross-thread steal-wake would let the
-  recheck be larger and tighten the tail further -- a Slice 4 refinement, not needed to close.
+- `BM_FanOut_Pool_Grid` re-sheds each pipeline through the in-tree `work::Grid`. A pipeline is a
+  reusable `Erg`; the stealer that pulls it runs the morsel, arms the sleep, and a detached
+  continuation re-sheds the `Erg` from the timer's completion. The clustered shard is stolen and
+  spread across every cooperator.
+- `BM_FanOut_Pool_StaticShard` binds each pipeline to its origin cooperator and never moves it --
+  the static shared-nothing baseline. Clustered, one core carries the whole compute while the rest
+  idle.
+
+The Grid-versus-static gap is the covenant.
+
+- **Green (CLOSED):** clustered, the Grid spreads the one-shard load and the static baseline cannot.
+  Measured on this host (M=3; 400 pipelines x 5 stages; ~80 µs mean morsel, wide-distribution
+  irregular; 2 ms inter-stage sleep; median of 5 repetitions):
+
+  | strategy | clustered makespan | balanced makespan |
+  |----------|-------------------:|------------------:|
+  | static shared-nothing (`_StaticShard`) | ~170 ms | ~62 ms |
+  | **work-stealing Grid (`_Grid`)** | **~59 ms** | **~56 ms** |
+
+  Static clustered is pinned at one core's worth of compute (~160 ms of total compute on a single
+  core); the Grid approaches total-compute / M -- a **~2.9x** clustered win. That closes the covenant
+  against the in-tree baseline the design actually controls: work-stealing balancing beats static
+  sharding for clustered irregular compute. The idle stealer's adaptive recheck interval bounds the
+  worst-case rebalancing latency; a cross-thread steal-wake would tighten the tail further -- a
+  Slice 4 refinement, not needed to close.
+
+  The earlier premise figures (a benchmark-level prototype timed against an out-of-tree stackful
+  runtime -- the "~44 ms / 1.7x" line) are *not* the closing instrument and are not reproduced here:
+  that comparison is not in-tree and not portable across hosts. The covenant is closed against the
+  in-tree static baseline, which is the apples-to-apples control.
+
+  *Host note:* captured on a shared box where an unrelated tenant held one physical core. The family
+  was therefore run unpinned within a clean three-physical-core cpuset
+  (`POOL_PINCORES=none taskset -c 0,1,3,4,5,7`), letting the scheduler avoid the contended core; its
+  default is one cooperator per cpu, correct on a quiet host. Hard-pinning a cooperator onto a
+  tenant-occupied core starves it and serializes the makespan behind that one straggler -- a
+  measurement artifact, not a property of the design.
 - **Red guard (the hot path is untaxed):** `BM_AcquireRelease` stays at 1.04 ns and the
   continuation dispatch benchmarks are unchanged. The substrate must add zero cost to the
   in-cooperator path — if a deque field or a steal check lands on the `Coordinator` /
@@ -212,9 +246,11 @@ family) is the instrument.
 - **Deque calibration:** the steal/pop race tests must include a known-bad case (a naive
   ordering that loses or duplicates an item under stress) proven to fail, alongside the
   correct version passing — red/green for the data structure itself, not just green at head.
-- **Robustness:** the mild (already-balanced) workload must not regress meaningfully against
-  static shared-nothing — confirming `Shed` is an opt-in relief valve, not a tax on the
-  balanced common case.
+- **Robustness (CLOSED):** on the already-balanced origin (each cooperator sheds its own pipelines)
+  the Grid must not regress against static shared-nothing. Measured: Grid **~56 ms** vs static
+  **~62 ms** -- no regression, slightly ahead -- confirming `Shed` is an opt-in relief valve, not a
+  tax on the balanced common case. And Grid clustered (~59 ms) lands within noise of Grid balanced
+  (~56 ms): the cluster is fully neutralized, which is the whole point.
 
 ## Adaptive recheck backoff (Slice 4)
 

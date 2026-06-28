@@ -723,8 +723,44 @@ void Cooperator::Block(Context* ctx)
         return;
     }
 
-    // The currently running context is placing itself into a blocked state
+    // The currently running context is placing itself into a blocked state. Direct-switch fastpath:
+    // park it in the blocked list and switch straight into the next runnable, skipping the loop
+    // trampoline (a second switch + HandleCooperatorResumption). The block/wake path is the bulk of a
+    // contended Coordinator's cost, so this is where the fastpath pays off for cooperative locks and
+    // sleeps.
     //
+    // Crucially there is NO inline governor poll here, unlike the yield fastpath. A self-block can be
+    // a teardown Flash whose own coordinator a completion would release; polling before this context
+    // is parked in m_blocked would deliver that wake to a context not yet on the blocked list and lose
+    // it (a hang). The original loop path registers the block first and only polls once control is
+    // back in the loop -- this matches that ordering: register, switch, and let directYieldBudget
+    // bring the loop (and its poll) back. Yields can poll inline because a yielding context waits on
+    // nothing, so nothing can wake it mid-poll.
+    //
+    if (m_config.directYield && m_directYieldsRemaining > 0 && !m_yielded.IsEmpty())
+    {
+        --m_directYieldsRemaining;
+
+        ctx->m_state = SchedulerState::BLOCKED;
+        m_blocked.Push(ctx);
+
+        Context* next = m_yielded.Pop();
+
+        if (m_config.trackContextCycles)
+        {
+            auto now = rdtsc();
+            ctx->m_statistics.ticks += now - ctx->m_lastRdtsc;
+            next->m_lastRdtsc = now;
+        }
+
+        next->m_state = SchedulerState::RUNNING;
+        m_scheduled = next;
+
+        auto ret = ContextSwitch(&ctx->m_sp, next->m_sp,
+                                 static_cast<int>(SchedulerJumpResult::RESUMED));
+        assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
+        return;
+    }
 
     auto ret = ContextSwitch(&ctx->m_sp, m_sp, static_cast<int>(SchedulerJumpResult::BLOCKED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);

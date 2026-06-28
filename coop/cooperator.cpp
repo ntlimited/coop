@@ -452,15 +452,28 @@ void Cooperator::Launch()
         {
             m_uring.Poll();
 
-            // Fire continuations queued by this poll's CQEs (and any earlier release) before we
-            // consider blocking — they are runnable work, and they may wake contexts.
-            //
-            DrainContinuations();
-
             if (m_hasSubmissions.load(std::memory_order_acquire))
             {
                 DrainSubmissions();
             }
+
+            // If this Poll completed IO that woke a context, schedule it before re-draining a
+            // continuation backlog. The backlog is the synchronous chain the CQE-peek broke us out
+            // of; the freshly-completed IO is exactly the work that was waiting behind it, and
+            // re-draining the chain to its budget ceiling first is what would reintroduce the
+            // completion-pickup tail the peek is meant to cut. The queued continuations are not
+            // lost — they ride the next iteration's drain, interleaved with the woken context.
+            //
+            if (!m_yielded.IsEmpty())
+            {
+                continue;
+            }
+
+            // No context woke. Fire continuations queued by this poll's CQEs (and any earlier
+            // release) before we consider blocking — they are runnable work, and they may wake
+            // contexts of their own.
+            //
+            DrainContinuations();
 
             if (!m_yielded.IsEmpty())
             {
@@ -647,14 +660,22 @@ void Cooperator::DrainContinuations()
     // back onto this queue, which this same loop picks up — so native stack depth stays bounded
     // no matter how deep the continuation chain is.
     //
-    // Bounded by m_drainBudget: a chain that re-arms and fires synchronously (its next stage always
-    // ready, never waiting on a CQE) would otherwise run this loop without ever returning to the
-    // scheduler, starving the next Poll and the IO completions waiting on it. Once the budget is
-    // spent the remainder stays queued; the loop above iterates back to Poll and then re-drains, so
-    // the chain still makes full progress, just interleaved with completion pickup. Budget 0 disables
-    // the bound and drains strictly to empty.
+    // A synchronous re-shedding chain (each stage's successor always ready, never waiting on a CQE)
+    // would otherwise run this loop to the chain's natural end before the scheduler returns to Poll,
+    // starving the IO completions sitting in the CQ behind it. Two bounds tame that, see the field
+    // comments on m_drainPeekStride / m_drainBudget for the rationale:
+    //
+    //   - The peek (m_drainPeekStride): every stride continuations, ask io_uring whether completions
+    //     are actually pending (a userspace ring read, no syscall). Break the instant they are, so a
+    //     waiting CQE is harvested within a stride. A quiet chain never trips it -- no spurious break.
+    //   - The budget (m_drainBudget): a hard ceiling that backstops the peek and bounds stack depth.
+    //
+    // On break the remainder stays queued; the loop iterates back to Poll and re-drains, so the chain
+    // still completes, interleaved with completion pickup.
     //
     uint32_t budget = m_drainBudget;
+    uint32_t stride = m_drainPeekStride;
+    uint32_t sinceCheck = 0;
     while (auto* waiter = m_pendingContinuations.Pop())
     {
         {
@@ -664,6 +685,14 @@ void Cooperator::DrainContinuations()
         if (budget && --budget == 0)
         {
             break;
+        }
+        if (stride && ++sinceCheck >= stride)
+        {
+            sinceCheck = 0;
+            if (m_uring.HasPendingCompletions())
+            {
+                break;
+            }
         }
     }
 }

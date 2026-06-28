@@ -197,6 +197,22 @@ struct io_uring_sqe* Uring::GetSqe()
     return sqe;
 }
 
+bool Uring::HasPendingCompletions() const
+{
+    // Two independent signals that real IO is ready to service. The continuation drain consults
+    // this to decide whether to yield mid-chain.
+    //
+    //   1. io_uring_cq_ready: CQEs already materialized in the completion ring, waiting for Poll
+    //      to dispatch them. A userspace read of the CQ head/tail.
+    //   2. IORING_SQ_TASKRUN: under COOP_TASKRUN the kernel completes operations into task_work
+    //      and sets this flag rather than filling the CQ ring directly; the CQEs only appear after
+    //      the next io_uring_enter(). During a synchronous continuation chain no enter() happens,
+    //      so cq_ready stays zero even though completions are pending -- this flag is the live
+    //      signal for that case. A volatile read of kernel-mapped SQ ring memory.
+    //
+    return io_uring_cq_ready(&m_ring) > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN);
+}
+
 int Uring::Poll()
 {
     // Check whether io_uring_submit() is needed before calling it. Poll() is invoked after

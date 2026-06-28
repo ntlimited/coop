@@ -69,12 +69,29 @@ synchronously through an already-released coordinator (buffered data, an interna
 rendezvous) rather than waiting on a CQE — breaks that assumption: it re-arms and fires within the
 same drain, so an unbounded drain would run it to its natural end before the loop could poll again,
 delaying the pickup of every unrelated IO completion sitting in the CQ behind it. This is the
-in-cooperator analogue of reactor starvation. The drain therefore carries a per-cooperator op budget
-(`Cooperator::m_drainBudget`): after that many continuations fire, the drain returns to the loop,
-which polls io_uring and then resumes draining the remainder. The chain still completes — just
-interleaved with completion pickup — so the bound converts "drain bounds stack depth" into "drain
-bounds completion-pickup latency" as well, the same way the resume batch is already capped at 16
-contexts. A budget of 0 restores draining strictly to empty.
+in-cooperator analogue of reactor starvation.
+
+The drain is paced against the real question — *is IO actually waiting?* — rather than a guessed
+count. Every `Cooperator::m_drainPeekStride` continuations it peeks io_uring
+(`Uring::HasPendingCompletions()`, a userspace read of the CQ head/tail and the COOP_TASKRUN flag, no
+syscall) and breaks the instant completions are pending, so a CQE sitting behind the chain is
+harvested within a stride. When nothing is pending the peek costs nothing observable and the chain
+runs on, so a purely synchronous chain with no concurrent IO pays no spurious breaks. A coarse op
+budget (`Cooperator::m_drainBudget`) backs the peek as a hard ceiling that bounds native stack depth
+and caps a pathological chain that somehow never lets a completion land. The budget alone is a blunt
+proxy for IO readiness — too low wastes polls on a quiet chain, too high lets a CQE languish; the
+peek supplies the precise signal and the budget only guarantees an upper bound.
+
+The break is only half the latency story: the scheduler's idle branch, when a poll completes IO that
+wakes a context, schedules that context *before* re-draining the continuation backlog. The
+freshly-completed IO is exactly the work that was queued behind the chain; re-draining to the budget
+ceiling first would reintroduce the very pickup tail the peek exists to cut. The queued continuations
+are not lost — they ride the next iteration's drain, interleaved with the woken context. Together the
+peek and the ordering convert "drain bounds stack depth" into "drain bounds completion-pickup
+latency" while keeping a high ceiling: at a fixed budget the peek cuts the synchronous-chain p99
+completion-pickup tail by roughly an order of magnitude with no throughput cost on a quiet chain.
+Stride 0 disables the peek (budget-only); budget 0 disables the ceiling (peek-only); both 0 drains
+strictly to empty.
 
 **Two flavors, one spectrum:**
 

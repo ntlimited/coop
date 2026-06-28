@@ -125,13 +125,62 @@ headroom to push ~53 → ~40 ms.
   No scheduler coupling. *Supporting structure — does not close a covenant on its own.*
 - **Slice 2 — `Shed` API + explicit pull**, driven by workers (as the prototype was), proving
   the deque + task pool in-tree without touching the loop. Reproduces ~53 ms.
-- **Slice 3 — scheduler-loop integration + wake protocol.** Pull/steal in the cooperator idle
-  path; sleep-when-dry; wake-on-shed folded into the existing `WaitAndPoll`/eventfd path.
-  *This closes the covenant.* The delicate slice: must not disturb yielded-context resume,
-  io_uring polling, continuation drain, submission drain, shutdown, or kill.
-- **Slice 4 — optimize:** chunked steals (batch claims cut coordination cost — measured in the
-  balancing experiments), then a shared injector for `Shed`-from-non-cooperator and smeared
-  work, then NUMA-aware steal order, then the rseq owner-end fast path.
+- **Slice 3 — opt-in participation + park policy** (reshaped by the Submit measurement below).
+  *Not* core-loop surgery and *not* a Submit rebuild. A participating cooperator runs a daemon
+  **stealer** context (spawned on opt-in) that pulls local / steals, runs the morsel, and when
+  idle parks via `CoordinateWith(stealCoord, recheckTimeout)`. An in-cooperator `Shed`/re-shed
+  pushes to the local deque and releases `stealCoord` (immediate local pickup); cross-cooperator
+  rebalancing happens when an idle stealer's `recheckTimeout` fires and it steals an overloaded
+  peer. This sidesteps the ~2.3µs cross-thread park-wake entirely (the stealer self-wakes via its
+  own timer CQE or a local coord release — both in-cooperator), so there is **no cross-thread wake
+  protocol and no change to `cooperator.cpp`'s loop**. The stealer is just a context; the
+  Cooperator core is untouched, which is how opt-in stays free. `recheckTimeout` is the tunable
+  park-policy parameter (start ~50µs, tune against the scoreboard). *This closes the covenant.*
+- **Slice 4 — optimize:** adaptive recheck backoff (longer timeout when persistently idle), then
+  chunked steals (batch claims cut coordination cost — measured in the balancing experiments),
+  then a shared injector for `Shed`-from-non-cooperator and smeared work (layered on Submit), then
+  NUMA-aware steal order, then the rseq owner-end fast path, then the per-cooperator task slab.
+
+## Submit measurement (why Slice 3 reshaped)
+
+Measured `Cooperator::Submit` to decide whether to rebuild it (scratchpad `submit_bench.cpp`):
+
+| metric | value |
+|--------|-------|
+| round-trip to a **parked** cooperator (tail) | ~2.3 µs |
+| round-trip to a **warm** (not-yet-parked) cooperator | ~0.6 µs |
+| single-producer throughput | ~600 ns/submit (1.4–1.7 M/s) |
+| contended (2/4/8 producers) | 439 / 431 / 506 ns/submit — scales; mutex is not the bottleneck |
+
+Conclusion: Submit's dominant cost is the **OS thread-wake floor (~2.3 µs)**, which no queue
+mechanism changes; its throughput is **spawn-dominated** (a context per task), not mutex-dominated.
+So Submit's mechanism is not the weakness, and combined with the opt-in covenant the decision is to
+**leave Submit unchanged**. The actionable lesson for the substrate: the ~2.3 µs cross-thread wake
+is expensive relative to nanosecond steal ops, so the stealer must **avoid cross-thread wakes** —
+hence the timed self-recheck park above instead of a wake protocol.
+
+## Opt-in covenant (load-bearing)
+
+The work-sharing subsystem is **optional and opt-in**. A cooperator that does not opt in must
+pay nothing — no deque allocated, no steal check on any path it runs, no participation in the
+idle-set or wake protocol, and byte-for-byte the current scheduler loop on its hot path. This is
+a hard requirement, not an aspiration, and it dictates the layering:
+
+- **Submit stays the base cross-thread primitive.** It is core and widely used (~42 sites), so it
+  must not be rebuilt *on* the work-stealing layer — that would make the opt-in subsystem
+  mandatory. Submit may be improved on its own merits if measurement shows its mutex-list /
+  eventfd-drainer is weak, but that is a separate, independent change.
+- **Work-stealing layers on/beside Submit, never under it.** Participating cooperators get a
+  deque + idle-path pull/steal + `Shed`; cross-thread `Shed` is expressed *via* Submit (deposit to
+  a participant), not by making Submit traverse the steal deques.
+- **Opt-in is explicit** (a `CooperatorConfiguration` flag / joining a work-sharing group). The
+  idle-path steal is gated on participation; a non-participant's idle path is the current
+  `WaitAndPoll`, unchanged.
+
+**Proof obligation (part of the calibration):** a non-participant cooperator must show *zero*
+regression — `BM_AcquireRelease`, the scheduler yield benchmarks, and a no-op-loop benchmark must
+be unchanged with the subsystem compiled in but unused. If opting out is not free, the design is
+wrong.
 
 ## Non-goals / what this must not become
 

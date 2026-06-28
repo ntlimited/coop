@@ -88,7 +88,21 @@ normally trampolines through the loop (two switches). With the fastpath, a yield
 runnable context switches straight into it (`Cooperator::YieldFrom`). To keep the interleaved poll
 above from starving, the chain is bounded by `directYieldBudget`: the budget refills in `Resume`
 (just after the loop polls) and decrements per direct yield; at zero, a yield falls back through the
-loop. Off by default; default path unchanged. See `docs/fast_context_switch_01.md`.
+loop. Off by default; default path unchanged.
+
+The same direct-switch also applies to the **self-block** path (`Cooperator::Block`) — a contended
+`Coordinator`'s block/wake is the bulk of a cooperative lock/sleep's cost (sleep round-trip 81→35ns,
+lock cycle 90→60ns with directYield on). The block fastpath does **not** poll inline (the yield one
+does): a self-block can be a teardown `Flash` whose wake a premature poll would lose, so it registers
+in `m_blocked` first and lets the budget bring the loop's poll back.
+
+**IO governor** (`ioPresentLimit`, default 8; 0 disables): the budget bound alone defers io_uring
+polling, which under `COOP_TASKRUN` can leave a queued SQE unsubmitted (timer never arms) for
+milliseconds. On a direct yield, when work is pending the governor enters the kernel **inline** — one
+`Poll()` submits SQEs and reaps completions in a single `io_uring_enter`. Submissions are detected
+every switch (`HasPendingSubmissions`, a field read); completions are sampled. Cuts timer-wake
+lateness under spinners from ~9.6ms to ~115µs at zero quiet-ring cost. See
+`docs/fast_context_switch_01.md`.
 
 ## Context Lifecycle (`context.cpp`)
 

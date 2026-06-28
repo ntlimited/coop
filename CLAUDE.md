@@ -28,6 +28,21 @@ benchmarks/     - Benchmark code to evaluate performance of the library and of a
 - Multiline comments should be avoided. Comment blocks should have a trailing, empty `//` line to
   improve visual separation
 
+### Documentation and comments
+
+Write docs and comments for a reader who did not build the thing, not as notes from someone who did.
+
+- **Motivate before mechanism.** Lead with why a thing exists, or the problem it solves, then how it
+  works. A mechanism stated without its motivation reads as noise even when it is correct — and the
+  author who just built it is the one least able to notice, because they supply the missing
+  motivation automatically. Re-read durable prose cold, as a stranger to the project, before calling
+  it done.
+- **Describe the design as it is, not as a delta from how it was built.** Avoid development-journey
+  residue ("we changed X to Y", "this used to …", "brought it down from …"); the reader never saw the
+  prior state.
+- **Keep process artifacts out of durable docs** — no commit hashes, no "as discussed", no reference
+  that only makes sense mid-development.
+
 ### Best Practices
 - Patterns that stack allocate, or enable stack allocation, are preferred
 - RAII should be used wherever possible

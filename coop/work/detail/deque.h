@@ -6,30 +6,34 @@
 
 namespace coop
 {
+namespace work
+{
+namespace detail
+{
 
 // Bounded single-owner / multi-thief work-stealing deque (Chase-Lev, with the Le, Pop, Cohen &
-// Nardelli 2013 memory ordering for weak memory models — correct on aarch64, not just x86 TSO).
+// Nardelli 2013 memory ordering for weak memory models -- correct on aarch64, not just x86 TSO).
 //
 // The owner pushes and pops its own end (the bottom): LIFO, so recently-shed work is cache-hot and
 // the owner's path is uncontended in the common case. Thieves steal the far end (the top): FIFO, so
 // they take the oldest task (likely the largest remaining unit of work). Exactly one consumer ever
-// receives a given item — the last-element race between the owner's pop and a thief's steal is
+// receives a given item -- the last-element race between the owner's pop and a thief's steal is
 // resolved by a CAS on the top index that only one side can win.
 //
 // Bounded (no growth): PushBottom returns false when full. Callers handle overflow out of band
 // (run the task inline, or push to a shared injector) rather than the deque reallocating. T must be
-// trivially copyable — a task pointer.
+// trivially copyable -- a task pointer.
 //
 template<typename T, size_t CAP = 256>
-class WorkDeque
+class Deque
 {
     static_assert((CAP & (CAP - 1)) == 0, "CAP must be a power of two");
     static constexpr int64_t kMask = (int64_t)CAP - 1;
 
   public:
-    WorkDeque() : m_top(0), m_bottom(0) {}
-    WorkDeque(const WorkDeque&) = delete;
-    WorkDeque& operator=(const WorkDeque&) = delete;
+    Deque() : m_top(0), m_bottom(0) {}
+    Deque(const Deque&) = delete;
+    Deque& operator=(const Deque&) = delete;
 
     // Owner only. Append to the bottom. Returns false if the deque is full.
     //
@@ -82,7 +86,7 @@ class WorkDeque
     }
 
     // Any thief. Take from the top (FIFO). Returns false on empty or on losing the steal race; the
-    // caller simply tries another victim — the item is not lost, another consumer has it.
+    // caller simply tries another victim -- the item is not lost, another consumer has it.
     //
     bool Steal(T& out)
     {
@@ -125,4 +129,6 @@ class WorkDeque
     alignas(64) T m_buf[CAP];
 };
 
+} // end namespace detail
+} // end namespace work
 } // end namespace coop

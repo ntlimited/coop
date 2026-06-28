@@ -26,4 +26,7 @@
   stackful-fiber model
 - `cross_thread_substrate_01.md`: the sharded work-stealing substrate (Grid, deque,
   covenants, calibration) that continuation bodies shed morsels into
+- `timer_slack_01.md`: opt-in deadline quantization on the `Sleep` path — collapses
+  per-timer kernel wakeups for a fan-out of concurrent sleeps, with the negative
+  covenant that correctness deadlines stay exact
 - `TODO.md`: prioritized follow-up work

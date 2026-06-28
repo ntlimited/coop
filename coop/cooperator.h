@@ -394,6 +394,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     std::atomic<bool> m_shutdown;
     Context*        m_scheduled;
 
+    // Remaining direct yields before the next one falls back through the cooperator loop to poll
+    // io_uring (see CooperatorConfiguration::directYield). Reset to directYieldBudget each time the
+    // loop resumes a context; decremented by each direct yield. Unused when directYield is off.
+    //
+    int m_directYieldsRemaining{0};
+
     io::Uring       m_uring;
 
     // Deadline-ordered queue of in-flight sleeps and the bookkeeping for the one kernel timer that

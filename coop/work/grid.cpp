@@ -8,8 +8,7 @@
 #include "coop/context.h"
 #include "coop/coordinate_with.h"
 #include "coop/coordinator.h"
-#include "coop/io/handle.h"
-#include "coop/io/timeout.h"
+#include "coop/time/sleep.h"
 
 namespace coop
 {
@@ -100,15 +99,19 @@ void Grid::StealerLoop(Context* ctx, int shard)
         {
         }
 
-        Coordinator coord;
-        io::Handle handle(ctx, GetUring(), &coord);
-        io::Timeout(handle, interval);
-
-        // Block on the doorbell and the timer together. On a doorbell win the timer is still in
-        // flight; the Handle destructor cancels and drains it. A doorbell win re-takes ownership of
-        // the doorbell, so the next idle pass parks correctly rather than spinning.
+        // Park on the shared per-cooperator timer queue instead of arming a private
+        // IORING_OP_TIMEOUT each park: the recheck deadline rides the one kernel timer the
+        // cooperator already maintains (docs/timer_wheel_001.md). The park is exact (no slack) — a
+        // recheck deadline that drifted would loosen rebalancing latency.
         //
-        CoordinateWithKill(ctx, &doorbell, &coord);
+        time::Sleeper sleeper(ctx, interval);
+        sleeper.Arm();
+
+        // Block on the doorbell and the park timer together. On a doorbell win the timer node is
+        // still queued; the Sleeper destructor removes it. A doorbell win re-takes ownership of the
+        // doorbell, so the next idle pass parks correctly rather than spinning.
+        //
+        CoordinateWithKill(ctx, &doorbell, sleeper.GetCoordinator());
     }
 }
 

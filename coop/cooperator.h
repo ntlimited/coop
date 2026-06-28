@@ -36,6 +36,8 @@ enum class SchedulerJumpResult
 struct Launchable;
 struct CooperateHandle;
 
+namespace work { struct Participation; }
+
 static constexpr int COOPERATOR_LIST_REGISTRY = 0;
 
 // A Cooperator manages multiple contexts
@@ -188,6 +190,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     //
     bool m_inThunk = false;
 #endif
+
+    // Opt-in work-sharing participation: null unless this cooperator has joined a work::Grid. Shed()
+    // reads it -- with a Grid it sheds a balanced Erg, without one it falls back to Spawn (the
+    // "shed = spawn" default). Set by work::Grid::Join; never touched on the scheduler hot path.
+    //
+    work::Participation* m_participation = nullptr;
 
     void Shutdown();
 

@@ -6,8 +6,11 @@
 
 #include <gtest/gtest.h>
 
+#include "coop/cooperator.h"
+#include "coop/cooperator_configuration.h"
 #include "coop/coordinator.h"
 #include "coop/self.h"
+#include "coop/thread.h"
 
 #include "coop/io/armed_handle.h"
 #include "coop/io/buffer_ring.h"
@@ -167,6 +170,49 @@ TEST(ArmedHandleTest, PoolExhaustionSurfacesEnobufs)
         EXPECT_GT(ah.Enobufs(), 0u);
         EXPECT_FALSE(ah.Armed());
     });
+}
+
+// Uring::Init registers a default buffer ring when the configuration asks for one and the kernel
+// supports pbuf rings. Exercises the feature-probe wiring end to end: the configured ring is
+// reachable via GetBufferRing() and an armed recv that names no explicit ring drains a stream
+// through it. (On a kernel without pbuf-ring support GetBufferRing() would be null; this host has
+// it, so we assert the registered path.)
+//
+TEST(ArmedHandleTest, InitRegistersDefaultBufferRing)
+{
+    coop::CooperatorConfiguration cfg;
+    cfg.uring.bufferRingEntries = 16;
+    cfg.uring.bufferRingBufSize = 256;
+    cfg.uring.bufferRingGroup = 5;
+
+    coop::Cooperator cooperator(cfg);
+    coop::Thread thread(&cooperator);
+
+    cooperator.SubmitSync([](coop::Context* ctx)
+    {
+        coop::io::BufferRing* br = coop::GetUring()->GetBufferRing();
+        ASSERT_NE(br, nullptr);
+        EXPECT_EQ(br->Group(), 5);
+        EXPECT_EQ(br->Entries(), 16u);
+
+        SocketPair sp;
+        coop::io::Descriptor reader(sp.fds[0], coop::GetUring());
+
+        coop::Coordinator coord;
+        coop::io::ArmedHandle ah(ctx, reader, br, &coord);
+        ah.Arm();
+
+        const char* kMsg = "default-ring";
+        const int kLen = 12;
+        ASSERT_EQ(::write(sp.fds[1], kMsg, kLen), (ssize_t)kLen);
+
+        coop::io::ArmedHandle::Chunk c;
+        int n = ah.Next(&c);
+        ASSERT_EQ(n, kLen);
+        EXPECT_EQ(memcmp(c.data, kMsg, kLen), 0);
+    });
+
+    cooperator.Shutdown();
 }
 
 } // namespace

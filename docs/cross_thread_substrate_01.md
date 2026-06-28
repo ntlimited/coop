@@ -135,10 +135,11 @@ headroom to push ~53 → ~40 ms.
   protocol and no change to `cooperator.cpp`'s loop**. The stealer is just a context; the
   Cooperator core is untouched, which is how opt-in stays free. `recheckTimeout` is the tunable
   park-policy parameter (start ~50µs, tune against the scoreboard). *This closes the covenant.*
-- **Slice 4 — optimize:** adaptive recheck backoff (longer timeout when persistently idle), then
-  chunked steals (batch claims cut coordination cost — measured in the balancing experiments),
-  then a shared injector for `Shed`-from-non-cooperator and smeared work (layered on Submit), then
-  NUMA-aware steal order, then the rseq owner-end fast path, then the per-cooperator task slab.
+- **Slice 4 — optimize:** adaptive recheck backoff (**landed** — see *Adaptive recheck backoff*
+  below), then chunked steals (batch claims cut coordination cost — measured in the balancing
+  experiments), then a shared injector for `Shed`-from-non-cooperator and smeared work (layered on
+  Submit), then NUMA-aware steal order, then the rseq owner-end fast path, then the per-cooperator
+  task slab.
 
 ## Submit measurement (why Slice 3 reshaped)
 
@@ -214,3 +215,40 @@ family) is the instrument.
 - **Robustness:** the mild (already-balanced) workload must not regress meaningfully against
   static shared-nothing — confirming `Shed` is an opt-in relief valve, not a tax on the
   balanced common case.
+
+## Adaptive recheck backoff (Slice 4)
+
+A fixed recheck interval taxes idle cores. The interval has to be small to keep the
+clustered-imbalance tail tight, but a fully quiescent core then arms a fresh timer on every tick and
+wakes for nothing — measured at **~60k wakeups/s per idle core at 10µs** on a 4-cooperator grid
+(an effective ~16µs period once io_uring overhead is counted). Four idle cores is a quarter-million
+wakeups a second spent discovering there is nothing to steal.
+
+The stealer's park interval is therefore adaptive (`Grid::StealerLoop`): per-stealer locals, no
+atomics, no shared state. It starts at `recheckMin`, and after `idleGrowAfter` consecutive empty
+re-checks doubles each empty re-check up to `recheckMax`; **any** successful pull (local work or a
+steal) snaps it back to `recheckMin`. So a stealer that is finding work stays aggressive, and only a
+persistently idle core coasts to the cap. `recheckMin` bounds rebalancing latency while load is
+present; `recheckMax` bounds it after the core has gone fully idle.
+
+Measured (4 cooperators; fixed 10µs vs the same floor adapting to a cap):
+
+| policy | idle wakeups/s/core | clustered makespan | cold-pickup latency (after full idle) |
+|--------|--------------------:|-------------------:|--------------------------------------:|
+| fixed 10µs        | ~59k | 10.26 ms | 2.1 µs  |
+| adaptive 10→200µs | ~4.4k (**13×** fewer) | 10.35 ms (+0.9%) | 107 µs |
+| adaptive 10→1ms   | ~0.96k (**62×** fewer) | 10.37 ms (+1.1%) | 464 µs |
+
+The clustered makespan is essentially unchanged because the workload keeps the stealers finding
+work, so they never leave `recheckMin` while load is present — the backoff is invisible to sustained
+imbalance. The cost is paid only on the **first** pickup after a core has been idle long enough to
+coast to the cap: that pickup waits up to ~`recheckMax`, then the successful steal snaps the stealer
+back to aggressive. `10→200µs` is the recommended default — an order-of-magnitude cut in idle
+wakeups for a sub-percent makespan cost and a ~100µs worst-case cold pickup.
+
+This is the measured gate for the cross-thread steal-wake (#2). Backoff alone holds the sustained
+clustered tail with no wake protocol, so #2 is **not** needed for throughput/makespan workloads. The
+one case it does not cover is cold-pickup latency: a workload that is latency-sensitive *and* bursty
+after idle pays up to `recheckMax` on the first unit of a burst. That — and only that — is the
+measured case that justifies the ~2.3µs `MSG_RING` steal-wake, which would replace the cold-pickup
+wait with the OS thread-wake floor. Absent that requirement, the cap is the cheaper instrument.

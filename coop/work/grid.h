@@ -41,12 +41,24 @@ class Grid
     Grid(const Grid&) = delete;
     Grid& operator=(const Grid&) = delete;
 
-    // Size for n cooperators; recheck is the idle stealer's park/re-check interval. It bounds how
-    // quickly an idle stealer notices stealable work, so it caps the worst-case rebalancing latency;
-    // ~10us keeps clustered makespan stable. (A cross-thread steal-wake would let it be larger -- a
-    // later refinement.)
+    // Size for n cooperators. The remaining parameters tune the idle stealer's park/re-check
+    // policy, which trades idle-core wakeup rate against worst-case rebalancing latency.
     //
-    void Init(int n, time::Interval recheck = std::chrono::microseconds(10));
+    // An idle stealer parks on an io_uring timer, wakes, re-checks for stealable work, and parks
+    // again. A short interval notices clustered work quickly (tight rebalancing tail) but a fully
+    // idle core then wakes tens of thousands of times a second doing nothing -- a steady timer-CQE
+    // drip that scales with the number of idle cores. To get both, the interval is adaptive: it
+    // starts at recheckMin and, after idleGrowAfter consecutive empty re-checks, doubles each empty
+    // re-check up to recheckMax. Any successful pull (local work or a steal) snaps it back to
+    // recheckMin, so a stealer that is finding work stays aggressive and only a persistently
+    // quiescent core coasts up to the cap. recheckMin therefore still bounds rebalancing latency
+    // while load is present; recheckMax bounds it after the core has gone fully idle -- the worst
+    // case a cross-thread steal-wake would address.
+    //
+    void Init(int n,
+              time::Interval recheckMin    = std::chrono::microseconds(10),
+              time::Interval recheckMax    = std::chrono::microseconds(200),
+              int            idleGrowAfter = 8);
 
     // Opt the cooperator into this grid: assign it the next shard, set its participation field, and
     // spawn its stealer. Call once per cooperator, after Init, before sheddding to it.
@@ -57,6 +69,16 @@ class Grid
     //
     void ShedErg(int shard, Erg* e) { m_shards.Shed(shard, e); }
 
+    // Stealer instrumentation, summed across all shards. Written only by the idle daemon stealers
+    // (off the in-cooperator Shed hot path); meant to be read after quiescence. Parks counts idle
+    // timer arms -- one per idle-core wakeup, the cost the backoff exists to cut. Pulls counts work
+    // units a stealer ran. MaxIdleRun is the longest observed run of consecutive empty re-checks.
+    // A production build would route these through the perf system rather than carry the atomics.
+    //
+    uint64_t Parks() const { return m_parks.load(std::memory_order_relaxed); }
+    uint64_t Pulls() const { return m_pulls.load(std::memory_order_relaxed); }
+    uint64_t MaxIdleRun() const { return m_maxIdleRun.load(std::memory_order_relaxed); }
+
   private:
     void StealerLoop(Context* ctx, int shard);
 
@@ -64,7 +86,13 @@ class Grid
     std::unique_ptr<Participation[]> m_parts;
     std::atomic<int>                 m_joined{0};
     int                              m_n = 0;
-    time::Interval                   m_recheck = std::chrono::microseconds(10);
+    time::Interval                   m_recheckMin    = std::chrono::microseconds(10);
+    time::Interval                   m_recheckMax    = std::chrono::microseconds(200);
+    int                              m_idleGrowAfter = 8;
+
+    std::atomic<uint64_t>            m_parks{0};
+    std::atomic<uint64_t>            m_pulls{0};
+    std::atomic<uint64_t>            m_maxIdleRun{0};
 };
 
 } // end namespace work

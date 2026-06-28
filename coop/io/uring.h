@@ -54,6 +54,13 @@ struct Uring
     //
     bool HasPendingCompletions() const;
 
+    // True when SQEs have been queued (Handle::Submit et al.) but not yet flushed to the kernel with
+    // io_uring_submit. Deferred submission batches these to the batch-boundary Poll for throughput,
+    // but a fastpath that defers the loop indefinitely leaves them unsubmitted -- a timer never arms,
+    // an async op never starts. The directYield governor reads this to bound submission staleness.
+    //
+    bool HasPendingSubmissions() const { return m_pendingSqes > 0; }
+
     void Init();
 
     // Submit any pending SQEs to the kernel. Returns the number of SQEs submitted (from

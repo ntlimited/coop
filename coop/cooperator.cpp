@@ -617,13 +617,50 @@ void Cooperator::YieldFrom(Context* ctx)
     // plus HandleCooperatorResumption). The yielding context takes the place the loop would have
     // given it -- pushed onto the yielded list -- and the next runnable is resumed directly.
     //
-    // The budget bounds how many direct switches happen before one falls back through the loop.
-    // The loop is the only place io_uring is polled, so the bound is what keeps CQE processing
-    // (and the Handle::Flash teardown barriers that depend on it) from starving: at most
-    // directYieldBudget switches separate two polls, no matter how tightly contexts yield.
+    // directYieldBudget is the quiet-ring bound: how many direct switches may pass before one falls
+    // back through the loop when no IO is pending.
     //
     if (m_config.directYield && m_directYieldsRemaining > 0 && !m_yielded.IsEmpty())
     {
+        // IO governor. The loop's hot path (ReapOnly) never enters the kernel, so a fastpath that
+        // keeps deferring the loop leaves queued SQEs unsubmitted (a timer never arms) and task_work
+        // completions undelivered -- IO latency balloons toward the batch-boundary poll, 16*budget
+        // switches away. The fix is to enter inline when work is pending: a real Poll submits queued
+        // SQEs AND reaps completions in one io_uring_enter (the enter runs task_work, materializing
+        // the completions the same call reaps -- the harvest rides the submit for free).
+        //
+        // Submissions are urgent and cheap to detect: an unsubmitted SQE is work that has not STARTED,
+        // strictly worse than a completion merely waiting, and HasPendingSubmissions is a field read,
+        // so check it EVERY yield. Completions (and cross-thread submissions handed in via
+        // m_hasSubmissions, acquire-ordered to match the loop) are lazier -- the work already
+        // happened, and the submit-enter harvests task_work anyway -- so only SAMPLE those reads once
+        // every kStride yields (a power of two, so the gate is a bitmask). After entering, clamp the
+        // budget to ioPresentLimit so a steady completion stream keeps polling promptly.
+        // ioPresentLimit == 0 disables the governor (pure count budget) for a known-CPU-bound workload.
+        //
+        constexpr int kStride = 4;
+        if (m_config.ioPresentLimit > 0)
+        {
+            const bool sample = (m_directYieldsRemaining & (kStride - 1)) == 0;
+            if (m_uring.HasPendingSubmissions() ||
+                (sample && (m_uring.HasPendingCompletions() ||
+                            m_hasSubmissions.load(std::memory_order_acquire))))
+            {
+                m_uring.Poll();
+
+                if (m_directYieldsRemaining > m_config.ioPresentLimit)
+                    m_directYieldsRemaining = m_config.ioPresentLimit;
+            }
+        }
+
+        if (m_directYieldsRemaining == 0)
+        {
+            auto ret = ContextSwitch(&ctx->m_sp, m_sp,
+                                     static_cast<int>(SchedulerJumpResult::YIELDED));
+            assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
+            return;
+        }
+
         --m_directYieldsRemaining;
 
         Context* next = m_yielded.Pop();

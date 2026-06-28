@@ -75,6 +75,21 @@ Handle destructors run Cancel + Flash during stack unwind, draining in-flight IO
 even when all contexts are blocked) and `m_uring.PendingOps() > 0` (keeps the loop alive to
 poll io_uring for cancel CQEs while Handle destructors drain in-flight operations).
 
+**Context switch** (`detail/context_switch.{S,h,cpp}`): on x86-64 the asm core
+`_coop_switch_context` saves only `%rbp` and swaps the stack; the `ContextSwitch` inline-asm
+wrapper lists the other callee-saved registers (rbx, r12-r15) in its clobber list, so the compiler
+preserves only the ones live across a given switch. aarch64 keeps an all-callee-saved core (plain
+call from the wrapper) pending an aarch64 host to validate the same idiom. `ContextInit` seeds a
+fresh stack with three slots (abort, trampoline, `%rbp = Context*`); the trampoline reads `Context*`
+from `%rbp`.
+
+**Direct-yield fastpath** (opt-in, `CooperatorConfiguration::directYield`): a plain `Yield`
+normally trampolines through the loop (two switches). With the fastpath, a yield that finds another
+runnable context switches straight into it (`Cooperator::YieldFrom`). To keep the interleaved poll
+above from starving, the chain is bounded by `directYieldBudget`: the budget refills in `Resume`
+(just after the loop polls) and decrements per direct yield; at zero, a yield falls back through the
+loop. Off by default; default path unchanged. See `docs/fast_context_switch_01.md`.
+
 ## Context Lifecycle (`context.cpp`)
 
 **Construction**: parent registers child in `m_children` list; first child `TryAcquire`s the

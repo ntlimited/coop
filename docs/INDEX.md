@@ -26,6 +26,11 @@
   stackful-fiber model
 - `cross_thread_substrate_01.md`: the sharded work-stealing substrate (Grid, deque,
   covenants, calibration) that continuation bodies shed morsels into
+- `fast_context_switch_01.md`: the three levers that cut `Context::Yield` cost to peer
+  parity and past it — gating the per-resume cycle-accounting rdtsc, the register-aware
+  (clobber-delegated) x86-64 switch core, and the opt-in direct context-to-context yield
+  fastpath, with the negative covenant that the fastpath must never starve io_uring (it is
+  bounded by a budget that forces a polling fallback through the cooperator loop)
 - `timer_slack_01.md`: opt-in deadline quantization on the `Sleep` path — collapses
   per-timer kernel wakeups for a fan-out of concurrent sleeps, with the negative
   covenant that correctness deadlines stay exact

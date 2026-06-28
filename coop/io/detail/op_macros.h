@@ -132,7 +132,6 @@
         {                                                                                \
             return -EAGAIN;                                                              \
         }                                                                                \
-        handle.MarkFastPathArmed();                                                      \
         return handle.Wait();                                                            \
     }
 
@@ -149,7 +148,6 @@
         {                                                                                \
             return -EAGAIN;                                                              \
         }                                                                                \
-        handle.MarkFastPathArmed();                                                      \
         int result = handle.Wait();                                                      \
         if (handle.TimedOut())                                                           \
         {                                                                                \
@@ -171,7 +169,6 @@
         {                                                                                \
             return -EAGAIN;                                                              \
         }                                                                                \
-        handle.MarkFastPathArmed();                                                      \
         return handle.WaitKill();                                                        \
     }
 
@@ -188,7 +185,6 @@
         {                                                                                \
             return -EAGAIN;                                                              \
         }                                                                                \
-        handle.MarkFastPathArmed();                                                      \
         int result = handle.WaitKill();                                                  \
         if (handle.TimedOut())                                                           \
         {                                                                                \

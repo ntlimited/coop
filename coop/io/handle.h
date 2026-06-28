@@ -111,17 +111,6 @@ struct Handle : EmbeddedListHookups<Handle>
 
     void Submit(struct io_uring_sqe*);
 
-    // Mark this Handle as armed from a nonblocking-fast-path caller (Recv/Send via
-    // COOP_IO_IMPLEMENTATIONS_FASTPATH). On that path a MSG_DONTWAIT direct syscall has already
-    // run and returned EAGAIN before the SQE was armed, so the operation provably has no data —
-    // or no send buffer space — ready right now. Wait()'s eager Poll() exists only to catch an
-    // inline completion before blocking; for a fast-path-armed Handle that completion cannot
-    // occur, so the eager submit is pure waste. When this flag is set, Wait()/WaitKill() skip the
-    // eager submit and let the SQE accumulate for the scheduler's batch-boundary Poll(), folding
-    // many socket ops into a single io_uring_enter().
-    //
-    void MarkFastPathArmed() { m_deferEagerSubmit = true; }
-
     // Submit with a linked timeout. Converts the interval to a __kernel_timespec stored in
     // m_timeout, marks the operation SQE with IOSQE_IO_LINK, appends a linked timeout SQE,
     // and sets m_pendingCqes to 2.
@@ -161,8 +150,8 @@ private:
     void Finalize();
 
     // Whether Wait()/WaitKill() should skip the eager submit and let the SQE accumulate for the
-    // scheduler's batch-boundary Poll(). True only for a fast-path-armed op (MarkFastPathArmed)
-    // when enough IO is in flight to amortize the deferred io_uring_enter() across a batch.
+    // scheduler's batch-boundary Poll(). Gated purely on in-flight depth (PendingOps > threshold):
+    // a fan-out server batches; a serial flow eager-submits for latency. See handle.cpp.
     //
     bool DeferSubmit() const;
 
@@ -174,7 +163,6 @@ private:
     int     m_result;
     int     m_pendingCqes;
     bool    m_timedOut;
-    bool    m_deferEagerSubmit{false};
 
     struct __kernel_timespec m_timeout;
 };

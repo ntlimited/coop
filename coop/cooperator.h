@@ -159,16 +159,36 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     // Shared wake dispatch for a Coordinated waiter, used by every site that wakes one
     // (Coordinator::Release, Signal::Notify): a continuation waiter is queued to fire from the
-    // loop's drain (DrainContinuations); a context waiter is Unblock'd. Routing all wakes here is
+    // loop's drain (DrainContinuationsPaced); a context waiter is Unblock'd. Routing all wakes here is
     // what makes continuations work with any coordinator-backed primitive, not just one.
     //
     void WakeWaiter(Coordinated* waiter, const bool schedule);
 
-    // Run all queued continuations to completion as function calls (no context switch). Drained
-    // by the cooperator loop after polling; iterative, so a continuation that queues another is
+    // Run *all* queued continuations to completion as function calls (no context switch), leaving
+    // the pending list empty on return. Iterative, so a continuation that queues another is
     // flattened rather than recursing on the native stack.
     //
+    // This is the unconditional contract a caller can rely on: once it returns, no queued
+    // continuation survives to fire later. That matters because a detached continuation captures
+    // state owned by its registrar (a coordinator, a counter, a stop flag); if the registrar tears
+    // that state down believing the queue is drained, a continuation fired afterward reads freed
+    // memory. The scheduler loop does NOT call this -- it paces its drain with
+    // DrainContinuationsPaced so an always-ready synchronous chain cannot starve io_uring pickup --
+    // but every other caller wants the whole queue gone, not a budget-sized prefix of it.
+    //
     void DrainContinuations();
+
+    // Scheduler-internal, latency-paced drain: fire at most m_drainBudget continuations, peeking
+    // io_uring every m_drainPeekStride to break the instant real completions are pending. Whatever
+    // is left rides the next loop iteration, which Polls first -- the bound that turns drain length
+    // into bounded completion-pickup latency (see the m_drainBudget / m_drainPeekStride comments).
+    //
+    // Only the scheduler loop may leave the queue partially drained, because only the scheduler
+    // guarantees it will come back and finish it before anything observes the gap. A general caller
+    // must use DrainContinuations (full drain); a budget-truncated public drain silently strands
+    // continuations, which is the bug this split exists to prevent.
+    //
+    void DrainContinuationsPaced();
 
     // Backing store for detached continuations (Coordinator::ContinueDetached). Allocated, fired,
     // and freed on this cooperator's thread, so the pool needs no synchronization. Routed through

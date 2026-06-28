@@ -22,7 +22,11 @@ static inline int TrySend(int fd, const void* buf, size_t size, int flags)
     return ::send(fd, buf, size, flags | MSG_DONTWAIT);
 }
 
-COOP_IO_IMPLEMENTATIONS_FASTPATH(Send, io_uring_prep_send, TrySend, SEND_ARGS)
+// Send submits straight to io_uring; SendFastpath tries a nonblocking send() first (a win when the
+// socket is usually writable, which is the common case for responses). See send.h.
+//
+COOP_IO_IMPLEMENTATIONS(Send, io_uring_prep_send, SEND_ARGS)
+COOP_IO_IMPLEMENTATIONS_FASTPATH(SendFastpath, io_uring_prep_send, TrySend, SEND_ARGS)
 
 int SendAll(Descriptor& desc, const void* buf, size_t size, int flags /* = 0 */)
 {
@@ -30,6 +34,21 @@ int SendAll(Descriptor& desc, const void* buf, size_t size, int flags /* = 0 */)
     while (offset < size)
     {
         int sent = Send(desc, (const char*)buf + offset, size - offset, flags);
+        if (sent <= 0)
+        {
+            return sent;
+        }
+        offset += sent;
+    }
+    return (int)size;
+}
+
+int SendAllFastpath(Descriptor& desc, const void* buf, size_t size, int flags /* = 0 */)
+{
+    size_t offset = 0;
+    while (offset < size)
+    {
+        int sent = SendFastpath(desc, (const char*)buf + offset, size - offset, flags);
         if (sent <= 0)
         {
             return sent;

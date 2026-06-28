@@ -20,18 +20,22 @@ struct PlaintextTransport
 
     io::Descriptor& Descriptor() { return m_desc; }
 
+    // Keep-alive HTTP usually has the next pipelined request already buffered and the response
+    // socket writable, so this transport opts into the recv/send fastpaths explicitly -- the case
+    // the speculative nonblocking syscall is built for.
+    //
     int Recv(void* buf, size_t size, int flags, time::Interval timeout)
     {
         if (timeout.count() > 0)
         {
-            return io::Recv(m_desc, buf, size, flags, timeout);
+            return io::RecvFastpath(m_desc, buf, size, flags, timeout);
         }
-        return io::Recv(m_desc, buf, size, flags);
+        return io::RecvFastpath(m_desc, buf, size, flags);
     }
 
     int SendAll(const void* buf, size_t size)
     {
-        return io::SendAll(m_desc, buf, size);
+        return io::SendAllFastpath(m_desc, buf, size);
     }
 
     int SendfileAll(int in_fd, off_t offset, size_t count)

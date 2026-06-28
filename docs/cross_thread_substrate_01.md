@@ -29,10 +29,10 @@ for "run this on *that* cooperator" (affinity, targeted wake). It is the wrong t
 "run this *somewhere with capacity*" — it requires the producer to choose a target, and a
 bad choice cannot be rebalanced.
 
-The a stackful runtime comparison and our own balancing experiments (see `[[coop-balancing-findings]]`,
-`[[comparison-notes]]`) landed on a clear bet: for irregular compute, **work-queue
+Our own balancing experiments, and a study of a production stackful-fiber work-stealing
+runtime built for a closely related space, landed on a clear bet: for irregular compute, **work-queue
 (morsel) balancing beats fiber/context migration**, and a **single global queue
-negative-scales** — it must be sharded. a stackful runtime migrates stackful fibers; we intend to shed
+negative-scales** — it must be sharded. That stackful model migrates whole fibers; we intend to shed
 cheap run-to-completion *morsels* and never migrate the execution context at all.
 
 ## The bet
@@ -43,12 +43,12 @@ cheap run-to-completion *morsels* and never migrate the execution context at all
 
 This keeps the in-cooperator fast path untouched and confines all cross-thread atomics to
 the substrate. The substrate is the morsel-sharing layer the balancing findings asked for,
-and the thing we measure against a stackful runtime.
+and the thing we measure against the stackful model.
 
 ## Measured result (premise proven)
 
-A benchmark-level prototype of this design beat a stackful runtime on the exact workload a stackful runtime's
-work-stealing exists to win. Workload: M=6 cooperators, 6000 IO pipelines, each alternating
+A benchmark-level prototype of this design went from being outperformed to outperforming a
+production stackful-fiber work-stealing runtime, on the exact workload such work-stealing targets. Workload: M=6 cooperators, 6000 IO pipelines, each alternating
 irregular `BusyFor` compute with an io_uring timed sleep; *clustered* imbalance (all heavy
 pipelines land on one static shard).
 
@@ -56,14 +56,14 @@ pipelines land on one static shard).
 |----------|-----------------------------|------------|
 | coop context-per-pipeline, static shard | ~148 ms | 24% |
 | coop continuation-per-pipeline, static shard | ~153 ms | 23% |
-| **a stackful runtime fiber-per-pipeline, work-stealing** | **~74 ms** | 47% |
+| **stackful-fiber work-stealing runtime** | **~74 ms** | 47% |
 | **coop pull-pool prototype (this design)** | **~53 ms** | 66% |
 
 The prototype: all pipelines in a shared pool; each cooperator runs a worker that pulls a
 ready stage, runs its compute, submits the timer, and a detached continuation re-sheds the
 pipeline to the pool when the timer fires. Static sharding can't move clustered load
-(~150 ms); the pull-pool spreads it across whoever is free and wins 1.4x over a stackful runtime. It is
-also robust — ~52 ms on the *mild* (already-balanced) workload too, where a stackful runtime runs ~65 ms.
+(~150 ms); the pull-pool spreads it across whoever is free and wins 1.4x over the stackful model. It is
+also robust — ~52 ms on the *mild* (already-balanced) workload too, where the stackful runtime runs ~65 ms.
 
 The prototype's known weaknesses are exactly the formalization work: it spin-yields when idle
 (burns cores, causes variance), uses a single ring rather than sharded deques, and runs
@@ -75,7 +75,7 @@ headroom to push ~53 → ~40 ms.
 1. **Per-cooperator shard, work-stealing deque.** Each cooperator owns one Chase-Lev-style
    deque. The owner pushes/pops its own end LIFO (recently-shed work is cache-hot); idle
    thieves steal the far end FIFO (oldest task, likely the largest remaining subtree).
-   This is the structure Go/Rayon/a stackful runtime all converged on; no reason to be cleverer first.
+   This is the structure Go, Rayon, and similar runtimes converged on; no reason to be cleverer first.
 
 2. **Pull, not push.** `Shed(task)` enqueues to the *local* shard (or the caller's nearest
    shard if shed from a non-cooperator thread). An idle cooperator — at the same point in
@@ -201,7 +201,7 @@ family) is the instrument.
 
 - **Green (CLOSED):** driven through the in-tree `work::Grid` (Erg pipeline stages re-shedding via
   `Shed` from their timer continuation), clustered makespan is a stable **~44 ms (80% of the 35 ms
-  floor)** vs a stackful runtime's ~74 ms -- **1.7x** -- and ~43.5 ms on the mild workload vs a stackful runtime's ~65 ms. The
+  floor)** vs the stackful model's ~74 ms -- **1.7x** -- and ~43.5 ms on the mild workload vs ~65 ms. The
   idle stealer's recheck interval bounds the worst-case rebalancing latency (default 10us keeps the
   clustered case stable; 30us showed an occasional outlier). A cross-thread steal-wake would let the
   recheck be larger and tighten the tail further -- a Slice 4 refinement, not needed to close.

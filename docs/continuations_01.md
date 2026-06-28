@@ -82,16 +82,25 @@ and caps a pathological chain that somehow never lets a completion land. The bud
 proxy for IO readiness — too low wastes polls on a quiet chain, too high lets a CQE languish; the
 peek supplies the precise signal and the budget only guarantees an upper bound.
 
-The break is only half the latency story: the scheduler's idle branch, when a poll completes IO that
-wakes a context, schedules that context *before* re-draining the continuation backlog. The
+The break is only half the latency story: when a poll completes IO that wakes a context, the
+scheduler schedules that context *before* re-draining the continuation backlog. The
 freshly-completed IO is exactly the work that was queued behind the chain; re-draining to the budget
 ceiling first would reintroduce the very pickup tail the peek exists to cut. The queued continuations
-are not lost — they ride the next iteration's drain, interleaved with the woken context. Together the
-peek and the ordering convert "drain bounds stack depth" into "drain bounds completion-pickup
-latency" while keeping a high ceiling: at a fixed budget the peek cuts the synchronous-chain p99
-completion-pickup tail by roughly an order of magnitude with no throughput cost on a quiet chain.
-Stride 0 disables the peek (budget-only); budget 0 disables the ceiling (peek-only); both 0 drains
-strictly to empty.
+are not lost — they ride a later iteration's drain, interleaved with the woken context. The ordering
+holds at both points where the loop drains: the idle branch (no runnable context, poll, then drain)
+and the resume batch (resume a context, poll, then drain). The resume-batch site defers its drain
+only when a poll wakes a context with nothing already runnable ahead of it — a lone IO completion
+that must not wait out a full-budget chain. When a backlog of runnable contexts already exists the
+drain proceeds as usual, so a steady stream of context wakes never starves the continuation chain;
+the op budget remains the ceiling on how long any one drain runs.
+
+Together the peek and the ordering convert "drain bounds stack depth" into "drain bounds
+completion-pickup latency" while keeping a high ceiling: at a fixed budget the peek cuts the
+synchronous-chain p99 completion-pickup tail by roughly an order of magnitude with no throughput cost
+on a quiet chain, and the woken-context-first ordering at both drain sites collapses the residual
+p99.9 — a lone wake landing just as a fresh budget-sized drain begins — back down to that same p99
+floor. Stride 0 disables the peek (budget-only); budget 0 disables the ceiling (peek-only); both 0
+drains strictly to empty.
 
 **Two flavors, one spectrum:**
 

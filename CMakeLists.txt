@@ -206,6 +206,9 @@ add_executable(coop_benchmarks
 )
 target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
 
+add_executable(bench_buffer_ring_throughput benchmarks/bench_buffer_ring_throughput.cpp)
+target_link_libraries(bench_buffer_ring_throughput PRIVATE coop)
+
 add_executable(bench_server benchmarks/bench_server.cpp)
 target_link_libraries(bench_server PRIVATE coop)
 target_link_options(bench_server PRIVATE -rdynamic)

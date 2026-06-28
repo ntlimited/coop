@@ -216,6 +216,9 @@ add_executable(bench_timer_fanout benchmarks/bench_timer_fanout.cpp)
 target_link_libraries(bench_timer_fanout PRIVATE coop)
 target_link_options(bench_timer_fanout PRIVATE -rdynamic)
 
+add_executable(bench_work_yield benchmarks/bench_work_yield.cpp)
+target_link_libraries(bench_work_yield PRIVATE coop)
+
 add_executable(bench_server benchmarks/bench_server.cpp)
 target_link_libraries(bench_server PRIVATE coop)
 target_link_options(bench_server PRIVATE -rdynamic)

@@ -17,7 +17,9 @@ on SQ ring exhaustion by flushing pending SQEs.
 **Completion**: io_uring CQE arrives -> `Callback` dispatches via tagged pointer (bit 0 of
 userdata): untagged -> `Complete()`, tagged -> `OnSecondaryComplete()`. Both call `Finalize()`
 which decrements `m_pendingCqes`; when it hits 0, pops from descriptor list and calls
-`m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator).
+`m_coord->Release(ctx, false)` (unblocks whoever is waiting on the coordinator). Neither
+completion handler advances the CQ head — they only read `cqe->res`. The kernel-visible head is
+advanced once per drain by `Uring::Poll` (see "CQ reaping" below), not once per CQE.
 
 **Blocking pattern** (`Wait()` / `WaitKill()`): `Wait()` calls `CoordinateWith(ctx, m_coord)`
 which blocks until the Handle's coordinator is released (IO completes). It is intentionally not
@@ -75,6 +77,17 @@ self-correcting SQE acquisition: if the SQ ring is full, it flushes pending SQEs
 memory) is set by the kernel when completions are pending under `COOP_TASKRUN` mode. When
 neither SQEs nor task_work are pending — the common case on pure-yield resumes — the submit
 is skipped entirely, saving ~9ns per Poll() (~3% of yield cost).
+
+**CQ reaping**: after submitting, `Poll()` reaps the whole ready batch with `io_uring_for_each_cqe`
+and then advances the kernel-visible CQ head exactly once via `io_uring_cq_advance(n)`. The
+alternative — `io_uring_cqe_seen` inside each completion handler — issues a release store to the CQ
+head per CQE plus pays the terminating empty-queue probe of `io_uring_peek_cqe` on every Poll. The
+batched form is safe because each callback only reads `cqe->res` and never depends on the kernel
+reclaiming a slot mid-drain. The win scales with how many completions land in one window: a Poll
+that reaps a single CQE is one head store either way (and still drops the peek probe), while a
+fan-out burst that reaps a large batch collapses N head stores into one. Completions that overflow
+the ring stay on the kernel overflow list and surface on the next Poll — the scheduler polls
+continuously, so nothing is lost, only deferred one iteration.
 
 **Non-native urings** (running as dedicated contexts via `Uring::Run()`) use the same deferred
 model — their `Poll()` submits + processes CQEs on each scheduling round. IO latency is bounded

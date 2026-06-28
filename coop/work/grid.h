@@ -40,9 +40,12 @@ class Grid
     Grid(const Grid&) = delete;
     Grid& operator=(const Grid&) = delete;
 
-    // Size for n cooperators; recheckUs is the idle stealer's park/re-check interval.
+    // Size for n cooperators; recheckUs is the idle stealer's park/re-check interval. The interval
+    // bounds how quickly an idle stealer notices stealable work, so it caps the worst-case
+    // rebalancing latency; ~10us keeps clustered makespan stable. (A cross-thread steal-wake would
+    // let this be larger -- a later refinement.)
     //
-    void Init(int n, uint32_t recheckUs = 30);
+    void Init(int n, uint32_t recheckUs = 10);
 
     // Opt the cooperator into this grid: assign it the next shard, set its participation field, and
     // spawn its stealer. Call once per cooperator, after Init, before sheddding to it.
@@ -62,7 +65,7 @@ class Grid
     std::unique_ptr<Participation[]> m_parts;
     std::atomic<int>                 m_joined{0};
     int                              m_n = 0;
-    uint32_t                         m_recheckUs = 30;
+    uint32_t                         m_recheckUs = 10;
 };
 
 } // end namespace work

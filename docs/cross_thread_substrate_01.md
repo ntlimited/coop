@@ -199,9 +199,12 @@ wrong.
 The `io_fanout` scoreboard (promoted into `benchmarks/` as the coop-only `BM_FanOut_Pool`
 family) is the instrument.
 
-- **Green (the covenant closes):** clustered makespan through the *scheduler-integrated* pool
-  stays below a stackful runtime's ~74 ms, with the target being to beat the prototype's ~53 ms toward the
-  ~40 ms compute floor as the wake protocol replaces spin-yield.
+- **Green (CLOSED):** driven through the in-tree `work::Grid` (Erg pipeline stages re-shedding via
+  `Shed` from their timer continuation), clustered makespan is a stable **~44 ms (80% of the 35 ms
+  floor)** vs a stackful runtime's ~74 ms -- **1.7x** -- and ~43.5 ms on the mild workload vs a stackful runtime's ~65 ms. The
+  idle stealer's recheck interval bounds the worst-case rebalancing latency (default 10us keeps the
+  clustered case stable; 30us showed an occasional outlier). A cross-thread steal-wake would let the
+  recheck be larger and tighten the tail further -- a Slice 4 refinement, not needed to close.
 - **Red guard (the hot path is untaxed):** `BM_AcquireRelease` stays at 1.04 ns and the
   continuation dispatch benchmarks are unchanged. The substrate must add zero cost to the
   in-cooperator path — if a deque field or a steal check lands on the `Coordinator` /

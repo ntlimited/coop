@@ -83,6 +83,20 @@ by the round-robin cycle time.
 `Init()` uses a progressive fallback chain: `DEFER_TASKRUN` -> `COOP_TASKRUN` -> `SINGLE_ISSUER`
 only -> bare init. Each step logs a warning.
 
+**Registered ring fd**: after a successful init, `Init()` calls `io_uring_register_ring_fd()`.
+`io_uring_enter()` is the hottest syscall coop makes, and coop runs many cooperators in one
+process with one ring per thread — so the process file table is shared (CLONE_FILES) and the
+kernel makes every enter pay an atomic fd refcount grab/put plus an fd->file lookup on the ring
+fd. Registering the ring resolves the file once and lets each enter reference it by a small index
+(`IORING_ENTER_REGISTERED_RING`), skipping that per-enter tax. liburing flips the ring into
+registered-fd mode on success and ORs the flag into every later enter, so Submit/Poll/WaitAndPoll
+need no change. Safe because `SINGLE_ISSUER` already guarantees only the registering (owning)
+thread ever enters the ring — the one documented caveat (register on one thread, enter on
+another) cannot arise. Needs kernel 5.18+; on older kernels the register call fails, the ring
+keeps its plain fd, and `Init()` warns and continues. Measured saving: ~15ns per enter in an
+isolated multi-thread microbench (~12-15%), ~8-20ns per blocking `io::Read` round trip end to end
+in coop (the enter is one part of a ~280ns scheduler round trip, so a smaller fraction there).
+
 **SQPOLL** (`sqpoll`): `IORING_SETUP_SQPOLL` — a kernel thread polls the SQ ring for new
 entries, eliminating `io_uring_enter()` syscalls for submission. Incompatible with
 `coopTaskrun`/`deferTaskrun` — disable those when enabling SQPOLL. Requires `CAP_SYS_ADMIN`

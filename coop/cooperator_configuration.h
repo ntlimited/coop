@@ -86,8 +86,24 @@ struct CooperatorConfiguration
     // Upper bound on consecutive direct yields before one falls back through the cooperator loop
     // to poll io_uring. Smaller bounds poll latency more tightly at the cost of more frequent
     // round trips; larger amortizes the round trip further. Only consulted when directYield is set.
+    // This is the *quiet-ring* bound: how long the fastpath defers a poll when no completion is
+    // pending.
     //
     int directYieldBudget = 64;
+
+    // directYield IO governor. A fixed budget alone cannot tell whether deferring the loop is
+    // starving pending IO. When directYield is set, the fastpath instead enters the kernel inline
+    // (a real Poll: submit queued SQEs + reap completions in one io_uring_enter) the moment work is
+    // pending -- aggressively for unsubmitted SQEs (work that has not started), lazily for
+    // completions (already happened, and the submit-enter harvests them anyway). After entering, the
+    // remaining budget is clamped to ioPresentLimit so a steady completion stream keeps polling
+    // promptly, rather than running out the full directYieldBudget.
+    //
+    // Set to 0 to disable the governor entirely (pure count budget) for a known-CPU-bound workload.
+    //
+    // A wall-clock floor for the short-list/expensive-task case is still future work (#23).
+    //
+    int ioPresentLimit = 8;
 };
 
 static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
@@ -98,6 +114,7 @@ static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
     .trackContextCycles = false,
     .directYield = false,
     .directYieldBudget = 64,
+    .ioPresentLimit = 8,
 };
 
 } // end namespace coop

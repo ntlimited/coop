@@ -29,6 +29,11 @@
 - `timer_slack_01.md`: opt-in deadline quantization on the `Sleep` path — collapses
   per-timer kernel wakeups for a fan-out of concurrent sleeps, with the negative
   covenant that correctness deadlines stay exact
+- `timer_wheel_001.md`: per-cooperator userspace timer queue (intrusive pairing heap)
+  that arms a single io_uring timeout for the nearest deadline and services many sleeps
+  per wakeup — cuts kernel hrtimer churn from O(N) per sleep to O(1) per cooperator,
+  with the negative covenants that the structure stays thread-local, a sleep never
+  fires early, and IO timeouts stay exact and uncoalesced
 - `buffer_ring_multishot_01.md`: provided buffer ring + multishot recv — decouples
   resident recv memory from connection count for keep-alive fan-out and removes the
   per-message recv submission, with measured throughput and memory and the honest

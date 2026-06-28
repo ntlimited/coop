@@ -13,10 +13,10 @@ namespace coop
 namespace work
 {
 
-void Grid::Init(int n, uint32_t recheckUs)
+void Grid::Init(int n, time::Interval recheck)
 {
     m_n = n;
-    m_recheckUs = recheckUs;
+    m_recheck = recheck;
     m_shards.Init(n);
     m_parts.reset(new Participation[n]);
 }
@@ -59,7 +59,7 @@ void Grid::StealerLoop(Context* ctx, int shard)
         //
         Coordinator coord;
         io::Handle handle(ctx, GetUring(), &coord);
-        io::Timeout(handle, std::chrono::microseconds(m_recheckUs));
+        io::Timeout(handle, m_recheck);
         handle.WaitKill();
     }
 }

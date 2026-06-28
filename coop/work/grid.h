@@ -8,6 +8,7 @@
 #include "coop/cooperator.h"
 #include "coop/cooperator.hpp"
 #include "coop/self.h"
+#include "coop/time/interval.h"
 #include "detail/shards.h"
 #include "erg.h"
 
@@ -40,12 +41,12 @@ class Grid
     Grid(const Grid&) = delete;
     Grid& operator=(const Grid&) = delete;
 
-    // Size for n cooperators; recheckUs is the idle stealer's park/re-check interval. The interval
-    // bounds how quickly an idle stealer notices stealable work, so it caps the worst-case
-    // rebalancing latency; ~10us keeps clustered makespan stable. (A cross-thread steal-wake would
-    // let this be larger -- a later refinement.)
+    // Size for n cooperators; recheck is the idle stealer's park/re-check interval. It bounds how
+    // quickly an idle stealer notices stealable work, so it caps the worst-case rebalancing latency;
+    // ~10us keeps clustered makespan stable. (A cross-thread steal-wake would let it be larger -- a
+    // later refinement.)
     //
-    void Init(int n, uint32_t recheckUs = 10);
+    void Init(int n, time::Interval recheck = std::chrono::microseconds(10));
 
     // Opt the cooperator into this grid: assign it the next shard, set its participation field, and
     // spawn its stealer. Call once per cooperator, after Init, before sheddding to it.
@@ -56,8 +57,6 @@ class Grid
     //
     void ShedErg(int shard, Erg* e) { m_shards.Shed(shard, e); }
 
-    uint32_t Recheck() const { return m_recheckUs; }
-
   private:
     void StealerLoop(Context* ctx, int shard);
 
@@ -65,7 +64,7 @@ class Grid
     std::unique_ptr<Participation[]> m_parts;
     std::atomic<int>                 m_joined{0};
     int                              m_n = 0;
-    uint32_t                         m_recheckUs = 10;
+    time::Interval                   m_recheck = std::chrono::microseconds(10);
 };
 
 } // end namespace work

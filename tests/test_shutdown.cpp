@@ -289,6 +289,27 @@ TEST(SleepTest, SleepCompletesNormally)
     });
 }
 
+TEST(SleepTest, SlackSleepIsOneSided)
+{
+    // Covenant: slack may only push a deadline later, never earlier. A slack sleep must wake no
+    // sooner than its requested interval, and overshoot by at most ~one slack tick.
+    //
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        const auto requested = std::chrono::microseconds(1000);
+        const auto slack     = std::chrono::microseconds(500);
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto result = coop::time::Sleep(ctx, requested, slack);
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0);
+
+        EXPECT_EQ(result, coop::time::SleepResult::Ok);
+        EXPECT_GE(elapsed.count(), requested.count());          // never early
+        EXPECT_LT(elapsed.count(), requested.count() + slack.count() + 2000);  // bounded overshoot
+    });
+}
+
 TEST(SleepTest, SleepReturnsFalseOnKill)
 {
     test::RunInCooperator([](coop::Context* ctx)

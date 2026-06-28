@@ -164,6 +164,7 @@ enable_testing()
 add_executable(coop_tests
     tests/test_coordinator.cpp
     tests/test_continuation.cpp
+    tests/test_timer.cpp
     tests/test_work_deque.cpp
     tests/test_work_pool.cpp
     tests/test_grid.cpp
@@ -209,6 +210,10 @@ target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
 
 add_executable(bench_buffer_ring_throughput benchmarks/bench_buffer_ring_throughput.cpp)
 target_link_libraries(bench_buffer_ring_throughput PRIVATE coop)
+
+add_executable(bench_timer_fanout benchmarks/bench_timer_fanout.cpp)
+target_link_libraries(bench_timer_fanout PRIVATE coop)
+target_link_options(bench_timer_fanout PRIVATE -rdynamic)
 
 add_executable(bench_server benchmarks/bench_server.cpp)
 target_link_libraries(bench_server PRIVATE coop)

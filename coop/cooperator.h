@@ -341,7 +341,18 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     perf::Counters  m_perf;
     char            m_name[COOPERATOR_NAME_MAX];
 
-    void*           m_sp{nullptr};
+    // Cache-line partitioning of the Cooperator's hottest fields. m_sp is written on every
+    // context switch (the scheduler saves its own stack pointer here before resuming a context).
+    // The submission quartet below is dirtied by external producer threads on every cross-thread
+    // Submit, and m_epochWatermark is read cross-thread by peers computing the reclamation
+    // horizon. Left adjacent, a producer's Submit (or a peer's epoch-horizon read) would
+    // invalidate the very line the owner needs for its next context switch — false sharing on the
+    // single hottest write in the runtime. The alignas(64) markers isolate three distinct access
+    // groups onto their own lines: owner-hot (m_sp), cross-thread-inbound (the submission
+    // quartet), and cross-thread-published (m_epochWatermark). The effect grows on weak-memory
+    // architectures (aarch64), where remote-line acquisition is costlier than on x86 TSO.
+    //
+    alignas(64) void*       m_sp{nullptr};
 
     void PushSubmission(SubmissionEntry* entry);
     void WakeCooperator();
@@ -349,7 +360,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     void SpawnFromSubmission(SubmissionEntry* entry);
     void DrainRemainingSubmissions();
 
-    int                     m_submitFd;
+    alignas(64) int         m_submitFd;
     std::mutex              m_submissionLock;
     SubmissionEntry*        m_submissionHead{nullptr};
     SubmissionEntry*        m_submissionTail{nullptr};
@@ -358,8 +369,9 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // Minimum pinned epoch across all contexts on this cooperator. Written by the cooperator
     // thread (via epoch::Manager::PublishWatermark) after each pin/unpin. Read cross-thread by
     // epoch::Manager::SafeEpoch() on other cooperators to compute the global reclamation horizon.
+    // On its own line so peers' horizon reads do not ping-pong the submission quartet.
     //
-    std::atomic<epoch::Epoch>           m_epochWatermark{epoch::Epoch::Alive()};
+    alignas(64) std::atomic<epoch::Epoch> m_epochWatermark{epoch::Epoch::Alive()};
 
     // Per-cooperator epoch manager. Constructed with this* so it can be a member even before
     // thread_cooperator is set. Declared after m_epochWatermark so its destructor (which resets

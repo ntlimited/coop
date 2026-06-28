@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace coop
 {
 namespace io
@@ -53,6 +55,22 @@ struct UringConfiguration
     // the fd of another ring to share its workers.
     //
     int attachSqFd = -1;
+
+    // Default provided buffer ring (IORING_REGISTER_PBUF_RING, kernel 5.19+). A buffer ring lets
+    // multishot recv draw a recv buffer from a shared pool only when bytes actually arrive,
+    // instead of pinning one userspace buffer per armed connection. When bufferRingEntries > 0,
+    // Init registers a ring of this many buffers (rounded up to a power of two) of bufferRingBufSize
+    // bytes each, under group id bufferRingGroup, reachable via Uring::GetBufferRing(). It is a
+    // convenience for the common single-pool case; code that wants several pools constructs
+    // BufferRing instances directly.
+    //
+    // The feature is probed by attempting the registration: on a kernel that lacks pbuf-ring
+    // support the register call fails, and Init warns and continues with no default ring (classic
+    // recv is unaffected), mirroring the registered-ring-fd fallback.
+    //
+    uint32_t bufferRingEntries = 0;
+    uint32_t bufferRingBufSize = 4096;
+    uint16_t bufferRingGroup = 0;
 };
 
 static const UringConfiguration s_defaultUringConfiguration = {

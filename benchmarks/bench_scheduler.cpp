@@ -18,10 +18,11 @@ struct BenchmarkArgs
     std::function<void(coop::Context*, benchmark::State&)>* fn;
 };
 
-static void RunBenchmark(benchmark::State& state,
+static void RunBenchmarkCfg(benchmark::State& state,
+    coop::CooperatorConfiguration const& config,
     std::function<void(coop::Context*, benchmark::State&)> fn)
 {
-    coop::Cooperator cooperator;
+    coop::Cooperator cooperator(config);
     coop::Thread t(&cooperator);
 
     BenchmarkArgs args;
@@ -34,6 +35,12 @@ static void RunBenchmark(benchmark::State& state,
         (*a->fn)(ctx, *a->state);
         ctx->GetCooperator()->Shutdown();
     }, &args);
+}
+
+static void RunBenchmark(benchmark::State& state,
+    std::function<void(coop::Context*, benchmark::State&)> fn)
+{
+    RunBenchmarkCfg(state, coop::s_defaultCooperatorConfiguration, std::move(fn));
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +102,64 @@ static void BM_Scheduler_Yield_Scaled(benchmark::State& state)
 }
 BENCHMARK(BM_Scheduler_Yield_Scaled)
     ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64);
+
+// ---------------------------------------------------------------------------
+// BM_Scheduler_Yield_Direct — direct context-to-context yield, off vs on
+// ---------------------------------------------------------------------------
+//
+// Prices the directYield fastpath (CooperatorConfiguration::directYield) against the default
+// trampoline-through-the-loop yield, at matched context counts. The fastpath only engages when
+// another context is runnable, so this is meaningful at N >= 2.
+//
+// arg0 selects directYield off(0)/on(1); arg1 is the round-robin context count. The off rows
+// reproduce the default scaled yield as a baseline; the on rows show the fastpath win. Because the
+// budget forces a poll fallback through the cooperator loop every directYieldBudget switches, the
+// on rows also fold in the amortized cost of that bound — so this is the honest steady-state
+// number, not a poll-free best case. This is the artifact for the "prove across regimes before it
+// can ship default" bar; directYield ships off by default.
+//
+static void BM_Scheduler_Yield_Direct(benchmark::State& state)
+{
+    const bool direct = state.range(0) != 0;
+    const int  n      = static_cast<int>(state.range(1));
+
+    coop::CooperatorConfiguration cfg = coop::s_defaultCooperatorConfiguration;
+    cfg.directYield = direct;
+
+    RunBenchmarkCfg(state, cfg, [n](coop::Context* ctx, benchmark::State& state)
+    {
+        auto* co = ctx->GetCooperator();
+
+        // N-1 background yielders are the round-robin partners the fastpath switches into.
+        //
+        for (int i = 0; i < n - 1; i++)
+        {
+            co->Spawn([](coop::Context* c)
+            {
+                while (!c->IsKilled()) c->Yield(true);
+            });
+        }
+
+        // Let them all reach their first yield before timing.
+        //
+        ctx->Yield(true);
+
+        for (auto _ : state)
+        {
+            ctx->Yield(true);
+        }
+
+        // The scheduler cycles all N contexts between two yields of the measured one, so each
+        // iteration is ~N context switches. Reporting N items/iteration makes the throughput
+        // column read as ~switches/s, directly comparable to the bare per-switch cost.
+        //
+        state.SetItemsProcessed(state.iterations() * n);
+    });
+}
+BENCHMARK(BM_Scheduler_Yield_Direct)
+    ->Args({0, 2})->Args({1, 2})
+    ->Args({0, 8})->Args({1, 8})
+    ->Args({0, 64})->Args({1, 64});
 
 // ---------------------------------------------------------------------------
 // BM_Scheduler_SpawnYieldExit — full context lifecycle

@@ -47,6 +47,7 @@ Filter: `--filter='BM_Scheduler_|BM_Coop_|BM_Pthread_|BM_AcquireRelease|BM_Coord
 |-----------|----------|
 | `BM_Scheduler_Yield` | Single-context yield round-trip |
 | `BM_Scheduler_Yield_Scaled` | Yield cost at 1–64 contexts |
+| `BM_Scheduler_Yield_Direct` | directYield fastpath off vs on, at 2–64 contexts (items/s ≈ switches/s) |
 | `BM_Scheduler_SpawnYieldExit` | Full context lifecycle |
 | `BM_AcquireRelease` | Uncontended coordinator fast path |
 | `BM_AcquireRelease_Contended` | Contended coordinator |

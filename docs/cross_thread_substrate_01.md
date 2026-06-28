@@ -1,6 +1,8 @@
-# Cross-Thread Work Substrate 01 (sketch)
+# Cross-Thread Work Substrate 01
 
-Status: **sketch / RFC** — direction and open questions, not a committed design yet.
+Status: **governing design** — the implementation contract for the work-sharing substrate.
+The premise has been measured (see *Measured result* below); what remains is to formalize it
+in-tree against the covenants and calibration here.
 
 ## Where we are
 
@@ -43,7 +45,32 @@ This keeps the in-cooperator fast path untouched and confines all cross-thread a
 the substrate. The substrate is the morsel-sharing layer the balancing findings asked for,
 and the thing we measure against a stackful runtime.
 
-## Approach (proposed)
+## Measured result (premise proven)
+
+A benchmark-level prototype of this design beat a stackful runtime on the exact workload a stackful runtime's
+work-stealing exists to win. Workload: M=6 cooperators, 6000 IO pipelines, each alternating
+irregular `BusyFor` compute with an io_uring timed sleep; *clustered* imbalance (all heavy
+pipelines land on one static shard).
+
+| approach | clustered makespan (median) | efficiency |
+|----------|-----------------------------|------------|
+| coop context-per-pipeline, static shard | ~148 ms | 24% |
+| coop continuation-per-pipeline, static shard | ~153 ms | 23% |
+| **a stackful runtime fiber-per-pipeline, work-stealing** | **~74 ms** | 47% |
+| **coop pull-pool prototype (this design)** | **~53 ms** | 66% |
+
+The prototype: all pipelines in a shared pool; each cooperator runs a worker that pulls a
+ready stage, runs its compute, submits the timer, and a detached continuation re-sheds the
+pipeline to the pool when the timer fires. Static sharding can't move clustered load
+(~150 ms); the pull-pool spreads it across whoever is free and wins 1.4x over a stackful runtime. It is
+also robust — ~52 ms on the *mild* (already-balanced) workload too, where a stackful runtime runs ~65 ms.
+
+The prototype's known weaknesses are exactly the formalization work: it spin-yields when idle
+(burns cores, causes variance), uses a single ring rather than sharded deques, and runs
+outside the scheduler loop. The compute floor is ~35 ms, so a proper wake protocol has
+headroom to push ~53 → ~40 ms.
+
+## Approach
 
 1. **Per-cooperator shard, work-stealing deque.** Each cooperator owns one Chase-Lev-style
    deque. The owner pushes/pops its own end LIFO (recently-shed work is cache-hot); idle
@@ -74,28 +101,37 @@ and the thing we measure against a stackful runtime.
    green thread, like a detached continuation — no context spawned). A task that may block
    asks to be run on its own context (spawn). Default morsel = cheapest; blocking = opt-in.
 
-## Open questions (want a steer before committing)
+## Decisions (resolved by the measured result)
 
-- **Replace or sit beside `Submit`?** Lean: sit beside. `Submit` = targeted ("that
-  cooperator"); `Shed` = balanced ("anywhere"). Different intents; collapsing them loses the
-  affinity case.
-- **Shard granularity:** per-cooperator (simplest, matches core pinning) vs per-NUMA-node
-  (fewer shards, less stealing, but coarser balance). Lean per-cooperator with NUMA-aware
-  steal order.
-- **Task representation:** a pooled closure node (like the continuation pool, but
-  cross-thread-owned) vs a `Launchable`. The continuation pool is single-cooperator/no-atomic
-  and cannot back cross-thread tasks; the task pool needs its own allocation story (likely a
-  per-cooperator slab freed by whoever runs the task — cross-thread free).
-- **Fairness vs locality knob:** pure LIFO-local can starve old tasks under a steady local
-  producer; how aggressively do thieves intervene? Start with classic Chase-Lev and measure.
+- **`Shed` sits beside `Submit`, not replacing it.** `Submit` = targeted ("that cooperator",
+  affinity); `Shed` = balanced ("anywhere with capacity"). Different intents; collapsing them
+  loses the affinity case.
+- **Shard granularity: per-cooperator deque**, with NUMA-aware *steal order* (not per-NUMA
+  shards). Matches core pinning; one owner per deque keeps the owner's end uncontended.
+- **A re-shed is a local push.** The benchmark re-sheds to a shared pool; in-tree the
+  completion continuation pushes to *its own* cooperator's deque, and an idle cooperator
+  steals it. Same balancing, no global queue.
+- **Task representation: a cross-thread-owned pooled closure node.** The single-cooperator
+  continuation pool cannot back it (a stolen task is freed on a different core than it was
+  shed). The task pool is a per-cooperator slab with cross-thread free — the one genuinely new
+  concurrency primitive this design introduces.
+- **Fairness vs locality: start with classic Chase-Lev (LIFO-local, FIFO-steal) and measure.**
+  No anti-starvation knob until the calibration shows one is needed.
 
-## Phasing
+## Implementation slices
 
-- **v1:** per-cooperator Chase-Lev deque, plain atomics, random-victim stealing, `Shed`
-  API, wake-on-shed. Benchmark vs `Submit` and vs the static-shard balancing skeletons
-  from `[[coop-balancing-findings]]`.
-- **v2:** NUMA-aware steal order.
-- **v3:** rseq fast path for the owner's local end.
+- **Slice 1 — bounded Chase-Lev deque** (`work_deque.h`), standalone, weak-memory-correct
+  (Le et al. ordering for the aarch64 target), with single-owner and concurrent-steal tests.
+  No scheduler coupling. *Supporting structure — does not close a covenant on its own.*
+- **Slice 2 — `Shed` API + explicit pull**, driven by workers (as the prototype was), proving
+  the deque + task pool in-tree without touching the loop. Reproduces ~53 ms.
+- **Slice 3 — scheduler-loop integration + wake protocol.** Pull/steal in the cooperator idle
+  path; sleep-when-dry; wake-on-shed folded into the existing `WaitAndPoll`/eventfd path.
+  *This closes the covenant.* The delicate slice: must not disturb yielded-context resume,
+  io_uring polling, continuation drain, submission drain, shutdown, or kill.
+- **Slice 4 — optimize:** chunked steals (batch claims cut coordination cost — measured in the
+  balancing experiments), then a shared injector for `Shed`-from-non-cooperator and smeared
+  work, then NUMA-aware steal order, then the rseq owner-end fast path.
 
 ## Non-goals / what this must not become
 
@@ -109,10 +145,21 @@ and the thing we measure against a stackful runtime.
 - **No producer-side target selection for balanced work.** If `Shed` requires the caller to
   name a consumer, it has become `Submit` and missed the point.
 
-## Validation
+## Calibration (red/green — the slice is not done until these hold)
 
-- Microbench: `Shed`+steal round-trip vs `Submit` round-trip (latency of crossing cores).
-- Scaling: the irregular-compute morsel workload from the balancing experiments, coop
-  work-stealing pool vs static sharding vs a stackful runtime — items/s across core counts, and tail
-  latency (the irregular case is where stealing should win).
-- Apples-to-apples vs a stackful runtime on the original morsel workload that motivated the comparison.
+The `io_fanout` scoreboard (promoted into `benchmarks/` as the coop-only `BM_FanOut_Pool`
+family) is the instrument.
+
+- **Green (the covenant closes):** clustered makespan through the *scheduler-integrated* pool
+  stays below a stackful runtime's ~74 ms, with the target being to beat the prototype's ~53 ms toward the
+  ~40 ms compute floor as the wake protocol replaces spin-yield.
+- **Red guard (the hot path is untaxed):** `BM_AcquireRelease` stays at 1.04 ns and the
+  continuation dispatch benchmarks are unchanged. The substrate must add zero cost to the
+  in-cooperator path — if a deque field or a steal check lands on the `Coordinator` /
+  `CompletionLatch` / scheduler hot path, the change is wrong.
+- **Deque calibration:** the steal/pop race tests must include a known-bad case (a naive
+  ordering that loses or duplicates an item under stress) proven to fail, alongside the
+  correct version passing — red/green for the data structure itself, not just green at head.
+- **Robustness:** the mild (already-balanced) workload must not regress meaningfully against
+  static shared-nothing — confirming `Shed` is an opt-in relief valve, not a tax on the
+  balanced common case.

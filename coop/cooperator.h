@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <linux/time_types.h>
 #include <mutex>
 #include <semaphore>
 
@@ -17,6 +18,7 @@
 #include "stack_pool.h"
 #include "perf/counters.h"
 #include "io/uring.h"
+#include "time/timer_queue.h"
 #include "topology.h"
 
 extern "C" void CoopContextEntry(coop::Context* ctx);
@@ -268,6 +270,33 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         return &m_uring;
     }
 
+    // Per-cooperator timer queue (docs/timer_wheel_001.md). A Sleeper registers its absolute
+    // deadline and the coordinator to Release on expiry, instead of arming its own kernel timer; the
+    // scheduler services the queue and keeps a single IORING_OP_TIMEOUT armed for the nearest
+    // deadline. Both run on this cooperator's thread only — no synchronization.
+    //
+    void RegisterTimer(time::TimerNode* node, int64_t deadlineUs, Coordinator* coord)
+    {
+        m_timers.Insert(node, deadlineUs, coord);
+    }
+
+    void CancelTimer(time::TimerNode* node)
+    {
+        m_timers.Remove(node);
+    }
+
+    // Invoked from io::Handle::Callback when the single per-cooperator deadline timer's CQE arrives.
+    // The expiry itself is serviced by the scheduler loop (ServiceExpiredTimers); this only clears
+    // the armed flag so the loop re-arms for the next nearest deadline.
+    //
+    void OnTimerExpired() { m_timerArmed = false; }
+
+    // Whether pure-timer deadlines on this cooperator use the userspace queue (one kernel timer for
+    // the nearest deadline) or the default kernel-per-timer path. Selected by
+    // CooperatorConfiguration::timerMode. Read by Sleeper to choose its backing.
+    //
+    bool UsesTimerQueue() const { return m_config.timerMode == TimerMode::UserspaceQueue; }
+
     int CpuId() const { return m_cpuId; }
     int NumaNode() const { return m_numaNode; }
 
@@ -344,6 +373,15 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     void HandleCooperatorResumption(const SchedulerJumpResult res);
 
+    // Timer-queue servicing and the single kernel timer. ServiceExpiredTimers releases every sleep
+    // whose deadline has passed; ArmNearestTimer keeps one IORING_OP_TIMEOUT armed (or rescheduled
+    // via IORING_TIMEOUT_UPDATE) for the nearest deadline before the loop blocks. See
+    // docs/timer_wheel_001.md.
+    //
+    void ServiceExpiredTimers();
+    void ArmNearestTimer();
+    void ArmTimerKernel(int64_t deadlineUs, bool update);
+
     int64_t rdtsc() const;
 
     int64_t m_lastRdtsc;
@@ -357,6 +395,17 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     Context*        m_scheduled;
 
     io::Uring       m_uring;
+
+    // Deadline-ordered queue of in-flight sleeps and the bookkeeping for the one kernel timer that
+    // backs them. m_timerArmed says whether an IORING_OP_TIMEOUT is in flight; m_timerDeadlineUs is
+    // the absolute deadline it is set to; m_timerTs backs the in-flight SQE's timespec (the kernel
+    // copies it at submit, so a single member suffices). All cooperator-thread-local.
+    //
+    time::TimerQueue m_timers;
+    bool             m_timerArmed{false};
+    int64_t          m_timerDeadlineUs{0};
+    struct __kernel_timespec m_timerTs{};
+
     StackPool       m_stackPool;
     perf::Counters  m_perf;
     char            m_name[COOPERATOR_NAME_MAX];

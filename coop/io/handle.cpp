@@ -13,6 +13,7 @@
 #include "coop/context.h"
 #include "coop/coordinate_with.h"
 #include "coop/coordinator.h"
+#include "coop/detail/timer_tag.h"
 #include "coop/perf/probe.h"
 #include "coop/cooperator.h"
 
@@ -286,6 +287,20 @@ void Handle::Callback(struct io_uring_cqe* cqe)
     if (data & 0x2)
     {
         ArmedHandle::Dispatch(cqe, data);
+        return;
+    }
+
+    // Bit 2 marks the cooperator's single deadline timer (docs/timer_wheel_001.md). The expiry
+    // clears the armed flag so the scheduler re-arms for the next nearest deadline; an
+    // IORING_TIMEOUT_UPDATE acknowledgement (bit 0 also set) carries no information and is dropped.
+    // The sleeps themselves are serviced by the scheduler loop, not here.
+    //
+    if (data & coop::detail::kTimerTag)
+    {
+        if (!(data & 0x1))
+        {
+            Cooperator::thread_cooperator->OnTimerExpired();
+        }
         return;
     }
 

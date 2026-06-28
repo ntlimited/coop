@@ -1,4 +1,5 @@
 #include <functional>
+#include <liburing.h>
 #include <mutex>
 #include <new>
 #include <pthread.h>
@@ -20,6 +21,8 @@
 #include "perf/patch.h"
 #include "perf/probe.h"
 #include "perf/sampler.h"
+#include "detail/timer_tag.h"
+#include "time/now.h"
 
 namespace coop
 {
@@ -452,6 +455,12 @@ void Cooperator::Launch()
         {
             m_uring.Poll();
 
+            // Release any sleeps whose deadline has passed (the timer CQE, if it fired, was just
+            // dispatched by Poll, clearing m_timerArmed). Woken sleepers join the yielded list, so
+            // the m_yielded check below picks them up before the loop considers blocking.
+            //
+            ServiceExpiredTimers();
+
             if (m_hasSubmissions.load(std::memory_order_acquire))
             {
                 DrainSubmissions();
@@ -498,6 +507,10 @@ void Cooperator::Launch()
             //
             if (!m_blocked.IsEmpty() || m_uring.PendingOps() > 0)
             {
+                // Ensure one kernel timer is armed for the nearest deadline before sleeping, so the
+                // wait wakes when the soonest sleep comes due. WaitAndPoll submits the SQE.
+                //
+                ArmNearestTimer();
                 m_uring.WaitAndPoll();
                 continue;
             }
@@ -572,6 +585,12 @@ void Cooperator::Launch()
         // Flash barrier) could sit unsubmitted indefinitely.
         //
         m_uring.Poll();
+
+        // Service due sleeps on the busy path too. A loop that never goes idle would otherwise only
+        // service timers in the idle branch above; here the loop's own iteration rate is the clock,
+        // and no kernel timer is needed while there is other work to run.
+        //
+        ServiceExpiredTimers();
     }
 
     epoch::SetManager(nullptr);
@@ -750,6 +769,87 @@ void Cooperator::DrainContinuationsPaced()
                 break;
             }
         }
+    }
+}
+
+void Cooperator::ServiceExpiredTimers()
+{
+    // Release every sleep whose deadline has passed. schedule=false moves each woken context to the
+    // yielded list rather than switching to it mid-loop. Reads the clock once, and only when there
+    // is something to service. Each released coordinator's waiter is the blocked sleeping context;
+    // the popped node is already unlinked, so the matching Sleeper destructor is a no-op.
+    //
+    if (m_timers.Empty())
+    {
+        return;
+    }
+
+    const int64_t now = time::MonotonicMicros();
+    while (auto* node = m_timers.PopExpired(now))
+    {
+        node->GetCoordinator()->Release(nullptr, false /* schedule */);
+    }
+}
+
+void Cooperator::ArmTimerKernel(int64_t deadlineUs, bool update)
+{
+    // Relative timeout from now to the deadline, clamped non-negative (a past deadline fires
+    // immediately). io_uring copies the timespec into the kernel request at submit, so backing it
+    // with the single m_timerTs member is safe: the prior armed SQE was already submitted by an
+    // earlier WaitAndPoll before this call overwrites it.
+    //
+    int64_t relUs = deadlineUs - time::MonotonicMicros();
+    if (relUs < 0)
+    {
+        relUs = 0;
+    }
+    m_timerTs.tv_sec  = relUs / 1000000;
+    m_timerTs.tv_nsec = (relUs % 1000000) * 1000;
+
+    auto* sqe = m_uring.GetSqe();
+    assert(sqe);
+    if (!update)
+    {
+        // Fresh timeout. Deliberately not counted in Uring::PendingOps(): a lingering far-future
+        // timer must not hold the shutdown loop open, and need not, because sleeping contexts in
+        // m_blocked already keep the loop alive exactly as long as there are sleeps to service.
+        //
+        io_uring_prep_timeout(sqe, &m_timerTs, 0, 0);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(detail::kTimerTag));
+    }
+    else
+    {
+        // Reschedule the existing timeout in place. The update reaches the kernel before the (later)
+        // armed deadline, so it always finds a live timer; its own acknowledgement CQE carries the
+        // ack tag and is ignored. The single timeout object still delivers exactly one expiry CQE.
+        //
+        io_uring_prep_timeout_update(sqe, &m_timerTs, detail::kTimerTag, 0);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(detail::kTimerAckTag));
+    }
+}
+
+void Cooperator::ArmNearestTimer()
+{
+    // Maintain the invariant: if the queue is non-empty, an armed kernel timer exists whose deadline
+    // is no later than the nearest queued deadline. Arming earlier than needed is a harmless spurious
+    // wake that re-arms; arming later would let a sleep fire late, which the invariant forbids.
+    //
+    if (m_timers.Empty())
+    {
+        return;
+    }
+
+    const int64_t nearest = m_timers.MinDeadlineUs();
+    if (!m_timerArmed)
+    {
+        ArmTimerKernel(nearest, false /* update */);
+        m_timerArmed = true;
+        m_timerDeadlineUs = nearest;
+    }
+    else if (nearest < m_timerDeadlineUs)
+    {
+        ArmTimerKernel(nearest, true /* update */);
+        m_timerDeadlineUs = nearest;
     }
 }
 

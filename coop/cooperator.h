@@ -197,6 +197,22 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     //
     work::Participation* m_participation = nullptr;
 
+    // Upper bound on continuations fired in a single drain pass before the loop returns to its top
+    // -- and therefore to the next io_uring Poll. The drain otherwise runs the pending list strictly
+    // to empty, which bounds native stack depth and batches a completion burst for I-cache locality.
+    // But a continuation chain that re-arms and fires synchronously -- a pipeline stage whose next
+    // stage is always ready (buffered data, an already-released coordinator) rather than waiting on a
+    // CQE -- can monopolize the drain and delay the next Poll indefinitely, inflating the
+    // completion-pickup tail latency of unrelated IO on this cooperator. Bounding the drain extends
+    // "drain bounds stack depth" to "drain bounds latency": once the budget is spent the remainder
+    // stays queued and rides the next loop iteration, which Polls first. 0 disables the bound (drain
+    // strictly to empty). Single-cooperator state -- read and written only on this thread, no
+    // synchronization.
+    //
+    uint32_t m_drainBudget = kDefaultDrainBudget;
+
+    static constexpr uint32_t kDefaultDrainBudget = 256;
+
     void Shutdown();
 
     static void ShutdownAll();

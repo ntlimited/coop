@@ -61,6 +61,21 @@ loop drains after it polls io_uring. That context-free drain is the load-bearing
 iteratively to empty also bounds native stack depth no matter how long a continuation chain runs, and
 batches a burst of completions for instruction-cache locality — both fall out for free.
 
+**The drain is bounded in length, not just stack depth.** Draining to empty is safe only because the
+usual continuation chain returns to io_uring between stages: a stage issues an async op and the next
+stage waits on its CQE, so the chain is paced by completions and the drain empties as soon as the
+current burst is consumed. A chain whose next stage is *always ready* — a stage that hands off
+synchronously through an already-released coordinator (buffered data, an internal producer/consumer
+rendezvous) rather than waiting on a CQE — breaks that assumption: it re-arms and fires within the
+same drain, so an unbounded drain would run it to its natural end before the loop could poll again,
+delaying the pickup of every unrelated IO completion sitting in the CQ behind it. This is the
+in-cooperator analogue of reactor starvation. The drain therefore carries a per-cooperator op budget
+(`Cooperator::m_drainBudget`): after that many continuations fire, the drain returns to the loop,
+which polls io_uring and then resumes draining the remainder. The chain still completes — just
+interleaved with completion pickup — so the bound converts "drain bounds stack depth" into "drain
+bounds completion-pickup latency" as well, the same way the resume batch is already capped at 16
+contexts. A budget of 0 restores draining strictly to empty.
+
 **Two flavors, one spectrum:**
 
 - **Structured** (`coord.Continue(fn)`) — frame-hosted via guaranteed copy elision (no heap), with a

@@ -467,6 +467,17 @@ void Cooperator::Launch()
                 continue;
             }
 
+            // A budget-truncated drain left continuations queued. They are runnable now, so loop
+            // back to the top to Poll (harvesting any CQE that arrived meanwhile, e.g. an unrelated
+            // IO completion that was waiting behind the chain) and fire the next budgeted batch,
+            // rather than sleeping with runnable work in hand. This is the half of the bound that
+            // turns drain length into bounded completion-pickup latency.
+            //
+            if (!m_pendingContinuations.IsEmpty())
+            {
+                continue;
+            }
+
             // No runnable contexts. Sleep in io_uring until the next CQE instead of spinning.
             // The submission drainer's eventfd read is an ordinary in-flight uring op, so
             // cross-thread Submit() also wakes this path via CQE delivery.
@@ -636,10 +647,24 @@ void Cooperator::DrainContinuations()
     // back onto this queue, which this same loop picks up — so native stack depth stays bounded
     // no matter how deep the continuation chain is.
     //
+    // Bounded by m_drainBudget: a chain that re-arms and fires synchronously (its next stage always
+    // ready, never waiting on a CQE) would otherwise run this loop without ever returning to the
+    // scheduler, starving the next Poll and the IO completions waiting on it. Once the budget is
+    // spent the remainder stays queued; the loop above iterates back to Poll and then re-drains, so
+    // the chain still makes full progress, just interleaved with completion pickup. Budget 0 disables
+    // the bound and drains strictly to empty.
+    //
+    uint32_t budget = m_drainBudget;
     while (auto* waiter = m_pendingContinuations.Pop())
     {
-        detail::ThunkScope inThunk;                  // debug: forbid suspending inside the Run
-        waiter->GetContinuation()->Run();
+        {
+            detail::ThunkScope inThunk;              // debug: forbid suspending inside the Run
+            waiter->GetContinuation()->Run();
+        }
+        if (budget && --budget == 0)
+        {
+            break;
+        }
     }
 }
 

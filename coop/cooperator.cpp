@@ -516,7 +516,7 @@ void Cooperator::Launch()
             auto* ctx = m_yielded.Pop();
             Resume(ctx);
 
-            // Was anything already runnable going into this Poll? If not, and the Poll then wakes a
+            // Was anything already runnable going into this reap? If not, and the reap then wakes a
             // context, that context is a fresh IO completion with nothing ahead of it -- and it
             // should be resumed before the continuation backlog is re-drained, the same
             // woken-context-first ordering the idle branch above uses. Re-draining a full budget of
@@ -524,7 +524,22 @@ void Cooperator::Launch()
             // resume-batch twin of the idle-branch completion-pickup tail.
             //
             bool hadRunnable = !m_yielded.IsEmpty();
-            m_uring.Poll();
+
+            // Reap completions without entering the kernel. SQEs armed by this resume but not
+            // yet submitted stay deferred and accumulate; the single Poll() at the batch
+            // boundary flushes them in one io_uring_enter rather than one per resume.
+            //
+            // This only batches SQEs that genuinely reach the loop unsubmitted — for example a
+            // context that arms several async ops via the Handle API and then yields. The
+            // blocking IO path does not benefit here: io::Recv/Send arm an SQE and then call
+            // Handle::Wait(), which submits eagerly to catch an inline completion before
+            // blocking, so those ops are already in flight by the time control returns. Folding
+            // that eager submit into this batch boundary would batch the blocking path too, but
+            // it trades away single-flow latency (the lone op that has no batch to amortize
+            // into is submitted a scheduler traversal later), so it is intentionally left as a
+            // per-op submit in Wait().
+            //
+            m_uring.ReapOnly();
 
             if (m_hasSubmissions.load(std::memory_order_acquire))
             {
@@ -535,18 +550,27 @@ void Cooperator::Launch()
                 }
             }
 
-            // Fire continuations after this poll/resume -- but defer that drain for the lone-wake
-            // case just described, letting the loop circle back to resume the woken context first.
-            // Whenever a backlog already existed the drain proceeds as before, so a continuation
-            // chain is never starved by a steady stream of context wakes: the per-iteration drain
-            // still fires, bounded by the op budget. A deferred backlog is not dropped -- it rides a
-            // later iteration (or the idle branch) once the freshly woken context has had its turn.
+            // Fire continuations after this iteration's reap -- but defer that drain for the
+            // lone-wake case just described, letting the loop circle back to resume the woken
+            // context first. Whenever a backlog already existed the drain proceeds as before, so a
+            // continuation chain is never starved by a steady stream of context wakes: the
+            // per-iteration drain still fires, bounded by the op budget. A deferred backlog is not
+            // dropped -- it rides a later iteration (or the idle branch) once the freshly woken
+            // context has had its turn.
             //
             if (hadRunnable || m_yielded.IsEmpty())
             {
                 DrainContinuations();
             }
         }
+
+        // Batch boundary: flush the SQEs accumulated across the resumes above and harvest any
+        // completions in one io_uring_enter. This bounds unsubmitted SQEs to a single batch —
+        // when the runnable list stays non-empty across batches the outer loop skips its own
+        // Poll(), so without this flush armed IO (including Handle-destructor cancels feeding a
+        // Flash barrier) could sit unsubmitted indefinitely.
+        //
+        m_uring.Poll();
     }
 
     epoch::SetManager(nullptr);

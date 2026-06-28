@@ -275,6 +275,32 @@ int Uring::Poll()
     return dispatched;
 }
 
+int Uring::ReapOnly()
+{
+    COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollCycle);
+
+    // Dispatch the completions a prior submit already materialized, without entering the kernel.
+    // As in Poll(), the callbacks only read cqe->res and never advance the CQ head themselves, so
+    // the whole ready batch is reaped with io_uring_for_each_cqe and the head is moved once with a
+    // single io_uring_cq_advance(dispatched). Peeking without that advance would re-dispatch the
+    // same CQE forever.
+    //
+    int dispatched = 0;
+    struct io_uring_cqe* cqe;
+    unsigned head;
+
+    io_uring_for_each_cqe(&m_ring, head, cqe)
+    {
+        COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollCqe);
+        Handle::Callback(cqe);
+        dispatched++;
+    }
+
+    io_uring_cq_advance(&m_ring, dispatched);
+
+    return dispatched;
+}
+
 int Uring::WaitAndPoll()
 {
     // Flush any pending SQEs before blocking — they may produce the CQE we're about to wait for.

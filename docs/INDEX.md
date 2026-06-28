@@ -38,4 +38,7 @@
   resident recv memory from connection count for keep-alive fan-out and removes the
   per-message recv submission, with measured throughput and memory and the honest
   push/pull impedance between kernel-push completions and coop's pull consumers
+- `buffer_ring_multishot_02.md`: cross-context delivery design (#16) — detached-continuation
+  delivery of a connection's multishot completions to a different (co-resident) consumer
+  context, with the buffer pool as the sole back-pressure; the deferred piece from _01
 - `TODO.md`: prioritized follow-up work

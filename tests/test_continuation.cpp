@@ -216,3 +216,24 @@ TEST(ContinuationDeathTest, LeakedWaiterTripsAssert)
         "waiters still queued");
 }
 #endif
+
+#ifndef NDEBUG
+// Thunk guard (red calibration): suspending inside a continuation's Run is forbidden and asserts.
+// A continuation borrows the cooperator's green thread to run to completion, so a Yield/Block would
+// stall the host, not the continuation. The guard catches it at the misuse site.
+//
+TEST(ContinuationDeathTest, SuspendInsideThunkAsserts)
+{
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    EXPECT_DEATH(
+        test::RunInCooperator([](Context* a)
+        {
+            Coordinator coord;
+            coord.Acquire(a);
+            coord.ContinueDetached([a](Coordinator*) { a->Yield(true); });   // forbidden inside Run
+            coord.Release(a, /*schedule=*/false);                            // enqueue
+            a->Yield(true);                                                  // drain -> fire -> assert
+        }),
+        "must not suspend");
+}
+#endif

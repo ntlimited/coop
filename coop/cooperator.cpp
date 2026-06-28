@@ -24,6 +24,33 @@
 namespace coop
 {
 
+#ifndef NDEBUG
+namespace detail
+{
+// The current cooperator's "running inside a Thunk" flag (see thunk.h). Single-threaded within a
+// cooperator, so a plain bool needs no synchronization; null-safe so RunErg etc. are callable from
+// a raw (non-cooperator) thread without tracking.
+//
+bool EnterThunk()
+{
+    auto* co = Cooperator::thread_cooperator;
+    if (!co) return false;
+    const bool prev = co->m_inThunk;
+    co->m_inThunk = true;
+    return prev;
+}
+void ExitThunk(bool prev)
+{
+    if (auto* co = Cooperator::thread_cooperator) co->m_inThunk = prev;
+}
+bool InThunk()
+{
+    auto* co = Cooperator::thread_cooperator;
+    return co && co->m_inThunk;
+}
+}
+#endif
+
 std::atomic<bool>        Cooperator::s_registryShutdown{false};
 std::mutex               Cooperator::s_registryMutex;
 Cooperator::RegistryList Cooperator::s_registry;
@@ -611,6 +638,7 @@ void Cooperator::DrainContinuations()
     //
     while (auto* waiter = m_pendingContinuations.Pop())
     {
+        detail::ThunkScope inThunk;                  // debug: forbid suspending inside the Run
         waiter->GetContinuation()->Run();
     }
 }

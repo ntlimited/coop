@@ -244,6 +244,30 @@ on scope exit. Free function `coop::Allocate<T>(extra, args...)` uses `Self()`.
 The bump heap enables contiguous allocations with trailing flexible arrays — the object and its
 buffer are one allocation with zero pointer indirection. Allocations are strictly LIFO.
 
+### Continuations & Work-Sharing (`coop/continuation.h`, `coop/work/`)
+
+Two stackless, run-to-completion units, both `coop::Thunk` (`virtual void Run()`):
+
+- **Continuation** (`coordinator.h` / `continuation.h`) — the in-cooperator species. Registered on a
+  Coordinator in place of a blocked Context; fires as a function call (no context switch) from the
+  loop's drain when the coordinator is Released. Single-cooperator: never migrates, atomic-free.
+  Structured (`coord.Continue(fn)` → frame-hosted, `Await()` a result) or detached
+  (`coord.ContinueDetached(fn)` → pooled, self-freeing, no awaiter). ~8ns dispatch; fires from real
+  io_uring CQEs.
+- **Erg** (`coop/work/erg.h`) — the cross-core species: shed into a `work::Grid`, run by a stealer
+  on whatever cooperator pulls it.
+
+`work::Grid` is the **opt-in** work-sharing domain. Cooperators `Join` it, each getting a shard (a
+bounded Chase-Lev `work::detail::Deque`) and a daemon stealer that pulls local / steals from peers /
+runs Ergs to completion and parks on a short io_uring timer when idle. `Shed(fn)` is the verb —
+sibling to `Spawn`: with a Grid it sheds a balanced Erg any participant may steal; without one it
+falls back to `Spawn` ("shed = spawn"). Opt-in is free: a non-participant has a null participation
+field and a byte-for-byte unchanged scheduler loop.
+
+Debug-only guard: suspending (Yield/Block) inside a Thunk asserts (`detail::ThunkScope` /
+`AssertNotInThunk`) — run-to-completion units must not stall their host context. Compiled out in
+release. See `docs/cross_thread_substrate_01.md` for the design, covenants, and the a stackful runtime comparison.
+
 ### HTTP Server (`coop/http/`)
 Route table maps paths to handler functions that receive a `ConnectionBase&`:
 ```cpp

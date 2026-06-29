@@ -275,12 +275,54 @@ struct Arm final : ArmBase
 {
     static constexpr size_t kBatch = 16;
 
+    // The arm does NOT register in its constructor: it has no channel traffic to react to until the
+    // SubscriptionCore is fully wired (m_arms/m_count/m_liveArms set), because a courtesy fire's
+    // handler may CancelAll, which walks every arm. Subscription's ctor body calls ArmInitial() once
+    // per arm after that wiring is done.
+    //
     Arm(SubscriptionCore* core, RecvChannel<T>* channel, H handler)
     : ArmBase(core, &channel->m_recv)
     , m_channel(channel)
     , m_handler(std::move(handler))
     {
-        Register();
+    }
+
+    // Initial arming, run once from Subscribe's context after the core is wired. If the channel
+    // already holds buffered data at subscribe time, adopt it now (a "courtesy fire") rather than
+    // strand it until the next Send -- m_recv is edge-triggered, and a Send into an
+    // already-non-empty channel would not pulse it. The courtesy fire runs the SAME drain path as a
+    // normal fire (FireOnce -> Channel::Drain), which re-Acquires m_recv when it empties, so the arm
+    // ends correctly registered on a held m_recv (empty <-> m_recv-held invariant restored) and
+    // future Sends re-pulse it. We are on a context here (not the continuation drain), so Drain's
+    // m_recv.Acquire-on-empty is an ordinary context acquire; the ThunkScope keeps the handler's
+    // no-suspend contract enforced exactly as the drain would.
+    //
+    void ArmInitial()
+    {
+        if (m_retired || m_core->m_cancelRequested)
+        {
+            return;
+        }
+        if (m_channel->IsEmpty())
+        {
+            // A channel already shut down before we subscribed will never fire us (its Shutdown
+            // already pulsed m_recv to an empty wait list), so registering would strand the arm and
+            // hang Wait(). Retire it straight away instead.
+            //
+            if (m_channel->IsShutdown())
+            {
+                Retire();
+                return;
+            }
+            Register();
+            return;
+        }
+
+        ::coop::detail::ThunkScope inThunk;
+        if (FireOnce())
+        {
+            Register();
+        }
     }
 
     void Run() final
@@ -300,10 +342,20 @@ struct Arm final : ArmBase
             return;
         }
 
-        // Drain to EMPTY (edge-triggered m_recv, see header). Channel::Drain re-Acquires m_recv on
-        // emptying and wakes a blocked sender with schedule=false. Stop/CancelAll break the drain so
-        // no further items are delivered once the handler asks to retire.
-        //
+        if (FireOnce())
+        {
+            Register();                    // re-arm IN PLACE -- same object, no allocation
+        }
+    }
+
+    // Drain the channel to EMPTY, dispatch each item, then decide the arm's fate. Returns true if
+    // the arm should (re-)register on m_recv, false if it has retired. Shared by Run (per fire) and
+    // ArmInitial (courtesy fire). Channel::Drain re-Acquires m_recv on emptying and wakes a blocked
+    // sender with schedule=false. Stop/CancelAll break the drain so no further items are delivered
+    // once the handler asks to retire.
+    //
+    bool FireOnce()
+    {
         T       batch[kBatch];
         Control ctl;
         bool    done = false;
@@ -327,15 +379,14 @@ struct Arm final : ArmBase
         if (ctl.m_cancelAll)
         {
             m_core->RetireAll();           // retires this arm and every sibling
-            return;
+            return false;
         }
         if (ctl.m_stop || m_channel->IsShutdown())
         {
-            Retire();                      // terminal: this node is disconnected, so just account it
-            return;
+            Retire();                      // terminal
+            return false;
         }
-
-        Register();                        // re-arm IN PLACE -- same object, no allocation
+        return true;
     }
 
     RecvChannel<T>* m_channel;
@@ -376,6 +427,7 @@ namespace detail
     {
         explicit ArmStorage(SubscriptionCore*) {}
         void Collect(ArmBase**, int&) {}
+        void ArmAll() {}
     };
 
     template<typename Spec, typename... Rest>
@@ -393,81 +445,113 @@ namespace detail
             m_tail.Collect(out, i);
         }
 
+        // Initial arming over the typed storage -- a compile-time fold, no virtual dispatch. Runs
+        // after the core is wired so a courtesy fire's CancelAll can safely walk every arm.
+        //
+        void ArmAll()
+        {
+            m_head.ArmInitial();
+            m_tail.ArmAll();
+        }
+
         typename Spec::ArmType m_head;
         ArmStorage<Rest...>    m_tail;
     };
 }
 
-// A live fan-in. Object-hosts its arms; non-copyable and non-movable. Build it with Subscribe.
+// Subscription -- the pure-virtual interface to a live fan-in. The subscription-LEVEL operations
+// (Cancel / Wait / WaitKill) are coarse and per-subscription, so a single vtable dispatch on each is
+// free; the hot per-item path (the arms) stays non-virtual and object-hosted in the concrete type.
+// This is coop's three-level idiom: a pure-virtual interface at the API boundary, a concrete
+// (template) implementation that owns the data. Callers that do not care about the arm types hold a
+// Subscription& or Subscription*, e.g. to collect heterogeneous subscriptions and cancel them all:
 //
-template<typename... Specs>
+//   std::vector<coop::chan::Subscription*> subs;
+//   subs.push_back(&subA); subs.push_back(&subB);
+//   for (auto* s : subs) s->Cancel();
+//
 struct Subscription
 {
-    static constexpr int N = static_cast<int>(sizeof...(Specs));
-
-    Subscription(Context* ctx, Specs... specs)
-    : m_core(ctx)
-    , m_storage(&m_core, std::move(specs)...)
-    {
-        int i = 0;
-        m_storage.Collect(m_armPtrs, i);
-        m_core.m_arms     = m_armPtrs;
-        m_core.m_count    = N;
-        m_core.m_liveArms = N;
-
-        // No arms -> already complete; release the completion coordinator so Wait() returns at once.
-        //
-        if (N == 0)
-        {
-            m_core.m_completion.Release(nullptr, /*schedule=*/false);
-        }
-    }
-
+    Subscription() = default;
     Subscription(Subscription const&) = delete;
     Subscription(Subscription&&)      = delete;
+    virtual ~Subscription() = default;
 
-    ~Subscription()
-    {
-        Cancel();
-    }
-
-    // Retire every arm now (RemoveAsBlocked each). Idempotent.
+    // Retire every arm now. Idempotent.
     //
-    void Cancel()
-    {
-        m_core.RetireAll();
-    }
+    virtual void Cancel() = 0;
 
     // Join: block the caller until every arm has retired (all channels shut down). NOT kill-aware.
     //
-    void Wait()
-    {
-        m_core.WaitComplete(Self());
-    }
+    virtual void Wait() = 0;
 
     // Kill-aware join: returns false if the caller is killed before completion.
     //
-    bool WaitKill()
-    {
-        return m_core.WaitCompleteKill(Self());
-    }
-
-  private:
-    SubscriptionCore             m_core;
-    detail::ArmStorage<Specs...> m_storage;
-    ArmBase*                     m_armPtrs[N > 0 ? N : 1];
+    virtual bool WaitKill() = 0;
 };
 
-// Subscribe(ctx, Drain(...), Drain(...), ...) -- arm a continuation-dispatched fan-in. Returns a
-// Subscription constructed in place (guaranteed copy elision), so the arms register at their final
-// addresses. Bind it to a named local that outlives the traffic:
+namespace detail
+{
+    // The concrete fan-in: object-hosts its arms (no heap), implements the Subscription interface.
+    // Non-copyable and non-movable -- the arms capture their own member addresses on coordinator
+    // wait lists. Build it with Subscribe.
+    //
+    template<typename... Specs>
+    struct SubscriptionImpl final : Subscription
+    {
+        static constexpr int N = static_cast<int>(sizeof...(Specs));
+
+        SubscriptionImpl(Context* ctx, Specs... specs)
+        : m_core(ctx)
+        , m_storage(&m_core, std::move(specs)...)
+        {
+            int i = 0;
+            m_storage.Collect(m_armPtrs, i);
+            m_core.m_arms     = m_armPtrs;
+            m_core.m_count    = N;
+            m_core.m_liveArms = N;
+
+            // No arms -> already complete; release the completion coordinator so Wait() returns at
+            // once.
+            //
+            if (N == 0)
+            {
+                m_core.m_completion.Release(nullptr, /*schedule=*/false);
+            }
+
+            // Arm every case now that the core is wired (a courtesy fire's CancelAll may walk all
+            // arms). This is also where already-buffered data is adopted -- see Arm::ArmInitial.
+            //
+            m_storage.ArmAll();
+        }
+
+        ~SubscriptionImpl() final
+        {
+            Cancel();
+        }
+
+        void Cancel() final     { m_core.RetireAll(); }
+        void Wait() final       { m_core.WaitComplete(Self()); }
+        bool WaitKill() final   { return m_core.WaitCompleteKill(Self()); }
+
+      private:
+        SubscriptionCore     m_core;
+        ArmStorage<Specs...> m_storage;
+        ArmBase*             m_armPtrs[N > 0 ? N : 1];
+    };
+}
+
+// Subscribe(ctx, Drain(...), Drain(...), ...) -- arm a continuation-dispatched fan-in. Returns the
+// concrete subscription constructed in place (guaranteed copy elision), so the arms register at
+// their final addresses. Bind it to a named local that outlives the traffic; pass it by
+// Subscription& / Subscription* where the arm types do not matter:
 //
 //   auto sub = coop::chan::Subscribe(ctx, coop::chan::Drain(ch, handler));
 //
 template<typename... Specs>
-[[nodiscard]] Subscription<Specs...> Subscribe(Context* ctx, Specs... specs)
+[[nodiscard]] detail::SubscriptionImpl<Specs...> Subscribe(Context* ctx, Specs... specs)
 {
-    return Subscription<Specs...>(ctx, std::move(specs)...);
+    return detail::SubscriptionImpl<Specs...>(ctx, std::move(specs)...);
 }
 
 } // end namespace chan

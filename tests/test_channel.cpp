@@ -2140,3 +2140,105 @@ TEST(ChannelTest, SubscribeWaitJoinsOnAllShutdown)
         EXPECT_TRUE(joined);                // both retired -> join completed
     });
 }
+
+// Courtesy trigger: a channel that already holds buffered data at Subscribe time has it adopted
+// immediately (delivered synchronously during Subscribe), not stranded until the next Send. The arm
+// is then correctly armed for future traffic.
+//
+TEST(ChannelTest, SubscribeAdoptsBufferedItems)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> ch(ctx);
+
+        // Pre-load items BEFORE subscribing. m_recv goes empty->non-empty on the first push and is
+        // not re-pulsed by the rest -- exactly the edge case the courtesy fire exists for.
+        //
+        EXPECT_TRUE(ch.TrySend(SubMsg{0, 0}));
+        EXPECT_TRUE(ch.TrySend(SubMsg{0, 1}));
+        EXPECT_TRUE(ch.TrySend(SubMsg{0, 2}));
+
+        int received   = 0;
+        int nextSeq    = 0;
+        int outOfOrder = 0;
+
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch, [&](SubMsg&& m)
+            {
+                if (m.seq != nextSeq) outOfOrder++;
+                nextSeq++; received++;
+            }));
+
+        // Adopted synchronously by the courtesy fire during Subscribe -- no scheduler turn needed.
+        //
+        EXPECT_EQ(received, 3);
+        EXPECT_EQ(outOfOrder, 0);
+
+        // And the arm is left correctly armed: a subsequent Send re-pulses m_recv and fires it.
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch.Send(SubMsg{0, 3});
+        });
+        while (received < 4) ctx->Yield(true);
+        EXPECT_EQ(received, 4);
+        EXPECT_EQ(outOfOrder, 0);
+
+        ch.Shutdown();
+        sub.Wait();
+    });
+}
+
+// The subscription-level ops are reachable through the pure-virtual Subscription interface: a
+// caller can collect heterogeneous subscriptions as Subscription* and Cancel/Wait them uniformly.
+//
+TEST(ChannelTest, SubscribeDrivenThroughBaseInterface)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> ch0(ctx);
+        coop::chan::FixedChannel<SubMsg, 4> ch1(ctx);
+
+        int r = 0;
+
+        // Two independent subscriptions with different (here identical) arm shapes.
+        //
+        auto subA = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch0, [&](SubMsg&&) { r++; }));
+        auto subB = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch1, [&](SubMsg&&) { r++; }));
+
+        coop::chan::Subscription* subs[2] = {&subA, &subB};
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch0.Send(SubMsg{0, 0});
+            ch1.Send(SubMsg{1, 0});
+        });
+        while (r < 2) ctx->Yield(true);
+        EXPECT_EQ(r, 2);
+
+        // Cancel both through the base interface (no knowledge of the concrete arm types).
+        //
+        for (auto* s : subs)
+        {
+            s->Cancel();
+        }
+
+        // After cancel, further sends are not delivered.
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch0.Send(SubMsg{0, 1});
+            ch1.Send(SubMsg{1, 1});
+        });
+        ctx->Yield(true);
+        ctx->Yield(true);
+        EXPECT_EQ(r, 2);
+
+        // Wait through a base reference -- already complete (cancelled), returns at once.
+        //
+        coop::chan::Subscription& base = subA;
+        base.Wait();
+    });
+}

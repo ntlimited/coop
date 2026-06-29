@@ -44,21 +44,22 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
 {
     using List = EmbeddedList<Coordinated>;
 
+    // The waiter pointer, the continuation tag, and the satisfied flag all share one word: the tag
+    // and satisfied live in the low bits of the (aligned) pointer, so neither costs storage. The
+    // ctors initialize the pointer with at most kContinuationTag, leaving satisfied clear.
+    //
     Coordinated(Context* ctx)
     : m_waiter(reinterpret_cast<uintptr_t>(ctx))
-    , m_satisfied(false)
     {
     }
 
     Coordinated(Continuation* cont)
     : m_waiter(reinterpret_cast<uintptr_t>(cont) | kContinuationTag)
-    , m_satisfied(false)
     {
     }
 
     Coordinated()
     : m_waiter(0)
-    , m_satisfied(false)
     {
     }
 
@@ -72,7 +73,7 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
 
     bool Satisfied() const
     {
-        return m_satisfied;
+        return (m_waiter & kSatisfied) != 0;
     }
 
     bool IsContinuation() const
@@ -86,18 +87,27 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
     friend struct Signal;
     friend struct Cooperator;
 
+    // Low-bit flags packed into the aligned waiter pointer (see the static_assert in coordinator.cpp
+    // guarding the alignment this relies on). kPtrMask recovers the pointer.
+    //
     static constexpr uintptr_t kContinuationTag = 1;
+    static constexpr uintptr_t kSatisfied       = 2;
+    static constexpr uintptr_t kPtrMask         = ~uintptr_t(kContinuationTag | kSatisfied);
 
     void Satisfy()
     {
-        m_satisfied = true;
+        m_waiter |= kSatisfied;
     }
 
     void Reset()
     {
-        m_satisfied = false;
+        m_waiter &= ~kSatisfied;
     }
 
+    // Repurpose as a fresh context waiter: pointer set, continuation tag and satisfied both cleared.
+    // Always paired with a following AddAsBlocked (which also Resets), so clearing satisfied here is
+    // a no-op in practice but keeps the state coherent.
+    //
     void SetContext(Context* ctx)
     {
         m_waiter = reinterpret_cast<uintptr_t>(ctx);
@@ -105,16 +115,15 @@ struct Coordinated : EmbeddedListHookups<Coordinated>
 
     Context* GetContext()
     {
-        return reinterpret_cast<Context*>(m_waiter & ~kContinuationTag);
+        return reinterpret_cast<Context*>(m_waiter & kPtrMask);
     }
 
     Continuation* GetContinuation()
     {
-        return reinterpret_cast<Continuation*>(m_waiter & ~kContinuationTag);
+        return reinterpret_cast<Continuation*>(m_waiter & kPtrMask);
     }
 
     uintptr_t   m_waiter;
-    bool        m_satisfied;
 };
 
 // Coordinator is the sole coordination primitive for contexts. It is heavily used and non-virtual,

@@ -8,6 +8,14 @@
 namespace coop
 {
 
+// Coordinated packs its continuation tag and satisfied flag into the low bits of the waiter pointer,
+// which is sound only if the pointed-to types are at least 4-byte aligned. Both far exceed that
+// (Context is cache-line aligned; Continuation holds pointers), but assert it where the types are
+// complete so a future layout change that broke the invariant fails loudly here.
+//
+static_assert(alignof(Context) >= 4 && alignof(Continuation) >= 4,
+    "Coordinated packs two flag bits into the low bits of the waiter pointer");
+
 namespace detail
 {
 bool CooperatorIsShuttingDown()

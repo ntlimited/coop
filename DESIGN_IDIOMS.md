@@ -151,3 +151,38 @@ cover for the case where it doesn't. Workaround machinery adds bytes, complexity
 exists only to defend against a mistake that a one-line diagnostic would catch instantly. The user
 who sees `static_assert: Interface type must have a virtual destructor` fixes it in seconds. The
 machinery you built to avoid that message costs everyone forever.
+
+## Thunk species: a continuation runs at the right time, an erg at the right place
+
+A `Thunk` is a stackless, run-to-completion unit of work. Its two species differ not by *what* they
+compute but by *which* guarantee they carry:
+
+- A **`Continuation`** is triggered by *time*: registered on a `Coordinator`, it fires when that
+  coordinator is released — "if I run, it is the right *time*." Single-cooperator, never migrates,
+  atomic-free.
+- An **`Erg`** is passed by *place*: shed into a `work::Grid` and run by whatever stealer pulls it —
+  "if I run, it is the right *place*." Cross-core, migratable, and run-to-completion so it never
+  blocks a stealer.
+
+These are not two localities of one axis; they compose. A continuation (right time) may shed an erg
+(right place); the erg's result returns to its *originator* — a specific cooperator — and that is a
+`Passage`, not the Grid, because a result has a designated recipient where load-balanced work does
+not. When you reach for one, ask which guarantee you need — *when* it runs or *where* — not "the
+cross-thread version of the other."
+
+## `Await` is transitive, `Wait` is intransitive
+
+Two blocking verbs, one grammatical rule that tells the reader at a glance whether a value comes back:
+
+- **`Await`** takes an object. *"I await my data."* You launched a computation and block to **retrieve
+  its result**; the call returns that value (`Result Await()`).
+- **`Wait`** takes none. *"I'm waiting."* You block until an **event or condition** occurs — a signal
+  fires, a latch trips, a timer elapses, an operation completes. It returns `void` or a *status* (how
+  the wait ended), never a computed value.
+
+The test is the grammar: if you can name the thing you are awaiting, it is `Await`; if you are merely
+waiting *for* something to happen, it is `Wait`. `Handle::Wait()` returns the IO result as an `int`,
+but the verb's object is the *operation* ("wait for the recv"), not the bytes — you wait for the
+read, you do not await the data — so it stays `Wait`, the `int` being the operation's outcome. A
+`Wait` whose return you would naturally *name* (a value, not a status or outcome) is the signal to
+rename it `Await`.

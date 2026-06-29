@@ -12,6 +12,7 @@
 #include "coop/chan/merge.h"
 #include "coop/chan/filter.h"
 #include "coop/chan/passage.h"
+#include "coop/chan/subscribe.h"
 #include "test_helpers.h"
 
 TEST(ChannelTest, SendRecv)
@@ -1855,5 +1856,287 @@ TEST(SpscPassageTest, ShutdownFromExternalThread)
         int v = 0;
         EXPECT_FALSE(passage.Recv(v));
         killer.join();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Subscribe / Drain -- object-hosted, continuation-dispatched fan-in. The handlers are
+// run-to-completion thunks; each Drain case re-arms IN PLACE (no per-fire heap). See
+// coop/chan/subscribe.h for the contract.
+//
+// NOTE: a handler that suspends (Yield/Block/blocking Recv) inside the thunk body is a contract
+// violation -- it trips AssertNotInThunk and aborts in debug. That is the debug-abort calibration
+// case; it is deliberately NOT exercised here so the suite does not abort.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+struct SubMsg
+{
+    int channel;
+    int seq;
+};
+
+} // namespace
+
+// Every item from both channels reaches its handler exactly once and in per-channel order, with no
+// parked consumer context: the handlers are continuations fired from the scheduler loop's drain.
+//
+TEST(ChannelTest, SubscribeDeliversInOrder)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int PER = 5;
+
+        coop::chan::FixedChannel<SubMsg, 4> ch0(ctx);
+        coop::chan::FixedChannel<SubMsg, 4> ch1(ctx);
+
+        int received[2] = {0, 0};
+        int nextSeq[2]  = {0, 0};
+        int outOfOrder  = 0;
+        int total       = 0;
+
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch0, [&](SubMsg&& m)
+            {
+                if (m.seq != nextSeq[0]) outOfOrder++;
+                nextSeq[0]++; received[0]++; total++;
+            }),
+            coop::chan::Drain(ch1, [&](SubMsg&& m)
+            {
+                if (m.seq != nextSeq[1]) outOfOrder++;
+                nextSeq[1]++; received[1]++; total++;
+            }));
+
+        coop::chan::Channel<SubMsg>* chans[2] = {&ch0, &ch1};
+        for (int c = 0; c < 2; c++)
+        {
+            ctx->GetCooperator()->Spawn([&, c](coop::Context*)
+            {
+                for (int i = 0; i < PER; i++) chans[c]->Send(SubMsg{c, i});
+            });
+        }
+
+        while (total < 2 * PER) ctx->Yield(true);
+
+        EXPECT_EQ(outOfOrder, 0);
+        EXPECT_EQ(total, 2 * PER);
+        EXPECT_EQ(received[0], PER);
+        EXPECT_EQ(received[1], PER);
+
+        // Shut both down so every arm retires before teardown (a still-armed node would trip the
+        // ~Coordinator "waiters still queued" assert). Join on it.
+        //
+        ch0.Shutdown();
+        ch1.Shutdown();
+        sub.Wait();
+    });
+}
+
+// Drain-all-per-fire: m_recv is edge-triggered, so a burst of sends into an already-non-empty
+// channel pulses it only once. A single fire must drain every queued item.
+//
+TEST(ChannelTest, SubscribeDrainsBurstInOneFire)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        constexpr int BURST = 6;
+
+        coop::chan::FixedChannel<SubMsg, 8> ch(ctx);
+
+        int received   = 0;
+        int nextSeq    = 0;
+        int outOfOrder = 0;
+
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch, [&](SubMsg&& m)
+            {
+                if (m.seq != nextSeq) outOfOrder++;
+                nextSeq++; received++;
+            }));
+
+        // A producer dumps the whole burst without yielding: all BURST items land in the channel,
+        // but only the first Send pulses m_recv (empty -> non-empty edge).
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            for (int i = 0; i < BURST; i++) ch.Send(SubMsg{0, i});
+        });
+
+        while (received < BURST) ctx->Yield(true);
+
+        EXPECT_EQ(outOfOrder, 0);
+        EXPECT_EQ(received, BURST);
+
+        ch.Shutdown();
+        sub.Wait();
+    });
+}
+
+// Shutting a channel down retires its arm: the terminal fire drains the tail, observes IsShutdown,
+// and does not re-arm. Wait() returns once that last (only) arm has retired.
+//
+TEST(ChannelTest, SubscribeShutdownRetiresArm)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> ch(ctx);
+
+        int received = 0;
+
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch, [&](SubMsg&&) { received++; }));
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch.Send(SubMsg{0, 0});
+            ch.Send(SubMsg{0, 1});
+        });
+
+        while (received < 2) ctx->Yield(true);
+
+        ch.Shutdown();
+        sub.Wait();              // join returns once the shut-down arm retires
+        EXPECT_EQ(received, 2);
+    });
+}
+
+// Control::Stop() from inside a handler retires THAT arm (subsequent sends to it are not delivered)
+// while the other arm keeps running.
+//
+TEST(ChannelTest, SubscribeControlStopRetiresOneArm)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> chStop(ctx);
+        coop::chan::FixedChannel<SubMsg, 4> chLive(ctx);
+
+        int stopReceived = 0;
+        int liveReceived = 0;
+
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(chStop, [&](SubMsg&&, coop::chan::Control& ctl)
+            {
+                stopReceived++;
+                ctl.Stop();      // retire this arm after this item
+            }),
+            coop::chan::Drain(chLive, [&](SubMsg&&)
+            {
+                liveReceived++;
+            }));
+
+        // First item to chStop triggers Stop. Deliver it, let the arm retire.
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            chStop.Send(SubMsg{0, 0});
+        });
+        while (stopReceived < 1) ctx->Yield(true);
+        EXPECT_EQ(stopReceived, 1);
+
+        // Subsequent sends to the stopped channel are NOT delivered; the live arm still is.
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            chStop.Send(SubMsg{0, 1});      // stranded -- arm retired
+            chLive.Send(SubMsg{1, 0});
+            chLive.Send(SubMsg{1, 1});
+        });
+        while (liveReceived < 2) ctx->Yield(true);
+
+        EXPECT_EQ(stopReceived, 1);         // never advanced past the Stop
+        EXPECT_EQ(liveReceived, 2);
+
+        chLive.Shutdown();                  // chStop's arm is already retired
+        sub.Wait();
+    });
+}
+
+// Control::CancelAll() from inside a handler retires the WHOLE subscription. After it, no arm
+// delivers, and Wait() returns immediately (completion already latched).
+//
+TEST(ChannelTest, SubscribeControlCancelAllRetiresSubscription)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> ch0(ctx);
+        coop::chan::FixedChannel<SubMsg, 4> ch1(ctx);
+
+        int r0 = 0;
+        int r1 = 0;
+
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch0, [&](SubMsg&&, coop::chan::Control& ctl)
+            {
+                r0++;
+                ctl.CancelAll();
+            }),
+            coop::chan::Drain(ch1, [&](SubMsg&&)
+            {
+                r1++;
+            }));
+
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch0.Send(SubMsg{0, 0});
+        });
+        while (r0 < 1) ctx->Yield(true);
+        EXPECT_EQ(r0, 1);
+
+        // Whole subscription is retired now: further sends to EITHER channel are not delivered.
+        //
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            ch0.Send(SubMsg{0, 1});
+            ch1.Send(SubMsg{1, 0});
+        });
+        ctx->Yield(true);
+        ctx->Yield(true);
+
+        EXPECT_EQ(r0, 1);
+        EXPECT_EQ(r1, 0);
+
+        sub.Wait();                         // already complete -> returns at once
+    });
+}
+
+// Wait() is a join: it returns once every channel has shut down (all arms retired), not before.
+//
+TEST(ChannelTest, SubscribeWaitJoinsOnAllShutdown)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> ch0(ctx);
+        coop::chan::FixedChannel<SubMsg, 4> ch1(ctx);
+
+        int total = 0;
+
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch0, [&](SubMsg&&) { total++; }),
+            coop::chan::Drain(ch1, [&](SubMsg&&) { total++; }));
+
+        bool joined = false;
+
+        // A waiter context blocks in Wait() until BOTH channels are shut down.
+        //
+        coop::Context::Handle waiterHandle;
+        ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            sub.Wait();
+            joined = true;
+        }, &waiterHandle);
+
+        ctx->Yield(true);
+        EXPECT_FALSE(joined);               // nothing shut down yet
+
+        ch0.Shutdown();
+        ctx->Yield(true);
+        EXPECT_FALSE(joined);               // one arm still live
+
+        ch1.Shutdown();
+        ctx->Yield(true);
+        ctx->Yield(true);
+        EXPECT_TRUE(joined);                // both retired -> join completed
     });
 }

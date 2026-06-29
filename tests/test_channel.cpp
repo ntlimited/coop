@@ -2189,6 +2189,49 @@ TEST(ChannelTest, SubscribeAdoptsBufferedItems)
     });
 }
 
+// Subscribing to a channel that is ALREADY shut down and empty must retire the arm during
+// ArmInitial rather than registering it: Shutdown already pulsed m_recv to an empty wait list, so a
+// registered arm would never fire and Wait() would hang. The handler never runs.
+//
+TEST(ChannelTest, SubscribeAlreadyShutdownEmptyRetiresImmediately)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> ch(ctx);
+        ch.Shutdown();                       // shut down BEFORE subscribing, channel empty
+
+        int received = 0;
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch, [&](SubMsg&&) { received++; }));
+
+        sub.Wait();                          // must return immediately -- arm retired in ArmInitial
+        EXPECT_EQ(received, 0);               // never fired
+    });
+}
+
+// The buffered-but-already-shut-down variant: items still sit in the channel when we subscribe AND
+// it is shut down. ArmInitial sees a non-empty channel, so its courtesy fire drains the buffered
+// items (delivering them), then FireOnce observes IsShutdown and retires -- the data is not lost
+// and Wait() still joins.
+//
+TEST(ChannelTest, SubscribeAlreadyShutdownDrainsBufferThenRetires)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::FixedChannel<SubMsg, 4> ch(ctx);
+        EXPECT_TRUE(ch.TrySend(SubMsg{0, 0}));
+        EXPECT_TRUE(ch.TrySend(SubMsg{0, 1}));
+        ch.Shutdown();                       // buffered items remain; channel shut down
+
+        int received = 0;
+        auto sub = coop::chan::Subscribe(ctx,
+            coop::chan::Drain(ch, [&](SubMsg&&) { received++; }));
+
+        EXPECT_EQ(received, 2);               // courtesy-drained synchronously before retiring
+        sub.Wait();                           // joins -- arm retired after the drain
+    });
+}
+
 // The subscription-level ops are reachable through the pure-virtual Subscription interface: a
 // caller can collect heterogeneous subscriptions as Subscription* and Cancel/Wait them uniformly.
 //

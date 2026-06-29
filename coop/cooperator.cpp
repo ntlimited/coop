@@ -90,8 +90,12 @@ Cooperator::~Cooperator()
         close(m_submitFd);
     }
 
+    // The run loop already removed us on exit (the common path); a cooperator destroyed without
+    // running never registered. Disconnected() is debug-only now, so check membership by walking the
+    // registry -- O(n) in the (small) cooperator count, paid once at teardown.
+    //
     std::lock_guard<std::mutex> lock(s_registryMutex);
-    if (!Disconnected())
+    if (s_registry.Contains(this))
     {
         s_registry.Remove(this);
     }

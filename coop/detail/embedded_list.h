@@ -22,10 +22,25 @@ struct EmbeddedListHookups
     using List = EmbeddedList<T, Tag, N>;
     using Ptr = T*;
 
-    EmbeddedListHookups()
-    : prev(nullptr)
-    , next(nullptr)
+    // A loud "not on a list" sentinel. prev/next exist only to link a node into a list; a node not on
+    // one has no meaningful neighbours. In debug we fill them with a non-canonical address so any
+    // stray dereference (e.g. Pop-ing a node already removed) faults at a recognizable 0xDEADBEEF
+    // rather than corrupting a live list, and Disconnected() can witness the state. In release we
+    // write nothing -- Push/InsertBefore overwrite before any read, and Disconnected() is debug-only
+    // (release callers that need membership use EmbeddedList::Contains). See Pop's caution.
+    //
+#ifndef NDEBUG
+    static Hookups* Poison()
     {
+        return reinterpret_cast<Hookups*>(static_cast<uintptr_t>(0xDEADBEEFDEADBEEFULL));
+    }
+#endif
+
+    EmbeddedListHookups()
+    {
+#ifndef NDEBUG
+        prev = next = Poison();
+#endif
     }
 
     EmbeddedListHookups(EmbeddedListHookups const&) = delete;
@@ -53,18 +68,26 @@ struct EmbeddedListHookups
     {
         prev->SetNext(next);
         next->SetPrev(prev);
-        
-        next = nullptr;
-        prev = nullptr;
+
+#ifndef NDEBUG
+        prev = next = Poison();
+#endif
     }
 
     // TODO lock down visibility
     //
     
+    // Debug-only witness: true when the node carries the poison sentinel (constructed or popped, not
+    // on a list). It does not EXIST in release -- nothing maintains the sentinel there, so a release
+    // call would be a silent lie; making it a compile error is the point. Release code that needs
+    // membership walks the list via EmbeddedList::Contains. (Asserts that use it compile out.)
+    //
+#ifndef NDEBUG
     bool Disconnected() const
     {
-        return next == nullptr;
+        return next == Poison();
     }
+#endif
 
     void InsertBefore(Hookups* other)
     {
@@ -164,14 +187,11 @@ struct EmbeddedList
         sentinel.prev = item;
     }
 
-    // CAUTION: this front-pop nulls the popped node's next/prev only under #ifndef NDEBUG. So
-    // Hookups::Disconnected() (next == nullptr) is a valid "am I still on a list?" test ONLY for a
-    // node removed via Hookups::Pop()/Remove() (which null unconditionally). A node taken off the
-    // front by THIS method reads falsely-linked in release -- its stale neighbour pointers survive --
-    // and Pop-ing it again would splice those stale pointers into whatever list it already left. A
-    // primitive that hands a node to a front-pop queue (e.g. the cooperator's pending-continuation
-    // drain) and later needs to know its membership must track that explicitly, not via
-    // Disconnected(). See coop/chan/subscribe.h's Arm::m_listed for the pattern.
+    // CAUTION: in release, nodes are never poisoned on removal (nor initialized), so
+    // Hookups::Disconnected() is a DEBUG-ONLY witness -- meaningful only because debug builds poison
+    // popped/constructed nodes for the membership asserts. A release caller that genuinely needs
+    // "am I on a list?" must track membership itself (see coop/chan/subscribe.h's Arm::m_listed) or,
+    // if it owns the list, walk it via Contains().
     //
     Ptr Pop()
     {
@@ -186,8 +206,8 @@ struct EmbeddedList
         second->prev = &sentinel;
 
 #ifndef NDEBUG
-        first->next = nullptr;
-        first->prev = nullptr;
+        first->next = Hookups::Poison();
+        first->prev = Hookups::Poison();
 #endif
 
         return first->Cast();
@@ -222,6 +242,19 @@ struct EmbeddedList
     bool IsEmpty() const
     {
         return sentinel.next == &sentinel;
+    }
+
+    // O(n) membership test. Disconnected() is the O(1) test but is debug-only (see Pop's caution);
+    // a release caller that owns this list and needs membership rarely (e.g. a teardown self-remove
+    // guard) walks it here instead.
+    //
+    bool Contains(Hookups* h) const
+    {
+        for (auto* at = sentinel.next; at != &sentinel; at = at->next)
+        {
+            if (at == h) return true;
+        }
+        return false;
     }
 
     void Remove(Hookups* h)

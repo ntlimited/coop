@@ -164,6 +164,15 @@ struct EmbeddedList
         sentinel.prev = item;
     }
 
+    // CAUTION: this front-pop nulls the popped node's next/prev only under #ifndef NDEBUG. So
+    // Hookups::Disconnected() (next == nullptr) is a valid "am I still on a list?" test ONLY for a
+    // node removed via Hookups::Pop()/Remove() (which null unconditionally). A node taken off the
+    // front by THIS method reads falsely-linked in release -- its stale neighbour pointers survive --
+    // and Pop-ing it again would splice those stale pointers into whatever list it already left. A
+    // primitive that hands a node to a front-pop queue (e.g. the cooperator's pending-continuation
+    // drain) and later needs to know its membership must track that explicitly, not via
+    // Disconnected(). See coop/chan/subscribe.h's Arm::m_listed for the pattern.
+    //
     Ptr Pop()
     {
         auto* first = sentinel.next;

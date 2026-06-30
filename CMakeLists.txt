@@ -44,14 +44,29 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG        v1.15.0
 )
-# spdlog's bundled fmt does not compile under clang's stricter consteval checking
-# (clang-21). Switch spdlog to std::format on clang, which clang ships. GCC keeps the
-# bundled fmt (GCC 11 has no std::format). coop's log call sites use only std::format-
-# compatible specifiers ({}, {:x}, {:p} on void*).
+# spdlog's bundled fmt fails clang's stricter consteval format-string checking on newer clang
+# (clang-21+), which ship std::format — so use std::format there. Older clang (e.g. 15) has no
+# <format> but compiles the bundled fmt fine, so it keeps the bundle. GCC keeps the bundle (GCC 11
+# has no <format>). The choice is driven by ACTUAL <format> availability, not a version guess, so it
+# is correct across the whole clang range. coop's log call sites use only std::format-compatible
+# specifiers ({}, {:x}, {:p} on void*).
 #
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    set(SPDLOG_USE_STD_FORMAT ON CACHE BOOL "clang: use std::format instead of bundled fmt" FORCE)
+    include(CheckCXXSourceCompiles)
+    include(CMakePushCheckState)
+    unset(COOP_HAVE_STD_FORMAT)
+    unset(COOP_HAVE_STD_FORMAT CACHE)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_FLAGS "-std=c++20")
+    check_cxx_source_compiles(
+        "#include <format>\nint main(){ return (int)std::format(\"{}\", 1).size(); }"
+        COOP_HAVE_STD_FORMAT)
+    cmake_pop_check_state()
+else()
+    set(COOP_HAVE_STD_FORMAT OFF)
 endif()
+set(SPDLOG_USE_STD_FORMAT ${COOP_HAVE_STD_FORMAT} CACHE BOOL
+    "Use std::format only when the active compiler and standard library provide it" FORCE)
 FetchContent_MakeAvailable(spdlog)
 
 # coop/chan — channel toolkit (compiled separately, folded into libcoop.a)

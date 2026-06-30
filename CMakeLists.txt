@@ -70,6 +70,17 @@ else()
     target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer)
 endif()
 
+# cooperator.cpp is the ONLY translation unit that emits the ContextSwitch inline asm
+# (coop/detail/context_switch.h -- it is static inline and called only from here). That asm hides a
+# `call` from the compiler's red-zone analysis, so on x86-64 the compiler may spill live values
+# (e.g. `this`) into the red zone that the stack switch then clobbers -- a latent crash that
+# manifests only under some codegen (e.g. -O2). GCC has no per-function/-block no-red-zone directive
+# (the `target` attribute rejects it), so the flag is scoped to this single TU. If a ContextSwitch
+# call site is ever added to another TU, that TU needs -mno-red-zone too (see context_switch.h).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+    set_source_files_properties(coop/cooperator.cpp PROPERTIES COMPILE_OPTIONS -mno-red-zone)
+endif()
+
 # Compile out trace/debug logging in release builds — eliminates ~1% overhead from runtime
 # level checks in the IO hot path (spdlog::trace calls on every Submit/Complete/Poll).
 #

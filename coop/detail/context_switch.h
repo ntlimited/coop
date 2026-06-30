@@ -30,6 +30,14 @@ extern "C" int _coop_switch_context(void** from_sp, void* to_sp, int result);
 // On aarch64 (and any other target) the core preserves every callee-saved register itself, so a
 // plain call is both correct and complete.
 //
+// RED ZONE (x86-64): the asm below hides a `call` (and a stack swap) from the compiler's red-zone
+// analysis. A function that inlines ContextSwitch must therefore be compiled -mno-red-zone -- else
+// the compiler may spill a live value (e.g. a `this`) into the red zone that the call/switch then
+// clobbers, a crash that surfaces only under particular codegen (observed at -O2, not -O0/-O1/-O3).
+// GCC has no per-function/-block no-red-zone directive, so this is enforced as a per-TU compile flag
+// in CMakeLists.txt. Today ContextSwitch is called only from cooperator.cpp, which carries the flag;
+// adding a call site in another TU REQUIRES extending -mno-red-zone to that TU.
+//
 #if defined(__x86_64__)
 
 static inline int ContextSwitch(void** from_sp, void* to_sp, int result)

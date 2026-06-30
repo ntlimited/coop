@@ -132,7 +132,7 @@ template<typename T, typename Tag /* = int */, const Tag N /* = 0 */>
 struct EmbeddedList
 {
     using Hookups = typename EmbeddedListHookups<T, Tag, N>::Hookups;
-    using Ptr = Hookups::Ptr;
+    using Ptr = typename Hookups::Ptr;
 
     struct Iterator
     {

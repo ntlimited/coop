@@ -28,9 +28,16 @@
   covenants, calibration) that continuation bodies shed morsels into
 - `fast_context_switch_01.md`: the three levers that cut `Context::Yield` cost to peer
   parity and past it — gating the per-resume cycle-accounting rdtsc, the register-aware
-  (clobber-delegated) x86-64 switch core, and the opt-in direct context-to-context yield
-  fastpath, with the negative covenant that the fastpath must never starve io_uring (it is
-  bounded by a budget that forces a polling fallback through the cooperator loop)
+  (clobber-delegated) x86-64 switch core (since superseded — see `context_switch_core_01.md`),
+  and the opt-in direct context-to-context yield fastpath, with the negative covenant that the
+  fastpath must never starve io_uring (it is bounded by a budget that forces a polling fallback
+  through the cooperator loop)
+- `context_switch_core_01.md`: why the switch core saves all callee-saved registers behind a
+  plain, compiler-visible call — the published register-save-minimization alternative (Photon's
+  CACS) evaluated, shipped, and withdrawn on evidence: hidden-call red-zone crash at `-O2`,
+  measured perf-neutrality once the mitigation cost is included, and an honest accounting of a
+  misattributed LTO episode; with the negative covenants that no inline asm may hide the switch
+  call and no TU may need a correctness-bearing codegen flag
 - `timer_slack_01.md`: opt-in deadline quantization on the `Sleep` path — collapses
   per-timer kernel wakeups for a fan-out of concurrent sleeps, with the negative
   covenant that correctness deadlines stay exact

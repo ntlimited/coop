@@ -2,18 +2,15 @@
 
 // Hand-rolled context switch core for x86-64 System V ABI.
 //
-// The core saves only %rbp and swaps the stack pointer. The remaining callee-saved registers
-// (rbx, r12-r15) are not touched here -- their preservation is delegated to the compiler at the
-// call site (see ContextSwitch in context_switch.h), which lists them in the inline-asm clobber
-// list. The compiler then spills and reloads only the ones actually live across a given switch,
-// instead of this routine unconditionally saving all six on every switch. On the common yield
-// path few callee-saved registers are live, so most switches save nothing beyond %rbp and the
-// return address.
+// The core saves all callee-saved registers (rbp, rbx, r12-r15) and swaps the stack pointer,
+// so the ABI contract of an ordinary function call holds and the call site (ContextSwitch in
+// context_switch.h) can be a plain, compiler-visible call. Shaving the save set by delegating
+// registers to a call-site inline-asm clobber list requires hiding the call from the compiler,
+// which provably breaks its red-zone analysis and blinds whole-program codegen to the switch —
+// and measures perf-neutral anyway. See docs/context_switch_core_01.md.
 //
-// %rbp is special: coop builds with -fno-omit-frame-pointer, so the compiler uses it as a frame
-// pointer and assumes it survives the call. The core therefore preserves it directly rather than
-// clobber-delegating it. It also doubles as the carrier for a new context's Context* on first
-// entry (see ContextInit / _context_trampoline).
+// %rbp doubles as the carrier for a new context's Context* on first entry (see ContextInit /
+// _context_trampoline).
 //
 
 .text
@@ -24,16 +21,27 @@
 //   rsi = to_sp    — stack pointer to switch to
 //   edx = result   — value delivered to the target's switch call site as its return value
 //
-// Saves %rbp and the return address on the current stack, stores RSP into *from_sp, loads to_sp
-// as the new RSP, restores the target's %rbp, and returns into the target with `result` in eax.
+// Saves the callee-saved registers and the return address on the current stack, stores RSP into
+// *from_sp, loads to_sp as the new RSP, restores the target's saved registers, and returns into
+// the target with `result` in eax.
 //
 .globl _coop_switch_context
 .type _coop_switch_context, @function
 .align 16
 _coop_switch_context:
     pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
     movq  %rsp, (%rdi)     // save current stack pointer
     movq  %rsi, %rsp       // switch to target stack
+    popq  %r15
+    popq  %r14
+    popq  %r13
+    popq  %r12
+    popq  %rbx
     popq  %rbp
     movl  %edx, %eax       // deliver result to the resumed call site
     ret
@@ -56,15 +64,8 @@ _context_trampoline:
 
 // Hand-rolled context switch core for AArch64 (AAPCS64).
 //
-// TODO(x86-64-parity): aarch64 still saves every callee-saved register unconditionally. The
-// clobber-delegated approach the x86-64 path uses (save only fp, list the rest in the call-site
-// clobber list so the compiler spills only live ones) applies here too, but writing and
-// validating that asm requires an aarch64 host. The host this lands on is x86-64, so the
-// aarch64 core stays the known-correct all-callee-saved version; optimizing it is a documented
-// follow-up. The call-site wrapper (context_switch.h) calls this core as a plain C function on
-// aarch64, which is correct precisely because the core preserves all callee-saved registers.
-//
-// Saves callee-saved registers (x19-x28, x29/fp, x30/lr) and swaps the stack pointer.
+// Saves all callee-saved registers (x19-x28, x29/fp, x30/lr) and swaps the stack pointer —
+// the same save-all model as the x86-64 core, invoked as a plain call from ContextSwitch.
 // d8-d15 (callee-saved SIMD) are not saved — coop contexts don't use SIMD in the framework.
 //
 

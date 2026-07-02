@@ -1,0 +1,53 @@
+# Build and test across the optimization configurations that have historically diverged.
+#
+# The lanes are not redundant: the context switch is hand-written assembly whose contract with
+# the compiler must hold at every optimization level and under LTO (see
+# docs/context_switch_core_01.md). A latent crash once shipped because only -O0 and -O3 were
+# ever built — the -O2 and LTO lanes exist so codegen-sensitive regressions surface on push,
+# not in a consumer's build.
+#
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: debug
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug
+          - lane: release
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+          - lane: o2
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG"
+          - lane: lto
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev libssl-dev
+
+      - name: Probe io_uring availability
+        run: |
+          # coop is io_uring-based end to end; if the runner kernel restricts io_uring the
+          # suite cannot run and this step makes that failure legible instead of mysterious.
+          sysctl kernel.io_uring_disabled 2>/dev/null || true
+          uname -r
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ./build/bin/coop_tests

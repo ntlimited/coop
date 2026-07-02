@@ -75,13 +75,14 @@ Handle destructors run Cancel + Flash during stack unwind, draining in-flight IO
 even when all contexts are blocked) and `m_uring.PendingOps() > 0` (keeps the loop alive to
 poll io_uring for cancel CQEs while Handle destructors drain in-flight operations).
 
-**Context switch** (`detail/context_switch.{S,h,cpp}`): on x86-64 the asm core
-`_coop_switch_context` saves only `%rbp` and swaps the stack; the `ContextSwitch` inline-asm
-wrapper lists the other callee-saved registers (rbx, r12-r15) in its clobber list, so the compiler
-preserves only the ones live across a given switch. aarch64 keeps an all-callee-saved core (plain
-call from the wrapper) pending an aarch64 host to validate the same idiom. `ContextInit` seeds a
-fresh stack with three slots (abort, trampoline, `%rbp = Context*`); the trampoline reads `Context*`
-from `%rbp`.
+**Context switch** (`detail/context_switch.{S,h,cpp}`): the asm core `_coop_switch_context`
+saves all callee-saved registers and swaps the stack; `ContextSwitch` is a plain compiler-visible
+call on both architectures. That is load-bearing: hiding the call inside inline asm (to delegate
+register saves to a clobber list) breaks the compiler's red-zone analysis, blinds whole-program
+codegen to the control transfer, and measures perf-neutral anyway — see
+`docs/context_switch_core_01.md` before changing the model. `ContextInit` seeds a fresh stack with the core's save-area layout
+(x86-64: abort, trampoline, `%rbp = Context*`, rbx/r12-r15 zeroed); the trampoline reads
+`Context*` from `%rbp` (x86-64) / `x19` (aarch64).
 
 **Direct-yield fastpath** (opt-in, `CooperatorConfiguration::directYield`): a plain `Yield`
 normally trampolines through the loop (two switches). With the fastpath, a yield that finds another

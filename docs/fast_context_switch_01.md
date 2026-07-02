@@ -33,6 +33,13 @@ Effect on the microbench: ~35 → ~26 ns/switch.
 
 ## 2. Register-aware switch (clobber-delegated callee saves)
 
+> **Superseded by `context_switch_core_01.md`.** The clobber-delegated core described below was
+> withdrawn: hiding the `call` inside inline asm broke the compiler's red-zone analysis (latent
+> `-O2` crash) and leaves the switch invisible to whole-program codegen, while measuring
+> perf-neutral against a save-all core once the mandatory `-mno-red-zone` mitigation is priced
+> in. Both architectures now use a save-all core behind a plain call. This section is kept as
+> the record of the lever as it was evaluated; levers 1 and 3 stand unchanged.
+
 The x86-64 switch core saved and restored all six callee-saved registers (rbp, rbx, r12–r15) on
 every switch, unconditionally. But most switches do not have all six live across them — saving a
 register the caller was not using is wasted memory traffic.

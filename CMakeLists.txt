@@ -20,6 +20,23 @@ if(COOP_COVERAGE)
     add_link_options(--coverage)
 endif()
 
+# Link-time optimization, default-on for standalone release builds. Whole-program codegen is a
+# measured win on the hottest dispatch paths (continuation fire ~-25%, text ~-6%) and is safe
+# because the context switch is an ordinary out-of-line call the optimizer can model (see
+# docs/context_switch_core_01.md). Scoped to standalone builds: when coop is a subdirectory the
+# parent project owns its own IPO policy.
+#
+option(COOP_LTO "Link-time optimization for standalone release builds" ON)
+if(COOP_STANDALONE AND COOP_LTO AND CMAKE_BUILD_TYPE MATCHES "Release|RelWithDebInfo")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT coopIpoSupported OUTPUT coopIpoMsg)
+    if(coopIpoSupported)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    else()
+        message(STATUS "coop: LTO not supported by this toolchain, building without: ${coopIpoMsg}")
+    endif()
+endif()
+
 # spdlog — header-only structured logging
 include(FetchContent)
 FetchContent_Declare(

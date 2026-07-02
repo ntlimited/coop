@@ -360,6 +360,13 @@ void Cooperator::Launch()
         s_registry.Push(this);
     }
 
+    // The thread-cooperator binding is valid only for Launch's dynamic extent and is cleared on
+    // exit. A stale binding is not a benign leak: thread-identity checks (BoundarySafeKill's
+    // boundary detection) compare cooperator addresses against it, and a dead cooperator's
+    // address can be reused by a later stack-allocated cooperator on another thread — making a
+    // foreign thread misidentify itself as the cooperator's own and race the live scheduler.
+    //
+    assert(Cooperator::thread_cooperator == nullptr);
     Cooperator::thread_cooperator = this;
     epoch::SetManager(&m_epochMgr);
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
@@ -612,6 +619,8 @@ void Cooperator::Launch()
         std::lock_guard<std::mutex> lock(s_registryMutex);
         s_registry.Remove(this);
     }
+
+    Cooperator::thread_cooperator = nullptr;
 }
 
 void Cooperator::YieldFrom(Context* ctx)

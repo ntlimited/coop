@@ -7,17 +7,21 @@
 #if defined(__x86_64__)
 
 // ContextInit prepares a fresh stack so that the switch core can "resume" into it for the first
-// time. The layout mirrors the minimal state the core leaves on a stack it switched away from:
-// only %rbp and a return address (the core saves nothing else — see context_switch.S).
+// time. The layout mirrors the state the core leaves on a stack it switched away from: the six
+// callee-saved registers and a return address (see context_switch.S).
 //
 //   stack_top (16-byte aligned by contract):
 //     [abort]                ← safety net: CoopContextEntry's notional return address
 //     [_context_trampoline]  ← the core's `ret` lands here
 //     [rbp = ctx]            ← popped into %rbp; trampoline reads it as Context*
-//                              (init_sp points here)
+//     [rbx = 0]
+//     [r12 = 0]
+//     [r13 = 0]
+//     [r14 = 0]
+//     [r15 = 0]              ← init_sp (popped first)
 //
-// After the core executes `popq %rbp` and `ret`, %rbp holds Context*, RSP is at 8-mod-16
-// (correct x86-64 ABI alignment at function entry — stack_top is 16-aligned and three 8-byte
+// After the core pops r15..rbp and executes `ret`, %rbp holds Context*, RSP is at 8-mod-16
+// (correct x86-64 ABI alignment at function entry — stack_top is 16-aligned and eight 8-byte
 // slots leave RSP at stack_top-8 by the time CoopContextEntry runs), and control transfers to
 // _context_trampoline, which moves %rbp into rdi and tail-calls CoopContextEntry.
 //
@@ -33,9 +37,15 @@ void* ContextInit(void* stack_top, coop::Context* ctx)
     //
     *--sp = reinterpret_cast<uintptr_t>(_context_trampoline);
 
-    // The only saved register the core restores: %rbp, carrying Context* into the trampoline
+    // The core's save area, seeded so its pops (r15..rbp) land rbp = Context* for the
+    // trampoline. The other callee-saved registers have no meaningful initial value.
     //
     *--sp = reinterpret_cast<uintptr_t>(ctx);           // rbp = Context*
+    *--sp = 0;                                          // rbx
+    *--sp = 0;                                          // r12
+    *--sp = 0;                                          // r13
+    *--sp = 0;                                          // r14
+    *--sp = 0;                                          // r15  <- init_sp (popped first)
 
     return static_cast<void*>(sp);
 }

@@ -3,6 +3,10 @@
 #include <thread>
 #include <vector>
 
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+
 #include <gtest/gtest.h>
 
 #include "coop/work/detail/deque.h"
@@ -20,6 +24,12 @@ static inline int   Index(void* v) { return (int)((intptr_t)v) - 1; }
 // Deliberately-broken deque for the red calibration: PopBottom takes the last element WITHOUT the
 // CAS that resolves the owner/thief race, so the owner and a concurrent thief can both receive it.
 // Everything else mirrors WorkDeque. The stress harness must catch the resulting duplication.
+//
+// The bottom decrement is deliberately published only AFTER the take: with an early decrement a
+// thief can double-take only while the owner's store is still draining — a window of store-buffer
+// latency that codegen changes can close entirely, silently costing the calibration its detection
+// power. Late publication keeps the element visible to thieves for the whole pop, so detection is
+// a property of the harness's accounting, not of instruction timing.
 //
 template<typename T, size_t CAP = 256>
 class BrokenDeque
@@ -40,12 +50,11 @@ class BrokenDeque
     bool PopBottom(T& out)
     {
         const int64_t b = m_bottom.load(std::memory_order_relaxed) - 1;
-        m_bottom.store(b, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const int64_t t = m_top.load(std::memory_order_relaxed);
-        if (t > b) { m_bottom.store(b + 1, std::memory_order_relaxed); return false; }
-        out = m_buf[b & kMask];
-        if (t == b) { m_bottom.store(b + 1, std::memory_order_relaxed); }   // BUG: no CAS on top
+        if (t > b) { return false; }
+        out = m_buf[b & kMask];                             // BUG: no CAS on top
+        m_bottom.store(b, std::memory_order_relaxed);       // BUG: published after the take
         return true;
     }
     bool Steal(T& out)
@@ -71,9 +80,19 @@ struct StressResult { bool anyZero; bool anyDup; bool stalled; };
 // One owner (this thread: push/pop), `thieves` stealing threads. Produce `items` unique items, then
 // everyone drains until all are consumed. Each item must be consumed exactly once.
 //
+// The harness's detection power (and the correct deque's exposure to real contention) requires the
+// owner and thieves on separate cores. Earlier tests in the suite pin the calling thread — a
+// cooperator launched on this thread sets CPU affinity that outlives it — and spawned threads
+// inherit that single-core mask, collapsing the race to preemption timing. Reset to all cores.
+//
 template<typename Deque>
 static StressResult RunStress(int items, int thieves)
 {
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (long c = 0; c < sysconf(_SC_NPROCESSORS_ONLN); c++) CPU_SET(c, &all);
+    pthread_setaffinity_np(pthread_self(), sizeof(all), &all);
+
     Deque dq;
     std::vector<std::atomic<int>> consumed(items);
     for (int i = 0; i < items; i++) consumed[i].store(0, std::memory_order_relaxed);

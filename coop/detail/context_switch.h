@@ -9,69 +9,33 @@ struct Context;
 
 } // end namespace coop
 
-// Assembly-level context switch core. Saves the minimal register state on the current stack,
-// stores the stack pointer to *from_sp, loads to_sp as the new stack pointer, restores the
-// minimal state, and returns `result` to the resumed call site.
+// Assembly-level context switch core. Saves the callee-saved register state on the current
+// stack, stores the stack pointer to *from_sp, loads to_sp as the new stack pointer, restores
+// the target's state, and returns `result` to the resumed call site.
 //
-// x86-64: saves only %rbp; swaps RSP. The other callee-saved registers (rbx, r12-r15) are
-//         preserved by the compiler at the call site via the ContextSwitch wrapper's clobber
-//         list, so only the live ones are spilled per switch.
-// aarch64: saves all callee-saved registers (x19-x28, fp, lr); swaps SP.
+// x86-64:  saves %rbp, %rbx, %r12-%r15; swaps RSP.
+// aarch64: saves x19-x28, fp, lr; swaps SP.
 //
 extern "C" int _coop_switch_context(void** from_sp, void* to_sp, int result);
 
 // ContextSwitch — the call-site wrapper around _coop_switch_context.
 //
-// On x86-64 this is inline asm rather than a plain call: the callee-saved registers the core does
-// not save are listed in the clobber list, so the compiler spills and reloads only those live
-// across this particular switch. A normal function call would instead force the core to preserve
-// all of them unconditionally (the ABI's callee-saved contract), which is the cost this avoids.
+// This is a plain, compiler-visible function call on every architecture, and that is a
+// load-bearing design decision. The core saves every callee-saved register, so the ABI
+// contract of a normal call holds and the compiler models the switch like any other call:
+// it never spills live values into the red zone across it, LTO's whole-program codegen sees a
+// real control transfer instead of an opaque asm block, and call-modeling toolchain features
+// (sanitizers, CET, PGO) observe a well-formed call.
 //
-// On aarch64 (and any other target) the core preserves every callee-saved register itself, so a
-// plain call is both correct and complete.
+// The tempting alternative — hide the call inside inline asm and delegate the callee-saved
+// registers to its clobber list, so the compiler spills only the ones live across a given
+// switch — measures perf-neutral on this codebase and is unsafe precisely because it hides
+// the call. See docs/context_switch_core_01.md before reintroducing it.
 //
-// RED ZONE (x86-64): the asm below hides a `call` (and a stack swap) from the compiler's red-zone
-// analysis. A function that inlines ContextSwitch must therefore be compiled -mno-red-zone -- else
-// the compiler may spill a live value (e.g. a `this`) into the red zone that the call/switch then
-// clobbers, a crash that surfaces only under particular codegen (observed at -O2, not -O0/-O1/-O3).
-// GCC has no per-function/-block no-red-zone directive, so this is enforced as a per-TU compile flag
-// in CMakeLists.txt. Today ContextSwitch is called only from cooperator.cpp, which carries the flag;
-// adding a call site in another TU REQUIRES extending -mno-red-zone to that TU.
-//
-#if defined(__x86_64__)
-
-static inline int ContextSwitch(void** from_sp, void* to_sp, int result)
-{
-    // Pin the arguments to the core's expected registers and mark every register the core may
-    // leave indeterminate. rdi/rsi/rdx are in/out so the compiler treats them as clobbered across
-    // the switch; rbx and r12-r15 in the clobber list make the compiler spill only the live ones.
-    // %rbp is preserved by the core and deliberately not clobbered (it is the frame pointer under
-    // -fno-omit-frame-pointer). "memory"/"cc" make the switch a full compiler barrier, matching
-    // the old extern-function call boundary.
-    //
-    register void** from asm("rdi") = from_sp;
-    register void*  to   asm("rsi") = to_sp;
-    register int    res  asm("edx") = result;
-    register int    ret  asm("eax");
-
-    asm volatile(
-        "call _coop_switch_context\n"
-        : "=r"(ret), "+r"(from), "+r"(to), "+r"(res)
-        :
-        : "rbx", "rcx", "r8", "r9", "r10", "r11",
-          "r12", "r13", "r14", "r15", "memory", "cc");
-
-    return ret;
-}
-
-#else
-
 static inline int ContextSwitch(void** from_sp, void* to_sp, int result)
 {
     return _coop_switch_context(from_sp, to_sp, result);
 }
-
-#endif
 
 // Assembly trampoline — first code a new context executes after the core restores its initial
 // frame. Reads Context* from a register set up by ContextInit (x86-64: %rbp, aarch64: x19) and

@@ -20,12 +20,15 @@ jobs:
         include:
           - lane: debug
             cmake_args: -DCMAKE_BUILD_TYPE=Debug
+          # The shipping release configuration: standalone release defaults to LTO (COOP_LTO=ON).
           - lane: release
             cmake_args: -DCMAKE_BUILD_TYPE=Release
-          - lane: o2
-            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG"
-          - lane: lto
-            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+          # Non-LTO -O3: what consumers get when they opt out (or embed coop without IPO).
+          - lane: release-nolto
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCOOP_LTO=OFF
+          # Plain -O2, no LTO: the codegen-fragility guard — the red-zone crash class hid here.
+          - lane: o2-nolto
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" -DCOOP_LTO=OFF
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:

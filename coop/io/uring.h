@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <liburing.h>
 #include <memory>
@@ -96,6 +97,15 @@ struct Uring
     //
     struct io_uring_sqe* GetSqe();
 
+    void LedgerAccounted(char const* site, struct io_uring_sqe const* sqe, uintptr_t userData);
+    void LedgerCompleted(char const* site,
+                         uintptr_t userData,
+                         int result,
+                         int pendingCqesBefore,
+                         int pendingCqesAfter,
+                         int pendingOpsBefore,
+                         int pendingOpsAfter);
+
     void Run(Context* ctx);
 
     // TODO lock down the guts
@@ -114,6 +124,8 @@ struct Uring
     DescriptorList m_descriptors;
     int m_pendingOps{0};
     int m_pendingSqes{0};
+    int m_ledgerAcquiredSinceSubmit{0};
+    int m_ledgerAccountedSinceSubmit{0};
 
     // io_uring fd registration table. Slots contain the real fd or -1 for empty. Registration is
     // opt-in via the Descriptor(Registered, ...) constructor. When a descriptor is registered, its

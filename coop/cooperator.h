@@ -430,7 +430,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     alignas(64) void*       m_sp{nullptr};
 
     void PushSubmission(SubmissionEntry* entry);
-    void WakeCooperator();
+    void WakeCooperator(char const* site = "Cooperator::WakeCooperator");
     void DrainSubmissions();
     void SpawnFromSubmission(SubmissionEntry* entry);
     void DrainRemainingSubmissions();

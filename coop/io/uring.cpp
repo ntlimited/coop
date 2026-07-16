@@ -1,5 +1,8 @@
 #include "uring.h"
 
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
 #include <spdlog/spdlog.h>
@@ -45,6 +48,88 @@ namespace coop
 
 namespace io
 {
+
+static bool UringLedgerEnabled()
+{
+    static bool enabled = []() -> bool
+    {
+        char const* env = getenv("COOP_URING_LEDGER");
+        return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }();
+    return enabled;
+}
+
+static void UringLedgerPrintf(char const* fmt, ...)
+{
+    if (!UringLedgerEnabled())
+    {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+static void UringLedgerSqe(char const* event,
+                           char const* site,
+                           Uring const* ring,
+                           struct io_uring_sqe const* sqe)
+{
+    if (!UringLedgerEnabled())
+    {
+        return;
+    }
+
+    UringLedgerPrintf(
+        "COOP_URING_LEDGER event=%s site=%s ring=%p sqe=%p opcode=%u flags=%u "
+        "fd=%d off=%llu addr=%llu len=%u user_data=%#llx pending_sqes=%d "
+        "pending_ops=%d acquired_since_submit=%d accounted_since_submit=%d",
+        event,
+        site,
+        static_cast<void const*>(ring),
+        static_cast<void const*>(sqe),
+        sqe ? static_cast<unsigned>(sqe->opcode) : 0u,
+        sqe ? static_cast<unsigned>(sqe->flags) : 0u,
+        sqe ? sqe->fd : -1,
+        sqe ? static_cast<unsigned long long>(sqe->off) : 0ull,
+        sqe ? static_cast<unsigned long long>(sqe->addr) : 0ull,
+        sqe ? sqe->len : 0u,
+        sqe ? static_cast<unsigned long long>(sqe->user_data) : 0ull,
+        ring->m_pendingSqes,
+        ring->m_pendingOps,
+        ring->m_ledgerAcquiredSinceSubmit,
+        ring->m_ledgerAccountedSinceSubmit);
+}
+
+static void UringLedgerSubmit(char const* site,
+                              Uring const* ring,
+                              int pendingSqesBefore,
+                              int acquiredBefore,
+                              int accountedBefore,
+                              int submitted)
+{
+    UringLedgerPrintf(
+        "COOP_URING_LEDGER event=KERNEL_ENTERED site=%s ring=%p "
+        "pending_sqes_before=%d acquired_since_submit=%d "
+        "accounted_since_submit=%d submitted=%d pending_ops=%d",
+        site,
+        static_cast<void const*>(ring),
+        pendingSqesBefore,
+        acquiredBefore,
+        accountedBefore,
+        submitted,
+        ring->m_pendingOps);
+}
+
+static void UringLedgerResetSubmitWindow(Uring* ring)
+{
+    ring->m_ledgerAcquiredSinceSubmit = 0;
+    ring->m_ledgerAccountedSinceSubmit = 0;
+}
 
 // Constructor and destructor live here, where BufferRing is complete, so the unique_ptr member
 // can be cleanly cleaned up (constructor exception path) and torn down (destructor unregister).
@@ -208,8 +293,18 @@ int Uring::Submit()
         return 0;
     }
 
+    int pendingSqesBefore = m_pendingSqes;
+    int acquiredBefore = m_ledgerAcquiredSinceSubmit;
+    int accountedBefore = m_ledgerAccountedSinceSubmit;
     int submitted = io_uring_submit(&m_ring);
+    UringLedgerSubmit("Uring::Submit",
+                      this,
+                      pendingSqesBefore,
+                      acquiredBefore,
+                      accountedBefore,
+                      submitted);
     m_pendingSqes = 0;
+    UringLedgerResetSubmitWindow(this);
     return submitted;
 }
 
@@ -226,15 +321,83 @@ struct io_uring_sqe* Uring::GetSqe()
     {
         // SQ ring is full — flush pending SQEs and retry
         //
-        io_uring_submit(&m_ring);
+        int pendingSqesBefore = m_pendingSqes;
+        int acquiredBefore = m_ledgerAcquiredSinceSubmit;
+        int accountedBefore = m_ledgerAccountedSinceSubmit;
+        int submitted = io_uring_submit(&m_ring);
+        UringLedgerSubmit("Uring::GetSqe.retry",
+                          this,
+                          pendingSqesBefore,
+                          acquiredBefore,
+                          accountedBefore,
+                          submitted);
         m_pendingSqes = 0;
+        UringLedgerResetSubmitWindow(this);
         sqe = io_uring_get_sqe(&m_ring);
     }
     if (sqe)
     {
         m_pendingSqes++;
+        if (UringLedgerEnabled())
+        {
+            m_ledgerAcquiredSinceSubmit++;
+        }
+        UringLedgerSqe("SQE_ACQUIRED", "Uring::GetSqe", this, sqe);
     }
     return sqe;
+}
+
+void Uring::LedgerAccounted(char const* site,
+                            struct io_uring_sqe const* sqe,
+                            uintptr_t userData)
+{
+    if (!UringLedgerEnabled())
+    {
+        return;
+    }
+
+    m_ledgerAccountedSinceSubmit++;
+    UringLedgerPrintf(
+        "COOP_URING_LEDGER event=ACCOUNTED site=%s ring=%p sqe=%p "
+        "user_data=%#llx opcode=%u flags=%u fd=%d off=%llu addr=%llu len=%u "
+        "pending_sqes=%d pending_ops=%d acquired_since_submit=%d "
+        "accounted_since_submit=%d",
+        site,
+        static_cast<void const*>(this),
+        static_cast<void const*>(sqe),
+        static_cast<unsigned long long>(userData),
+        sqe ? static_cast<unsigned>(sqe->opcode) : 0u,
+        sqe ? static_cast<unsigned>(sqe->flags) : 0u,
+        sqe ? sqe->fd : -1,
+        sqe ? static_cast<unsigned long long>(sqe->off) : 0ull,
+        sqe ? static_cast<unsigned long long>(sqe->addr) : 0ull,
+        sqe ? sqe->len : 0u,
+        m_pendingSqes,
+        m_pendingOps,
+        m_ledgerAcquiredSinceSubmit,
+        m_ledgerAccountedSinceSubmit);
+}
+
+void Uring::LedgerCompleted(char const* site,
+                            uintptr_t userData,
+                            int result,
+                            int pendingCqesBefore,
+                            int pendingCqesAfter,
+                            int pendingOpsBefore,
+                            int pendingOpsAfter)
+{
+    UringLedgerPrintf(
+        "COOP_URING_LEDGER event=COMPLETED site=%s ring=%p user_data=%#llx "
+        "result=%d pending_cqes_before=%d pending_cqes_after=%d "
+        "pending_ops_before=%d pending_ops_after=%d",
+        site,
+        static_cast<void const*>(this),
+        static_cast<unsigned long long>(userData),
+        result,
+        pendingCqesBefore,
+        pendingCqesAfter,
+        pendingOpsBefore,
+        pendingOpsAfter);
 }
 
 bool Uring::HasPendingCompletions() const
@@ -250,7 +413,8 @@ bool Uring::HasPendingCompletions() const
     //      so cq_ready stays zero even though completions are pending -- this flag is the live
     //      signal for that case. A volatile read of kernel-mapped SQ ring memory.
     //
-    return io_uring_cq_ready(&m_ring) > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN);
+    return io_uring_cq_ready(&m_ring) > 0
+        || (IO_URING_READ_ONCE(*m_ring.sq.kflags) & IORING_SQ_TASKRUN);
 }
 
 int Uring::Poll()
@@ -278,11 +442,21 @@ int Uring::Poll()
     // For DEFER_TASKRUN: io_uring_submit() cannot flush deferred completions (it doesn't pass
     // IORING_ENTER_GETEVENTS when submitted==0). io_uring_get_events() is required separately.
     //
-    if (m_pendingSqes > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN))
+    if (m_pendingSqes > 0 || (IO_URING_READ_ONCE(*m_ring.sq.kflags) & IORING_SQ_TASKRUN))
     {
         COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollSubmit);
-        io_uring_submit(&m_ring);
+        int pendingSqesBefore = m_pendingSqes;
+        int acquiredBefore = m_ledgerAcquiredSinceSubmit;
+        int accountedBefore = m_ledgerAccountedSinceSubmit;
+        int submitted = io_uring_submit(&m_ring);
+        UringLedgerSubmit("Uring::Poll",
+                          this,
+                          pendingSqesBefore,
+                          acquiredBefore,
+                          accountedBefore,
+                          submitted);
         m_pendingSqes = 0;
+        UringLedgerResetSubmitWindow(this);
     }
 
     if (m_ring.flags & IORING_SETUP_DEFER_TASKRUN)
@@ -349,8 +523,18 @@ int Uring::WaitAndPoll()
     // enter rate -- and the per-syscall pthread-cancel overhead that rides every enter with it. With
     // COOP_TASKRUN this enter also runs pending task_work, delivering deferred completions.
     //
+    int pendingSqesBefore = m_pendingSqes;
+    int acquiredBefore = m_ledgerAcquiredSinceSubmit;
+    int accountedBefore = m_ledgerAccountedSinceSubmit;
     int ret = io_uring_submit_and_wait(&m_ring, 1);
+    UringLedgerSubmit("Uring::WaitAndPoll",
+                      this,
+                      pendingSqesBefore,
+                      acquiredBefore,
+                      accountedBefore,
+                      ret);
     m_pendingSqes = 0;
+    UringLedgerResetSubmitWindow(this);
     if (ret < 0)
     {
         return 0;

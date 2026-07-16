@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <linux/time_types.h>
 
 #include "coop/detail/embedded_list.h"
@@ -147,7 +148,7 @@ private:
     // Shared finalization logic. Decrements m_pendingCqes and only releases the coordinator
     // when it hits zero.
     //
-    void Finalize();
+    void Finalize(int cqeResult, uintptr_t cqeUserData);
 
     // Whether Wait()/WaitKill() should skip the eager submit and let the SQE accumulate for the
     // scheduler's batch-boundary Poll(). Gated purely on in-flight depth (PendingOps > threshold):

@@ -83,6 +83,7 @@ void Handle::Submit(struct io_uring_sqe* sqe)
     }
 
     io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(this));
+    m_ring->LedgerAccounted("Handle::Submit", sqe, reinterpret_cast<uintptr_t>(this));
 }
 
 void Handle::SubmitWithTimeout(struct io_uring_sqe* sqe, time::Interval timeout)
@@ -117,6 +118,9 @@ void Handle::SubmitLinked(struct io_uring_sqe* sqe)
     //
     sqe->flags |= IOSQE_IO_LINK;
     io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(this));
+    m_ring->LedgerAccounted("Handle::SubmitLinked",
+                            sqe,
+                            reinterpret_cast<uintptr_t>(this));
 
     // Second SQE: linked timeout with tagged pointer (bit 0 set)
     //
@@ -125,6 +129,9 @@ void Handle::SubmitLinked(struct io_uring_sqe* sqe)
     io_uring_prep_link_timeout(timeout_sqe, &m_timeout, 0);
     io_uring_sqe_set_data(timeout_sqe, reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(this) | 1));
+    m_ring->LedgerAccounted("Handle::SubmitLinked.timeout",
+                            timeout_sqe,
+                            reinterpret_cast<uintptr_t>(this) | 1);
 }
 
 void Handle::Cancel()
@@ -143,6 +150,9 @@ void Handle::Cancel()
     io_uring_prep_cancel(sqe, reinterpret_cast<void*>(this), 0);
     io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(this) | 1));
+    m_ring->LedgerAccounted("Handle::Cancel",
+                            sqe,
+                            reinterpret_cast<uintptr_t>(this) | 1);
     m_pendingCqes++;
 }
 
@@ -237,14 +247,30 @@ int Handle::Result() const
     return m_result;
 }
 
-void Handle::Finalize()
+void Handle::Finalize(int cqeResult, uintptr_t cqeUserData)
 {
+    int pendingCqesBefore = m_pendingCqes;
+    int pendingOpsBefore = m_ring->m_pendingOps;
     if (--m_pendingCqes > 0)
     {
+        m_ring->LedgerCompleted("Handle::Finalize.partial",
+                                cqeUserData,
+                                cqeResult,
+                                pendingCqesBefore,
+                                m_pendingCqes,
+                                pendingOpsBefore,
+                                m_ring->m_pendingOps);
         return;
     }
 
     m_ring->m_pendingOps--;
+    m_ring->LedgerCompleted("Handle::Finalize.final",
+                            cqeUserData,
+                            cqeResult,
+                            pendingCqesBefore,
+                            m_pendingCqes,
+                            pendingOpsBefore,
+                            m_ring->m_pendingOps);
 
     if (m_descriptor)
     {
@@ -264,7 +290,7 @@ void Handle::Complete(struct io_uring_cqe* cqe)
     ++m_context->m_statistics.ioCompletes;
     m_result = cqe->res;
     SPDLOG_TRACE("handle complete result={}", m_result);
-    Finalize();
+    Finalize(cqe->res, reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
 }
 
 void Handle::OnSecondaryComplete(struct io_uring_cqe* cqe)
@@ -274,7 +300,7 @@ void Handle::OnSecondaryComplete(struct io_uring_cqe* cqe)
     {
         m_timedOut = true;
     }
-    Finalize();
+    Finalize(cqe->res, reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
 }
 
 void Handle::Callback(struct io_uring_cqe* cqe)

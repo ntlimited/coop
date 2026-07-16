@@ -1,3 +1,5 @@
+#include <cstdarg>
+#include <cerrno>
 #include <functional>
 #include <liburing.h>
 #include <mutex>
@@ -58,6 +60,57 @@ std::atomic<bool>        Cooperator::s_registryShutdown{false};
 std::mutex               Cooperator::s_registryMutex;
 Cooperator::RegistryList Cooperator::s_registry;
 
+namespace
+{
+
+bool CooperatorUringLedgerEnabled()
+{
+    static bool enabled = []() -> bool
+    {
+        char const* env = getenv("COOP_URING_LEDGER");
+        return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+    }();
+    return enabled;
+}
+
+void CooperatorUringLedgerPrintf(char const* fmt, ...)
+{
+    if (!CooperatorUringLedgerEnabled())
+    {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+void CooperatorLedgerWakeWrite(char const* site, Cooperator const* co, int fd, ssize_t ret)
+{
+    int err = ret < 0 ? errno : 0;
+    CooperatorUringLedgerPrintf(
+        "COOP_URING_LEDGER event=WAKE_WRITE site=%s cooperator=%p fd=%d ret=%lld errno=%d",
+        site,
+        static_cast<void const*>(co),
+        fd,
+        static_cast<long long>(ret),
+        err);
+}
+
+void CooperatorLedgerKillCheck(char const* site, Context const* ctx, bool killed)
+{
+    CooperatorUringLedgerPrintf(
+        "COOP_URING_LEDGER event=KILL_CHECK site=%s ctx=%p killed=%d",
+        site,
+        static_cast<void const*>(ctx),
+        killed ? 1 : 0);
+}
+
+} // end anonymous namespace
+
 Cooperator::Cooperator(CooperatorConfiguration const& config)
 : m_lastRdtsc(0)
 , m_ticks(0)
@@ -104,7 +157,7 @@ Cooperator::~Cooperator()
 void Cooperator::Shutdown()
 {
     m_shutdown.store(true, detail::kStoreFlag);
-    WakeCooperator();
+    WakeCooperator("Cooperator::Shutdown");
 }
 
 void Cooperator::ShutdownAll()
@@ -154,10 +207,11 @@ void Cooperator::PushSubmission(SubmissionEntry* entry)
     m_hasSubmissions.store(true, std::memory_order_release);
 }
 
-void Cooperator::WakeCooperator()
+void Cooperator::WakeCooperator(char const* site)
 {
     uint64_t val = 1;
-    [[maybe_unused]] auto ret = write(m_submitFd, &val, sizeof(val));
+    auto ret = write(m_submitFd, &val, sizeof(val));
+    CooperatorLedgerWakeWrite(site, this, m_submitFd, ret);
 }
 
 void Cooperator::DrainSubmissions()
@@ -403,11 +457,21 @@ void Cooperator::Launch()
 
         io::Descriptor desc(io::borrowed, m_submitFd);
 
-        while (!ctx->IsKilled())
+        while (true)
         {
+            bool killed = ctx->IsKilled();
+            CooperatorLedgerKillCheck("SubmissionDrainer.while", ctx, killed);
+            if (killed)
+            {
+                break;
+            }
+
             uint64_t val;
-            io::Read(desc, &val, sizeof(val));
-            if (ctx->IsKilled()) break;
+            int ret = io::ReadKill(desc, &val, sizeof(val));
+            if (ret == -ECANCELED || ctx->IsKilled())
+            {
+                break;
+            }
             DrainSubmissions();
         }
     });
@@ -461,10 +525,11 @@ void Cooperator::Launch()
                 });
             });
 
-            // Wake the eventfd so the submission drainer's io::Read completes. The drainer
-            // uses non-kill-aware IO; it checks IsKilled() after each read returns.
+            // Wake the eventfd so any already-completable submission-drainer read is serviced
+            // promptly. The read is also kill-aware, so shutdown does not rely on this write
+            // racing ahead of the drainer re-arming another read.
             //
-            WakeCooperator();
+            WakeCooperator("Cooperator::Launch.shutdown");
         }
 
         if (m_yielded.IsEmpty())

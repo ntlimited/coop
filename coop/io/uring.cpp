@@ -135,13 +135,28 @@ static void UringLedgerResetSubmitWindow(Uring* ring)
 // can be cleanly cleaned up (constructor exception path) and torn down (destructor unregister).
 //
 Uring::Uring(UringConfiguration const& config)
-: m_config(config)
-, m_registered(config.registeredSlots, -1)
+: m_registered(config.registeredSlots, -1)
+, m_config(config)
 {
     memset(&m_ring, 0, sizeof(m_ring));
 }
 
-Uring::~Uring() = default;
+Uring::~Uring()
+{
+    if (!m_initialized)
+    {
+        return;
+    }
+
+    m_bufferRing.reset();
+    if (m_filesRegistered)
+    {
+        (void)io_uring_unregister_files(&m_ring);
+        m_filesRegistered = false;
+    }
+    io_uring_queue_exit(&m_ring);
+    m_initialized = false;
+}
 
 void Uring::Init()
 {
@@ -220,6 +235,7 @@ void Uring::Init()
         std::abort();
     }
     assert(ret == 0);
+    m_initialized = true;
 
     spdlog::info("uring init flags={:#x}", m_ring.flags);
 
@@ -255,6 +271,10 @@ void Uring::Init()
         {
             spdlog::warn("uring register_files failed ret={}", ret);
             m_registered.clear();
+        }
+        else
+        {
+            m_filesRegistered = true;
         }
     }
 

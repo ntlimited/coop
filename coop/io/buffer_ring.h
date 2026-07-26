@@ -90,7 +90,7 @@ struct BufferRing
     {
         if (m_ring && m_uring)
         {
-            io_uring_unregister_buf_ring(&m_uring->m_ring, m_group);
+            (void)io_uring_free_buf_ring(&m_uring->m_ring, m_ring, m_entries, m_group);
         }
     }
 

@@ -126,6 +126,8 @@ struct Uring
     int m_pendingSqes{0};
     int m_ledgerAcquiredSinceSubmit{0};
     int m_ledgerAccountedSinceSubmit{0};
+    bool m_initialized{false};
+    bool m_filesRegistered{false};
 
     // io_uring fd registration table. Slots contain the real fd or -1 for empty. Registration is
     // opt-in via the Descriptor(Registered, ...) constructor. When a descriptor is registered, its

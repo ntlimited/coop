@@ -123,3 +123,27 @@ TEST(UringLifecycleTest, SequentialCooperatorsDoNotLeakFdsUnderLowLimit)
     EXPECT_LE(after, before + kFdSlack);
     EXPECT_GE(after, before - kFdSlack);
 }
+
+#ifndef NDEBUG
+TEST(UringLifecycleTest, FatalEnterErrorAbortsProcess)
+{
+    EXPECT_DEATH({
+        coop::io::Uring::SetInjectedEnterError(-EBADF);
+        coop::Cooperator cooperator;
+        coop::Thread thread(&cooperator);
+        (void)cooperator.SubmitSync([](coop::Context* ctx) {
+            ctx->GetCooperator()->Shutdown();
+        });
+    }, "Fatal io_uring enter error|uring enter fatal error");
+}
+
+TEST(UringLifecycleTest, RetryableEnterErrorDoesNotAbort)
+{
+    coop::io::Uring::SetInjectedEnterError(-EINTR);
+    coop::Cooperator cooperator;
+    coop::Thread thread(&cooperator);
+    ASSERT_TRUE(cooperator.SubmitSync([](coop::Context* ctx) {
+        ctx->GetCooperator()->Shutdown();
+    }));
+}
+#endif

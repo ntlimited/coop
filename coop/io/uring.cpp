@@ -58,6 +58,14 @@ static inline pid_t GetTid()
 #endif
 }
 
+#ifndef NDEBUG
+static int s_injectedEnterError{0};
+void Uring::SetInjectedEnterError(int err)
+{
+    s_injectedEnterError = err;
+}
+#endif
+
 static bool UringLedgerEnabled()
 {
     static bool enabled = []() -> bool
@@ -318,6 +326,7 @@ void Uring::Init()
 
 int Uring::Submit()
 {
+    assert(m_initialized && "Submit called on uninitialized or torn-down ring");
     if (m_pendingSqes <= 0)
     {
         return 0;
@@ -326,20 +335,42 @@ int Uring::Submit()
     int pendingSqesBefore = m_pendingSqes;
     int acquiredBefore = m_ledgerAcquiredSinceSubmit;
     int accountedBefore = m_ledgerAccountedSinceSubmit;
+#ifndef NDEBUG
+    int submitted;
+    if (s_injectedEnterError != 0)
+    {
+        submitted = s_injectedEnterError;
+        s_injectedEnterError = 0;
+    }
+    else
+    {
+        submitted = io_uring_submit(&m_ring);
+    }
+#else
     int submitted = io_uring_submit(&m_ring);
+#endif
     UringLedgerSubmit("Uring::Submit",
                       this,
                       pendingSqesBefore,
                       acquiredBefore,
                       accountedBefore,
                       submitted);
-    if (submitted < 0)
+
+    if (submitted >= 0)
     {
-        LedgerEnterFailure("Uring::Submit", submitted);
+        m_pendingSqes = (submitted >= m_pendingSqes) ? 0 : (m_pendingSqes - submitted);
+        UringLedgerResetSubmitWindow(this);
+        return submitted;
     }
-    m_pendingSqes = 0;
-    UringLedgerResetSubmitWindow(this);
-    return submitted;
+
+    LedgerEnterFailure("Uring::Submit", submitted);
+    if (IsRetryableError(submitted))
+    {
+        return 0;
+    }
+
+    HandleFatalEnterError("Uring::Submit", submitted);
+    return 0;
 }
 
 struct io_uring_sqe* Uring::GetSqe()
@@ -358,19 +389,39 @@ struct io_uring_sqe* Uring::GetSqe()
         int pendingSqesBefore = m_pendingSqes;
         int acquiredBefore = m_ledgerAcquiredSinceSubmit;
         int accountedBefore = m_ledgerAccountedSinceSubmit;
+#ifndef NDEBUG
+        int submitted;
+        if (s_injectedEnterError != 0)
+        {
+            submitted = s_injectedEnterError;
+            s_injectedEnterError = 0;
+        }
+        else
+        {
+            submitted = io_uring_submit(&m_ring);
+        }
+#else
         int submitted = io_uring_submit(&m_ring);
+#endif
         UringLedgerSubmit("Uring::GetSqe.retry",
                           this,
                           pendingSqesBefore,
                           acquiredBefore,
                           accountedBefore,
                           submitted);
-        if (submitted < 0)
+        if (submitted >= 0)
+        {
+            m_pendingSqes = (submitted >= m_pendingSqes) ? 0 : (m_pendingSqes - submitted);
+            UringLedgerResetSubmitWindow(this);
+        }
+        else
         {
             LedgerEnterFailure("Uring::GetSqe.retry", submitted);
+            if (!IsRetryableError(submitted))
+            {
+                HandleFatalEnterError("Uring::GetSqe.retry", submitted);
+            }
         }
-        m_pendingSqes = 0;
-        UringLedgerResetSubmitWindow(this);
         sqe = io_uring_get_sqe(&m_ring);
     }
     if (sqe)
@@ -469,6 +520,30 @@ void Uring::LedgerEnterFailure(char const* site, int err)
         plainRetry);
 }
 
+bool Uring::IsRetryableError(int err)
+{
+    int e = err < 0 ? -err : err;
+    return e == EAGAIN || e == EINTR || e == EBUSY;
+}
+
+void Uring::HandleFatalEnterError(char const* site, int err)
+{
+    int errCode = err < 0 ? -err : err;
+    pid_t tid = GetTid();
+    spdlog::critical(
+        "uring enter fatal error site={} ring={} ring_fd={} enter_ring_fd={} owner_tid={} current_tid={} errno={}: {}",
+        site,
+        static_cast<void const*>(this),
+        m_ring.ring_fd,
+        m_ring.enter_ring_fd,
+        m_ownerTid,
+        tid,
+        errCode,
+        std::strerror(errCode));
+    assert(false && "Fatal io_uring enter error");
+    std::abort();
+}
+
 bool Uring::HasPendingCompletions() const
 {
     // Two independent signals that real IO is ready to service. The continuation drain consults
@@ -488,6 +563,7 @@ bool Uring::HasPendingCompletions() const
 
 int Uring::Poll()
 {
+    assert(m_initialized && "Poll called on uninitialized or torn-down ring");
     // Check whether io_uring_submit() is needed before calling it. Poll() is invoked after
     // every context Resume() in the scheduler loop, and most resumes don't produce SQEs (pure
     // yields, coordinator-only operations). Checking here avoids io_uring_submit()'s internal
@@ -517,19 +593,40 @@ int Uring::Poll()
         int pendingSqesBefore = m_pendingSqes;
         int acquiredBefore = m_ledgerAcquiredSinceSubmit;
         int accountedBefore = m_ledgerAccountedSinceSubmit;
+#ifndef NDEBUG
+        int submitted;
+        if (s_injectedEnterError != 0)
+        {
+            submitted = s_injectedEnterError;
+            s_injectedEnterError = 0;
+        }
+        else
+        {
+            submitted = io_uring_submit(&m_ring);
+        }
+#else
         int submitted = io_uring_submit(&m_ring);
+#endif
         UringLedgerSubmit("Uring::Poll",
                           this,
                           pendingSqesBefore,
                           acquiredBefore,
                           accountedBefore,
                           submitted);
-        if (submitted < 0)
+
+        if (submitted >= 0)
+        {
+            m_pendingSqes = (submitted >= m_pendingSqes) ? 0 : (m_pendingSqes - submitted);
+            UringLedgerResetSubmitWindow(this);
+        }
+        else
         {
             LedgerEnterFailure("Uring::Poll", submitted);
+            if (!IsRetryableError(submitted))
+            {
+                HandleFatalEnterError("Uring::Poll", submitted);
+            }
         }
-        m_pendingSqes = 0;
-        UringLedgerResetSubmitWindow(this);
     }
 
     if (m_ring.flags & IORING_SETUP_DEFER_TASKRUN)
@@ -564,6 +661,7 @@ int Uring::Poll()
 
 int Uring::ReapOnly()
 {
+    assert(m_initialized && "ReapOnly called on uninitialized or torn-down ring");
     COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollCycle);
 
     // Dispatch the completions a prior submit already materialized, without entering the kernel.
@@ -590,6 +688,7 @@ int Uring::ReapOnly()
 
 int Uring::WaitAndPoll()
 {
+    assert(m_initialized && "WaitAndPoll called on uninitialized or torn-down ring");
     // Flush pending SQEs AND block for a completion in one io_uring_enter. The separate
     // io_uring_submit() + io_uring_wait_cqe() this replaces cost two enters per idle poll; on a busy
     // fan-out server the idle poll runs ~once per round-trip, so fusing them halves the wait-side
@@ -599,22 +698,40 @@ int Uring::WaitAndPoll()
     int pendingSqesBefore = m_pendingSqes;
     int acquiredBefore = m_ledgerAcquiredSinceSubmit;
     int accountedBefore = m_ledgerAccountedSinceSubmit;
+#ifndef NDEBUG
+    int ret;
+    if (s_injectedEnterError != 0)
+    {
+        ret = s_injectedEnterError;
+        s_injectedEnterError = 0;
+    }
+    else
+    {
+        ret = io_uring_submit_and_wait(&m_ring, 1);
+    }
+#else
     int ret = io_uring_submit_and_wait(&m_ring, 1);
+#endif
     UringLedgerSubmit("Uring::WaitAndPoll",
                       this,
                       pendingSqesBefore,
                       acquiredBefore,
                       accountedBefore,
                       ret);
-    if (ret < 0)
+
+    if (ret >= 0)
+    {
+        m_pendingSqes = (ret >= m_pendingSqes) ? 0 : (m_pendingSqes - ret);
+        UringLedgerResetSubmitWindow(this);
+    }
+    else
     {
         LedgerEnterFailure("Uring::WaitAndPoll", ret);
-    }
-    m_pendingSqes = 0;
-    UringLedgerResetSubmitWindow(this);
-    if (ret < 0)
-    {
-        return 0;
+        if (IsRetryableError(ret))
+        {
+            return 0;
+        }
+        HandleFatalEnterError("Uring::WaitAndPoll", ret);
     }
 
     // Process all available CQEs the enter delivered (it may have reaped several).

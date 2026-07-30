@@ -107,10 +107,13 @@ struct Uring
                          int pendingOpsBefore,
                          int pendingOpsAfter);
     void LedgerEnterFailure(char const* site, int err);
+    void LedgerTeardown(char const* site);
     static bool IsRetryableError(int err);
     void HandleFatalEnterError(char const* site, int err);
 #ifndef NDEBUG
     static void SetInjectedEnterError(int err);
+    static uint64_t OffOwnerThreadTeardownCount();
+    static void ResetOffOwnerThreadTeardownCount();
 #endif
 
     pid_t OwnerTid() const { return m_ownerTid; }

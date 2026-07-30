@@ -4,6 +4,7 @@
 #include <cstring>
 #include <liburing.h>
 #include <memory>
+#include <sys/types.h>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -105,6 +106,9 @@ struct Uring
                          int pendingCqesAfter,
                          int pendingOpsBefore,
                          int pendingOpsAfter);
+    void LedgerEnterFailure(char const* site, int err);
+
+    pid_t OwnerTid() const { return m_ownerTid; }
 
     void Run(Context* ctx);
 
@@ -126,6 +130,7 @@ struct Uring
     int m_pendingSqes{0};
     int m_ledgerAcquiredSinceSubmit{0};
     int m_ledgerAccountedSinceSubmit{0};
+    pid_t m_ownerTid{0};
     bool m_initialized{false};
     bool m_filesRegistered{false};
 

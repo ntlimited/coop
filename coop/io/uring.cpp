@@ -49,6 +49,15 @@ namespace coop
 namespace io
 {
 
+static inline pid_t GetTid()
+{
+#ifdef SYS_gettid
+    return static_cast<pid_t>(syscall(SYS_gettid));
+#else
+    return gettid();
+#endif
+}
+
 static bool UringLedgerEnabled()
 {
     static bool enabled = []() -> bool
@@ -236,6 +245,7 @@ void Uring::Init()
     }
     assert(ret == 0);
     m_initialized = true;
+    m_ownerTid = GetTid();
 
     spdlog::info("uring init flags={:#x}", m_ring.flags);
 
@@ -323,6 +333,10 @@ int Uring::Submit()
                       acquiredBefore,
                       accountedBefore,
                       submitted);
+    if (submitted < 0)
+    {
+        LedgerEnterFailure("Uring::Submit", submitted);
+    }
     m_pendingSqes = 0;
     UringLedgerResetSubmitWindow(this);
     return submitted;
@@ -351,6 +365,10 @@ struct io_uring_sqe* Uring::GetSqe()
                           acquiredBefore,
                           accountedBefore,
                           submitted);
+        if (submitted < 0)
+        {
+            LedgerEnterFailure("Uring::GetSqe.retry", submitted);
+        }
         m_pendingSqes = 0;
         UringLedgerResetSubmitWindow(this);
         sqe = io_uring_get_sqe(&m_ring);
@@ -420,6 +438,37 @@ void Uring::LedgerCompleted(char const* site,
         pendingOpsAfter);
 }
 
+void Uring::LedgerEnterFailure(char const* site, int err)
+{
+    pid_t tid = GetTid();
+    int ringFd = m_ring.ring_fd;
+    int enterFd = m_ring.enter_ring_fd;
+    unsigned int intFlags = static_cast<unsigned int>(m_ring.int_flags);
+
+    int plainRetry = -1;
+    if (ringFd >= 0)
+    {
+        plainRetry = static_cast<int>(syscall(__NR_io_uring_enter, ringFd, 0, 0, 0, nullptr, 0));
+        if (plainRetry < 0)
+        {
+            plainRetry = -errno;
+        }
+    }
+
+    UringLedgerPrintf(
+        "COOP_URING_LEDGER event=ENTER_FAILURE site=%s ring=%p owner_tid=%d current_tid=%d "
+        "ring_fd=%d enter_ring_fd=%d int_flags=%#x errno=%d plain_fd_retry=%d",
+        site,
+        static_cast<void const*>(this),
+        m_ownerTid,
+        tid,
+        ringFd,
+        enterFd,
+        intFlags,
+        err,
+        plainRetry);
+}
+
 bool Uring::HasPendingCompletions() const
 {
     // Two independent signals that real IO is ready to service. The continuation drain consults
@@ -475,6 +524,10 @@ int Uring::Poll()
                           acquiredBefore,
                           accountedBefore,
                           submitted);
+        if (submitted < 0)
+        {
+            LedgerEnterFailure("Uring::Poll", submitted);
+        }
         m_pendingSqes = 0;
         UringLedgerResetSubmitWindow(this);
     }
@@ -553,6 +606,10 @@ int Uring::WaitAndPoll()
                       acquiredBefore,
                       accountedBefore,
                       ret);
+    if (ret < 0)
+    {
+        LedgerEnterFailure("Uring::WaitAndPoll", ret);
+    }
     m_pendingSqes = 0;
     UringLedgerResetSubmitWindow(this);
     if (ret < 0)

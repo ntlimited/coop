@@ -146,4 +146,29 @@ TEST(UringLifecycleTest, RetryableEnterErrorDoesNotAbort)
         ctx->GetCooperator()->Shutdown();
     }));
 }
+
+TEST(UringLifecycleTest, UninitializedUringTeardownFiresWithoutIncrementingCount)
+{
+    coop::io::Uring::ResetOffOwnerThreadTeardownCount();
+    {
+        coop::io::Uring uring;
+        // uring is not Init()'d, m_initialized == false
+    } // ~Uring runs on uninitialized uring path
+    EXPECT_EQ(coop::io::Uring::OffOwnerThreadTeardownCount(), 0u);
+}
+
+TEST(UringLifecycleTest, OffOwnerThreadTeardownIncrementsCounter)
+{
+    coop::io::Uring::ResetOffOwnerThreadTeardownCount();
+    {
+        coop::Cooperator cooperator;
+        coop::Thread thread(&cooperator);
+        (void)cooperator.SubmitSync([](coop::Context* ctx) {
+            ctx->GetCooperator()->Shutdown();
+        });
+        // thread joins on destruction, then ~Cooperator / ~Uring runs on main thread (off owner thread)
+    }
+    // S3a: prior to S3b fix, ~Uring runs off-owner-thread on the joining thread with live registration
+    EXPECT_GT(coop::io::Uring::OffOwnerThreadTeardownCount(), 0u);
+}
 #endif

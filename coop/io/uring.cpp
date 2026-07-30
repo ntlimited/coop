@@ -1,5 +1,6 @@
 #include "uring.h"
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -63,6 +64,16 @@ static int s_injectedEnterError{0};
 void Uring::SetInjectedEnterError(int err)
 {
     s_injectedEnterError = err;
+}
+
+static std::atomic<uint64_t> s_offOwnerThreadTeardownCount{0};
+uint64_t Uring::OffOwnerThreadTeardownCount()
+{
+    return s_offOwnerThreadTeardownCount.load(std::memory_order_relaxed);
+}
+void Uring::ResetOffOwnerThreadTeardownCount()
+{
+    s_offOwnerThreadTeardownCount.store(0, std::memory_order_relaxed);
 }
 #endif
 
@@ -160,6 +171,8 @@ Uring::Uring(UringConfiguration const& config)
 
 Uring::~Uring()
 {
+    LedgerTeardown("~Uring");
+
     if (!m_initialized)
     {
         return;
@@ -518,6 +531,36 @@ void Uring::LedgerEnterFailure(char const* site, int err)
         intFlags,
         err,
         plainRetry);
+}
+
+void Uring::LedgerTeardown(char const* site)
+{
+    pid_t tid = GetTid();
+    bool initialized = m_initialized;
+    int ringFd = initialized ? m_ring.ring_fd : -1;
+    int enterFd = initialized ? m_ring.enter_ring_fd : -1;
+    unsigned int intFlags = initialized ? static_cast<unsigned int>(m_ring.int_flags) : 0u;
+    bool liveReg = initialized && ((intFlags & 1u) != 0);
+
+    if (initialized && liveReg && m_ownerTid != 0 && m_ownerTid != tid)
+    {
+#ifndef NDEBUG
+        s_offOwnerThreadTeardownCount.fetch_add(1, std::memory_order_relaxed);
+#endif
+    }
+
+    UringLedgerPrintf(
+        "COOP_URING_LEDGER event=TEARDOWN site=%s ring=%p owner_tid=%d current_tid=%d "
+        "initialized=%d ring_fd=%d enter_ring_fd=%d int_flags=%#x live_reg=%d",
+        site,
+        static_cast<void const*>(this),
+        m_ownerTid,
+        tid,
+        initialized ? 1 : 0,
+        ringFd,
+        enterFd,
+        intFlags,
+        liveReg ? 1 : 0);
 }
 
 bool Uring::IsRetryableError(int err)

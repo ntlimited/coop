@@ -114,15 +114,19 @@ in coop (the enter is one part of a ~280ns scheduler round trip, so a smaller fr
 table of the task (thread) that initialized them. `io_uring_queue_exit()` implicitly issues a
 task-scoped unregister request (`IORING_UNREGISTER_RING_FDS`) against the calling thread's
 table. Destroying a registered `Uring` from a thread other than its owner mutates the destroying
-thread's registration table. Because registered indices collide across threads (e.g. index 0),
-cross-thread teardown clears the calling thread's matching slot. On kernels that enforce task table
-boundaries (Linux 6.3+), this silently invalidates an unrelated live ring's registered index on the
-destroying thread. The failure does not crash at the point of misuse; it surfaces later as `EBADF`
-or index cross-contamination when the destroying thread enters its own ring. Therefore, ring
-construction, submission, and teardown must be strictly thread-affine. `Uring::Teardown()` runs on
-the owning thread via a scope guard during `Cooperator::Launch()` unwind, while `~Uring()` acts only
-as a backstop for unlaunched rings. If foreign-thread teardown occurs at runtime, coop abandons the
-release to prevent corrupting live registrations on the calling thread.
+thread's registration table. Because each task has its own registration table and each table's
+first entry is index 0, rings registered by different threads routinely hold the same index — so
+cross-thread teardown clears the calling thread's matching slot. On kernels that apply this
+request to the calling thread's table rather than rejecting it, this silently invalidates an
+unrelated live ring's registered index on the destroying thread. Observed applied on Linux 6.18.36
+and rejected with `EEXIST` on 6.1.161; the version at which the behaviour changes has not been
+determined, so treat kernels between those as untested rather than safe. The failure does not
+crash at the point of misuse; it surfaces later as `EBADF` or index cross-contamination when the
+destroying thread enters its own ring. Therefore, ring construction, submission, and teardown
+must be strictly thread-affine. `Uring::Teardown()` runs on the owning thread via a scope guard
+during `Cooperator::Launch()` unwind, while `~Uring()` acts only as a backstop for unlaunched
+rings. If foreign-thread teardown occurs at runtime, coop abandons the release to prevent
+corrupting live registrations on the calling thread.
 
 **SQPOLL** (`sqpoll`): `IORING_SETUP_SQPOLL` — a kernel thread polls the SQ ring for new
 entries, eliminating `io_uring_enter()` syscalls for submission. Incompatible with

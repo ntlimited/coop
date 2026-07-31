@@ -110,6 +110,20 @@ keeps its plain fd, and `Init()` warns and continues. Measured saving: ~15ns per
 isolated multi-thread microbench (~12-15%), ~8-20ns per blocking `io::Read` round trip end to end
 in coop (the enter is one part of a ~280ns scheduler round trip, so a smaller fraction there).
 
+**Ring teardown and thread affinity**: Registered ring file descriptors are entries in the kernel
+table of the task (thread) that initialized them. `io_uring_queue_exit()` implicitly issues a
+task-scoped unregister request (`IORING_UNREGISTER_RING_FDS`) against the calling thread's
+table. Destroying a registered `Uring` from a thread other than its owner mutates the destroying
+thread's registration table. Because registered indices collide across threads (e.g. index 0),
+cross-thread teardown clears the calling thread's matching slot. On kernels that enforce task table
+boundaries (Linux 6.3+), this silently invalidates an unrelated live ring's registered index on the
+destroying thread. The failure does not crash at the point of misuse; it surfaces later as `EBADF`
+or index cross-contamination when the destroying thread enters its own ring. Therefore, ring
+construction, submission, and teardown must be strictly thread-affine. `Uring::Teardown()` runs on
+the owning thread via a scope guard during `Cooperator::Launch()` unwind, while `~Uring()` acts only
+as a backstop for unlaunched rings. If foreign-thread teardown occurs at runtime, coop abandons the
+release to prevent corrupting live registrations on the calling thread.
+
 **SQPOLL** (`sqpoll`): `IORING_SETUP_SQPOLL` — a kernel thread polls the SQ ring for new
 entries, eliminating `io_uring_enter()` syscalls for submission. Incompatible with
 `coopTaskrun`/`deferTaskrun` — disable those when enabling SQPOLL. Requires `CAP_SYS_ADMIN`

@@ -94,12 +94,13 @@ static void UringLedgerPrintf(char const* fmt, ...)
         return;
     }
 
+    char buf[1024];
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    fputc('\n', stderr);
-    fflush(stderr);
+
+    spdlog::info("{}", buf);
 }
 
 static void UringLedgerSqe(char const* event,

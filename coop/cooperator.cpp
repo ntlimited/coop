@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <spdlog/spdlog.h>
+
 #include "cooperator.h"
 #include "cooperate.h"
 #include "context_var.h"
@@ -80,12 +82,13 @@ void CooperatorUringLedgerPrintf(char const* fmt, ...)
         return;
     }
 
+    char buf[1024];
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    fputc('\n', stderr);
-    fflush(stderr);
+
+    spdlog::info("{}", buf);
 }
 
 void CooperatorLedgerWakeWrite(char const* site, Cooperator const* co, int fd, ssize_t ret)

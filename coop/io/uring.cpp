@@ -171,10 +171,30 @@ Uring::Uring(UringConfiguration const& config)
 
 Uring::~Uring()
 {
-    LedgerTeardown("~Uring");
+    Teardown();
+}
 
+void Uring::Teardown()
+{
     if (!m_initialized)
     {
+        return;
+    }
+
+    pid_t tid = GetTid();
+    unsigned int intFlags = static_cast<unsigned int>(m_ring.int_flags);
+    bool liveReg = (intFlags & 1u) != 0;
+
+    LedgerTeardown("Teardown");
+
+    if (liveReg && m_ownerTid != 0 && m_ownerTid != tid)
+    {
+        assert(false && "Uring::Teardown called off owner thread with live registered ring");
+        spdlog::critical(
+            "uring teardown on foreign thread ring={} owner_tid={} current_tid={} - skipping unregister",
+            static_cast<void const*>(this),
+            m_ownerTid,
+            tid);
         return;
     }
 

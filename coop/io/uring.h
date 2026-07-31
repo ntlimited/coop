@@ -64,6 +64,7 @@ struct Uring
     bool HasPendingSubmissions() const { return m_pendingSqes > 0; }
 
     void Init();
+    void Teardown();
 
     // Submit any pending SQEs to the kernel. Returns the number of SQEs submitted (from
     // io_uring_submit), or 0 if nothing was pending.

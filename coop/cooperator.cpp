@@ -445,6 +445,14 @@ void Cooperator::Launch()
     m_lastRdtsc = rdtsc();
 
     m_uring.Init();
+    struct UringTeardownGuard
+    {
+        io::Uring& ring;
+        ~UringTeardownGuard()
+        {
+            ring.Teardown();
+        }
+    } uringGuard{m_uring};
 
     // Spawn a detached context that reads the eventfd and drains cross-thread submissions.
     // The eventfd is just another fd with a normal io_uring read — no special-case CQE handling

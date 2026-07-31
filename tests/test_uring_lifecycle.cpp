@@ -157,7 +157,7 @@ TEST(UringLifecycleTest, UninitializedUringTeardownFiresWithoutIncrementingCount
     EXPECT_EQ(coop::io::Uring::OffOwnerThreadTeardownCount(), 0u);
 }
 
-TEST(UringLifecycleTest, OffOwnerThreadTeardownIncrementsCounter)
+TEST(UringLifecycleTest, OffOwnerThreadTeardownCounterIsZeroWithOwnerTeardown)
 {
     coop::io::Uring::ResetOffOwnerThreadTeardownCount();
     {
@@ -166,9 +166,9 @@ TEST(UringLifecycleTest, OffOwnerThreadTeardownIncrementsCounter)
         (void)cooperator.SubmitSync([](coop::Context* ctx) {
             ctx->GetCooperator()->Shutdown();
         });
-        // thread joins on destruction, then ~Cooperator / ~Uring runs on main thread (off owner thread)
+        // thread joins on destruction, ~Uring already ran on owner thread at Launch exit
     }
-    // S3a: prior to S3b fix, ~Uring runs off-owner-thread on the joining thread with live registration
-    EXPECT_GT(coop::io::Uring::OffOwnerThreadTeardownCount(), 0u);
+    // S3b: with F2 fix, Teardown runs on owner thread at Launch exit, so off-owner counter stays 0
+    EXPECT_EQ(coop::io::Uring::OffOwnerThreadTeardownCount(), 0u);
 }
 #endif

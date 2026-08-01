@@ -1072,6 +1072,10 @@ void Cooperator::SanityCheck()
     {
         switch (ctx->m_state)
         {
+            case SchedulerState::LAUNCHING:
+                // In the Launch construction window: in m_contexts, on no
+                // list, not scheduled. Exempt from list accounting.
+                break;
             case SchedulerState::YIELDED:
                 yielded++;
                 break;
@@ -1275,7 +1279,8 @@ void Cooperator::PrintContextTree(Context* ctx /* = nullptr */, int indent /* = 
             printf("\t");
         }
         const char* status = ctx->m_state == coop::SchedulerState::RUNNING ? "Running" :
-            ctx->m_state == SchedulerState::YIELDED ? "Yielded" : "Blocked";
+            ctx->m_state == SchedulerState::YIELDED ? "Yielded" :
+            ctx->m_state == SchedulerState::LAUNCHING ? "Launching" : "Blocked";
         printf("%s (%p) [%s%s] {yields=%lu, blocks=%lu, ticks=%lu, io=%lu/%lu}\n",
             ctx->GetName(),
             ctx,

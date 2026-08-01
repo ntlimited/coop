@@ -142,6 +142,7 @@ const char* StateString(SchedulerState state)
         case SchedulerState::RUNNING: return "running";
         case SchedulerState::YIELDED: return "yielded";
         case SchedulerState::BLOCKED: return "blocked";
+        case SchedulerState::LAUNCHING: return "launching";
     }
     return "unknown";
 }

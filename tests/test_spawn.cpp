@@ -394,3 +394,50 @@ TEST(SpawnTest, KillParentKillsChildren)
         EXPECT_TRUE(grandchildKilled);
     });
 }
+
+namespace
+{
+
+// Red calibration for the launch-window scheduler-accounting bug: a
+// Launchable whose CONSTRUCTOR spawns (the ShutdownOnKillGuard pattern —
+// coop/io/shutdown_on_kill.cpp). Before the LAUNCHING state, the outer
+// context sat in m_contexts as YIELDED without m_yielded membership while
+// its constructor ran, and the inner Spawn's EnterContext SanityCheck
+// aborted (`yielded == YieldedCount()`, first hit via strata_server's
+// /healthz HttpConnection, 2026-08-01).
+struct SpawnInCtorLaunchable : coop::Launchable
+{
+    SpawnInCtorLaunchable(coop::Context* ctx, bool* ctorSpawnRan, bool* launched)
+    : coop::Launchable(ctx)
+    , m_launched(launched)
+    {
+        ctx->GetCooperator()->Spawn([ctorSpawnRan](coop::Context*)
+        {
+            *ctorSpawnRan = true;
+        });
+    }
+
+    virtual void Launch() final
+    {
+        *m_launched = true;
+    }
+
+    bool* m_launched;
+};
+
+} // end anonymous namespace
+
+TEST(SpawnTest, LaunchWhoseConstructorSpawns)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        bool ctorSpawnRan = false;
+        bool launched = false;
+        auto* obj = ctx->GetCooperator()->Launch<SpawnInCtorLaunchable>(
+            &ctorSpawnRan, &launched);
+        EXPECT_NE(obj, nullptr);
+        EXPECT_TRUE(launched);
+        ctx->Yield(true);
+        EXPECT_TRUE(ctorSpawnRan);
+    });
+}

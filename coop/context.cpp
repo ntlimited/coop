@@ -13,7 +13,7 @@ Context::Context(
         Cooperator* cooperator)
 : m_parent(parent)
 , m_handle(handle)
-, m_state(SchedulerState::YIELDED)
+, m_state(SchedulerState::LAUNCHING)
 , m_priority(config.priority)
 , m_currentPriority(config.priority)
 , m_cooperator(cooperator)

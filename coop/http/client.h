@@ -146,6 +146,7 @@ struct ClientConnectionImpl : detail::ParserBuffer<Derived>
     using detail::ParserBuffer<Derived>::m_bufEpoch;
     using detail::ParserBuffer<Derived>::RecvMore;
     using detail::ParserBuffer<Derived>::Compact;
+    using detail::ParserBuffer<Derived>::Win;
 
     bool RecvAborted() const { return false; }   // no context; kill-awareness is the
                                                  // caller's (guard/timeout) concern

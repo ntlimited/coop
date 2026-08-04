@@ -119,6 +119,25 @@ statuses are framing-only — `ReadBody` ends immediately while `ContentLength()
 reports the advertised entity length (a proxy forwards it), keeping the connection
 positioned for keep-alive reuse.
 
+## Pbuf-mode parsing (ParseWindow + RecvSource)
+
+`detail::ParserBuffer` windows the parsers over either the connection's own buffer
+(classic) or borrowed provided-buffer-ring chunks (`io::RecvSource`: a Peek/Consume span
+facade over one armed multishot recv per connection). Whole-request-in-one-chunk parses
+zero-copy directly from the kernel-selected buffer — the common case; tokens spanning
+chunks are reassembled through the own buffer as staging (overflow surfaces exactly like
+the classic too-long-token path). Window transitions bump the staleness epoch, so the
+memoized request/response-line view guards carry over unchanged.
+
+Opt in per server via `ServerConfiguration::pbufRecv` (requires
+`UringConfiguration::bufferRingEntries`; silently classic without a ring). Plaintext
+only — TLS bytes need the SSL decrypt path. ReadBodyToFile forces the bounce engine in
+pbuf mode: the armed recv continuously drains the socket, so there is nothing left there
+for splice to move. Choose per workload: pbuf for keep-alive head-heavy traffic (one
+armed SQE per connection lifetime, zero-copy heads), classic+splice for large-body
+receive-to-disk (the measured ~2x engine). The ~13KiB multishot ceiling from the survey
+applies: very large streamed bodies favor classic mode.
+
 ## Performance Profile (perf observations)
 
 Under wrk load, the HTTP server is **overwhelmingly kernel-bound**. Top userspace symbols:

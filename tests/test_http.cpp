@@ -17,6 +17,11 @@
 #include "coop/http/connection.h"
 #include "coop/http/client.h"
 #include "coop/http/server.h"
+#include "coop/io/recv_source.h"
+#include "coop/io/buffer_ring.h"
+#include "coop/io/uring.h"
+#include "coop/thread.h"
+#include <functional>
 #include "coop/http/transport.h"
 
 using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
@@ -1786,5 +1791,256 @@ TEST(HttpClientTest, PollFirstRoundtrip)
             body.append(static_cast<const char*>(chunk->data), chunk->size);
         }
         EXPECT_EQ(body, "ok");
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Pbuf-mode parsing: kernel-selected chunks through the ParseWindow seam
+// -------------------------------------------------------------------------------------
+
+namespace
+{
+
+// Run fn on a cooperator whose uring carries a provided buffer ring of `entries` bufs
+// of `bufSize` bytes — small sizes force multi-chunk requests through the reassembly
+// path.
+//
+void RunWithBufferRing(uint32_t entries, uint32_t bufSize,
+                       std::function<void(coop::Context*)> fn)
+{
+    coop::CooperatorConfiguration cfg;
+    cfg.uring.bufferRingEntries = entries;
+    cfg.uring.bufferRingBufSize = bufSize;
+
+    coop::Cooperator cooperator(cfg);
+    coop::Thread thread(&cooperator);
+
+    cooperator.SubmitSync([&](coop::Context* ctx)
+    {
+        fn(ctx);
+        cooperator.Shutdown();
+    });
+}
+
+} // end anonymous namespace
+
+TEST(HttpPbufTest, WholeRequestInOneChunk)
+{
+    RunWithBufferRing(16, 4096, [](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        ASSERT_NE(uring->GetBufferRing(), nullptr);
+
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client,
+            "GET /bucket/key?v=1 HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "x-amz-test: abc\r\n"
+            "\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+
+        coop::io::RecvSource source(ctx, server, uring->GetBufferRing());
+        conn->AttachRecvSource(&source);
+
+        auto* req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->method, "GET");
+        EXPECT_EQ(req->path, "/bucket/key");
+        EXPECT_EQ(req->target, "/bucket/key?v=1");
+
+        bool sawHeader = false;
+        while (auto* name = conn->NextHeaderName())
+        {
+            if (strcasecmp(name, "x-amz-test") == 0)
+            {
+                auto* v = conn->ReadHeaderValue();
+                ASSERT_NE(v, nullptr);
+                EXPECT_EQ(std::string_view(static_cast<const char*>(v->data), v->size),
+                          "abc");
+                sawHeader = true;
+            }
+            else
+            {
+                conn->SkipHeaderValue();
+            }
+        }
+        EXPECT_TRUE(sawHeader);
+        EXPECT_TRUE(conn->Send(200, "text/plain", "OK"));
+
+        std::string resp = RecvAll(client);
+        EXPECT_NE(resp.find("HTTP/1.1 200 OK"), std::string::npos);
+    });
+}
+
+TEST(HttpPbufTest, RequestSplitAcrossChunks)
+{
+    // 128-byte pool buffers force the head across several chunks — the staging
+    // reassembly path — while the 2KB staging buffer absorbs it comfortably.
+    //
+    RunWithBufferRing(32, 128, [](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        std::string request =
+            "PUT /obj HTTP/1.1\r\n"
+            "Host: bucket.s3.example\r\n"
+            "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260804/us-east-1/"
+            "s3/aws4_request, SignedHeaders=host;x-amz-date, Signature="
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n"
+            "x-amz-date: 20260804T000000Z\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "hello";
+        SendString(client, request.c_str());
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+
+        coop::io::RecvSource source(ctx, server, uring->GetBufferRing());
+        conn->AttachRecvSource(&source);
+
+        auto* req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->method, "PUT");
+
+        bool sawAuth = false;
+        while (auto* name = conn->NextHeaderName())
+        {
+            if (strcasecmp(name, "Authorization") == 0)
+            {
+                std::string value;
+                // Header values can arrive in pieces at this pool geometry
+                //
+                for (auto* v = conn->ReadHeaderValue(); v != nullptr;
+                     v = v->complete ? nullptr : conn->ReadHeaderValue())
+                {
+                    value.append(static_cast<const char*>(v->data), v->size);
+                    if (v->complete) break;
+                }
+                EXPECT_NE(value.find("Signature=0123456789abcdef"), std::string::npos);
+                sawAuth = true;
+            }
+            else
+            {
+                conn->SkipHeaderValue();
+            }
+        }
+        EXPECT_TRUE(sawAuth);
+
+        std::string body;
+        while (auto* chunk = conn->ReadBody())
+        {
+            body.append(static_cast<const char*>(chunk->data), chunk->size);
+        }
+        EXPECT_EQ(body, "hello");
+    });
+}
+
+TEST(HttpPbufTest, BodyStreamsAndKeepAliveReuses)
+{
+    RunWithBufferRing(16, 512, [](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        std::string body = PatternBody(4096);
+        std::string request =
+            "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n" + body +
+            "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+        coop::io::SendAll(client, request.data(), request.size());
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+
+        coop::io::RecvSource source(ctx, server, uring->GetBufferRing());
+        conn->AttachRecvSource(&source);
+
+        auto* req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->path, "/a");
+
+        std::string got;
+        while (auto* chunk = conn->ReadBody())
+        {
+            got.append(static_cast<const char*>(chunk->data), chunk->size);
+        }
+        EXPECT_EQ(got.size(), body.size());
+        EXPECT_EQ(got, body);
+
+        // The pipelined second request survives the window transitions
+        //
+        conn->Reset();
+        req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->path, "/b");
+    });
+}
+
+TEST(HttpPbufTest, RunServerFullModernPath)
+{
+    // Multishot accept + pbuf-chunk parsing together — the modern server data path
+    //
+    RunWithBufferRing(64, 2048, [](coop::Context* ctx)
+    {
+        int port = 41000 + (getpid() % 20000);
+
+        coop::Context::Handle serverHandle;
+        bool serverReturned = false;
+        ctx->GetCooperator()->Spawn(
+            {.priority = 0, .stackSize = 65536},
+            [&, port](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = port;
+            config.multishotAccept = true;
+            config.pbufRecv = true;
+            config.name = "TestModernServer";
+            coop::http::RunServer(serverCtx, config, kOkRoutes, 1);
+            serverReturned = true;
+        }, &serverHandle);
+
+        for (int i = 0; i < 10; i++)
+        {
+            ctx->Yield(true);
+        }
+
+        for (int round = 0; round < 3; round++)
+        {
+            int cfd = socket(AF_INET, SOCK_STREAM, 0);
+            ASSERT_GE(cfd, 0);
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = htons(port);
+            ASSERT_EQ(connect(cfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0)
+                << strerror(errno);
+
+            coop::io::Descriptor client(cfd, coop::GetUring());
+            const char* req = "GET /ok HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+            ASSERT_GT(coop::io::SendAll(client, req, strlen(req)), 0);
+
+            std::string resp = RecvAll(client, 4096);
+            EXPECT_NE(resp.find("HTTP/1.1 200 OK"), std::string::npos) << "round " << round;
+        }
+
+        serverHandle.Kill();
+        for (int i = 0; i < 200 && !serverReturned; i++)
+        {
+            ctx->Yield(true);
+        }
+        EXPECT_TRUE(serverReturned);
     });
 }

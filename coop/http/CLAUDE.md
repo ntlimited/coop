@@ -72,6 +72,23 @@ used), or `ForceClose()` for EOF-framed passthrough. A proxy must not forward th
 upstream forwarding; `path` remains the pre-`?` slice. Views dangle once parsing advances —
 copy before consuming headers.
 
+## Disk Data Paths
+
+`ReadBodyToFile(fileFd, offset)` (server and client) is the receive-to-disk idiom: body bytes
+already pulled into the recv buffer during header parsing are written first (through the
+ring), then the framed remainder moves socket -> pipe -> page cache via `io::SpliceToFile`
+with a pool-leased pipe — no userspace visit. The splice length is bounded by the body's
+framing, so pipelined bytes behind the body stay in the socket. Transport spliceability is a
+compile-time property (`Transport::kSpliceable`: plaintext yes, TLS no — decryption must
+visit userspace); TLS and chunked bodies bounce through the parser buffer instead, same
+contract, just copied. On success the parser lands in DONE, positioned for keep-alive Reset.
+Client side treats HEAD/204/304 as framing-only (returns 0).
+
+Serve-from-disk was already first-class: `Sendfile` on the server (kTLS-aware via the
+transport), and now `SendBodyFromFile` on the client (PUT of a cached object — flush headers,
+then sendfile through the transport). Splice and sendfile need non-blocking sockets; accepted
+server sockets and anything from `io::Connect` should already be `O_NONBLOCK`.
+
 For small responses (headers + body fit in 512B), the entire response coalesces in the send
 buffer and goes out in one `SendAll` syscall. Large bodies flush headers first, then send the
 body directly via `SendRaw`. Chunked encoding accumulates hex size + data + CRLF in the buffer,

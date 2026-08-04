@@ -16,6 +16,10 @@ namespace http
 //
 struct PlaintextTransport
 {
+    // A bare socket: body bytes can move by splice without visiting userspace.
+    //
+    static constexpr bool kSpliceable = true;
+
     explicit PlaintextTransport(io::Descriptor& desc) : m_desc(desc) {}
 
     io::Descriptor& Descriptor() { return m_desc; }

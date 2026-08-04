@@ -23,9 +23,12 @@
 #include "coop/io/recv.h"
 #include "coop/io/resolve.h"
 #include "coop/io/send.h"
+#include "coop/io/pipe_pool.h"
 #include "coop/io/sendfile.h"
 #include "coop/io/splice.h"
+#include "coop/io/statx.h"
 #include "coop/io/shutdown_on_kill.h"
+#include "coop/io/uring.h"
 
 #include "coop/time/interval.h"
 
@@ -831,5 +834,122 @@ TEST(ResolveTest, ConnectWithHostname)
         EXPECT_GE(ret, 0);
 
         desc.Close();
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Statx
+// -------------------------------------------------------------------------------------
+
+TEST(IoTest, StatxFd)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        char tmpPath[] = "/tmp/coop_statx_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+        unlink(tmpPath);
+
+        const char* data = "0123456789";
+        [[maybe_unused]] ssize_t w = ::write(fileFd, data, 10);
+        assert(w == 10);
+
+        struct statx stx = {};
+        int ret = coop::io::StatxFd(fileFd, STATX_SIZE | STATX_TYPE, &stx);
+        ASSERT_EQ(ret, 0);
+        EXPECT_EQ(stx.stx_size, 10u);
+        EXPECT_TRUE(S_ISREG(stx.stx_mode));
+
+        ::close(fileFd);
+    });
+}
+
+TEST(IoTest, StatxPath)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        char tmpPath[] = "/tmp/coop_statx_path_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+
+        [[maybe_unused]] ssize_t w = ::write(fileFd, "abc", 3);
+        assert(w == 3);
+
+        struct statx stx = {};
+        int ret = coop::io::Statx(tmpPath, 0, STATX_SIZE, &stx);
+        ASSERT_EQ(ret, 0);
+        EXPECT_EQ(stx.stx_size, 3u);
+
+        // Missing path surfaces the errno through the checked return
+        //
+        ret = coop::io::Statx("/tmp/coop_statx_definitely_missing", 0, STATX_SIZE, &stx);
+        EXPECT_EQ(ret, -ENOENT);
+
+        ::close(fileFd);
+        unlink(tmpPath);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// SpliceToFile
+// -------------------------------------------------------------------------------------
+
+TEST(IoTest, SpliceToFile)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        fcntl(sp.fds[0], F_SETFL, fcntl(sp.fds[0], F_GETFL) | O_NONBLOCK);
+        coop::io::Descriptor in(sp.fds[0], uring);
+
+        char tmpPath[] = "/tmp/coop_splice_file_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+        unlink(tmpPath);
+
+        const char* msg = "spliced to page cache";
+        size_t msgLen = strlen(msg);
+        [[maybe_unused]] ssize_t w = ::write(sp.fds[1], msg, msgLen);
+        assert(w == (ssize_t)msgLen);
+
+        // Pool-leased pipe, data lands at offset 4
+        //
+        coop::io::PipeLease pipe(uring->GetPipePool());
+        ASSERT_TRUE(static_cast<bool>(pipe));
+
+        int transferred = coop::io::SpliceToFile(in, fileFd, 4, pipe.Fds(), 65536);
+        ASSERT_EQ(transferred, (int)msgLen);
+
+        char buf[64] = {};
+        ssize_t r = ::pread(fileFd, buf, sizeof(buf), 4);
+        ASSERT_EQ(r, (ssize_t)msgLen);
+        EXPECT_EQ(memcmp(buf, msg, msgLen), 0);
+
+        ::close(fileFd);
+    });
+}
+
+TEST(IoTest, PipePoolReuse)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        auto& pool = coop::GetUring()->GetPipePool();
+
+        int first[2];
+        {
+            coop::io::PipeLease lease(pool);
+            ASSERT_TRUE(static_cast<bool>(lease));
+            first[0] = lease.Fds()[0];
+            first[1] = lease.Fds()[1];
+        }
+
+        // A clean release caches the pipe; the next lease gets the same fds back
+        //
+        coop::io::PipeLease again(pool);
+        ASSERT_TRUE(static_cast<bool>(again));
+        EXPECT_EQ(again.Fds()[0], first[0]);
+        EXPECT_EQ(again.Fds()[1], first[1]);
     });
 }

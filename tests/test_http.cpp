@@ -1,6 +1,8 @@
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -1387,5 +1389,288 @@ TEST(HttpProxyTest, PassThrough)
         EXPECT_NE(finalResp.find("x-amz-request-id: REQ123\r\n"), std::string::npos);
         EXPECT_NE(finalResp.find("Content-Length: 5\r\n"), std::string::npos);
         EXPECT_NE(finalResp.find("\r\n\r\nllo w"), std::string::npos);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Receive-to-disk: ReadBodyToFile
+// -------------------------------------------------------------------------------------
+
+namespace
+{
+
+// A body large enough that header parsing leaves most of it in the socket: the leftover
+// drain covers the recv-buffer slice and the splice path moves the rest.
+//
+std::string PatternBody(size_t size)
+{
+    std::string body;
+    body.reserve(size);
+    while (body.size() < size)
+    {
+        body.append("0123456789abcdef");
+    }
+    body.resize(size);
+    return body;
+}
+
+int MakeTmpFile()
+{
+    char tmpPath[] = "/tmp/coop_http_body_XXXXXX";
+    int fd = mkstemp(tmpPath);
+    if (fd >= 0) unlink(tmpPath);
+    return fd;
+}
+
+std::string ReadFileAt(int fd, off_t offset, size_t size)
+{
+    std::string content(size, '\0');
+    ssize_t r = ::pread(fd, content.data(), size, offset);
+    content.resize(r > 0 ? r : 0);
+    return content;
+}
+
+} // end anonymous namespace
+
+TEST(HttpTest, ReadBodyToFileSplicesAndPreservesPipelining)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        // Splice requires a non-blocking socket (production accepted sockets already are)
+        //
+        fcntl(sp.fds[1], F_SETFL, fcntl(sp.fds[1], F_GETFL) | O_NONBLOCK);
+
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        // 8KB body: far larger than the 2KB recv buffer. A second pipelined request rides
+        // directly behind the body — the splice length is framed, so it must survive.
+        //
+        std::string body = PatternBody(8192);
+        std::string request =
+            "PUT /bucket/key HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Length: 8192\r\n"
+            "\r\n" + body +
+            "GET /after HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        coop::io::SendAll(client, request.data(), request.size());
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+
+        auto* req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->method, "PUT");
+        conn->SkipHeaders();
+
+        int fileFd = MakeTmpFile();
+        ASSERT_GE(fileFd, 0);
+
+        int64_t written = conn->ReadBodyToFile(fileFd, 0);
+        ASSERT_EQ(written, 8192);
+        EXPECT_EQ(ReadFileAt(fileFd, 0, 8192), body);
+
+        conn->Send(200, "text/plain", "");
+
+        // The pipelined GET was not consumed by the splice
+        //
+        conn->Reset();
+        req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->method, "GET");
+        EXPECT_EQ(req->path, "/after");
+
+        ::close(fileFd);
+    });
+}
+
+TEST(HttpTest, ReadBodyToFileChunked)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client,
+            "PUT /obj HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "5\r\nhello\r\n"
+            "7\r\n, world\r\n"
+            "0\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+        conn->GetRequestLine();
+        conn->SkipHeaders();
+
+        int fileFd = MakeTmpFile();
+        ASSERT_GE(fileFd, 0);
+
+        int64_t written = conn->ReadBodyToFile(fileFd, 0);
+        ASSERT_EQ(written, 12);
+        EXPECT_EQ(ReadFileAt(fileFd, 0, 12), "hello, world");
+
+        ::close(fileFd);
+    });
+}
+
+TEST(HttpClientTest, ReadBodyToFileCacheFill)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        fcntl(sp.fds[0], F_SETFL, fcntl(sp.fds[0], F_GETFL) | O_NONBLOCK);
+
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "origin.example");
+
+        EXPECT_TRUE(conn->Get("/object"));
+        RecvAll(server);
+
+        // 16KB object: recv buffer is 4KB, so most of the body splices. A second
+        // keep-alive response follows later on the same connection.
+        //
+        std::string body = PatternBody(16384);
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 16384\r\n"
+            "ETag: \"cache-me\"\r\n"
+            "\r\n" + body;
+        coop::io::SendAll(server, response.data(), response.size());
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 200);
+        conn->SkipHeaders();
+
+        int fileFd = MakeTmpFile();
+        ASSERT_GE(fileFd, 0);
+
+        int64_t written = conn->ReadBodyToFile(fileFd, 0);
+        ASSERT_EQ(written, 16384);
+        EXPECT_EQ(ReadFileAt(fileFd, 0, 16384), body);
+
+        // Connection is positioned for keep-alive reuse
+        //
+        conn->Reset();
+        EXPECT_TRUE(conn->Get("/next"));
+        RecvAll(server);
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+        resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        conn->SkipHeaders();
+        std::string small;
+        while (auto* chunk = conn->ReadBody())
+        {
+            small.append(static_cast<const char*>(chunk->data), chunk->size);
+        }
+        EXPECT_EQ(small, "ok");
+
+        ::close(fileFd);
+    });
+}
+
+TEST(HttpClientTest, ReadBodyToFileHeadIsEmpty)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        EXPECT_TRUE(conn->Head("/object"));
+        RecvAll(server);
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n");
+
+        ASSERT_NE(conn->GetResponseLine(), nullptr);
+        conn->SkipHeaders();
+
+        int fileFd = MakeTmpFile();
+        ASSERT_GE(fileFd, 0);
+
+        EXPECT_EQ(conn->ReadBodyToFile(fileFd, 0), 0);
+
+        struct stat st;
+        ASSERT_EQ(fstat(fileFd, &st), 0);
+        EXPECT_EQ(st.st_size, 0);
+
+        ::close(fileFd);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Send-from-disk: client SendBodyFromFile (PUT of a cached object)
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, SendBodyFromFile)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        // Sendfile requires a non-blocking socket
+        //
+        fcntl(sp.fds[0], F_SETFL, fcntl(sp.fds[0], F_GETFL) | O_NONBLOCK);
+
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        int fileFd = MakeTmpFile();
+        ASSERT_GE(fileFd, 0);
+        std::string content = PatternBody(4000);
+        ASSERT_EQ(::pwrite(fileFd, content.data(), content.size(), 0),
+                  (ssize_t)content.size());
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "bucket.s3.amazonaws.com");
+
+        EXPECT_TRUE(conn->BeginRequest("PUT", "/key"));
+        EXPECT_TRUE(conn->AppendHeader("Content-Length", content.size()));
+        EXPECT_TRUE(conn->EndHeaders());
+        EXPECT_TRUE(conn->SendBodyFromFile(fileFd, 0, content.size()));
+
+        std::string req = RecvAll(server, 8192);
+        EXPECT_NE(req.find("PUT /key HTTP/1.1\r\n"), std::string::npos);
+        EXPECT_NE(req.find("Content-Length: 4000\r\n"), std::string::npos);
+
+        // Everything after the header block is the file body, byte for byte
+        //
+        size_t bodyStart = req.find("\r\n\r\n");
+        ASSERT_NE(bodyStart, std::string::npos);
+        std::string bodyOnWire = req.substr(bodyStart + 4);
+        while (bodyOnWire.size() < content.size())
+        {
+            std::string more = RecvAll(server, content.size() - bodyOnWire.size());
+            if (more.empty()) break;
+            bodyOnWire += more;
+        }
+        EXPECT_EQ(bodyOnWire, content);
+
+        ::close(fileFd);
     });
 }

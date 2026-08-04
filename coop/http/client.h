@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <sys/types.h>
 
 #include "types.h"
 #include "coop/io/descriptor.h"
@@ -53,6 +54,12 @@ struct ClientConnectionImpl
     bool EndHeaders();
     bool SendBody(const void* data, size_t size);
 
+    // Stream a request body straight from a file — the send-from-disk idiom (a PUT of a
+    // cached object). Flushes any buffered headers, then sendfile through the transport
+    // (kTLS-aware on TLS). The caller appended the matching Content-Length header.
+    //
+    bool SendBodyFromFile(int fileFd, off_t offset, size_t count);
+
     // --- Response parsing ---
     //
     // Phase 1: Status line. Null on parse failure, connection closed, or timeout.
@@ -75,6 +82,14 @@ struct ClientConnectionImpl
     void SkipBody();
     int64_t ContentLength();
 
+    // Receive the remaining response body directly into a file at `offset` — the
+    // cache-fill idiom (GET from origin, body to disk). Buffered bytes are written first;
+    // the framed remainder splices socket -> pipe -> page cache on plaintext transports,
+    // and bounces through the parser buffer for TLS or chunked bodies. Framing-only
+    // responses (HEAD/204/304) return 0. Returns total bytes written or negative errno.
+    //
+    int64_t ReadBodyToFile(int fileFd, off_t offset);
+
     bool KeepAlive() const { return m_keepAlive && !m_serverClose; }
     void Reset();
 
@@ -96,6 +111,11 @@ struct ClientConnectionImpl
     int TransportSendAll(const void* buf, size_t size)
     {
         return static_cast<Derived*>(this)->DoSendAll(buf, size);
+    }
+
+    int TransportSendfileAll(int in_fd, off_t offset, size_t count)
+    {
+        return static_cast<Derived*>(this)->DoSendfileAll(in_fd, offset, count);
     }
 
     // Write buffer management
@@ -157,6 +177,8 @@ struct ClientConnectionImpl
 template<typename Transport>
 struct ClientConnection final : ClientConnectionImpl<ClientConnection<Transport>>
 {
+    static constexpr bool kSpliceable = Transport::kSpliceable;
+
     static constexpr size_t DEFAULT_RECV_SIZE = 4096;
     static constexpr size_t DEFAULT_SEND_SIZE = 512;
 
@@ -186,6 +208,11 @@ struct ClientConnection final : ClientConnectionImpl<ClientConnection<Transport>
     int DoSendAll(const void* buf, size_t size)
     {
         return m_transport.SendAll(buf, size);
+    }
+
+    int DoSendfileAll(int in_fd, off_t offset, size_t count)
+    {
+        return m_transport.SendfileAll(in_fd, offset, count);
     }
 
     Transport       m_transport;

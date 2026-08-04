@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "descriptor.h"
+#include "pipe_pool.h"
 #include "uring_configuration.h"
 
 #include "coop/coordinator.h"
@@ -47,6 +48,10 @@ struct Uring
     // is set and the kernel supports pbuf rings; nullptr otherwise (feature absent or not requested).
     //
     BufferRing* GetBufferRing() const { return m_bufferRing.get(); }
+
+    // Per-thread pipes for splice data paths (fills lazily; closed with the uring).
+    //
+    PipePool& GetPipePool() { return m_pipePool; }
 
     // True when io_uring has completions waiting to be harvested -- either CQEs already sitting in
     // the completion ring, or, under COOP_TASKRUN, kernel task_work that will materialize CQEs on
@@ -154,6 +159,7 @@ struct Uring
     // Held by pointer so its registration outlives Init and is torn down with the Uring.
     //
     std::unique_ptr<BufferRing> m_bufferRing;
+    PipePool m_pipePool;
 };
 
 } // end namespace io

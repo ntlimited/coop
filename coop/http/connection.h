@@ -55,6 +55,17 @@ struct ConnectionBase
     virtual void SkipBody() = 0;
     virtual int64_t ContentLength() = 0;
 
+    // Receive the remaining body directly into a file at `offset` — the receive-to-disk
+    // idiom. Body bytes already pulled into the recv buffer during header parsing are
+    // written first; the framed remainder then moves socket -> pipe -> page cache without
+    // visiting userspace on spliceable (plaintext) transports. TLS and chunked bodies
+    // bounce through the parser buffer instead (correct, just copied). Consumes the body
+    // to its end: the connection is positioned for Reset/keep-alive on success.
+    //
+    // Returns total bytes written, or negative errno (-ECONNRESET: peer closed mid-body).
+    //
+    virtual int64_t ReadBodyToFile(int fileFd, off_t offset) = 0;
+
     // Response methods. Return false on send failure. Callers must not call send methods after
     // a failure (asserts in debug). Use SendError() to check.
     //
@@ -128,6 +139,7 @@ struct ConnectionImpl : ConnectionBase
     Chunk* ReadBody() override;
     void SkipBody() override;
     int64_t ContentLength() override;
+    int64_t ReadBodyToFile(int fileFd, off_t offset) override;
     bool Send(int status, const char* contentType, const void* body, size_t size) override;
     bool Send(int status, const char* contentType, const std::string& body) override;
     bool SendHeaders(int status, const char* contentType, size_t contentLength) override;
@@ -261,6 +273,8 @@ struct ConnectionImpl : ConnectionBase
 template<typename Transport>
 struct Connection final : ConnectionImpl<Connection<Transport>>
 {
+    static constexpr bool kSpliceable = Transport::kSpliceable;
+
     // Trailing bytes needed for Allocate: recv buffer + send buffer.
     //
     static constexpr size_t ExtraBytes(

@@ -17,6 +17,11 @@ namespace http
 //
 struct TlsTransport
 {
+    // Decryption must visit userspace (kTLS-RX aside), so body bytes bounce through the
+    // parser buffer rather than splice.
+    //
+    static constexpr bool kSpliceable = false;
+
     TlsTransport(io::ssl::Connection& conn, io::Descriptor& desc)
     : m_conn(conn)
     , m_desc(desc)

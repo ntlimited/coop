@@ -2044,3 +2044,66 @@ TEST(HttpPbufTest, RunServerFullModernPath)
         EXPECT_TRUE(serverReturned);
     });
 }
+
+// A keep-alive client that disconnects idle must END its server connection context —
+// not spin it hot on instant zero-byte reads (which monopolizes the cooperator and
+// starves every other connection). The second connection here starves if the first
+// one's EOF spins.
+//
+TEST(HttpTest, KeepAliveClientDisconnectDoesNotSpin)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int port = 43000 + (getpid() % 20000);
+
+        coop::Context::Handle serverHandle;
+        ctx->GetCooperator()->Spawn(
+            {.priority = 0, .stackSize = 65536},
+            [&, port](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = port;
+            config.name = "EofSpinServer";
+            coop::http::RunServer(serverCtx, config, kOkRoutes, 1);
+        }, &serverHandle);
+
+        for (int i = 0; i < 10; i++) ctx->Yield(true);
+
+        auto roundtrip = [&](bool close) -> bool
+        {
+            int cfd = socket(AF_INET, SOCK_STREAM, 0);
+            if (cfd < 0) return false;
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = htons(port);
+            if (connect(cfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+            {
+                ::close(cfd);
+                return false;
+            }
+            coop::io::Descriptor client(cfd, coop::GetUring());
+            const char* req = close
+                ? "GET /ok HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+                : "GET /ok HTTP/1.1\r\nHost: t\r\n\r\n";
+            if (coop::io::SendAll(client, req, strlen(req)) <= 0) return false;
+            std::string resp = RecvAll(client, 2048);
+            return resp.find("200 OK") != std::string::npos;
+        };
+
+        // Keep-alive roundtrip, then the client just disconnects (Descriptor dtor)
+        //
+        ASSERT_TRUE(roundtrip(false));
+
+        // Give the EOF a few scheduler passes to land on the server side
+        //
+        for (int i = 0; i < 20; i++) ctx->Yield(true);
+
+        // A spinning EOF loop would monopolize the cooperator and starve this one
+        //
+        EXPECT_TRUE(roundtrip(true));
+
+        serverHandle.Kill();
+        for (int i = 0; i < 100; i++) ctx->Yield(true);
+    });
+}

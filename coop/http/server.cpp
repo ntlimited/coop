@@ -14,6 +14,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include "coop/coordinator.h"
+#include "coop/io/armed_accept.h"
+#include "coop/io/shutdown_on_kill.h"
+
 #include "coop/alloc.h"
 #include "coop/cooperator.h"
 #include "coop/launchable.h"
@@ -112,7 +116,11 @@ void HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
     auto* req = conn.GetRequestLine();
     if (!req)
     {
-        if (!conn.SendError())
+        // A clean keep-alive EOF (peer closed between requests) leaves nothing in the
+        // buffer — answering it with a 400 writes into a dead socket. Only malformed
+        // bytes earn a response.
+        //
+        if (!conn.SendError() && conn.LeftoverSize() > 0)
         {
             conn.Send(400, "text/plain", "Bad Request\n");
         }
@@ -172,9 +180,15 @@ struct HttpConnection : Launchable
         {
             HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths);
 
-            if (conn->SendError() || !conn->KeepAlive()) return;
+            if (conn->SendError()) return;
 
+            // Drain the request before judging keep-alive: a handler that never touched
+            // the headers hasn't parsed Connection yet, and checking first would let
+            // Reset() wipe a close that SkipBody just discovered — a phantom extra
+            // iteration against a closed peer.
+            //
             conn->SkipBody();
+            if (!conn->KeepAlive()) return;
             conn->Reset();
         }
     }
@@ -239,9 +253,15 @@ struct HttpTlsConnection : Launchable
         {
             HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths);
 
-            if (conn->SendError() || !conn->KeepAlive()) return;
+            if (conn->SendError()) return;
 
+            // Drain the request before judging keep-alive: a handler that never touched
+            // the headers hasn't parsed Connection yet, and checking first would let
+            // Reset() wipe a close that SkipBody just discovered — a phantom extra
+            // iteration against a closed peer.
+            //
             conn->SkipBody();
+            if (!conn->KeepAlive()) return;
             conn->Reset();
         }
     }
@@ -262,7 +282,7 @@ struct HttpTlsConnection : Launchable
 // healthy-looking server unreachable on its configured port, with no diagnostic.
 // Returns the listening fd, or -1 with the failure logged.
 //
-static int BindListen(int port)
+static int BindListen(ServerConfiguration const& config)
 {
     int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (serverFd < 0)
@@ -273,7 +293,8 @@ static int BindListen(int port)
 
     int on = 1;
     if (setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0 ||
-        setsockopt(serverFd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) != 0)
+        (config.reusePort &&
+         setsockopt(serverFd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) != 0))
     {
         spdlog::error("http server setsockopt failed: {}", strerror(errno));
         close(serverFd);
@@ -282,19 +303,21 @@ static int BindListen(int port)
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
+    addr.sin_port = htons(config.port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in)) != 0)
     {
-        spdlog::error("http server bind(port={}) failed: {}", port, strerror(errno));
+        spdlog::error("http server bind(port={}) failed: {}", config.port,
+                      strerror(errno));
         close(serverFd);
         return -1;
     }
 
-    if (listen(serverFd, 512) != 0)
+    if (listen(serverFd, config.backlog) != 0)
     {
-        spdlog::error("http server listen(port={}) failed: {}", port, strerror(errno));
+        spdlog::error("http server listen(port={}) failed: {}", config.port,
+                      strerror(errno));
         close(serverFd);
         return -1;
     }
@@ -302,7 +325,74 @@ static int BindListen(int port)
     return serverFd;
 }
 
+// The accept loop, shared by plaintext and TLS servers. One-shot accepts go through
+// the kill-aware blocking op; the multishot path arms one SQE for the listener's
+// lifetime and gets kill-awareness the amortized way — the guard's watcher shuts the
+// listener down on kill, which terminates the armed stream with an error.
+//
+template<typename LaunchFn>
+static void AcceptLoop(Context* ctx, io::Descriptor& desc,
+                       ServerConfiguration const& config, LaunchFn&& launch)
+{
+    if (config.multishotAccept)
+    {
+        io::ShutdownOnKillGuard guard(ctx, desc, SHUT_RDWR);
+        Coordinator coord;
+        io::ArmedAccept armed(ctx, desc, &coord, config.maxPendingAccepts);
+        armed.Arm();
+
+        while (!ctx->IsKilled())
+        {
+            int fd = armed.Next();
+            if (fd < 0)
+            {
+                break;
+            }
+            launch(fd);
+            ctx->Yield();
+        }
+        return;
+    }
+
+    while (!ctx->IsKilled())
+    {
+        int fd = io::AcceptKill(desc);
+        if (fd < 0)
+        {
+            break;
+        }
+        launch(fd);
+        ctx->Yield();
+    }
+}
+
 } // end anonymous namespace
+
+bool RunServer(
+    Context* ctx,
+    ServerConfiguration const& config,
+    const Route* routes,
+    int routeCount)
+{
+    ctx->SetName(config.name);
+
+    int serverFd = BindListen(config);
+    if (serverFd < 0)
+    {
+        return false;
+    }
+
+    auto* co = ctx->GetCooperator();
+    io::Descriptor desc(serverFd);
+
+    AcceptLoop(ctx, desc, config, [&](int fd)
+    {
+        static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 32768};
+        co->Launch<HttpConnection>(spawn, fd, co, routes, routeCount,
+                                   config.searchPaths, config.timeout);
+    });
+    return true;
+}
 
 bool RunServer(
     Context* ctx,
@@ -313,9 +403,24 @@ bool RunServer(
     const char* const* searchPaths /* = nullptr */,
     time::Interval timeout /* = std::chrono::seconds(30) */)
 {
-    ctx->SetName(name);
+    ServerConfiguration config;
+    config.port = port;
+    config.name = name;
+    config.searchPaths = searchPaths;
+    config.timeout = timeout;
+    return RunServer(ctx, config, routes, routeCount);
+}
 
-    int serverFd = BindListen(port);
+bool RunTlsServer(
+    Context* ctx,
+    ServerConfiguration const& config,
+    const Route* routes,
+    int routeCount,
+    io::ssl::Context& sslCtx)
+{
+    ctx->SetName(config.name);
+
+    int serverFd = BindListen(config);
     if (serverFd < 0)
     {
         return false;
@@ -324,18 +429,14 @@ bool RunServer(
     auto* co = ctx->GetCooperator();
     io::Descriptor desc(serverFd);
 
-    while (!ctx->IsKilled())
+    AcceptLoop(ctx, desc, config, [&](int fd)
     {
-        int fd = io::AcceptKill(desc);
-        if (fd < 0)
-        {
-            break;
-        }
-
-        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 32768};
-        co->Launch<HttpConnection>(config, fd, co, routes, routeCount, searchPaths, timeout);
-        ctx->Yield();
-    }
+        // TLS handshake + HTTP requires more stack for OpenSSL
+        //
+        static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 65536};
+        co->Launch<HttpTlsConnection>(spawn, fd, co, routes, routeCount,
+                                      sslCtx, config.searchPaths, config.timeout);
+    });
     return true;
 }
 
@@ -349,33 +450,12 @@ bool RunTlsServer(
     const char* const* searchPaths /* = nullptr */,
     time::Interval timeout /* = std::chrono::seconds(30) */)
 {
-    ctx->SetName(name);
-
-    int serverFd = BindListen(port);
-    if (serverFd < 0)
-    {
-        return false;
-    }
-
-    auto* co = ctx->GetCooperator();
-    io::Descriptor desc(serverFd);
-
-    while (!ctx->IsKilled())
-    {
-        int fd = io::AcceptKill(desc);
-        if (fd < 0)
-        {
-            break;
-        }
-
-        // TLS handshake + HTTP requires more stack for OpenSSL
-        //
-        static constexpr SpawnConfiguration config = {.priority = 0, .stackSize = 65536};
-        co->Launch<HttpTlsConnection>(config, fd, co, routes, routeCount,
-                                      sslCtx, searchPaths, timeout);
-        ctx->Yield();
-    }
-    return true;
+    ServerConfiguration config;
+    config.port = port;
+    config.name = name;
+    config.searchPaths = searchPaths;
+    config.timeout = timeout;
+    return RunTlsServer(ctx, config, routes, routeCount, sslCtx);
 }
 
 } // end namespace coop::http

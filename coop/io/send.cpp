@@ -26,7 +26,13 @@ static inline int TrySend(int fd, const void* buf, size_t size, int flags)
     // (Launch sets PTHREAD_CANCEL_DISABLE), so that wrapper is pure overhead -- ~14% of a fan-out
     // echo server's CPU in profiling. The raw sendto syscall skips it.
     //
-    return (int)syscall(SYS_sendto, fd, buf, size, flags | MSG_DONTWAIT, nullptr, (socklen_t)0);
+    // MSG_NOSIGNAL: a raw send to a peer-closed socket raises SIGPIPE, whose default
+    // disposition kills the process — the uring path reports -EPIPE instead, and this
+    // fastpath must match it. (A keep-alive server writing a response race-to-a-closing
+    // client is a routine event, not an error worth a signal.)
+    //
+    return (int)syscall(SYS_sendto, fd, buf, size, flags | MSG_DONTWAIT | MSG_NOSIGNAL,
+                        nullptr, (socklen_t)0);
 }
 
 // Send submits straight to io_uring; SendFastpath tries a nonblocking send() first (a win when the

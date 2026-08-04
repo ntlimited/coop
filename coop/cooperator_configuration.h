@@ -60,6 +60,14 @@ struct CooperatorConfiguration
     //
     TimerMode timerMode = TimerMode::KernelPerTimer;
 
+    // Virtual time (test/simulation): the cooperator's clock is a value it advances itself
+    // rather than CLOCK_MONOTONIC. When idle with only timers pending, it jumps the clock
+    // to the nearest deadline instead of really sleeping — so timer-heavy tests run at full
+    // speed, deterministically. Forces TimerMode::UserspaceQueue (kernel timers cannot be
+    // virtualized). Zero cost when off: one predicted-not-taken branch per clock read.
+    //
+    bool virtualTime = false;
+
     // Per-context CPU-cycle accounting. When set, every resume reads the timestamp counter and
     // charges the elapsed cycles to the running context's m_statistics.ticks (surfaced by the
     // status server's per-context view). It is pure observability — nothing on a scheduling or

@@ -239,6 +239,31 @@ File metadata through the ring (IORING_OP_STATX) — the cooperative replacement
 `StatxFd(fd, mask, &stx)` by descriptor (AT_EMPTY_PATH). Metadata is usually dentry-cache hot;
 the point is that a cold inode only blocks the calling context, not the cooperator.
 
+## Armed lifecycle (`armed_handle.h`, `detail/armed_handle_impl.hpp`, `armed_accept.{h,cpp}`)
+
+`ArmedHandleImpl<Derived, Entry>` is the multishot lifecycle core: coordinator held across
+the CQE stream, bounded surfaced-slot queue, consumer park/wake, cancel, teardown drain.
+Species supply SQE prep, CQE decode, disposal, and re-arm/backpressure policy; every
+species destructor calls `TeardownDrain()` before the base dtor (the drain runs species
+callbacks). Tagged userdata: bit 1 armed, bit 2 species, bit 0 cancel-ack. Species today:
+`ArmedHandle` (multishot recv over a pbuf ring) and `ArmedAccept` (multishot accept,
+SOCK_NONBLOCK fds, three-tier backpressure: pause at maxPending via cancel — the listen
+backlog takes over — burst-absorb to max(2x, +16) for the Poll-batch race with the
+deferred cancel, shed-with-reset past that, counted).
+
+## Registration (`uring.cpp` Register/Unregister, `buffer_arena.h`, `fixed_buffer.h`)
+
+The fixed-file table registers SPARSE at Init (RLIMIT_NOFILE pre-checked — liburing's
+sparse helper silently setrlimits the process on -EMFILE, which a per-ring call must not);
+slots attach via FILES_UPDATE from an O(1) free stack. First update failure latches the
+feature off for the ring's lifetime; a failed unregister also quarantines its slot.
+`BufferArena` (opt-in `registeredBufferBytes`) registers one anonymous slab as fixed
+buffer 0 for the READ_FIXED/WRITE_FIXED disk legs and future SEND_ZC; `io::FixedBuffer`
+overloads Read/Write under the same names. There is no registered-buffer recv in any
+released kernel; the socket read path is pbuf rings or caller-owned buffers. Measured
+(bench_disk_path): WRITE_FIXED beats the plain bounce 8-20% at 64K+, and splice beats
+both ~2x — splice remains the ReadBodyToFile engine.
+
 ## Buffer ring + multishot recv (`buffer_ring.h`, `armed_handle.{h,cpp}`)
 
 Opt-in. Classic recv is caller-owned: every recv pins a userspace buffer at submit time, so an armed

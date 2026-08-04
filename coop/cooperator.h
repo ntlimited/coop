@@ -315,6 +315,38 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     bool VirtualTime() const { return m_virtualTime; }
     int64_t VirtualNowUs() const { return m_virtualNowUs; }
 
+    // Stall-detection seam. A StallDetector arms this and watches m_stallState from a sibling
+    // thread. The state packs a switch generation in the high bits with a running bit in bit 0:
+    // every switch INTO a context bumps the generation and sets the bit; every return to the loop
+    // (or idle) clears the bit. A context that runs without yielding freezes the value with the
+    // bit set -- the watchdog sees an unchanged running state persist past the threshold and reports
+    // the stall. Zero cost when unarmed: one predicted-not-taken branch per context switch, the same
+    // shape as trackContextCycles. The whole seam compiles to nothing observable until a detector
+    // attaches. See stall_detector.h.
+    //
+    uint64_t StallState() const { return m_stallState.load(std::memory_order_acquire); }
+    void ArmStall(bool on) { m_stallArmed = on; }
+
+    // Kernel thread id of the thread running Launch(). 0 until Launch() binds. A StallDetector
+    // uses it to target the running thread with a capture signal.
+    //
+    int Tid() const { return m_tid.load(std::memory_order_acquire); }
+
+    void StallEnter()
+    {
+        if (m_stallArmed) [[unlikely]]
+        {
+            m_stallState.store((++m_stallGen << 1) | 1u, std::memory_order_release);
+        }
+    }
+    void StallLeave()
+    {
+        if (m_stallArmed) [[unlikely]]
+        {
+            m_stallState.store(m_stallGen << 1, std::memory_order_release);
+        }
+    }
+
     int CpuId() const { return m_cpuId; }
     int NumaNode() const { return m_numaNode; }
 
@@ -417,6 +449,14 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     CooperatorConfiguration m_config;
     bool m_virtualTime{false};
     int64_t m_virtualNowUs{0};
+
+    // Stall-detection state (see StallEnter/StallLeave). m_stallGen is cooperator-thread-only;
+    // m_stallState is the atomic the watchdog reads. Armed only while a StallDetector is attached.
+    //
+    bool m_stallArmed{false};
+    uint64_t m_stallGen{0};
+    std::atomic<uint64_t> m_stallState{0};
+    std::atomic<int> m_tid{0};
 
     std::atomic<bool> m_shutdown;
     Context*        m_scheduled;

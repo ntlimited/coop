@@ -201,6 +201,7 @@ add_executable(coop_tests
     tests/test_deadline.cpp
     tests/test_group.cpp
     tests/test_virtual_time.cpp
+    tests/test_stall_detector.cpp
     tests/test_drain.cpp
     tests/test_direct_yield.cpp
     tests/test_timer.cpp

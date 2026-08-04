@@ -5,7 +5,9 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -951,5 +953,75 @@ TEST(IoTest, PipePoolReuse)
         ASSERT_TRUE(static_cast<bool>(again));
         EXPECT_EQ(again.Fds()[0], first[0]);
         EXPECT_EQ(again.Fds()[1], first[1]);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Cooperative fairness: bulk sendfile must not monopolize the cooperator
+// -------------------------------------------------------------------------------------
+
+TEST(IoTest, SendfileAllYieldsUnderFastReader)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+
+        fcntl(sp.fds[1], F_SETFL, fcntl(sp.fds[1], F_GETFL) | O_NONBLOCK);
+        coop::io::Descriptor writer(sp.fds[1], uring);
+
+        constexpr size_t kSize = 64 * 1024 * 1024;
+
+        char tmpPath[] = "/tmp/coop_sendfile_yield_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+        unlink(tmpPath);
+
+        std::vector<char> block(1 << 20, 'x');
+        for (int i = 0; i < 64; i++)
+        {
+            ASSERT_EQ(::write(fileFd, block.data(), block.size()),
+                      (ssize_t)block.size());
+        }
+
+        // External drainer keeps the socket writable so sendfile rarely (or never)
+        // blocks through Poll — without the yield budget, the sendfile context would
+        // hold the cooperator for the whole transfer.
+        //
+        std::thread drainer([&]
+        {
+            std::vector<char> buf(1 << 20);
+            size_t got = 0;
+            while (got < kSize)
+            {
+                ssize_t r = ::recv(sp.fds[0], buf.data(), buf.size(), 0);
+                if (r <= 0) break;
+                got += static_cast<size_t>(r);
+            }
+        });
+
+        bool done = false;
+        int canaryRuns = 0;
+        ctx->GetCooperator()->Spawn([&](coop::Context* c)
+        {
+            while (!done)
+            {
+                canaryRuns++;
+                c->Yield(true);
+            }
+        });
+
+        int sent = coop::io::SendfileAll(writer, fileFd, 0, kSize);
+        done = true;
+        drainer.join();
+
+        EXPECT_EQ(sent, (int)kSize);
+
+        // 64MB at a 2MB yield budget guarantees ~31 scheduler passes even when the
+        // socket never pushes back; a generous floor keeps the assertion robust.
+        //
+        EXPECT_GE(canaryRuns, 8);
+
+        ::close(fileFd);
     });
 }

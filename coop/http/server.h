@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 
 #include "coop/time/interval.h"
 
@@ -18,11 +19,13 @@ namespace http
 struct ConnectionBase;
 struct ServerHandle;
 
-struct Route
-{
-    const char* path;
-    void (*handler)(ConnectionBase&);
-};
+// The request handler owns dispatch entirely. coop parses the request line and headers, then hands
+// the connection to this one callback -- it inspects conn.GetRequestLine()->path and writes a
+// response however it likes. coop does no path matching, no static-file fallback, and no default
+// 404 of its own: routing is the application's concern, not the library's. userData is passed
+// through verbatim from ServerConfiguration for handlers that need per-server state.
+//
+using RequestHandler = void (*)(ConnectionBase& conn, void* userData);
 
 // Declared server topology and accept policy. reusePort is the sharding contract: N
 // RunServer calls with the same port — one per cooperator — each get their own listen
@@ -54,50 +57,35 @@ struct ServerConfiguration
     //
     ServerHandle* control = nullptr;
 
+    // The one request handler and its pass-through state. handler must be non-null: RunServer logs
+    // and returns false otherwise.
+    //
+    RequestHandler handler = nullptr;
+    void* userData = nullptr;
+
     const char* name = "HttpServer";
-    const char* const* searchPaths = nullptr;
     time::Interval timeout = std::chrono::seconds(30);
 };
 
-// Run an HTTP server on the given port with the provided route table. Binds, listens, and accepts
-// connections in a loop, launching a handler context per client. Returns false (with the failure
-// logged) when the socket cannot be created, bound, or listened — callers must not assume the
-// server came up. Multiple callers on one port intentionally shard accepts via SO_REUSEPORT.
+// Run an HTTP server. Binds, listens, and accepts connections in a loop, launching a context per
+// client that parses requests and calls config.handler. Returns false (with the failure logged)
+// when handler is null or the socket cannot be created, bound, or listened — callers must not
+// assume the server came up. Multiple callers on one port intentionally shard accepts via
+// SO_REUSEPORT.
 //
-bool RunServer(
-    Context* ctx,
-    ServerConfiguration const& config,
-    const Route* routes,
-    int routeCount);
-
-bool RunServer(
-    Context* ctx,
-    int port,
-    const Route* routes,
-    int routeCount,
-    const char* name = "HttpServer",
-    const char* const* searchPaths = nullptr,
-    time::Interval timeout = std::chrono::seconds(30));
+bool RunServer(Context* ctx, ServerConfiguration const& config);
 
 // Run an HTTPS server. Same as RunServer but performs a TLS handshake on each accepted connection
 // before entering the HTTP handler loop. Uses socket BIO mode with kTLS when available.
 //
-bool RunTlsServer(
-    Context* ctx,
-    ServerConfiguration const& config,
-    const Route* routes,
-    int routeCount,
-    io::ssl::Context& sslCtx);
+bool RunTlsServer(Context* ctx, ServerConfiguration const& config, io::ssl::Context& sslCtx);
 
-bool RunTlsServer(
-    Context* ctx,
-    int port,
-    const Route* routes,
-    int routeCount,
-    io::ssl::Context& sslCtx,
-    const char* name = "HttpsServer",
-    const char* const* searchPaths = nullptr,
-    time::Interval timeout = std::chrono::seconds(30));
+// Serve a static file matching reqPath from a null-terminated list of search-path roots. A helper
+// for handlers that want static serving -- coop does not call it on its own. Returns true if a file
+// was found and sent (200 + sendfile), false if no candidate existed (the handler should then send
+// its own 404). Rejects paths containing "..".
+//
+bool ServeFile(ConnectionBase& conn, std::string_view reqPath, const char* const* searchPaths);
 
 } // end namespace coop::http
 } // end namespace coop

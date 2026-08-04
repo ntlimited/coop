@@ -59,8 +59,11 @@ bool HasPathTraversal(const char* path)
     return strstr(path, "..") != nullptr;
 }
 
-// Try to serve a static file matching the requested path from the search paths.
-// Returns true if a file was found and served.
+} // end anonymous namespace
+
+// Public static-file helper (declared in server.h). A handler opts into static serving by calling
+// it; coop never calls it on its own. ContentTypeForExtension / HasPathTraversal above stay
+// internal to this TU but remain visible here.
 //
 bool ServeFile(ConnectionBase& conn, std::string_view reqPath,
                const char* const* searchPaths)
@@ -115,13 +118,15 @@ bool ServeFile(ConnectionBase& conn, std::string_view reqPath,
     return false;
 }
 
+namespace
+{
+
 // Serve one request. Returns false when no request could be parsed — clean keep-alive
 // EOF or malformed bytes — which must END the connection loop: a clean EOF that keeps
 // looping spins hot on instant zero-byte reads (the recv fastpath returns EOF without
 // ever parking), monopolizing the cooperator.
 //
-bool HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
-                   const char* const* searchPaths)
+bool HandleRequest(ConnectionBase& conn, RequestHandler handler, void* userData)
 {
     auto* req = conn.GetRequestLine();
     if (!req)
@@ -137,21 +142,10 @@ bool HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
         return false;
     }
 
-    for (int i = 0; i < routeCount; i++)
-    {
-        if (req->path == routes[i].path)
-        {
-            routes[i].handler(conn);
-            return true;
-        }
-    }
-
-    if (searchPaths && ServeFile(conn, req->path, searchPaths))
-    {
-        return true;
-    }
-
-    conn.Send(404, "text/plain", "Not Found\n");
+    // Everything past parsing is the application's: matching, static serving, 404s. coop just
+    // hands over the parsed connection.
+    //
+    handler(conn, userData);
     return true;
 }
 
@@ -162,8 +156,7 @@ bool HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
 struct HttpConnection : Launchable
 {
     HttpConnection(Context* ctx, int fd, Cooperator* co,
-                   const Route* routes, int routeCount,
-                   const char* const* searchPaths,
+                   RequestHandler handler, void* userData,
                    time::Interval timeout,
                    bool pbufRecv = false,
                    ServerHandle* control = nullptr)
@@ -171,9 +164,8 @@ struct HttpConnection : Launchable
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd)
     , m_co(co)
-    , m_routes(routes)
-    , m_routeCount(routeCount)
-    , m_searchPaths(searchPaths)
+    , m_handler(handler)
+    , m_userData(userData)
     , m_timeout(timeout)
     , m_pbufRecv(pbufRecv)
     , m_control(control)
@@ -223,7 +215,7 @@ struct HttpConnection : Launchable
             {
                 conn->ForceClose();
             }
-            if (!HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths)) return;
+            if (!HandleRequest(*conn, m_handler, m_userData)) return;
 
             if (conn->SendError()) return;
 
@@ -251,9 +243,8 @@ struct HttpConnection : Launchable
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
-    const Route*        m_routes;
-    int                 m_routeCount;
-    const char* const*  m_searchPaths;
+    RequestHandler      m_handler;
+    void*               m_userData;
     time::Interval      m_timeout;
     bool                m_pbufRecv;
     ServerHandle*       m_control;
@@ -266,18 +257,16 @@ struct HttpConnection : Launchable
 struct HttpTlsConnection : Launchable
 {
     HttpTlsConnection(Context* ctx, int fd, Cooperator* co,
-                      const Route* routes, int routeCount,
+                      RequestHandler handler, void* userData,
                       io::ssl::Context& sslCtx,
-                      const char* const* searchPaths,
                       time::Interval timeout)
     : Launchable(ctx)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd)
     , m_co(co)
-    , m_routes(routes)
-    , m_routeCount(routeCount)
+    , m_handler(handler)
+    , m_userData(userData)
     , m_sslCtx(sslCtx)
-    , m_searchPaths(searchPaths)
     , m_timeout(timeout)
     {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
@@ -308,7 +297,7 @@ struct HttpTlsConnection : Launchable
 
         while (!GetContext()->IsKilled())
         {
-            if (!HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths)) return;
+            if (!HandleRequest(*conn, m_handler, m_userData)) return;
 
             if (conn->SendError()) return;
 
@@ -326,10 +315,9 @@ struct HttpTlsConnection : Launchable
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
-    const Route*        m_routes;
-    int                 m_routeCount;
+    RequestHandler      m_handler;
+    void*               m_userData;
     io::ssl::Context&   m_sslCtx;
-    const char* const*  m_searchPaths;
     time::Interval      m_timeout;
 };
 
@@ -429,12 +417,14 @@ static void AcceptLoop(Context* ctx, io::Descriptor& desc,
 
 } // end anonymous namespace
 
-bool RunServer(
-    Context* ctx,
-    ServerConfiguration const& config,
-    const Route* routes,
-    int routeCount)
+bool RunServer(Context* ctx, ServerConfiguration const& config)
 {
+    if (!config.handler)
+    {
+        spdlog::error("http RunServer: config.handler is null");
+        return false;
+    }
+
     ctx->SetName(config.name);
 
     int serverFd = BindListen(config);
@@ -453,37 +443,20 @@ bool RunServer(
     AcceptLoop(ctx, desc, config, [&](int fd)
     {
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 32768};
-        co->Launch<HttpConnection>(spawn, fd, co, routes, routeCount,
-                                   config.searchPaths, config.timeout,
-                                   config.pbufRecv, config.control);
+        co->Launch<HttpConnection>(spawn, fd, co, config.handler, config.userData,
+                                   config.timeout, config.pbufRecv, config.control);
     });
     return true;
 }
 
-bool RunServer(
-    Context* ctx,
-    int port,
-    const Route* routes,
-    int routeCount,
-    const char* name /* = "HttpServer" */,
-    const char* const* searchPaths /* = nullptr */,
-    time::Interval timeout /* = std::chrono::seconds(30) */)
+bool RunTlsServer(Context* ctx, ServerConfiguration const& config, io::ssl::Context& sslCtx)
 {
-    ServerConfiguration config;
-    config.port = port;
-    config.name = name;
-    config.searchPaths = searchPaths;
-    config.timeout = timeout;
-    return RunServer(ctx, config, routes, routeCount);
-}
+    if (!config.handler)
+    {
+        spdlog::error("http RunTlsServer: config.handler is null");
+        return false;
+    }
 
-bool RunTlsServer(
-    Context* ctx,
-    ServerConfiguration const& config,
-    const Route* routes,
-    int routeCount,
-    io::ssl::Context& sslCtx)
-{
     ctx->SetName(config.name);
 
     int serverFd = BindListen(config);
@@ -500,28 +473,10 @@ bool RunTlsServer(
         // TLS handshake + HTTP requires more stack for OpenSSL
         //
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 65536};
-        co->Launch<HttpTlsConnection>(spawn, fd, co, routes, routeCount,
-                                      sslCtx, config.searchPaths, config.timeout);
+        co->Launch<HttpTlsConnection>(spawn, fd, co, config.handler, config.userData,
+                                      sslCtx, config.timeout);
     });
     return true;
-}
-
-bool RunTlsServer(
-    Context* ctx,
-    int port,
-    const Route* routes,
-    int routeCount,
-    io::ssl::Context& sslCtx,
-    const char* name /* = "HttpsServer" */,
-    const char* const* searchPaths /* = nullptr */,
-    time::Interval timeout /* = std::chrono::seconds(30) */)
-{
-    ServerConfiguration config;
-    config.port = port;
-    config.name = name;
-    config.searchPaths = searchPaths;
-    config.timeout = timeout;
-    return RunTlsServer(ctx, config, routes, routeCount, sslCtx);
 }
 
 } // end namespace coop::http

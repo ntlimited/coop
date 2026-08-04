@@ -22,12 +22,10 @@
 namespace
 {
 
-void OkHandler(coop::http::ConnectionBase& conn)
+void OkHandler(coop::http::ConnectionBase& conn, void*)
 {
     conn.Send(200, "text/plain", "OK");
 }
-
-const coop::http::Route kRoutes[] = { { "/ok", &OkHandler } };
 
 int ConnectBlocking(int port)
 {
@@ -68,7 +66,8 @@ TEST(DrainTest, GracefulDrainClosesKeepAlive)
             config.port = port;
             config.control = &handle;
             config.name = "DrainServer";
-            coop::http::RunServer(serverCtx, config, kRoutes, 1);
+            config.handler = &OkHandler;
+            coop::http::RunServer(serverCtx, config);
             serverReturned = true;
         }, &serverHandle);
 
@@ -148,7 +147,8 @@ TEST(DrainTest, HardDeadlineKillsStragglers)
             coop::http::ServerConfiguration config;
             config.port = port;
             config.control = &handle;
-            coop::http::RunServer(serverCtx, config, kRoutes, 1);
+            config.handler = &OkHandler;
+            coop::http::RunServer(serverCtx, config);
         }, &serverHandle);
 
         for (int i = 0; i < 10; i++) ctx->Yield(true);

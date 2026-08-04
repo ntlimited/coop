@@ -26,18 +26,32 @@ void HandleJson(http::ConnectionBase& conn)
     conn.Send(200, "application/json", R"({"message":"Hello, World!"})", 27);
 }
 
-static const http::Route s_appRoutes[] = {
+// This benchmark owns its own routing — coop no longer does path matching. A tiny app route table,
+// then (optionally) the built-in status API via http::StatusDispatch, then static files, then 404.
+//
+struct AppRoute { const char* path; void (*handler)(http::ConnectionBase&); };
+
+static const AppRoute s_appRoutes[] = {
     {"/plaintext", HandlePlaintext},
     {"/json", HandleJson},
 };
 
-static constexpr int APP_ROUTE_COUNT = sizeof(s_appRoutes) / sizeof(s_appRoutes[0]);
-
-// Shared route table (built once in main, read by all workers).
-//
-static http::Route s_routes[APP_ROUTE_COUNT + 16];
-static int s_routeCount = 0;
+static bool s_status = false;
 static const char* const* s_searchPaths = nullptr;
+
+void BenchDispatch(http::ConnectionBase& conn, void*)
+{
+    std::string_view path = conn.GetRequestLine()->path;
+
+    for (auto& route : s_appRoutes)
+    {
+        if (path == route.path) { route.handler(conn); return; }
+    }
+    if (s_status && http::StatusDispatch(conn, path)) return;
+    if (s_searchPaths && http::ServeFile(conn, path, s_searchPaths)) return;
+
+    conn.Send(404, "text/plain", "Not Found\n");
+}
 
 struct TlsArgs
 {
@@ -80,14 +94,7 @@ int main(int argc, char* argv[])
         config.uring.entries = 1024;
     }
 
-    // Build shared route table
-    //
-    for (int i = 0; i < APP_ROUTE_COUNT; i++) s_routes[s_routeCount++] = s_appRoutes[i];
-    if (status)
-    {
-        for (int i = 0; i < http::StatusRouteCount(); i++)
-            s_routes[s_routeCount++] = http::StatusRoutes()[i];
-    }
+    s_status = status;
 
     static const char* staticPaths[] = {"static", nullptr};
     s_searchPaths = status ? staticPaths : nullptr;
@@ -158,16 +165,24 @@ int main(int argc, char* argv[])
                 sslCtx.LoadPrivateKey(keyBuf, keyLen);
                 sslCtx.EnableKTLS();
 
-                http::RunTlsServer(ctx, port, s_routes, s_routeCount, sslCtx, "BenchTlsServer",
-                                   s_searchPaths, std::chrono::seconds(0));
+                http::ServerConfiguration cfg;
+                cfg.port = port;
+                cfg.name = "BenchTlsServer";
+                cfg.handler = &BenchDispatch;
+                cfg.timeout = std::chrono::seconds(0);
+                http::RunTlsServer(ctx, cfg, sslCtx);
             }, reinterpret_cast<void*>(static_cast<intptr_t>(port)), tlsConfig);
         }
         else
         {
             co->Submit([](Context* ctx, void* arg) {
                 int port = static_cast<int>(reinterpret_cast<intptr_t>(arg));
-                http::RunServer(ctx, port, s_routes, s_routeCount, "BenchServer",
-                                s_searchPaths, std::chrono::seconds(0));
+                http::ServerConfiguration cfg;
+                cfg.port = port;
+                cfg.name = "BenchServer";
+                cfg.handler = &BenchDispatch;
+                cfg.timeout = std::chrono::seconds(0);
+                http::RunServer(ctx, cfg);
             }, reinterpret_cast<void*>(static_cast<intptr_t>(port)));
         }
     }

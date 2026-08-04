@@ -1689,12 +1689,10 @@ TEST(HttpClientTest, SendBodyFromFile)
 namespace
 {
 
-void OkHandler(coop::http::ConnectionBase& conn)
+void OkHandler(coop::http::ConnectionBase& conn, void*)
 {
     conn.Send(200, "text/plain", "OK");
 }
-
-const coop::http::Route kOkRoutes[] = { { "/ok", &OkHandler } };
 
 } // end anonymous namespace
 
@@ -1717,7 +1715,8 @@ TEST(HttpTest, RunServerMultishotAcceptRoundtrip)
             config.multishotAccept = true;
             config.maxPendingAccepts = 8;
             config.name = "TestMultishotServer";
-            coop::http::RunServer(serverCtx, config, kOkRoutes, 1);
+            config.handler = &OkHandler;
+            coop::http::RunServer(serverCtx, config);
             serverReturned = true;
         }, &serverHandle);
 
@@ -2008,7 +2007,8 @@ TEST(HttpPbufTest, RunServerFullModernPath)
             config.multishotAccept = true;
             config.pbufRecv = true;
             config.name = "TestModernServer";
-            coop::http::RunServer(serverCtx, config, kOkRoutes, 1);
+            config.handler = &OkHandler;
+            coop::http::RunServer(serverCtx, config);
             serverReturned = true;
         }, &serverHandle);
 
@@ -2064,7 +2064,8 @@ TEST(HttpTest, KeepAliveClientDisconnectDoesNotSpin)
             coop::http::ServerConfiguration config;
             config.port = port;
             config.name = "EofSpinServer";
-            coop::http::RunServer(serverCtx, config, kOkRoutes, 1);
+            config.handler = &OkHandler;
+            coop::http::RunServer(serverCtx, config);
         }, &serverHandle);
 
         for (int i = 0; i < 10; i++) ctx->Yield(true);

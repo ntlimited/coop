@@ -128,6 +128,16 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
     assert(m_submitFd >= 0);
     memcpy(m_name, config.name, sizeof(m_name));
 
+    // Virtual time cannot use kernel timers; force the userspace queue and seed the clock
+    // at a fixed non-zero base (a year of microseconds) so deadlines are plausible values.
+    //
+    m_virtualTime = config.virtualTime;
+    if (m_virtualTime)
+    {
+        m_config.timerMode = TimerMode::UserspaceQueue;
+        m_virtualNowUs = 1000000LL * 60 * 60 * 24 * 365;
+    }
+
     auto& registry = detail::CooperatorVarRegistry::Instance();
     assert(registry.TotalSize() <= LOCAL_STORAGE_SIZE
            && "CooperatorVar registrations exceed LOCAL_STORAGE_SIZE");
@@ -599,6 +609,22 @@ void Cooperator::Launch()
             //
             if (!m_blocked.IsEmpty() || m_uring.PendingOps() > 0)
             {
+                // Virtual time: rather than really sleeping, jump the clock forward to the
+                // nearest timer deadline. The next iteration's ServiceExpiredTimers (which
+                // reads NowUs) fires everything now due, waking the sleepers. Only timers
+                // can be virtualized — real IO still needs a real completion — so advance
+                // only when a timer is what we would be waiting on.
+                //
+                if (m_virtualTime && !m_timers.Empty())
+                {
+                    int64_t nearest = m_timers.MinDeadlineUs();
+                    if (nearest > m_virtualNowUs)
+                    {
+                        m_virtualNowUs = nearest;
+                    }
+                    continue;
+                }
+
                 // Ensure one kernel timer is armed for the nearest deadline before sleeping, so the
                 // wait wakes when the soonest sleep comes due. WaitAndPoll submits the SQE.
                 //
@@ -995,7 +1021,7 @@ void Cooperator::ServiceExpiredTimers()
         return;
     }
 
-    const int64_t now = time::MonotonicMicros();
+    const int64_t now = NowUs();
     while (auto* node = m_timers.PopExpired(now))
     {
         node->GetCoordinator()->Release(nullptr, false /* schedule */);

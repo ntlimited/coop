@@ -18,6 +18,7 @@
 #include "stack_pool.h"
 #include "perf/counters.h"
 #include "io/uring.h"
+#include "time/now.h"
 #include "time/timer_queue.h"
 #include "topology.h"
 
@@ -297,6 +298,23 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     //
     bool UsesTimerQueue() const { return m_config.timerMode == TimerMode::UserspaceQueue; }
 
+    // The cooperator clock, in monotonic microseconds. Real CLOCK_MONOTONIC normally; the
+    // self-advanced virtual clock under CooperatorConfiguration::virtualTime. All
+    // timer-relevant reads (sleep deadlines, timer service, context deadlines) go through
+    // here so virtual time is a single seam. NowUsCeil rounds up (the sleep never-early
+    // covenant); both are the real reader when virtual time is off.
+    //
+    int64_t NowUs() const
+    {
+        return m_virtualTime ? m_virtualNowUs : time::MonotonicMicros();
+    }
+    int64_t NowUsCeil() const
+    {
+        return m_virtualTime ? m_virtualNowUs : time::MonotonicMicrosCeil();
+    }
+    bool VirtualTime() const { return m_virtualTime; }
+    int64_t VirtualNowUs() const { return m_virtualNowUs; }
+
     int CpuId() const { return m_cpuId; }
     int NumaNode() const { return m_numaNode; }
 
@@ -397,6 +415,8 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     int m_cpuId{-1};
     int m_numaNode{-1};
     CooperatorConfiguration m_config;
+    bool m_virtualTime{false};
+    int64_t m_virtualNowUs{0};
 
     std::atomic<bool> m_shutdown;
     Context*        m_scheduled;

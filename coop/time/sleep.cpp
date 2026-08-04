@@ -46,7 +46,7 @@ int64_t Sleeper::DeadlineUs() const
     // Ceil the start so the absolute deadline is never earlier than now+interval in real terms (see
     // MonotonicMicrosCeil) -- the queue path's guard against returning a sub-microsecond early.
     //
-    const int64_t nowUs    = MonotonicMicrosCeil();
+    const int64_t nowUs    = m_context->GetCooperator()->NowUsCeil();
     const int64_t deadline = nowUs + m_interval.count();
     if (m_slack <= Interval::zero())
     {

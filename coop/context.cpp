@@ -126,7 +126,7 @@ void Context::Unblock(Context* other, const bool schedule /* = true */)
 
 void Context::SetDeadlineIn(time::Interval budget)
 {
-    SetDeadline(time::MonotonicMicros() +
+    SetDeadline(m_cooperator->NowUs() +
                 std::chrono::duration_cast<std::chrono::microseconds>(budget).count());
 }
 
@@ -136,7 +136,7 @@ int64_t Context::RemainingUs() const
     {
         return INT64_MAX;
     }
-    int64_t remaining = m_deadlineUs - time::MonotonicMicros();
+    int64_t remaining = m_deadlineUs - m_cooperator->NowUs();
     return remaining > 0 ? remaining : 0;
 }
 

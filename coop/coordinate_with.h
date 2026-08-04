@@ -266,6 +266,51 @@ CoordinationResult CoordinateWithKill(Context* ctx, Args... args)
         }
     }
 
+    // Deadline enforcement, zero-cost when unset. When the context carries a deadline
+    // and the caller did NOT already pass a trailing timeout, the remaining budget
+    // becomes this wait's timeout. A timeout win that is actually the deadline expiring
+    // kills the context tree with KillCause::Deadline and reports Killed — so a whole
+    // request's DNS + connect + TLS + read draw from one inherited budget without any
+    // per-call timeout arithmetic. The `constexpr` gate means a caller with no deadline
+    // (m_deadlineUs == 0) takes exactly the original path.
+    //
+    // Same predicate CoordinateWith uses to recognize a trailing timeout — any chrono
+    // duration, not just time::Interval — so a caller who already passed a timeout is
+    // not double-appended a deadline one.
+    //
+    constexpr bool kHasTrailingTimeout =
+        sizeof...(Args) > 0 &&
+        std::is_convertible_v<detail::LastType<Args...>, time::Interval>;
+
+    if constexpr (!kHasTrailingTimeout)
+    {
+        if (ctx->DeadlineUs() != 0)
+        {
+            int64_t remainingUs = ctx->RemainingUs();
+            auto budget = std::chrono::microseconds(remainingUs);
+            auto result = CoordinateWith(ctx, ctx->GetKilledSignal(),
+                                         std::forward<Args>(args)..., time::Interval(budget));
+            if (result.index == 0)
+            {
+                return CoordinationResult { static_cast<size_t>(-1), nullptr };
+            }
+            if (result.TimedOut())
+            {
+                // The budget expired — kill the tree and report Killed, not TimedOut,
+                // so the caller sees a single "aborted" outcome with a cause.
+                //
+                ctx->KillSelf(KillCause::Deadline);
+                return CoordinationResult { static_cast<size_t>(-1), nullptr };
+            }
+            if (result.coordinator == nullptr)
+            {
+                return result;
+            }
+            result.index -= 1;
+            return result;
+        }
+    }
+
     auto result = CoordinateWith(ctx, ctx->GetKilledSignal(), std::forward<Args>(args)...);
 
     // Kill signal fired (index 0)

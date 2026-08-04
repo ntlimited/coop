@@ -5,6 +5,7 @@
 #include "coordinator.h"
 #include "epoch/epoch.h"
 #include "signal.h"
+#include "time/interval.h"
 #include "detail/embedded_list.h"
 #include "detail/scheduler_state.h"
 #include "spawn_configuration.h"
@@ -14,6 +15,16 @@ namespace coop
 
 template<typename T> struct Alloc;
 struct AllocBuffer;
+
+// Why a context died. Extensible; None means "not killed".
+//
+enum class KillCause : uint8_t
+{
+    None = 0,
+    Kill,       // explicit Kill / parent tree kill
+    Deadline,   // the context's deadline budget expired
+    Drain,      // graceful shutdown draining
+};
 
 struct Segment
 {
@@ -93,6 +104,83 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
         return m_killedSignal.IsSignaled();
     }
 
+    // Why this context was killed — None while alive. The cause picks the HTTP status
+    // and the metric bucket that IsKilled() alone cannot: Kill (explicit/parent),
+    // Deadline (budget expired), Drain (graceful shutdown). First cause wins.
+    //
+    KillCause WhyKilled() const { return m_killCause; }
+
+    // Absolute deadline (monotonic microseconds; 0 = none). Children inherit the
+    // parent's deadline at spawn; setting one only ever TIGHTENS (min with existing),
+    // so a callee cannot extend the budget its caller granted. Enforcement is
+    // cooperative and zero-cost when unset: kill-aware waits gate on it — a wait past
+    // the deadline kills the context tree with KillCause::Deadline.
+    //
+    int64_t DeadlineUs() const { return m_deadlineUs; }
+    void SetDeadline(int64_t absoluteUs)
+    {
+        if (m_deadlineUs == 0 || absoluteUs < m_deadlineUs)
+        {
+            m_deadlineUs = absoluteUs;
+        }
+    }
+    void SetDeadlineIn(time::Interval budget);
+
+    // Remaining budget in microseconds; INT64_MAX when no deadline is set.
+    //
+    int64_t RemainingUs() const;
+
+    // Kill hook: fn(arg) runs when this context is killed (during kill propagation,
+    // before waiters wake), in kill-traversal order. The node is caller-owned and
+    // stack-resident; the RAII guard deregisters on scope exit. Generalizes the
+    // watcher-context pattern (io::ShutdownOnKillGuard) for cheap cases: no context,
+    // no coordinator — one intrusive node. Hooks must not block.
+    //
+    struct KillHook : EmbeddedListHookups<KillHook>
+    {
+        void (*fn)(void*) = nullptr;
+        void* arg = nullptr;
+    };
+
+    void OnKill(KillHook* hook) { m_killHooks.Push(hook); }
+    void RemoveKillHook(KillHook* hook) { m_killHooks.Remove(hook); }
+
+    // Kill this context's own subtree with a cause — the self-abort entry a
+    // deadline-expiring wait uses. Runs on this cooperator (this == running context or
+    // an ancestor of it); schedule=false since the caller is mid-wait-unwind.
+    //
+    void KillSelf(KillCause cause) { Kill(this, false, cause); }
+
+    // Kill-machinery internals (public for the traversal in context.cpp; not user API)
+    //
+    void RecordKillCause(KillCause cause)
+    {
+        if (m_killCause == KillCause::None)
+        {
+            m_killCause = cause;
+        }
+    }
+    void FireKillHooks()
+    {
+        // Fire once (a context can be reached by more than one Kill — parent tree kill
+        // then a deadline). Non-destructive: hooks stay linked so their owner's
+        // RemoveKillHook / scope-exit deregistration remains valid.
+        //
+        if (m_killHooksFired)
+        {
+            return;
+        }
+        m_killHooksFired = true;
+        // Peek() on an empty list returns the (garbage) sentinel cast, not null — guard
+        // with IsEmpty(); Next() correctly returns null at the sentinel.
+        //
+        for (auto* hook = m_killHooks.IsEmpty() ? nullptr : m_killHooks.Peek();
+             hook; hook = m_killHooks.Next(hook))
+        {
+            hook->fn(hook->arg);
+        }
+    }
+
     // Returns the kill signal for use with Wait or CoordinateWith patterns.
     //
     Signal* GetKilledSignal()
@@ -153,7 +241,8 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     // scheduled in the cooperator, this kills the other given context. In practice, it's also
     // simply necessary that we leverage the current context to coordinate downstream events.
     //
-    void Kill(Context* other, const bool schedule = true);
+    void Kill(Context* other, const bool schedule = true,
+              KillCause cause = KillCause::Kill);
 
   public:
     Context* m_parent;
@@ -163,6 +252,10 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     int m_currentPriority;
     Cooperator* m_cooperator;
     Signal m_killedSignal;
+    KillCause m_killCause{KillCause::None};
+    bool m_killHooksFired{false};
+    int64_t m_deadlineUs{0};
+    EmbeddedList<KillHook> m_killHooks;
     ContextChildrenList m_children;
     Coordinator m_lastChild;
     const char* m_name;
@@ -229,7 +322,7 @@ struct Context::Handle
     {
     }
 
-    void Kill();
+    void Kill(KillCause cause = KillCause::Kill);
 
     Signal* GetKilledSignal();
 

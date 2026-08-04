@@ -15,11 +15,11 @@ Signal* Context::Handle::GetKilledSignal()
 
 // Note that the kill works on the handle, not the context
 //
-void Context::Handle::Kill()
+void Context::Handle::Kill(KillCause cause /* = KillCause::Kill */)
 {
     if (m_context)
     {
-        m_context->GetCooperator()->BoundarySafeKill(this, false);
+        m_context->GetCooperator()->BoundarySafeKill(this, false, cause);
     }
 }
 

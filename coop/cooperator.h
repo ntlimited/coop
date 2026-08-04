@@ -347,7 +347,8 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     // Ideally this would be better protected
     //
-    void BoundarySafeKill(Context::Handle*, const bool crossed = false);
+    void BoundarySafeKill(Context::Handle*, const bool crossed = false,
+                          KillCause cause = KillCause::Kill);
 
     void PrintContextTree(Context* ctx = nullptr, int indent = 0) ;
 

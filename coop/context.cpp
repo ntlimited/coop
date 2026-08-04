@@ -1,4 +1,5 @@
 #include "context.h"
+#include "time/now.h"
 #include "thunk.h"
 #include "cooperator.h"
 #include "debug_borrow.h"
@@ -17,6 +18,7 @@ Context::Context(
 , m_priority(config.priority)
 , m_currentPriority(config.priority)
 , m_cooperator(cooperator)
+, m_deadlineUs(parent ? parent->m_deadlineUs : 0)
 , m_killedSignal(this)
 {
     if (m_handle)
@@ -112,7 +114,36 @@ void Context::Unblock(Context* other, const bool schedule /* = true */)
     m_cooperator->Unblock(other, schedule);
 }
 
-void Context::Kill(Context* other, const bool schedule /* = true */)
+void Context::SetDeadlineIn(time::Interval budget)
+{
+    SetDeadline(time::MonotonicMicros() +
+                std::chrono::duration_cast<std::chrono::microseconds>(budget).count());
+}
+
+int64_t Context::RemainingUs() const
+{
+    if (m_deadlineUs == 0)
+    {
+        return INT64_MAX;
+    }
+    int64_t remaining = m_deadlineUs - time::MonotonicMicros();
+    return remaining > 0 ? remaining : 0;
+}
+
+// Record the cause (first wins) and run caller-registered kill hooks, then notify.
+// Hooks fire before waiters wake so a hook's side effect (e.g. a socket shutdown) is
+// visible to whatever the wake resumes.
+//
+static void FireKill(Context* ctx, KillCause cause, Signal& signal, Context* notifier,
+                     const bool schedule)
+{
+    ctx->RecordKillCause(cause);
+    ctx->FireKillHooks();
+    signal.Notify(notifier, schedule);
+}
+
+void Context::Kill(Context* other, const bool schedule /* = true */,
+                   KillCause cause /* = KillCause::Kill */)
 {
     using ChildHookups = EmbeddedListHookups<Context, int, CONTEXT_LIST_CHILDREN>;
 
@@ -134,7 +165,7 @@ void Context::Kill(Context* other, const bool schedule /* = true */)
     //
     while (ctx != other)
     {
-        ctx->m_killedSignal.Notify(ctx, false);
+        FireKill(ctx, cause, ctx->m_killedSignal, ctx, false);
 
         // Move to next sibling, or ascend if this was the last child
         //
@@ -153,7 +184,7 @@ void Context::Kill(Context* other, const bool schedule /* = true */)
         }
     }
 
-    other->m_killedSignal.Notify(other, schedule);
+    FireKill(other, cause, other->m_killedSignal, other, schedule);
 }
 
 } // end namespace coop

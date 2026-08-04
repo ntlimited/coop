@@ -8,6 +8,7 @@
 #include <sys/eventfd.h>
 #include <thread>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -413,6 +414,7 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         }
     }
     m_scheduled = nullptr;
+    StallLeave();
 }
 
 void Cooperator::Launch()
@@ -435,6 +437,7 @@ void Cooperator::Launch()
     //
     assert(Cooperator::thread_cooperator == nullptr);
     Cooperator::thread_cooperator = this;
+    m_tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
     epoch::SetManager(&m_epochMgr);
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
 
@@ -722,6 +725,7 @@ void Cooperator::Launch()
         s_registry.Remove(this);
     }
 
+    m_tid.store(0, std::memory_order_release);
     Cooperator::thread_cooperator = nullptr;
 }
 
@@ -792,6 +796,7 @@ void Cooperator::YieldFrom(Context* ctx)
 
         next->m_state = SchedulerState::RUNNING;
         m_scheduled = next;
+        StallEnter();
 
         auto ret = ContextSwitch(&ctx->m_sp, next->m_sp,
                                  static_cast<int>(SchedulerJumpResult::RESUMED));
@@ -812,6 +817,7 @@ void Cooperator::Resume(Context* ctx)
 
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
+    StallEnter();
 
     // A fresh resume from the loop means io_uring was just polled (the loop polls at every batch
     // boundary and before idling), so the direct-yield budget refills here. The chain of direct
@@ -870,6 +876,7 @@ void Cooperator::Block(Context* ctx)
 
         next->m_state = SchedulerState::RUNNING;
         m_scheduled = next;
+        StallEnter();
 
         auto ret = ContextSwitch(&ctx->m_sp, next->m_sp,
                                  static_cast<int>(SchedulerJumpResult::RESUMED));
@@ -928,6 +935,7 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
 
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
+    StallEnter();
 
     auto ret = ContextSwitch(&prev->m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
@@ -1195,6 +1203,7 @@ void Cooperator::EnterContext(Context* ctx)
     ctx->m_state = SchedulerState::RUNNING;
     m_scheduled = ctx;
     ctx->m_lastRdtsc = now;
+    StallEnter();
 
 #ifndef NDEBUG
     SanityCheck();

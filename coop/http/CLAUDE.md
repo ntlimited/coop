@@ -129,8 +129,11 @@ chunks are reassembled through the own buffer as staging (overflow surfaces exac
 the classic too-long-token path). Window transitions bump the staleness epoch, so the
 memoized request/response-line view guards carry over unchanged.
 
-Opt in per server via `ServerConfiguration::pbufRecv` (requires
-`UringConfiguration::bufferRingEntries`; silently classic without a ring). Plaintext
+Measured (bench_pbuf_http, keep-alive closed loop, release, shared host): pbuf beats
+classic by ~8-12% req/s and ~7-9% less CPU per request at 64-256 connections, the gap
+widening with concurrency — one armed SQE per connection lifetime plus zero-copy heads
+versus per-request recv ceremony. Opt in per server via `ServerConfiguration::pbufRecv`
+(requires `UringConfiguration::bufferRingEntries`; silently classic without a ring). Plaintext
 only — TLS bytes need the SSL decrypt path. ReadBodyToFile forces the bounce engine in
 pbuf mode: the armed recv continuously drains the socket, so there is nothing left there
 for splice to move. Choose per workload: pbuf for keep-alive head-heavy traffic (one

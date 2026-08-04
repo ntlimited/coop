@@ -114,7 +114,12 @@ bool ServeFile(ConnectionBase& conn, std::string_view reqPath,
     return false;
 }
 
-void HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
+// Serve one request. Returns false when no request could be parsed — clean keep-alive
+// EOF or malformed bytes — which must END the connection loop: a clean EOF that keeps
+// looping spins hot on instant zero-byte reads (the recv fastpath returns EOF without
+// ever parking), monopolizing the cooperator.
+//
+bool HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
                    const char* const* searchPaths)
 {
     auto* req = conn.GetRequestLine();
@@ -128,7 +133,7 @@ void HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
         {
             conn.Send(400, "text/plain", "Bad Request\n");
         }
-        return;
+        return false;
     }
 
     for (int i = 0; i < routeCount; i++)
@@ -136,16 +141,17 @@ void HandleRequest(ConnectionBase& conn, const Route* routes, int routeCount,
         if (req->path == routes[i].path)
         {
             routes[i].handler(conn);
-            return;
+            return true;
         }
     }
 
     if (searchPaths && ServeFile(conn, req->path, searchPaths))
     {
-        return;
+        return true;
     }
 
     conn.Send(404, "text/plain", "Not Found\n");
+    return true;
 }
 
 // -------------------------------------------------------------------------------------
@@ -196,7 +202,7 @@ struct HttpConnection : Launchable
 
         while (!GetContext()->IsKilled())
         {
-            HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths);
+            if (!HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths)) return;
 
             if (conn->SendError()) return;
 
@@ -270,7 +276,7 @@ struct HttpTlsConnection : Launchable
 
         while (!GetContext()->IsKilled())
         {
-            HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths);
+            if (!HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths)) return;
 
             if (conn->SendError()) return;
 

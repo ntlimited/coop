@@ -314,7 +314,7 @@ void Handle::Callback(struct io_uring_cqe* cqe)
     //
     if (data & 0x2)
     {
-        ArmedHandle::Dispatch(cqe, data);
+        detail::ArmedDispatch(cqe, data);
         return;
     }
 

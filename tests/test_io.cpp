@@ -18,6 +18,7 @@
 #include "coop/signal.h"
 
 #include "coop/io/accept.h"
+#include "coop/io/armed_accept.h"
 #include "coop/io/connect.h"
 #include "coop/io/descriptor.h"
 #include "coop/io/handle.h"
@@ -1056,4 +1057,162 @@ TEST(IoTest, IowqWorkerCount)
     //
     int count = coop::io::IowqWorkerCount();
     EXPECT_GE(count, 0);
+}
+
+// -------------------------------------------------------------------------------------
+// ArmedAccept: multishot accept with bounded-queue backpressure
+// -------------------------------------------------------------------------------------
+
+namespace
+{
+
+// Nonblocking connect: the test drives client and server from one cooperator thread, so
+// a blocking connect against a full backlog would deadlock the whole test (nothing left
+// to run the accept side). EINPROGRESS is success here — the kernel completes the
+// handshake as the acceptor drains.
+//
+int ConnectLoopback(int listenFd)
+{
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (getsockname(listenFd, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+    {
+        return -1;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 &&
+        errno != EINPROGRESS)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+} // end anonymous namespace
+
+TEST(IoTest, ArmedAcceptStreams)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ListeningSocket ls;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor listener(coop::io::borrowed, ls.fd, uring);
+
+        coop::Coordinator coord;
+        coop::io::ArmedAccept armed(ctx, listener, &coord, 16);
+        armed.Arm();
+
+        std::vector<int> clients;
+        for (int i = 0; i < 3; i++)
+        {
+            int fd = ConnectLoopback(ls.fd);
+            ASSERT_GE(fd, 0);
+            clients.push_back(fd);
+        }
+
+        for (int i = 0; i < 3; i++)
+        {
+            int fd = armed.Next();
+            ASSERT_GE(fd, 0);
+
+            // Accepted with SOCK_NONBLOCK — required by the data-path engines
+            //
+            EXPECT_NE(fcntl(fd, F_GETFL) & O_NONBLOCK, 0);
+            close(fd);
+        }
+        EXPECT_EQ(armed.Delivered(), 3u);
+
+        for (int fd : clients)
+        {
+            close(fd);
+        }
+    });
+}
+
+TEST(IoTest, ArmedAcceptBackpressurePausesAndResumes)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ListeningSocket ls;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor listener(coop::io::borrowed, ls.fd, uring);
+
+        coop::Coordinator coord;
+        coop::io::ArmedAccept armed(ctx, listener, &coord, 4);
+        armed.Arm();
+
+        // Flood past the pending bound; the kernel-side backlog absorbs the rest while
+        // the multishot is paused.
+        //
+        std::vector<int> clients;
+        for (int i = 0; i < 12; i++)
+        {
+            int fd = ConnectLoopback(ls.fd);
+            ASSERT_GE(fd, 0);
+            clients.push_back(fd);
+        }
+
+        // Let the CQE stream reach the bound (Yield drives the scheduler's Poll)
+        //
+        for (int i = 0; i < 50; i++)
+        {
+            ctx->Yield(true);
+        }
+
+        // Every connection is eventually served across pause/resume cycles
+        //
+        for (int i = 0; i < 12; i++)
+        {
+            int fd = armed.Next();
+            ASSERT_GE(fd, 0) << "connection " << i;
+            close(fd);
+        }
+        EXPECT_EQ(armed.Delivered(), 12u);
+        EXPECT_GE(armed.Paused(), 1u);
+
+        for (int fd : clients)
+        {
+            close(fd);
+        }
+    });
+}
+
+TEST(IoTest, ArmedAcceptTeardownClosesQueuedFds)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ListeningSocket ls;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor listener(coop::io::borrowed, ls.fd, uring);
+
+        std::vector<int> clients;
+        {
+            coop::Coordinator coord;
+            coop::io::ArmedAccept armed(ctx, listener, &coord, 8);
+            armed.Arm();
+
+            for (int i = 0; i < 3; i++)
+            {
+                int fd = ConnectLoopback(ls.fd);
+                ASSERT_GE(fd, 0);
+                clients.push_back(fd);
+            }
+
+            // Consume one, leave the rest queued; the destructor must close them
+            //
+            int fd = armed.Next();
+            ASSERT_GE(fd, 0);
+            close(fd);
+        }
+
+        for (int fd : clients)
+        {
+            close(fd);
+        }
+    });
 }

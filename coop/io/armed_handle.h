@@ -179,6 +179,7 @@ struct ArmedHandle final : ArmedHandleImpl<ArmedHandle, ArmedRecvEntry>
     void OnCancelAck(struct io_uring_cqe* cqe);
     uint32_t QueueBound() const;
     bool ResumeOnEmpty() { return false; }   // recv never self-pauses
+    bool ParkKillAware() const { return false; } // post-kill drain reads are legal
 
     static void Dispatch(struct io_uring_cqe* cqe, uintptr_t data);
 

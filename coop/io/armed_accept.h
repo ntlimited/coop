@@ -79,6 +79,11 @@ struct ArmedAccept final : ArmedHandleImpl<ArmedAccept, ArmedAcceptEntry>
         return m_armed || m_pausing || m_cancelPending;
     }
 
+    // Kill must wake a parked acceptor even when the kernel never terminates the armed
+    // op; Next() then returns -ECANCELED and the accept loop exits.
+    //
+    bool ParkKillAware() const { return true; }
+
     static void Dispatch(struct io_uring_cqe* cqe, uintptr_t data);
 
 private:

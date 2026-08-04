@@ -26,8 +26,6 @@ ClientConnectionImpl<Derived>::ClientConnectionImpl(
 : m_desc(desc)
 , m_host(host)
 , m_timeout(timeout)
-, m_bufLen(0)
-, m_parsePos(0)
 , m_sendLen(0)
 , m_phase(RESPONSE_LINE)
 , m_contentLength(-1)
@@ -35,7 +33,6 @@ ClientConnectionImpl<Derived>::ClientConnectionImpl(
 , m_bodyRemaining(0)
 , m_responseLine{}
 , m_chunk{}
-, m_bufEpoch(0)
 , m_responseLineEpoch(0)
 , m_responseLineParsed(false)
 , m_chunkedDone(false)
@@ -75,41 +72,6 @@ void ClientConnectionImpl<Derived>::Reset()
 // -------------------------------------------------------------------------------------
 // Buffer management
 // -------------------------------------------------------------------------------------
-
-template<typename Derived>
-int ClientConnectionImpl<Derived>::RecvMore()
-{
-    if (m_bufLen >= RecvBufSize())
-    {
-        Compact();
-        if (m_bufLen >= RecvBufSize()) return 0;
-    }
-
-    int n = TransportRecv(RecvBuf() + m_bufLen, RecvBufSize() - m_bufLen, 0, m_timeout);
-    if (n <= 0) return -1;
-
-    m_bufLen += n;
-    return n;
-}
-
-template<typename Derived>
-void ClientConnectionImpl<Derived>::Compact()
-{
-    if (m_parsePos == 0) return;
-
-    // Bytes before m_parsePos — including the status line the memoized ResponseLine
-    // reason view points into — are discarded here (see GetResponseLine).
-    //
-    ++m_bufEpoch;
-
-    size_t remaining = m_bufLen - m_parsePos;
-    if (remaining > 0)
-    {
-        memmove(RecvBuf(), RecvBuf() + m_parsePos, remaining);
-    }
-    m_bufLen = remaining;
-    m_parsePos = 0;
-}
 
 // -------------------------------------------------------------------------------------
 // Phase 1: Response status line — "HTTP/1.1 200 OK\r\n"

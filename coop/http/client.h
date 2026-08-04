@@ -5,6 +5,7 @@
 #include <string_view>
 #include <sys/types.h>
 
+#include "detail/parser_buffer.hpp"
 #include "types.h"
 #include "coop/io/descriptor.h"
 #include "coop/time/interval.h"
@@ -24,8 +25,10 @@ namespace http
 // query strings).
 //
 template<typename Derived>
-struct ClientConnectionImpl
+struct ClientConnectionImpl : detail::ParserBuffer<Derived>
 {
+    friend struct detail::ParserBuffer<Derived>;
+
     ClientConnectionImpl(io::Descriptor& desc, const char* host,
                          time::Interval timeout);
 
@@ -138,8 +141,14 @@ struct ClientConnectionImpl
         DONE,
     };
 
-    int RecvMore();
-    void Compact();
+    using detail::ParserBuffer<Derived>::m_bufLen;
+    using detail::ParserBuffer<Derived>::m_parsePos;
+    using detail::ParserBuffer<Derived>::m_bufEpoch;
+    using detail::ParserBuffer<Derived>::RecvMore;
+    using detail::ParserBuffer<Derived>::Compact;
+
+    bool RecvAborted() const { return false; }   // no context; kill-awareness is the
+                                                 // caller's (guard/timeout) concern
 
     bool ParseResponseLine();
     bool AdvanceToPhase(Phase target);
@@ -150,8 +159,6 @@ struct ClientConnectionImpl
     const char*     m_host;
     time::Interval  m_timeout;
 
-    size_t          m_bufLen;
-    size_t          m_parsePos;
     size_t          m_sendLen;
 
     Phase           m_phase;
@@ -161,7 +168,6 @@ struct ClientConnectionImpl
 
     ResponseLine    m_responseLine;
     Chunk           m_chunk;
-    uint32_t        m_bufEpoch;          // bumped when recv-buffer bytes move (Compact)
     uint32_t        m_responseLineEpoch; // m_bufEpoch when the response line was parsed
     bool            m_responseLineParsed;
     bool            m_chunkedDone;

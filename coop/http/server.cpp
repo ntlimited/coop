@@ -327,8 +327,11 @@ static int BindListen(ServerConfiguration const& config)
 
 // The accept loop, shared by plaintext and TLS servers. One-shot accepts go through
 // the kill-aware blocking op; the multishot path arms one SQE for the listener's
-// lifetime and gets kill-awareness the amortized way — the guard's watcher shuts the
-// listener down on kill, which terminates the armed stream with an error.
+// lifetime and parks kill-aware (ArmedAccept::ParkKillAware) — a kill wakes the loop
+// directly, and ArmedAccept's teardown drain cancels the armed op ring-side. No
+// listener-shutdown guard: a second waiter on the same kill signal would race the
+// kill-aware park for a single notify, and a listener shutdown does not reliably
+// terminate an armed multishot accept anyway.
 //
 template<typename LaunchFn>
 static void AcceptLoop(Context* ctx, io::Descriptor& desc,
@@ -336,7 +339,6 @@ static void AcceptLoop(Context* ctx, io::Descriptor& desc,
 {
     if (config.multishotAccept)
     {
-        io::ShutdownOnKillGuard guard(ctx, desc, SHUT_RDWR);
         Coordinator coord;
         io::ArmedAccept armed(ctx, desc, &coord, config.maxPendingAccepts);
         armed.Arm();

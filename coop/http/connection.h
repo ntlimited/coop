@@ -67,6 +67,26 @@ struct ConnectionBase
     virtual bool EndChunked(const void* lastChunkData, size_t lastChunkSize) = 0;
     virtual bool Sendfile(int fileFd, off_t offset, size_t count) = 0;
 
+    // Component response API — for proxying and any response the composed methods above don't
+    // cover. BeginResponse writes the status line: known codes use pre-compiled fragments, any
+    // other code is formatted at runtime with `reason` (or a status-class default when empty).
+    // AppendHeader appends one header line; EndHeaders closes the block with the framework's
+    // Connection header and flushes. The caller owns body framing: append a Content-Length or
+    // Transfer-Encoding header (or ForceClose), then stream body bytes via SendRawBytes — or
+    // SendChunk/EndChunked when Transfer-Encoding: chunked was declared.
+    //
+    virtual bool BeginResponse(int status, std::string_view reason = {}) = 0;
+    virtual bool AppendHeader(const char* name, std::string_view value) = 0;
+    virtual bool AppendHeader(const char* name, size_t value) = 0;
+    virtual bool EndHeaders() = 0;
+
+    // Close the connection after the current response: the Connection header written by
+    // EndHeaders (or the composed send methods) says close and the keep-alive loop exits.
+    // For responses whose end can only be signaled by EOF, e.g. proxying an upstream
+    // response that carries no length framing.
+    //
+    virtual void ForceClose() = 0;
+
     virtual bool SendError() const = 0;
     virtual void Reset() = 0;
     virtual bool KeepAlive() const = 0;
@@ -116,6 +136,11 @@ struct ConnectionImpl : ConnectionBase
     bool EndChunked() override;
     bool EndChunked(const void* lastChunkData, size_t lastChunkSize) override;
     bool Sendfile(int fileFd, off_t offset, size_t count) override;
+    bool BeginResponse(int status, std::string_view reason = {}) override;
+    bool AppendHeader(const char* name, std::string_view value) override;
+    bool AppendHeader(const char* name, size_t value) override;
+    bool EndHeaders() override;
+    void ForceClose() override { m_clientClose = true; }
     bool SendError() const override { return m_sendError; }
     void Reset() override;
     bool KeepAlive() const override { return m_keepAlive && !m_clientClose; }
@@ -167,6 +192,8 @@ struct ConnectionImpl : ConnectionBase
     template<size_t N>
     bool AppendLiteral(const char (&s)[N]);
     bool AppendConnectionTrailer();
+    bool AppendStatusLine(int status, std::string_view reason);
+    bool AppendChunkedHeaders();
 
     enum Phase
     {

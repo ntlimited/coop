@@ -1,8 +1,8 @@
-# coop/http/ — HTTP Server Internals
+# coop/http/ — HTTP Internals
 
 For the API surface (Route, Connection pull API, response methods, RunServer), see the
-top-level `CLAUDE.md`. This file covers parser internals, buffer management, and performance
-characteristics.
+top-level `CLAUDE.md`. This file covers parser internals, buffer management, the client,
+and performance characteristics.
 
 ## Connection Buffer Management (`connection.cpp`)
 
@@ -52,6 +52,26 @@ trailers are pre-built `Fragment`s — memcpy'd via `Append`/`AppendLiteral`. Nu
 (Content-Length, chunk sizes) use hand-rolled `AppendUInt`/`AppendHex` (no snprintf). The
 write buffer flushes automatically on overflow or explicitly via `Flush()`.
 
+Status lines outside the pre-compiled table are formatted at runtime by `AppendStatusLine`:
+`HTTP/1.1 <code> <reason>` where the reason is the caller's (proxy passthrough of the
+upstream phrase) or `response::DefaultReason(code)`'s status-class fallback. All response
+methods route through it, so any 3-digit code is sendable.
+
+## Component Response API (proxying)
+
+`BeginResponse(status, reason)` / `AppendHeader(name, value)` / `EndHeaders()` emit the
+response in parts for responses the composed methods can't express — arbitrary header sets
+(Content-Range, ETag, x-amz-*), forwarded reason phrases. `EndHeaders` appends the
+framework's Connection header and flushes. Body framing is the caller's job: append
+Content-Length and stream via `SendRawBytes`, append `Transfer-Encoding: chunked` and use
+`SendChunk`/`EndChunked` (they skip their deferred-header path when `BeginChunked` wasn't
+used), or `ForceClose()` for EOF-framed passthrough. A proxy must not forward the upstream
+`Connection` header — `EndHeaders` owns it.
+
+`RequestLine::target`/`query` carry the raw request-target (path + query, verbatim) for
+upstream forwarding; `path` remains the pre-`?` slice. Views dangle once parsing advances —
+copy before consuming headers.
+
 For small responses (headers + body fit in 512B), the entire response coalesces in the send
 buffer and goes out in one `SendAll` syscall. Large bodies flush headers first, then send the
 body directly via `SendRaw`. Chunked encoding accumulates hex size + data + CRLF in the buffer,
@@ -66,6 +86,21 @@ coalescing that `WritevAll` previously handled.
 `Reset()` reinitializes parser state between requests on the same connection. It calls
 `Compact()` first to preserve any leftover pipelined data in the buffer, then zeroes all
 parser state. `SkipBody()` must be called before `Reset()` to drain unconsumed body bytes.
+
+## Client (`client.{h,cpp}`)
+
+`ClientConnection<Transport>` mirrors the server connection: CRTP parser, trailing dual
+buffers, phases `RESPONSE_LINE -> HEADERS -> BODY -> DONE`. Composed requests: `Get`,
+`Post`, `Head`, `SendRequest`. Component requests for arbitrary headers and streamed
+bodies: `BeginRequest(method, path)` (request line + Host, and remembers HEAD) /
+`AppendHeader(name, value)` / `EndHeaders()` (blank line + flush) / `SendBody(data, size)`
+(append + flush; oversized bodies bypass the buffer). Caller owns body framing via a
+Content-Length or Transfer-Encoding header.
+
+Response bodies: `ReadBody` handles Content-Length and chunked. HEAD responses and 204/304
+statuses are framing-only — `ReadBody` ends immediately while `ContentLength()` still
+reports the advertised entity length (a proxy forwards it), keeping the connection
+positioned for keep-alive reuse.
 
 ## Performance Profile (perf observations)
 

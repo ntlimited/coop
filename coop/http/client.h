@@ -39,6 +39,19 @@ struct ClientConnectionImpl
     bool Get(const char* path);
     bool Post(const char* path, const char* contentType,
               const void* body, size_t bodySize);
+    bool Head(const char* path);
+
+    // Component request API — for requests needing arbitrary headers (auth signatures,
+    // ranges, conditionals) or streamed bodies. BeginRequest writes the request line and
+    // Host header; AppendHeader appends one header; EndHeaders closes the block and
+    // flushes. The caller owns body framing: append a Content-Length (or Transfer-
+    // Encoding) header, then stream the body with SendBody.
+    //
+    bool BeginRequest(const char* method, const char* path);
+    bool AppendHeader(const char* name, std::string_view value);
+    bool AppendHeader(const char* name, size_t value);
+    bool EndHeaders();
+    bool SendBody(const void* data, size_t size);
 
     // --- Response parsing ---
     //
@@ -53,7 +66,9 @@ struct ClientConnectionImpl
     void SkipHeaderValue();
     void SkipHeaders();
 
-    // Phase 3: Body. Handles Content-Length and Transfer-Encoding: chunked.
+    // Phase 3: Body. Handles Content-Length and Transfer-Encoding: chunked. HEAD
+    // responses and 204/304 statuses are framing-only: body reads end immediately,
+    // whatever Content-Length said (which ContentLength() still reports, for forwarding).
     // Null = end of body or recv failure.
     //
     Chunk* ReadBody();
@@ -132,6 +147,7 @@ struct ClientConnectionImpl
 
     bool            m_keepAlive;
     bool            m_serverClose;
+    bool            m_isHead;
 };
 
 // ClientConnection<Transport> is the final concrete type. Same trailing-buffer pattern as the

@@ -335,6 +335,15 @@ conn->Send(200, "text/plain", body);
 **Response methods**: `Send` (status + body), `SendHeaders` (headers only), `BeginChunked` /
 `SendChunk` / `EndChunked` (chunked response), `Sendfile` (zero-copy file serving).
 
+**Component response API** (proxying): `BeginResponse(status, reason)` / `AppendHeader(name,
+value)` / `EndHeaders()` emit status line, arbitrary headers, and the Connection trailer as
+separate steps; body bytes then flow via `SendRawBytes` (Content-Length framing) or
+`SendChunk`/`EndChunked` (chunked). Any 3-digit status code works — codes outside the
+pre-compiled table are formatted at runtime with the given reason (e.g. an upstream's
+phrase) or a status-class default. `ForceClose()` makes the response close-framed and exits
+the keep-alive loop. `RequestLine` exposes `target`/`query` (raw request-target, verbatim)
+for upstream forwarding alongside the parsed `path`.
+
 `RunServer` accepts connections in a loop, launches an `HttpConnection` (Launchable, 32KB stack)
 per client. No method filtering in framework — handlers decide.
 

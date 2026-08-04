@@ -944,3 +944,448 @@ TEST(HttpClientTest, MalformedResponseReturnsNull)
         EXPECT_EQ(conn->GetResponseLine(), nullptr);
     });
 }
+
+// -------------------------------------------------------------------------------------
+// Request target: raw path + query for forwarding
+// -------------------------------------------------------------------------------------
+
+TEST(HttpTest, RequestTargetWithQuery)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client,
+            "GET /bucket/key?versionId=abc123&partNumber=2 HTTP/1.1\r\n"
+            "Host: localhost\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+        auto* req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->path, "/bucket/key");
+        EXPECT_EQ(req->query, "versionId=abc123&partNumber=2");
+        EXPECT_EQ(req->target, "/bucket/key?versionId=abc123&partNumber=2");
+
+        // Args parsing is unaffected by target capture
+        //
+        const char* name = conn->NextArgName();
+        ASSERT_NE(name, nullptr);
+        EXPECT_STREQ(name, "versionId");
+    });
+}
+
+TEST(HttpTest, RequestTargetNoQuery)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client, "GET /bucket/key HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+        auto* req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_TRUE(req->query.empty());
+        EXPECT_EQ(req->target, "/bucket/key");
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Component response API: BeginResponse / AppendHeader / EndHeaders
+// -------------------------------------------------------------------------------------
+
+TEST(HttpTest, ComponentResponseCustomHeaders)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client, "GET /obj HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+        conn->GetRequestLine();
+
+        EXPECT_TRUE(conn->BeginResponse(206));
+        EXPECT_TRUE(conn->AppendHeader("Content-Type", "application/octet-stream"));
+        EXPECT_TRUE(conn->AppendHeader("Content-Range", "bytes 2-6/10"));
+        EXPECT_TRUE(conn->AppendHeader("ETag", "\"abc123\""));
+        EXPECT_TRUE(conn->AppendHeader("Content-Length", size_t(5)));
+        EXPECT_TRUE(conn->EndHeaders());
+        EXPECT_TRUE(conn->SendRawBytes("llo w", 5));
+
+        server.Close();
+
+        std::string resp = RecvAll(client);
+        EXPECT_NE(resp.find("HTTP/1.1 206 Partial Content\r\n"), std::string::npos);
+        EXPECT_NE(resp.find("Content-Range: bytes 2-6/10\r\n"), std::string::npos);
+        EXPECT_NE(resp.find("ETag: \"abc123\"\r\n"), std::string::npos);
+        EXPECT_NE(resp.find("Content-Length: 5\r\n"), std::string::npos);
+        EXPECT_NE(resp.find("Connection: keep-alive\r\n\r\nllo w"), std::string::npos);
+    });
+}
+
+TEST(HttpTest, ComponentResponseRuntimeStatus)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+        conn->GetRequestLine();
+
+        // Status outside the pre-compiled table, with an upstream reason phrase (a
+        // string_view, not null-terminated — the proxy passthrough case)
+        //
+        std::string upstream = "Slow Down Please";
+        EXPECT_TRUE(conn->BeginResponse(599, std::string_view(upstream)));
+        EXPECT_TRUE(conn->AppendHeader("Content-Length", size_t(0)));
+        EXPECT_TRUE(conn->EndHeaders());
+
+        server.Close();
+
+        std::string resp = RecvAll(client);
+        EXPECT_NE(resp.find("HTTP/1.1 599 Slow Down Please\r\n"), std::string::npos);
+    });
+}
+
+TEST(HttpTest, ComponentResponseDefaultReason)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+        conn->GetRequestLine();
+
+        EXPECT_TRUE(conn->BeginResponse(418));
+        EXPECT_TRUE(conn->AppendHeader("Content-Length", size_t(0)));
+        EXPECT_TRUE(conn->EndHeaders());
+
+        server.Close();
+
+        std::string resp = RecvAll(client);
+        EXPECT_NE(resp.find("HTTP/1.1 418 Client Error\r\n"), std::string::npos);
+    });
+}
+
+TEST(HttpTest, ForceCloseSetsConnectionClose)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        SendString(client, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+        conn->GetRequestLine();
+
+        conn->ForceClose();
+        EXPECT_FALSE(conn->KeepAlive());
+
+        EXPECT_TRUE(conn->BeginResponse(200));
+        EXPECT_TRUE(conn->EndHeaders());
+        EXPECT_TRUE(conn->SendRawBytes("unframed body", 13));
+
+        server.Close();
+
+        std::string resp = RecvAll(client);
+        EXPECT_NE(resp.find("Connection: close\r\n\r\nunframed body"), std::string::npos);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: component request API — BeginRequest / AppendHeader / SendBody
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, ComponentRequestCustomHeaders)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "bucket.s3.amazonaws.com");
+
+        EXPECT_TRUE(conn->BeginRequest("PUT", "/key?partNumber=1&uploadId=xyz"));
+        EXPECT_TRUE(conn->AppendHeader("Authorization",
+            "AWS4-HMAC-SHA256 Credential=AKID/20260804/us-east-1/s3/aws4_request"));
+        EXPECT_TRUE(conn->AppendHeader("x-amz-content-sha256", "UNSIGNED-PAYLOAD"));
+        EXPECT_TRUE(conn->AppendHeader("Content-Length", size_t(8)));
+        EXPECT_TRUE(conn->EndHeaders());
+
+        // Stream the body in two pieces
+        //
+        EXPECT_TRUE(conn->SendBody("part", 4));
+        EXPECT_TRUE(conn->SendBody("data", 4));
+
+        std::string req = RecvAll(server);
+        EXPECT_NE(req.find("PUT /key?partNumber=1&uploadId=xyz HTTP/1.1\r\n"),
+                  std::string::npos);
+        EXPECT_NE(req.find("Host: bucket.s3.amazonaws.com\r\n"), std::string::npos);
+        EXPECT_NE(req.find("Authorization: AWS4-HMAC-SHA256"), std::string::npos);
+        EXPECT_NE(req.find("x-amz-content-sha256: UNSIGNED-PAYLOAD\r\n"),
+                  std::string::npos);
+        EXPECT_NE(req.find("Content-Length: 8\r\n"), std::string::npos);
+        EXPECT_NE(req.find("\r\n\r\npartdata"), std::string::npos);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Client: HEAD and 304 responses are framing-only — no body bytes on the wire
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, HeadResponseHasNoBody)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        EXPECT_TRUE(conn->Head("/object"));
+
+        std::string req = RecvAll(server);
+        EXPECT_NE(req.find("HEAD /object HTTP/1.1\r\n"), std::string::npos);
+
+        // HEAD response advertises the entity's length but carries no body
+        //
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 1234\r\n"
+            "ETag: \"abc\"\r\n"
+            "\r\n");
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 200);
+        conn->SkipHeaders();
+
+        // Content-Length is still reported (a proxy forwards it), but ReadBody ends
+        // immediately instead of waiting for 1234 bytes that will never arrive
+        //
+        EXPECT_EQ(conn->ContentLength(), 1234);
+        EXPECT_EQ(conn->ReadBody(), nullptr);
+
+        // The connection remains usable: a second request/response parses cleanly
+        //
+        conn->Reset();
+        EXPECT_TRUE(conn->Get("/next"));
+        RecvAll(server);
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 2\r\n"
+            "\r\n"
+            "ok");
+
+        resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        conn->SkipHeaders();
+
+        std::string body;
+        while (auto* chunk = conn->ReadBody())
+        {
+            body.append(static_cast<const char*>(chunk->data), chunk->size);
+        }
+        EXPECT_EQ(body, "ok");
+    });
+}
+
+TEST(HttpClientTest, NotModifiedResponseHasNoBody)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "localhost");
+
+        EXPECT_TRUE(conn->Get("/cached"));
+        RecvAll(server);
+
+        SendResponse(server,
+            "HTTP/1.1 304 Not Modified\r\n"
+            "Content-Length: 512\r\n"
+            "ETag: \"abc\"\r\n"
+            "\r\n");
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 304);
+        conn->SkipHeaders();
+        EXPECT_EQ(conn->ReadBody(), nullptr);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Proxy passthrough: client -> proxy (server conn + client conn) -> origin
+// -------------------------------------------------------------------------------------
+
+TEST(HttpProxyTest, PassThrough)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        auto* uring = coop::GetUring();
+
+        // Socketpair A: test client <-> proxy's server-side connection
+        // Socketpair B: proxy's upstream client connection <-> origin
+        //
+        SocketPair a;
+        SocketPair b;
+        coop::io::Descriptor testClient(a.fds[0], uring);
+        coop::io::Descriptor proxyDownstream(a.fds[1], uring);
+        coop::io::Descriptor proxyUpstream(b.fds[0], uring);
+        coop::io::Descriptor origin(b.fds[1], uring);
+
+        // Test client sends a ranged GET with conditional headers
+        //
+        SendString(testClient,
+            "GET /bucket/key?versionId=v7 HTTP/1.1\r\n"
+            "Host: proxy.local\r\n"
+            "Range: bytes=2-6\r\n"
+            "If-Match: \"etag1\"\r\n"
+            "\r\n");
+
+        // Proxy: parse the downstream request
+        //
+        coop::http::PlaintextTransport downTransport(proxyDownstream);
+        auto down = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            downTransport, ctx, ctx->GetCooperator());
+
+        auto* req = down->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        std::string method(req->method);
+        std::string target(req->target);
+
+        // Forward selected headers upstream. Header values are consumed as chunks;
+        // for this test they always fit in one chunk.
+        //
+        coop::http::PlaintextTransport upTransport(proxyUpstream);
+        auto up = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            upTransport, "bucket.s3.amazonaws.com");
+
+        ASSERT_TRUE(up->BeginRequest(method.c_str(), target.c_str()));
+        while (auto* name = down->NextHeaderName())
+        {
+            if (strcasecmp(name, "Range") == 0 || strcasecmp(name, "If-Match") == 0)
+            {
+                std::string headerName(name);
+                auto* value = down->ReadHeaderValue();
+                ASSERT_NE(value, nullptr);
+                ASSERT_TRUE(value->complete);
+                ASSERT_TRUE(up->AppendHeader(headerName.c_str(),
+                    std::string_view(static_cast<const char*>(value->data),
+                                     value->size)));
+            }
+            else
+            {
+                down->SkipHeaderValue();
+            }
+        }
+        ASSERT_TRUE(up->AppendHeader("Authorization", "AWS4-HMAC-SHA256 test"));
+        ASSERT_TRUE(up->EndHeaders());
+
+        // Origin: verify the forwarded request, respond 206 with entity headers
+        //
+        std::string upstreamReq = RecvAll(origin);
+        EXPECT_NE(upstreamReq.find("GET /bucket/key?versionId=v7 HTTP/1.1\r\n"),
+                  std::string::npos);
+        EXPECT_NE(upstreamReq.find("Host: bucket.s3.amazonaws.com\r\n"),
+                  std::string::npos);
+        EXPECT_NE(upstreamReq.find("Range: bytes=2-6\r\n"), std::string::npos);
+        EXPECT_NE(upstreamReq.find("If-Match: \"etag1\"\r\n"), std::string::npos);
+        EXPECT_NE(upstreamReq.find("Authorization: AWS4-HMAC-SHA256 test\r\n"),
+                  std::string::npos);
+
+        SendResponse(origin,
+            "HTTP/1.1 206 Partial Content\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Range: bytes 2-6/10\r\n"
+            "Content-Length: 5\r\n"
+            "ETag: \"etag1\"\r\n"
+            "x-amz-request-id: REQ123\r\n"
+            "\r\n"
+            "llo w");
+
+        // Proxy: forward status line, selected headers, and body downstream
+        //
+        auto* resp = up->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 206);
+        ASSERT_TRUE(down->BeginResponse(resp->status, resp->reason));
+
+        while (auto* name = up->NextHeaderName())
+        {
+            std::string headerName(name);
+            auto* value = up->ReadHeaderValue();
+            ASSERT_NE(value, nullptr);
+            ASSERT_TRUE(value->complete);
+            ASSERT_TRUE(down->AppendHeader(headerName.c_str(),
+                std::string_view(static_cast<const char*>(value->data), value->size)));
+        }
+        ASSERT_TRUE(down->EndHeaders());
+
+        while (auto* chunk = up->ReadBody())
+        {
+            ASSERT_TRUE(down->SendRawBytes(chunk->data, chunk->size));
+        }
+
+        proxyDownstream.Close();
+
+        // Test client: everything passed through
+        //
+        std::string finalResp = RecvAll(testClient);
+        EXPECT_NE(finalResp.find("HTTP/1.1 206 Partial Content\r\n"), std::string::npos);
+        EXPECT_NE(finalResp.find("Content-Range: bytes 2-6/10\r\n"), std::string::npos);
+        EXPECT_NE(finalResp.find("ETag: \"etag1\"\r\n"), std::string::npos);
+        EXPECT_NE(finalResp.find("x-amz-request-id: REQ123\r\n"), std::string::npos);
+        EXPECT_NE(finalResp.find("Content-Length: 5\r\n"), std::string::npos);
+        EXPECT_NE(finalResp.find("\r\n\r\nllo w"), std::string::npos);
+    });
+}

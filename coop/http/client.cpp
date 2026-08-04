@@ -36,6 +36,7 @@ ClientConnectionImpl<Derived>::ClientConnectionImpl(
 , m_pendingConnection(false)
 , m_keepAlive(true)
 , m_serverClose(false)
+, m_isHead(false)
 {
 }
 
@@ -59,6 +60,7 @@ void ClientConnectionImpl<Derived>::Reset()
     m_pendingTransferEncoding = false;
     m_pendingConnection     = false;
     m_serverClose           = false;
+    m_isHead                = false;
 }
 
 // -------------------------------------------------------------------------------------
@@ -462,6 +464,16 @@ Chunk* ClientConnectionImpl<Derived>::ReadBody()
     }
     if (m_phase != BODY) return nullptr;
 
+    // HEAD responses and 204/304 statuses are framing-only: the headers describe the
+    // entity but no body bytes follow on the wire, whatever Content-Length or
+    // Transfer-Encoding said.
+    //
+    if (m_isHead || m_responseLine.status == 204 || m_responseLine.status == 304)
+    {
+        m_phase = DONE;
+        return nullptr;
+    }
+
     if (m_chunkedBody)
     {
         return ReadChunkedBody();
@@ -615,6 +627,7 @@ Chunk* ClientConnectionImpl<Derived>::ReadChunkedBody()
 template<typename Derived>
 bool ClientConnectionImpl<Derived>::Append(const void* data, size_t size)
 {
+    if (size == 0) return true;
     if (size > SendBufSize())
     {
         if (!Flush()) return false;
@@ -686,11 +699,13 @@ bool ClientConnectionImpl<Derived>::SendRaw(const void* data, size_t size)
 // -------------------------------------------------------------------------------------
 
 template<typename Derived>
-bool ClientConnectionImpl<Derived>::SendRequest(
-    const char* method, const char* path,
-    const char* contentType,
-    const void* body, size_t bodySize)
+bool ClientConnectionImpl<Derived>::BeginRequest(const char* method, const char* path)
 {
+    // HEAD responses carry framing headers with no body bytes — remember the method so
+    // the response parser knows not to wait for one.
+    //
+    m_isHead = (strcasecmp(method, "HEAD") == 0);
+
     // Request line: "METHOD /path HTTP/1.1\r\n"
     //
     if (!Append(method, strlen(method))) return false;
@@ -702,19 +717,61 @@ bool ClientConnectionImpl<Derived>::SendRequest(
     //
     if (!AppendLiteral("Host: ")) return false;
     if (!Append(m_host, strlen(m_host))) return false;
+    return AppendLiteral("\r\n");
+}
+
+template<typename Derived>
+bool ClientConnectionImpl<Derived>::AppendHeader(const char* name, std::string_view value)
+{
+    if (!Append(name, strlen(name))) return false;
+    if (!AppendLiteral(": ")) return false;
+    if (!Append(value.data(), value.size())) return false;
+    return AppendLiteral("\r\n");
+}
+
+template<typename Derived>
+bool ClientConnectionImpl<Derived>::AppendHeader(const char* name, size_t value)
+{
+    if (!Append(name, strlen(name))) return false;
+    if (!AppendLiteral(": ")) return false;
+    if (!AppendUInt(value)) return false;
+    return AppendLiteral("\r\n");
+}
+
+template<typename Derived>
+bool ClientConnectionImpl<Derived>::EndHeaders()
+{
     if (!AppendLiteral("\r\n")) return false;
+    return Flush();
+}
+
+template<typename Derived>
+bool ClientConnectionImpl<Derived>::SendBody(const void* data, size_t size)
+{
+    if (size == 0) return true;
+    if (!Append(data, size)) return false;
+    return Flush();
+}
+
+template<typename Derived>
+bool ClientConnectionImpl<Derived>::SendRequest(
+    const char* method, const char* path,
+    const char* contentType,
+    const void* body, size_t bodySize)
+{
+    if (!BeginRequest(method, path)) return false;
 
     // Content-Type + Content-Length for requests with bodies
     //
     if (body && bodySize > 0 && contentType)
     {
-        if (!AppendLiteral("Content-Type: ")) return false;
-        if (!Append(contentType, strlen(contentType))) return false;
-        if (!AppendLiteral("\r\nContent-Length: ")) return false;
-        if (!AppendUInt(bodySize)) return false;
-        if (!AppendLiteral("\r\n")) return false;
+        if (!AppendHeader("Content-Type", contentType)) return false;
+        if (!AppendHeader("Content-Length", bodySize)) return false;
     }
 
+    // Terminate the header block directly (not EndHeaders — that flushes) so headers
+    // and a small body coalesce into one send.
+    //
     if (!AppendLiteral("\r\n")) return false;
 
     if (body && bodySize > 0)
@@ -729,6 +786,12 @@ template<typename Derived>
 bool ClientConnectionImpl<Derived>::Get(const char* path)
 {
     return SendRequest("GET", path);
+}
+
+template<typename Derived>
+bool ClientConnectionImpl<Derived>::Head(const char* path)
+{
+    return SendRequest("HEAD", path);
 }
 
 template<typename Derived>

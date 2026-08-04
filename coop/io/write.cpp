@@ -16,7 +16,14 @@ namespace coop
 namespace io
 {
 
-COOP_IO_IMPLEMENTATIONS(Write, io_uring_prep_write, WRITE_ARGS)
+static inline void PrepWrite(struct io_uring_sqe* sqe, int fd, const void* buf,
+                             size_t size, uint64_t offset, int rwFlags)
+{
+    io_uring_prep_write(sqe, fd, buf, size, offset);
+    sqe->rw_flags = rwFlags;
+}
+
+COOP_IO_IMPLEMENTATIONS(Write, PrepWrite, WRITE_ARGS)
 
 static inline void PrepWriteFixed(struct io_uring_sqe* sqe, int fd, FixedBuffer buf,
                                   size_t size, uint64_t offset)

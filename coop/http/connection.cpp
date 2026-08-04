@@ -12,6 +12,7 @@
 #include "coop/context.h"
 #include "coop/cooperator.h"
 #include "coop/self.h"
+#include "coop/io/detail/yield_budget.h"
 #include "coop/io/splice.h"
 #include "coop/io/uring.h"
 #include "coop/io/write.h"
@@ -782,12 +783,10 @@ int64_t ConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
             io::PipeLease pipe(m_desc.m_ring->GetPipePool());
             if (!pipe) return -EMFILE;
 
-            // A sender that always has bytes ready never blocks us through Poll —
-            // yield after each budget of unblocked progress so one body cannot
-            // monopolize the cooperator (nginx's sendfile_max_chunk lesson).
+            // Fairness: a sender that always has bytes ready never blocks us
+            // through Poll — the budget forces scheduler passes.
             //
-            constexpr size_t kYieldBudgetBytes = 2 * 1024 * 1024;
-            size_t sinceYield = 0;
+            io::detail::YieldBudget budget(m_ctx);
 
             while (m_bodyRemaining > 0)
             {
@@ -801,12 +800,9 @@ int64_t ConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
                 }
                 total += n;
                 m_bodyRemaining -= n;
-
-                sinceYield += static_cast<size_t>(n);
-                if (sinceYield >= kYieldBudgetBytes && m_bodyRemaining > 0)
+                if (m_bodyRemaining > 0)
                 {
-                    sinceYield = 0;
-                    m_ctx->Yield(true);
+                    budget.Charge(static_cast<size_t>(n));
                 }
             }
         }

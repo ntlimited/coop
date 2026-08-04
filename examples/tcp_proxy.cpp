@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include "coop/cooperator.h"
+#include "coop/io/detail/yield_budget.h"
 #include "coop/launchable.h"
 #include "coop/thread.h"
 #include "coop/io/io.h"
@@ -78,10 +79,12 @@ struct ProxyHandler : coop::Launchable
             int pipefd[2];
             pipe2(pipefd, O_NONBLOCK);
 
+            coop::io::detail::YieldBudget childBudget(childCtx);
             while (!childCtx->IsKilled())
             {
                 int n = coop::io::Splice(*clientPtr, *upstreamPtr, pipefd, 65536);
                 if (n <= 0) break;
+                childBudget.Charge(static_cast<size_t>(n));
             }
 
             close(pipefd[0]);
@@ -94,10 +97,12 @@ struct ProxyHandler : coop::Launchable
         int pipefd[2];
         pipe2(pipefd, O_NONBLOCK);
 
+        coop::io::detail::YieldBudget budget(ctx);
         while (!ctx->IsKilled())
         {
             int n = coop::io::Splice(upstream, m_client, pipefd, 65536);
             if (n <= 0) break;
+            budget.Charge(static_cast<size_t>(n));
 
             // If the child exited (client closed its write side), propagate the half-close
             // to upstream so it knows no more data is coming, then keep draining.

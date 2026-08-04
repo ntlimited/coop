@@ -1753,3 +1753,38 @@ TEST(HttpTest, RunServerMultishotAcceptRoundtrip)
         EXPECT_TRUE(serverReturned);
     });
 }
+
+// -------------------------------------------------------------------------------------
+// RecvPolicy::PollFirst — the client turnaround shape (send request, await response)
+// -------------------------------------------------------------------------------------
+
+TEST(HttpClientTest, PollFirstRoundtrip)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        coop::http::PlaintextTransport transport(client, coop::http::RecvPolicy::PollFirst);
+        auto conn = ctx->Allocate<HttpClient>(CLIENT_EXTRA,
+            transport, "origin.example");
+
+        EXPECT_TRUE(conn->Get("/x"));
+        RecvAll(server);
+        SendResponse(server,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+        auto* resp = conn->GetResponseLine();
+        ASSERT_NE(resp, nullptr);
+        EXPECT_EQ(resp->status, 200);
+        conn->SkipHeaders();
+        std::string body;
+        while (auto* chunk = conn->ReadBody())
+        {
+            body.append(static_cast<const char*>(chunk->data), chunk->size);
+        }
+        EXPECT_EQ(body, "ok");
+    });
+}

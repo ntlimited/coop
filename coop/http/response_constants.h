@@ -15,9 +15,14 @@ struct Fragment
     size_t size;
 };
 
-// Pre-compiled HTTP/1.1 status lines including trailing \r\n.
+// Pre-compiled HTTP/1.1 status lines including trailing \r\n. Returns a null-data Fragment
+// for codes outside the table — callers fall back to runtime formatting with DefaultReason.
 //
 Fragment StatusLine(int code);
+
+// Reason phrase for codes outside the pre-compiled table, by status class. Never null.
+//
+const char* DefaultReason(int code);
 
 // Header name prefixes — used with AppendLiteral for zero-overhead memcpy.
 //

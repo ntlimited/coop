@@ -15,6 +15,9 @@ struct RequestLine
 {
     std::string_view method;
     std::string_view path;      // before '?'
+    std::string_view query;     // after '?', empty if none
+    std::string_view target;    // full request-target (path + '?' + query), verbatim for
+                                // forwarding — a proxy sends this as the upstream path
 };
 
 // Parsed HTTP response status line. String_view points into the recv buffer.

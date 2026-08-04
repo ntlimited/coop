@@ -170,10 +170,22 @@ bool ConnectionImpl<Derived>::ParseRequestLine()
 
     if (RecvBuf()[i] == '?')
     {
-        m_parsePos = i + 1;
+        // Capture the raw query for target reconstruction. The caller (GetRequestLine)
+        // guarantees the full request line is buffered, so the terminating space/CR is
+        // present. Args parsing still consumes from just past the '?' as before.
+        //
+        size_t queryStart = i + 1;
+        size_t j = queryStart;
+        while (j < m_bufLen && base[j] != ' ' && base[j] != '\r') j++;
+
+        m_requestLine.query = std::string_view(base + queryStart, j - queryStart);
+        m_requestLine.target = std::string_view(base + pathStart, j - pathStart);
+        m_parsePos = queryStart;
     }
     else
     {
+        m_requestLine.query = {};
+        m_requestLine.target = m_requestLine.path;
         m_parsePos = i;
     }
 
@@ -809,6 +821,7 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::Append(const void* data, size_t size)
 {
     if (m_sendError) return false;
+    if (size == 0) return true;
 
     // Data larger than the entire send buffer: flush what we have, then send directly
     //
@@ -905,6 +918,28 @@ bool ConnectionImpl<Derived>::AppendConnectionTrailer()
     return AppendLiteral(response::CONN_CLOSE);
 }
 
+// Status line for any code: pre-compiled fragment when the code is in the table and no
+// custom reason is given, runtime-formatted otherwise.
+//
+template<typename Derived>
+bool ConnectionImpl<Derived>::AppendStatusLine(int status, std::string_view reason)
+{
+    assert(status >= 100 && status <= 999);
+
+    if (reason.empty())
+    {
+        auto sl = response::StatusLine(status);
+        if (sl.data) return Append(sl.data, sl.size);
+        reason = response::DefaultReason(status);
+    }
+
+    if (!AppendLiteral("HTTP/1.1 ")) return false;
+    if (!AppendUInt(static_cast<size_t>(status))) return false;
+    if (!AppendLiteral(" ")) return false;
+    if (!Append(reason.data(), reason.size())) return false;
+    return AppendLiteral(response::CRLF);
+}
+
 // -------------------------------------------------------------------------------------
 // Response
 // -------------------------------------------------------------------------------------
@@ -931,8 +966,7 @@ bool ConnectionImpl<Derived>::SendHeaders(int status, const char* contentType,
 {
     assert(!m_sendError);
 
-    auto sl = response::StatusLine(status);
-    if (!Append(sl.data, sl.size)) return false;
+    if (!AppendStatusLine(status, {})) return false;
     if (!AppendLiteral(response::CONTENT_TYPE)) return false;
     if (!Append(contentType, strlen(contentType))) return false;
     if (!AppendLiteral(response::CONTENT_LENGTH)) return false;
@@ -948,8 +982,7 @@ bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
 {
     assert(!m_sendError);
 
-    auto sl = response::StatusLine(status);
-    if (!Append(sl.data, sl.size)) return false;
+    if (!AppendStatusLine(status, {})) return false;
     if (!AppendLiteral(response::CONTENT_TYPE)) return false;
     if (!Append(contentType, strlen(contentType))) return false;
     if (!AppendLiteral(response::CONTENT_LENGTH)) return false;
@@ -994,25 +1027,31 @@ bool ConnectionImpl<Derived>::BeginChunked(int status, const char* contentType)
     return true;
 }
 
-// Append chunked response headers into the write buffer (deferred until first chunk).
+// Chunked response headers, deferred from BeginChunked until the first chunk (or EndChunked)
+// so the status line and headers coalesce with the first data flush.
 //
+template<typename Derived>
+bool ConnectionImpl<Derived>::AppendChunkedHeaders()
+{
+    m_chunkedHeadersPending = false;
+
+    if (!AppendStatusLine(m_chunkedStatus, {})) return false;
+    if (!AppendLiteral(response::CONTENT_TYPE)) return false;
+    if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
+    if (!AppendLiteral(response::CRLF)) return false;
+    if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
+    return AppendConnectionTrailer();
+}
+
 template<typename Derived>
 bool ConnectionImpl<Derived>::SendChunk(const void* data, size_t size)
 {
     assert(!m_sendError);
     if (size == 0) return false;
 
-    if (m_chunkedHeadersPending)
+    if (m_chunkedHeadersPending && !AppendChunkedHeaders())
     {
-        m_chunkedHeadersPending = false;
-
-        auto sl = response::StatusLine(m_chunkedStatus);
-        if (!Append(sl.data, sl.size)) return false;
-        if (!AppendLiteral(response::CONTENT_TYPE)) return false;
-        if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
-        if (!AppendLiteral(response::CRLF)) return false;
-        if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
-        if (!AppendConnectionTrailer()) return false;
+        return false;
     }
 
     if (!AppendHex(size)) return false;
@@ -1027,17 +1066,9 @@ bool ConnectionImpl<Derived>::EndChunked()
 {
     assert(!m_sendError);
 
-    if (m_chunkedHeadersPending)
+    if (m_chunkedHeadersPending && !AppendChunkedHeaders())
     {
-        m_chunkedHeadersPending = false;
-
-        auto sl = response::StatusLine(m_chunkedStatus);
-        if (!Append(sl.data, sl.size)) return false;
-        if (!AppendLiteral(response::CONTENT_TYPE)) return false;
-        if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
-        if (!AppendLiteral(response::CRLF)) return false;
-        if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
-        if (!AppendConnectionTrailer()) return false;
+        return false;
     }
 
     if (!AppendLiteral(response::CHUNKED_TERMINATOR)) return false;
@@ -1050,17 +1081,9 @@ bool ConnectionImpl<Derived>::EndChunked(const void* lastChunkData, size_t lastC
     assert(!m_sendError);
     if (lastChunkSize == 0) return EndChunked();
 
-    if (m_chunkedHeadersPending)
+    if (m_chunkedHeadersPending && !AppendChunkedHeaders())
     {
-        m_chunkedHeadersPending = false;
-
-        auto sl = response::StatusLine(m_chunkedStatus);
-        if (!Append(sl.data, sl.size)) return false;
-        if (!AppendLiteral(response::CONTENT_TYPE)) return false;
-        if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
-        if (!AppendLiteral(response::CRLF)) return false;
-        if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
-        if (!AppendConnectionTrailer()) return false;
+        return false;
     }
 
     if (!AppendHex(lastChunkSize)) return false;
@@ -1087,6 +1110,43 @@ bool ConnectionImpl<Derived>::Sendfile(int fileFd, off_t offset, size_t count)
         return false;
     }
     return true;
+}
+
+// -------------------------------------------------------------------------------------
+// Component response API — status line / headers / body as separate steps, for proxying
+// and responses the composed methods don't cover
+// -------------------------------------------------------------------------------------
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::BeginResponse(int status, std::string_view reason)
+{
+    assert(!m_sendError);
+    return AppendStatusLine(status, reason);
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::AppendHeader(const char* name, std::string_view value)
+{
+    if (!Append(name, strlen(name))) return false;
+    if (!AppendLiteral(": ")) return false;
+    if (!Append(value.data(), value.size())) return false;
+    return AppendLiteral(response::CRLF);
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::AppendHeader(const char* name, size_t value)
+{
+    if (!Append(name, strlen(name))) return false;
+    if (!AppendLiteral(": ")) return false;
+    if (!AppendUInt(value)) return false;
+    return AppendLiteral(response::CRLF);
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::EndHeaders()
+{
+    if (!AppendConnectionTrailer()) return false;
+    return Flush();
 }
 
 // -------------------------------------------------------------------------------------

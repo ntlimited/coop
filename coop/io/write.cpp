@@ -18,5 +18,13 @@ namespace io
 
 COOP_IO_IMPLEMENTATIONS(Write, io_uring_prep_write, WRITE_ARGS)
 
+static inline void PrepWriteFixed(struct io_uring_sqe* sqe, int fd, FixedBuffer buf,
+                                  size_t size, uint64_t offset)
+{
+    io_uring_prep_write_fixed(sqe, fd, buf.data, size, offset, buf.index);
+}
+
+COOP_IO_IMPLEMENTATIONS(Write, PrepWriteFixed, WRITE_FIXED_ARGS)
+
 } // end namespace coop::io
 } // end namespace coop

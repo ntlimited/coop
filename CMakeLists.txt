@@ -199,6 +199,7 @@ add_executable(coop_tests
     tests/test_registered.cpp
     tests/test_semaphore.cpp
     tests/test_deadline.cpp
+    tests/test_group.cpp
     tests/test_direct_yield.cpp
     tests/test_timer.cpp
     tests/test_work_deque.cpp

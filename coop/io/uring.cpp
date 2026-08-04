@@ -330,6 +330,22 @@ void Uring::Init()
         }
     }
 
+    // Optional io-wq worker caps. The bounded pool (buffered file IO that punts) defaults
+    // to min(sq_entries, 4 * cpus) PER RING, and coop runs one ring per cooperator — an
+    // explicit cap bounds the process-wide aggregate. Warn-and-continue on kernels
+    // without IORING_REGISTER_IOWQ_MAX_WORKERS (pre-5.15), like every probe above.
+    //
+    if (m_config.iowqMaxBoundedWorkers > 0 || m_config.iowqMaxUnboundedWorkers > 0)
+    {
+        unsigned int caps[2] = { m_config.iowqMaxBoundedWorkers,
+                                 m_config.iowqMaxUnboundedWorkers };
+        ret = io_uring_register_iowq_max_workers(&m_ring, caps);
+        if (ret < 0)
+        {
+            spdlog::warn("uring register_iowq_max_workers failed ret={}", ret);
+        }
+    }
+
     // Register the optional default provided buffer ring. The registration doubles as the runtime
     // feature probe: on a kernel without pbuf-ring support (pre-5.19) io_uring_setup_buf_ring
     // fails, and we warn and continue with no default ring -- classic recv is untouched -- exactly

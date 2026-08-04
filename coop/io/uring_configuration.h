@@ -71,6 +71,18 @@ struct UringConfiguration
     uint32_t bufferRingEntries = 0;
     uint32_t bufferRingBufSize = 4096;
     uint16_t bufferRingGroup = 0;
+
+    // IORING_REGISTER_IOWQ_MAX_WORKERS caps for this ring's kernel worker pools
+    // ([bounded, unbounded]; 0 = keep the kernel default). The bounded pool (regular
+    // files, buffered reads/writes that punt) defaults to min(sq_entries, 4 * cpus) PER
+    // RING — with one ring per cooperator the process-wide aggregate scales with
+    // cooperator count, so a many-cooperator deployment doing buffered file IO may want
+    // an explicit cap. coop never submits work that reaches the unbounded pool today
+    // (sockets ride poll-arm retry, IOSQE_ASYNC is never set); the unbounded cap is
+    // insurance. Applied at Init with warn-and-continue on unsupported kernels (5.15+).
+    //
+    uint32_t iowqMaxBoundedWorkers = 0;
+    uint32_t iowqMaxUnboundedWorkers = 0;
 };
 
 static const UringConfiguration s_defaultUringConfiguration = {

@@ -35,6 +35,8 @@ ClientConnectionImpl<Derived>::ClientConnectionImpl(
 , m_bodyRemaining(0)
 , m_responseLine{}
 , m_chunk{}
+, m_bufEpoch(0)
+, m_responseLineEpoch(0)
 , m_responseLineParsed(false)
 , m_chunkedDone(false)
 , m_valueConsumed(true)
@@ -95,6 +97,11 @@ void ClientConnectionImpl<Derived>::Compact()
 {
     if (m_parsePos == 0) return;
 
+    // Bytes before m_parsePos — including the status line the memoized ResponseLine
+    // reason view points into — are discarded here (see GetResponseLine).
+    //
+    ++m_bufEpoch;
+
     size_t remaining = m_bufLen - m_parsePos;
     if (remaining > 0)
     {
@@ -113,7 +120,21 @@ ResponseLine* ClientConnectionImpl<Derived>::GetResponseLine()
 {
     if (m_responseLineParsed)
     {
-        return m_responseLine.status > 0 ? &m_responseLine : nullptr;
+        if (m_responseLine.status <= 0)
+        {
+            return nullptr;
+        }
+
+        // The memoized reason view points into recv-buffer bytes that Compact() has
+        // since discarded — copy or forward it before header/body parsing (client.h).
+        //
+        if (m_responseLineEpoch != m_bufEpoch)
+        {
+            assert(false && "ResponseLine view invalidated by buffer compaction — "
+                            "copy status/reason before parsing headers");
+            return nullptr;
+        }
+        return &m_responseLine;
     }
     m_responseLineParsed = true;
 
@@ -128,6 +149,7 @@ ResponseLine* ClientConnectionImpl<Derived>::GetResponseLine()
         {
             if (!ParseResponseLine()) return nullptr;
             m_parsePos = (cr - RecvBuf()) + 2;
+            m_responseLineEpoch = m_bufEpoch;
             m_phase = HEADERS;
             return &m_responseLine;
         }

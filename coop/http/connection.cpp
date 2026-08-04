@@ -37,6 +37,8 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_bodyRemaining(0)
 , m_requestLine{}
 , m_chunk{}
+, m_bufEpoch(0)
+, m_requestLineEpoch(0)
 , m_requestLineParsed(false)
 , m_chunkedDone(false)
 , m_valueConsumed(true)
@@ -107,6 +109,12 @@ void ConnectionImpl<Derived>::Compact()
 {
     if (m_parsePos == 0) return;
 
+    // Bytes before m_parsePos — including the request line the memoized RequestLine
+    // views point into — are discarded here. The epoch bump lets GetRequestLine detect
+    // that its views no longer reference live bytes.
+    //
+    ++m_bufEpoch;
+
     size_t remaining = m_bufLen - m_parsePos;
     if (remaining > 0)
     {
@@ -125,7 +133,22 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
 {
     if (m_requestLineParsed)
     {
-        return m_requestLine.method.empty() ? nullptr : &m_requestLine;
+        if (m_requestLine.method.empty())
+        {
+            return nullptr;
+        }
+
+        // The memoized views point into recv-buffer bytes that Compact() has since
+        // discarded — serving them would read reused memory. Callers must copy what
+        // they need before header/body parsing (see connection.h).
+        //
+        if (m_requestLineEpoch != m_bufEpoch)
+        {
+            assert(false && "RequestLine views invalidated by buffer compaction — "
+                            "copy method/path/target before parsing headers");
+            return nullptr;
+        }
+        return &m_requestLine;
     }
     m_requestLineParsed = true;
 
@@ -139,6 +162,7 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
         if (cr && cr + 1 < RecvBuf() + m_bufLen && cr[1] == '\n')
         {
             if (!ParseRequestLine()) return nullptr;
+            m_requestLineEpoch = m_bufEpoch;
             m_phase = ARGS;
             return &m_requestLine;
         }

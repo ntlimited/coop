@@ -3,6 +3,7 @@
 #include "transport.h"
 #include "tls_transport.h"
 
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -10,6 +11,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <spdlog/spdlog.h>
 
 #include "coop/alloc.h"
 #include "coop/cooperator.h"
@@ -253,9 +256,55 @@ struct HttpTlsConnection : Launchable
     time::Interval      m_timeout;
 };
 
+// Create, bind, and listen the server socket with checked returns. An assert-only
+// version of this block once let a release build miss bind(443) (EACCES without
+// CAP_NET_BIND_SERVICE) and then listen() autobound an ephemeral port — a
+// healthy-looking server unreachable on its configured port, with no diagnostic.
+// Returns the listening fd, or -1 with the failure logged.
+//
+static int BindListen(int port)
+{
+    int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (serverFd < 0)
+    {
+        spdlog::error("http server socket() failed: {}", strerror(errno));
+        return -1;
+    }
+
+    int on = 1;
+    if (setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0 ||
+        setsockopt(serverFd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) != 0)
+    {
+        spdlog::error("http server setsockopt failed: {}", strerror(errno));
+        close(serverFd);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in)) != 0)
+    {
+        spdlog::error("http server bind(port={}) failed: {}", port, strerror(errno));
+        close(serverFd);
+        return -1;
+    }
+
+    if (listen(serverFd, 512) != 0)
+    {
+        spdlog::error("http server listen(port={}) failed: {}", port, strerror(errno));
+        close(serverFd);
+        return -1;
+    }
+
+    return serverFd;
+}
+
 } // end anonymous namespace
 
-void RunServer(
+bool RunServer(
     Context* ctx,
     int port,
     const Route* routes,
@@ -266,25 +315,11 @@ void RunServer(
 {
     ctx->SetName(name);
 
-    int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    assert(serverFd > 0);
-
-    int on = 1;
-    int ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    assert(ret == 0);
-    ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
-    assert(ret == 0);
-
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
-    assert(ret == 0);
-
-    ret = listen(serverFd, 512);
-    assert(ret == 0);
+    int serverFd = BindListen(port);
+    if (serverFd < 0)
+    {
+        return false;
+    }
 
     auto* co = ctx->GetCooperator();
     io::Descriptor desc(serverFd);
@@ -301,9 +336,10 @@ void RunServer(
         co->Launch<HttpConnection>(config, fd, co, routes, routeCount, searchPaths, timeout);
         ctx->Yield();
     }
+    return true;
 }
 
-void RunTlsServer(
+bool RunTlsServer(
     Context* ctx,
     int port,
     const Route* routes,
@@ -315,25 +351,11 @@ void RunTlsServer(
 {
     ctx->SetName(name);
 
-    int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    assert(serverFd > 0);
-
-    int on = 1;
-    int ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    assert(ret == 0);
-    ret = setsockopt(serverFd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
-    assert(ret == 0);
-
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    ret = bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
-    assert(ret == 0);
-
-    ret = listen(serverFd, 512);
-    assert(ret == 0);
+    int serverFd = BindListen(port);
+    if (serverFd < 0)
+    {
+        return false;
+    }
 
     auto* co = ctx->GetCooperator();
     io::Descriptor desc(serverFd);
@@ -353,6 +375,7 @@ void RunTlsServer(
                                       sslCtx, searchPaths, timeout);
         ctx->Yield();
     }
+    return true;
 }
 
 } // end namespace coop::http

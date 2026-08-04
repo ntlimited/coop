@@ -2107,3 +2107,37 @@ TEST(HttpTest, KeepAliveClientDisconnectDoesNotSpin)
         for (int i = 0; i < 100; i++) ctx->Yield(true);
     });
 }
+
+// A peer that closes mid-header-block (an incomplete request, then EOF) must not spin
+// the parser: AdvanceToPhase used to loop forever when SkipHeaders hit EOF without
+// advancing the phase. Surfaced by graceful drain's SHUT_RD mid-parse.
+//
+TEST(HttpTest, MidHeaderEofDoesNotSpinParser)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor client(sp.fds[0], uring);
+        coop::io::Descriptor server(sp.fds[1], uring);
+
+        // Complete request line, one header, then close — no terminating blank line.
+        //
+        SendString(client, "GET /x HTTP/1.1\r\nHost: t\r\n");
+        client.Close();
+        sp.fds[0] = -1;
+
+        coop::http::PlaintextTransport transport(server);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            transport, ctx, ctx->GetCooperator());
+
+        auto* req = conn->GetRequestLine();
+        ASSERT_NE(req, nullptr);
+        EXPECT_EQ(req->path, "/x");
+
+        // SkipBody advances through the truncated header block; must terminate, not spin.
+        //
+        conn->SkipBody();
+        EXPECT_EQ(conn->ReadBody(), nullptr);   // no body; reached DONE cleanly
+    });
+}

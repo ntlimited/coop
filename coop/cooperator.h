@@ -328,6 +328,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         return m_contexts.Size();
     }
 
+    // Live contexts excluding daemons (SpawnConfiguration::daemon) — the "real work"
+    // count a drain waits to reach zero. O(n) in total contexts (Size walks), so a
+    // control-plane query, not a hot-path read.
+    //
+    size_t NonDaemonContexts() const { return m_contexts.Size() - m_daemonCount; }
+
     size_t YieldedCount() const
     {
         return m_yielded.Size();
@@ -470,6 +476,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     friend struct CooperatorVar;
 
     Context::AllContextsList    m_contexts;
+    size_t                      m_daemonCount{0};
     Context::ContextStateList   m_yielded;
     Context::ContextStateList   m_blocked;
     Coordinated::List           m_pendingContinuations;

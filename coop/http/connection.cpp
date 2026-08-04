@@ -193,6 +193,7 @@ bool ConnectionImpl<Derived>::AdvanceToPhase(Phase target)
 {
     while (m_phase < target)
     {
+        Phase before = m_phase;
         switch (m_phase)
         {
             case REQUEST_LINE:
@@ -213,6 +214,16 @@ bool ConnectionImpl<Derived>::AdvanceToPhase(Phase target)
 
             case DONE:
                 return false;
+        }
+
+        // A skip step that made no progress hit EOF/error mid-phase (e.g. the peer
+        // closed while the header block was incomplete). Without this, the phase never
+        // advances and the loop spins on recv-returns-EOF. Treat it as terminal.
+        //
+        if (m_phase == before)
+        {
+            m_phase = DONE;
+            return false;
         }
     }
     return true;

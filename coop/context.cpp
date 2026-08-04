@@ -19,6 +19,7 @@ Context::Context(
 , m_currentPriority(config.priority)
 , m_cooperator(cooperator)
 , m_deadlineUs(parent ? parent->m_deadlineUs : 0)
+, m_daemon(config.daemon)
 , m_killedSignal(this)
 {
     if (m_handle)
@@ -42,6 +43,11 @@ Context::Context(
     m_statistics.ioCompletes = 0;
     m_statistics.samples = 0;
     m_lastRdtsc = 0;
+
+    if (m_daemon)
+    {
+        m_cooperator->m_daemonCount++;
+    }
 }
 
 Context::~Context()
@@ -66,6 +72,10 @@ Context::~Context()
     // Wait on the last child before we allow the context to be cleaned up
     //
     m_lastChild.Acquire(this);
+    if (m_daemon)
+    {
+        m_cooperator->m_daemonCount--;
+    }
     m_cooperator->m_contexts.Remove(this);
 }
 

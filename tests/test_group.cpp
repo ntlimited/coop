@@ -7,6 +7,7 @@
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"
 #include "coop/coordinate_with.h"
+#include "coop/signal.h"
 #include "coop/group.h"
 #include "coop/self.h"
 
@@ -147,5 +148,36 @@ TEST(GroupTest, EmptyGroupWaitsImmediately)
         coop::Group g(ctx);
         EXPECT_TRUE(g.Wait());
         EXPECT_EQ(g.InFlight(), 0u);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// Daemon contexts are excluded from the "real work" count
+// -------------------------------------------------------------------------------------
+
+TEST(DaemonTest, DaemonExcludedFromNonDaemonCount)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        auto* co = ctx->GetCooperator();
+        size_t baseNonDaemon = co->NonDaemonContexts();
+
+        coop::Signal hold(ctx);   // broadcast: one Notify wakes all waiters
+
+        // A regular child raises the non-daemon count; a daemon child does not.
+        //
+        co->Spawn([&](coop::Context* c) { hold.Wait(c); });
+        co->Spawn({.priority = 0, .stackSize = 16384, .daemon = true},
+                  [&](coop::Context* c) { hold.Wait(c); });
+
+        for (int i = 0; i < 5; i++) ctx->Yield(true);
+
+        // +1 for the regular child; the daemon is excluded.
+        //
+        EXPECT_EQ(co->NonDaemonContexts(), baseNonDaemon + 1);
+
+        hold.Notify(ctx, false);
+        for (int i = 0; i < 10; i++) ctx->Yield(true);
+        EXPECT_EQ(co->NonDaemonContexts(), baseNonDaemon);
     });
 }

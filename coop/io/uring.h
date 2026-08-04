@@ -151,8 +151,15 @@ struct Uring
     // io_uring fd registration table. Slots contain the real fd or -1 for empty. Registration is
     // opt-in via the Descriptor(Registered, ...) constructor. When a descriptor is registered, its
     // slot index is stored in Descriptor::m_registeredIndex and operations use IOSQE_FIXED_FILE.
+    // The kernel-side table is registered SPARSE at Init; per-descriptor slots attach and detach
+    // through FILES_UPDATE. m_freeSlots makes allocation O(1); m_registrationBroken is the sticky
+    // latch — after the first update failure the feature is off for the ring's lifetime rather
+    // than degrading per call (a failing registration path is a configuration problem, and
+    // half-registered workloads are harder to reason about than unregistered ones).
     //
     std::vector<int> m_registered;
+    std::vector<int> m_freeSlots;
+    bool m_registrationBroken{false};
     UringConfiguration m_config;
 
     // Optional default provided buffer ring, registered by Init when configured and supported.

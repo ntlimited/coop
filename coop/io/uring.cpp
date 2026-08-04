@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <spdlog/spdlog.h>
 
@@ -318,15 +319,37 @@ void Uring::Init()
 
     if (!m_registered.empty())
     {
-        ret = io_uring_register_files(&m_ring, m_registered.data(), m_registered.size());
-        if (ret < 0)
+        // Sparse registration: the kernel allocates an empty fixed-file table and slots
+        // attach later through FILES_UPDATE — no full-table upload at Init. Pre-check
+        // RLIMIT_NOFILE headroom ourselves: liburing's helper reacts to -EMFILE by
+        // silently setrlimit()ing the PROCESS limit and retrying, and a per-ring library
+        // call must not mutate process-global state (coop is N rings in one process).
+        //
+        rlimit nofile{};
+        if (getrlimit(RLIMIT_NOFILE, &nofile) == 0 &&
+            m_registered.size() > nofile.rlim_cur)
         {
-            spdlog::warn("uring register_files failed ret={}", ret);
-            m_registered.clear();
+            spdlog::warn("uring registeredSlots={} exceeds RLIMIT_NOFILE={}; "
+                         "fd registration disabled (raise the rlimit at startup)",
+                         m_registered.size(), nofile.rlim_cur);
         }
         else
         {
-            m_filesRegistered = true;
+            ret = io_uring_register_files_sparse(&m_ring, m_registered.size());
+            if (ret < 0)
+            {
+                spdlog::warn("uring register_files_sparse failed ret={}", ret);
+                m_registered.clear();
+            }
+            else
+            {
+                m_filesRegistered = true;
+                m_freeSlots.reserve(m_registered.size());
+                for (int i = static_cast<int>(m_registered.size()) - 1; i >= 0; i--)
+                {
+                    m_freeSlots.push_back(i);
+                }
+            }
         }
     }
 
@@ -839,26 +862,33 @@ void Uring::Run(Context* ctx)
 
 void Uring::Register(Descriptor* descriptor)
 {
-    int slots = static_cast<int>(m_registered.size());
-    for (int i = 0; i < slots; i++)
+    if (!m_filesRegistered || m_registrationBroken || m_freeSlots.empty())
     {
-        if (m_registered[i] == -1)
-        {
-            m_registered[i] = descriptor->m_fd;
-            int ret = io_uring_register_files_update(&m_ring, i, &descriptor->m_fd, 1);
-            if (ret < 0)
-            {
-                spdlog::warn("uring register_files_update failed fd={} ret={}",
-                    descriptor->m_fd, ret);
-                m_registered[i] = -1;
-                return;
-            }
-            descriptor->m_registeredIndex = i;
-            SPDLOG_TRACE("uring register fd={} slot={}", descriptor->m_fd, i);
-            return;
-        }
+        SPDLOG_DEBUG("uring register fd={} unavailable (registered={} broken={} free={})",
+            descriptor->m_fd, m_filesRegistered, m_registrationBroken, m_freeSlots.size());
+        return;
     }
-    SPDLOG_DEBUG("uring register fd={} no slot available", descriptor->m_fd);
+
+    int i = m_freeSlots.back();
+    m_freeSlots.pop_back();
+
+    int ret = io_uring_register_files_update(&m_ring, i, &descriptor->m_fd, 1);
+    if (ret < 0)
+    {
+        // Sticky latch: a failing update path is a configuration problem (rlimits,
+        // kernel state), and half-registered workloads are harder to reason about than
+        // unregistered ones. Disable for the ring's lifetime.
+        //
+        spdlog::warn("uring register_files_update failed fd={} ret={}; "
+                     "fd registration disabled for this ring", descriptor->m_fd, ret);
+        m_freeSlots.push_back(i);
+        m_registrationBroken = true;
+        return;
+    }
+
+    m_registered[i] = descriptor->m_fd;
+    descriptor->m_registeredIndex = i;
+    SPDLOG_TRACE("uring register fd={} slot={}", descriptor->m_fd, i);
 }
 
 void Uring::Unregister(Descriptor* descriptor)
@@ -871,8 +901,17 @@ void Uring::Unregister(Descriptor* descriptor)
     int ret = io_uring_register_files_update(&m_ring, idx, &negOne, 1);
     if (ret < 0)
     {
-        spdlog::warn("uring unregister_files_update failed fd={} slot={} ret={}",
+        // The slot may still pin the file kernel-side — do NOT recycle it (a future
+        // occupant would alias), and latch the feature off.
+        //
+        spdlog::warn("uring unregister_files_update failed fd={} slot={} ret={}; "
+                     "slot quarantined, fd registration disabled for this ring",
             descriptor->m_fd, idx, ret);
+        m_registrationBroken = true;
+    }
+    else
+    {
+        m_freeSlots.push_back(idx);
     }
     descriptor->m_registeredIndex = -1;
     SPDLOG_TRACE("uring unregister fd={} slot={}", descriptor->m_fd, idx);

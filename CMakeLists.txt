@@ -245,6 +245,9 @@ target_link_libraries(coop_benchmarks PRIVATE coop benchmark::benchmark_main)
 add_executable(bench_buffer_ring_throughput benchmarks/bench_buffer_ring_throughput.cpp)
 target_link_libraries(bench_buffer_ring_throughput PRIVATE coop)
 
+add_executable(bench_disk_path benchmarks/bench_disk_path.cpp)
+target_link_libraries(bench_disk_path PRIVATE coop)
+
 add_executable(bench_timer_fanout benchmarks/bench_timer_fanout.cpp)
 target_link_libraries(bench_timer_fanout PRIVATE coop)
 target_link_options(bench_timer_fanout PRIVATE -rdynamic)

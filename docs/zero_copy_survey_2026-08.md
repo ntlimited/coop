@@ -89,6 +89,19 @@ research time; items flagged unverified should be confirmed before entering a de
 
 1. `SpliceToFile` vs ring-bounce (Recv + `io::Write`) for receive-to-disk at 4K/64K/1M/
    16M bodies — decides the default engine under `ReadBodyToFile`.
+
+   **Answered** (`benchmarks/bench_disk_path.cpp`, TCP loopback, warm page cache,
+   interleaved rounds, shared 8-core host under ~12 ambient load — treat as
+   directional): splice wins every size class, ~2x wall throughput at 64K-16M and ~5x
+   at 4K, at 55-75% less CPU per GiB (e.g. 1M: 4.9-5.3 GiB/s at 0.28-0.32 cpu-sec/GiB
+   vs 2.3-2.6 GiB/s at 0.42-0.47). Splice stays the default engine.
+
+   Why the survey's "bounce wins" prediction inverted here: that argument priced the
+   bounce as fully-inline io_uring ops with ~0 amortized syscalls. coop's bounce today
+   is blocking-style ops — a fastpath recv plus a full ring round trip per `io::Write`
+   — so its syscall budget matches splice's two-per-hop while paying both memcpys.
+   Revisit the comparison if/when registered-buffer `WRITE_FIXED` batching lands; until
+   then the survey's table row does not describe coop's actual bounce.
 2. Serve-after-fill hit-rate window for real traffic — decides buffered+DONTCACHE vs
    O_DIRECT for the cache tier.
 3. MSG_MORE / writev-first-chunk / cork for header+body coalescing.

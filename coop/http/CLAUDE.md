@@ -137,3 +137,6 @@ nearly invisible in profiles.
   and response-size-scaling scenarios. Always run in release mode.
 - `benchmarks/bench_server.cpp`: Standalone HTTP server for external load testing with wrk.
   Supports `--sqpoll` flag for SQPOLL mode. Usage: `bench_server [port] [--sqpoll]`
+- `benchmarks/bench_disk_path.cpp`: Standalone receive-to-disk engine A/B (SpliceToFile vs
+  recv+write bounce) over TCP loopback. Run in release, pinned. Result and interpretation
+  recorded in `docs/zero_copy_survey_2026-08.md`.

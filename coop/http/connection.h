@@ -29,7 +29,15 @@ struct ConnectionBase
 
     virtual ~ConnectionBase() = default;
 
-    // Phase 1: Request line. Lazy, memoized. Null = parse failure.
+    // Phase 1: Request line. Lazy, memoized. Null = parse failure — or, on a repeat
+    // call, that the views have been invalidated by buffer movement (see below).
+    //
+    // View lifetime: RequestLine's string_views point into the recv buffer, and the
+    // bytes they reference are DISCARDED the first time later parsing compacts the
+    // buffer (large or split header blocks, body reads). Copy what must outlive header
+    // iteration — a proxy copies method/target before forwarding headers. Repeat
+    // GetRequestLine() calls after invalidation return null (and assert in debug)
+    // rather than serving views into reused memory.
     //
     virtual RequestLine* GetRequestLine() = 0;
 
@@ -245,6 +253,8 @@ struct ConnectionImpl : ConnectionBase
 
     RequestLine     m_requestLine;
     Chunk           m_chunk;
+    uint32_t        m_bufEpoch;         // bumped when recv-buffer bytes move (Compact)
+    uint32_t        m_requestLineEpoch; // m_bufEpoch when the request line was parsed
     bool            m_requestLineParsed;
     bool            m_chunkedDone;
     bool            m_valueConsumed;

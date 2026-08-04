@@ -31,10 +31,23 @@ research time; items flagged unverified should be confirmed before entering a de
    caching proxy: data rides the page cache (coherency, readahead, write combining, no
    alignment rules) but pages drop once IO completes. Axboe: 65% faster at half the CPU
    on a thrash benchmark. Per-IO policy: large streaming fills use it, small hot objects
-   stay buffered. O_DIRECT + registered buffers remains the ceiling (up to 4.8× write
-   throughput in the VLDB io_uring-for-DBMS study) but obliges building our own cache.
+   stay buffered. O_DIRECT + registered buffers is *not* the ceiling it once looked
+   like here: in the VLDB io_uring-for-DBMS study (Jasny et al.) registered buffers
+   alone are worth ~11% end-to-end; the paper's headline 3.4–3.5× scale-out multiple
+   (3.51× read / 3.37× write) is RegBufs + NVMe *passthrough* + IOPOLL combined, and
+   passthrough needs raw block-device access while IOPOLL needs a socket-free ring —
+   neither applies to a filesystem-backed cache tier. (An earlier revision of this doc
+   claimed "up to 4.8×"; that number is not in the paper.)
 
 ## Trap list (verified)
+
+- **There is no registered-buffer recv.** No released upstream kernel (through v7.1)
+  accepts `IORING_RECVSEND_FIXED_BUF` on plain RECV — the socket *read* path uses
+  provided buffer rings or caller-owned buffers, permanently for planning purposes.
+  Registered buffers help exactly two legs on this host: disk READ_FIXED/WRITE_FIXED and
+  SEND_ZC-with-fixed-buf. Registered buffers and pbuf rings serve opposite directions and
+  must not share a config axis (`sqe->buf_index` and `sqe->buf_group` are the same u16
+  union field — setting both is silently wrong).
 
 - **`pipe_user_pages_soft` cliff**: an unprivileged UID gets 1024 pipes at 64 KiB;
   every pipe after that is silently created with 8 KiB capacity — an 8× throughput cliff

@@ -24,9 +24,11 @@ struct Route
 };
 
 // Run an HTTP server on the given port with the provided route table. Binds, listens, and accepts
-// connections in a loop, launching a handler context per client.
+// connections in a loop, launching a handler context per client. Returns false (with the failure
+// logged) when the socket cannot be created, bound, or listened — callers must not assume the
+// server came up. Multiple callers on one port intentionally shard accepts via SO_REUSEPORT.
 //
-void RunServer(
+bool RunServer(
     Context* ctx,
     int port,
     const Route* routes,
@@ -38,7 +40,7 @@ void RunServer(
 // Run an HTTPS server. Same as RunServer but performs a TLS handshake on each accepted connection
 // before entering the HTTP handler loop. Uses socket BIO mode with kTLS when available.
 //
-void RunTlsServer(
+bool RunTlsServer(
     Context* ctx,
     int port,
     const Route* routes,

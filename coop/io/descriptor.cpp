@@ -72,6 +72,19 @@ int Descriptor::Close()
     {
         return 0;
     }
+
+    // Unregister before closing. IORING_OP_CLOSE rejects IOSQE_FIXED_FILE with -EBADF,
+    // and Handle::Submit rewrites the SQE to the fixed-file index whenever
+    // m_registeredIndex >= 0 — so a registered descriptor's close would never reach the
+    // fd at all: the close fails, the fd leaks for the process lifetime, and the
+    // descriptor keeps a working IO path through the still-populated slot. The
+    // destructor already unregisters first; this makes the explicit path match.
+    //
+    if (m_registeredIndex >= 0)
+    {
+        m_ring->Unregister(this);
+    }
+
     SPDLOG_DEBUG("descriptor close fd={}", m_fd);
     int result = io::Close(*this);
     m_fd = -1;
@@ -80,6 +93,14 @@ int Descriptor::Close()
 
 int Descriptor::Release()
 {
+    // The caller is taking the raw fd away from coop; the ring's fixed-file slot must
+    // not keep pinning the file (and silently keep an IO path open) past that handoff.
+    //
+    if (m_registeredIndex >= 0)
+    {
+        m_ring->Unregister(this);
+    }
+
     int fd = m_fd;
     m_fd = -1;
     return fd;

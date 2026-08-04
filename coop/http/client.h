@@ -63,6 +63,10 @@ struct ClientConnectionImpl
     // --- Response parsing ---
     //
     // Phase 1: Status line. Null on parse failure, connection closed, or timeout.
+    // ResponseLine::reason views recv-buffer bytes that are discarded once later
+    // parsing compacts the buffer — copy it (or forward it, e.g. into BeginResponse)
+    // before iterating headers. Repeat calls after invalidation return null (and
+    // assert in debug).
     //
     ResponseLine* GetResponseLine();
 
@@ -157,6 +161,8 @@ struct ClientConnectionImpl
 
     ResponseLine    m_responseLine;
     Chunk           m_chunk;
+    uint32_t        m_bufEpoch;          // bumped when recv-buffer bytes move (Compact)
+    uint32_t        m_responseLineEpoch; // m_bufEpoch when the response line was parsed
     bool            m_responseLineParsed;
     bool            m_chunkedDone;
     bool            m_valueConsumed;

@@ -5,6 +5,7 @@
 // stays out of headers so liburing does too.
 
 #include <cassert>
+#include <cerrno>
 #include <liburing.h>
 
 #include "coop/io/armed_handle.h"
@@ -197,8 +198,26 @@ int ArmedHandleImpl<Derived, Entry>::NextSlot(Entry* out)
         }
 
         m_consumerParked = true;
-        CoordinateWith(m_context, m_coord);
-        m_consumerParked = false;
+        if (static_cast<Derived*>(this)->ParkKillAware())
+        {
+            // Kill-aware park: a kill wakes the consumer even when the kernel never
+            // terminates the armed op (a listener shutdown does not reliably complete a
+            // multishot accept). The coordinator stays held either way — the teardown
+            // drain (Cancel + Flash) runs from exactly this state.
+            //
+            auto r = CoordinateWithKill(m_context, m_coord);
+            m_consumerParked = false;
+            if (r.Killed())
+            {
+                *out = Entry{};
+                return -ECANCELED;
+            }
+        }
+        else
+        {
+            CoordinateWith(m_context, m_coord);
+            m_consumerParked = false;
+        }
     }
 
     Slot s = DequeueSlot();

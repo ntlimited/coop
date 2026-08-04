@@ -28,8 +28,6 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_ctx(ctx)
 , m_co(co)
 , m_timeout(timeout)
-, m_bufLen(0)
-, m_parsePos(0)
 , m_sendLen(0)
 , m_phase(REQUEST_LINE)
 , m_contentLength(-1)
@@ -37,7 +35,6 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_bodyRemaining(0)
 , m_requestLine{}
 , m_chunk{}
-, m_bufEpoch(0)
 , m_requestLineEpoch(0)
 , m_requestLineParsed(false)
 , m_chunkedDone(false)
@@ -85,43 +82,9 @@ void ConnectionImpl<Derived>::Reset()
 // -------------------------------------------------------------------------------------
 
 template<typename Derived>
-int ConnectionImpl<Derived>::RecvMore()
+bool ConnectionImpl<Derived>::RecvAborted() const
 {
-    if (m_ctx->IsKilled()) return -1;
-
-    if (m_bufLen >= RecvBufSize())
-    {
-        Compact();
-        if (m_bufLen >= RecvBufSize()) return 0;
-    }
-
-    int n = TransportRecv(RecvBuf() +m_bufLen, RecvBufSize() - m_bufLen, 0, m_timeout);
-
-    if (m_ctx->IsKilled()) return -1;
-    if (n <= 0) return -1;
-
-    m_bufLen += n;
-    return n;
-}
-
-template<typename Derived>
-void ConnectionImpl<Derived>::Compact()
-{
-    if (m_parsePos == 0) return;
-
-    // Bytes before m_parsePos — including the request line the memoized RequestLine
-    // views point into — are discarded here. The epoch bump lets GetRequestLine detect
-    // that its views no longer reference live bytes.
-    //
-    ++m_bufEpoch;
-
-    size_t remaining = m_bufLen - m_parsePos;
-    if (remaining > 0)
-    {
-        memmove(RecvBuf(), RecvBuf() +m_parsePos, remaining);
-    }
-    m_bufLen = remaining;
-    m_parsePos = 0;
+    return m_ctx->IsKilled();
 }
 
 // -------------------------------------------------------------------------------------

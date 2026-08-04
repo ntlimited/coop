@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "detail/parser_buffer.hpp"
 #include "types.h"
 #include "coop/io/descriptor.h"
 #include "coop/time/interval.h"
@@ -128,8 +129,10 @@ struct ConnectionBase
 // via explicit template instantiation.
 //
 template<typename Derived>
-struct ConnectionImpl : ConnectionBase
+struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
 {
+    friend struct detail::ParserBuffer<Derived>;
+
     ConnectionImpl(io::Descriptor& desc, Context* ctx, Cooperator* co,
                    time::Interval timeout);
 
@@ -224,10 +227,16 @@ struct ConnectionImpl : ConnectionBase
         DONE,
     };
 
-    // Buffer management
+    // Buffer mechanics live in detail::ParserBuffer (shared with the client parser);
+    // using-declarations make the dependent-base names visible unqualified.
     //
-    int RecvMore();
-    void Compact();
+    using detail::ParserBuffer<Derived>::m_bufLen;
+    using detail::ParserBuffer<Derived>::m_parsePos;
+    using detail::ParserBuffer<Derived>::m_bufEpoch;
+    using detail::ParserBuffer<Derived>::RecvMore;
+    using detail::ParserBuffer<Derived>::Compact;
+
+    bool RecvAborted() const;
 
     // Internal parsing helpers
     //
@@ -242,8 +251,6 @@ struct ConnectionImpl : ConnectionBase
     Cooperator*     m_co;
     time::Interval  m_timeout;
 
-    size_t          m_bufLen;
-    size_t          m_parsePos;
     size_t          m_sendLen;
 
     Phase           m_phase;
@@ -253,7 +260,6 @@ struct ConnectionImpl : ConnectionBase
 
     RequestLine     m_requestLine;
     Chunk           m_chunk;
-    uint32_t        m_bufEpoch;         // bumped when recv-buffer bytes move (Compact)
     uint32_t        m_requestLineEpoch; // m_bufEpoch when the request line was parsed
     bool            m_requestLineParsed;
     bool            m_chunkedDone;

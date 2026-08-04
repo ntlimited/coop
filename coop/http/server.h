@@ -16,6 +16,7 @@ namespace http
 {
 
 struct ConnectionBase;
+struct ServerHandle;
 
 struct Route
 {
@@ -45,6 +46,14 @@ struct ServerConfiguration
     // splice-to-disk bodies bounce in this mode (armed recv already drained the socket).
     //
     bool pbufRecv = false;
+
+    // Graceful-drain control. When set, connections detach from the acceptor and
+    // register with this handle so ServerHandle::Drain can stop accepting and drain
+    // in-flight connections without cascade-killing them. nullptr = no drain machinery,
+    // identical to the pre-drain behavior.
+    //
+    ServerHandle* control = nullptr;
+
     const char* name = "HttpServer";
     const char* const* searchPaths = nullptr;
     time::Interval timeout = std::chrono::seconds(30);

@@ -19,6 +19,7 @@
 #include "coop/io/armed_accept.h"
 #include "coop/io/buffer_ring.h"
 #include "coop/io/recv_source.h"
+#include "server_handle.h"
 #include "coop/io/uring.h"
 #include "coop/io/shutdown_on_kill.h"
 
@@ -164,7 +165,8 @@ struct HttpConnection : Launchable
                    const Route* routes, int routeCount,
                    const char* const* searchPaths,
                    time::Interval timeout,
-                   bool pbufRecv = false)
+                   bool pbufRecv = false,
+                   ServerHandle* control = nullptr)
     : Launchable(ctx)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd)
@@ -174,6 +176,7 @@ struct HttpConnection : Launchable
     , m_searchPaths(searchPaths)
     , m_timeout(timeout)
     , m_pbufRecv(pbufRecv)
+    , m_control(control)
     {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
         ctx->SetName("HttpConnection");
@@ -181,6 +184,18 @@ struct HttpConnection : Launchable
 
     virtual void Launch() final
     {
+        // Drain mode: detach from the acceptor so stopping it does not cascade-kill this
+        // connection, and register with the control so Drain can find and drain it. The
+        // node is stack-resident for the connection's lifetime; deregister on exit.
+        //
+        ServerHandle::ConnNode connNode;
+        if (m_control)
+        {
+            GetContext()->Detach();
+            m_control->Register(&connNode, &m_fd);
+        }
+        DrainDeregister deregister{m_control, &connNode};
+
         using Conn = Connection<PlaintextTransport>;
         PlaintextTransport transport(m_fd);
         auto conn = GetContext()->Allocate<Conn>(
@@ -202,6 +217,12 @@ struct HttpConnection : Launchable
 
         while (!GetContext()->IsKilled())
         {
+            // Draining: force this response to close the connection, then exit after it.
+            //
+            if (m_control && m_control->IsDraining())
+            {
+                conn->ForceClose();
+            }
             if (!HandleRequest(*conn, m_routes, m_routeCount, m_searchPaths)) return;
 
             if (conn->SendError()) return;
@@ -213,9 +234,19 @@ struct HttpConnection : Launchable
             //
             conn->SkipBody();
             if (!conn->KeepAlive()) return;
+            if (m_control && m_control->IsDraining()) return;   // exit promptly on drain
             conn->Reset();
         }
     }
+
+    // RAII deregistration from the drain control on any exit path (return, throw).
+    //
+    struct DrainDeregister
+    {
+        ServerHandle* control;
+        ServerHandle::ConnNode* node;
+        ~DrainDeregister() { if (control) control->Deregister(node); }
+    };
 
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
@@ -225,6 +256,7 @@ struct HttpConnection : Launchable
     const char* const*  m_searchPaths;
     time::Interval      m_timeout;
     bool                m_pbufRecv;
+    ServerHandle*       m_control;
 };
 
 // -------------------------------------------------------------------------------------
@@ -362,13 +394,15 @@ template<typename LaunchFn>
 static void AcceptLoop(Context* ctx, io::Descriptor& desc,
                        ServerConfiguration const& config, LaunchFn&& launch)
 {
+    auto draining = [&] { return config.control && config.control->IsDraining(); };
+
     if (config.multishotAccept)
     {
         Coordinator coord;
         io::ArmedAccept armed(ctx, desc, &coord, config.maxPendingAccepts);
         armed.Arm();
 
-        while (!ctx->IsKilled())
+        while (!ctx->IsKilled() && !draining())
         {
             int fd = armed.Next();
             if (fd < 0)
@@ -381,7 +415,7 @@ static void AcceptLoop(Context* ctx, io::Descriptor& desc,
         return;
     }
 
-    while (!ctx->IsKilled())
+    while (!ctx->IsKilled() && !draining())
     {
         int fd = io::AcceptKill(desc);
         if (fd < 0)
@@ -411,13 +445,17 @@ bool RunServer(
 
     auto* co = ctx->GetCooperator();
     io::Descriptor desc(serverFd);
+    if (config.control)
+    {
+        config.control->SetListener(&desc);
+    }
 
     AcceptLoop(ctx, desc, config, [&](int fd)
     {
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 32768};
         co->Launch<HttpConnection>(spawn, fd, co, routes, routeCount,
                                    config.searchPaths, config.timeout,
-                                   config.pbufRecv);
+                                   config.pbufRecv, config.control);
     });
     return true;
 }

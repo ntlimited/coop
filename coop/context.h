@@ -268,6 +268,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     KillCause m_killCause{KillCause::None};
     bool m_killHooksFired{false};
     int64_t m_deadlineUs{0};
+    bool m_daemon{false};
     KillHook* m_killHooks{nullptr};
     ContextChildrenList m_children;
     Coordinator m_lastChild;

@@ -401,6 +401,16 @@ the existing special-header mechanism (alongside Content-Length / Transfer-Encod
 before `Reset()` to keep the parser positioned correctly.
 Optional `searchPaths` for static file fallback, optional `timeout` (default 30s).
 
+**Graceful drain** (`coop/http/server_handle.h`): pass a `ServerHandle*` as
+`ServerConfiguration::control` (nullptr = no drain machinery, identical behavior). In drain
+mode connections detach from the acceptor and register with the handle. `Drain(ctx,
+timeout)` is two-phase: soft — stop accepting (shut the listen socket) and wake idle
+keep-alive connections (SHUT_RD → clean EOF), in-flight responses get `Connection: close`;
+hard — at the deadline, SHUT_RDWR the stragglers so their blocked IO unwinds. Daemon
+contexts (`SpawnConfiguration::daemon`, e.g. Grid stealers) are excluded from
+`Cooperator::NonDaemonContexts()` so a drain-until-idle is not held open by background
+helpers.
+
 `SpawnStatusServer(co, port, staticPath)` provides a JSON API at `/api/status` and serves the
 dashboard from static files. Multi-cooperator endpoints: `/api/cooperators` (all cooperators),
 `/api/cooperators/perf` (per-cooperator counters).

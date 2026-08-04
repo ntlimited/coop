@@ -39,7 +39,9 @@ void Grid::Join(Cooperator* co)
     co->Submit([this, p, shard](Context* ctx)
     {
         ctx->GetCooperator()->m_participation = p;
-        Spawn([this, shard](Context* s)
+        static constexpr SpawnConfiguration daemonConfig = {
+            .priority = 0, .stackSize = COOP_DEFAULT_STACK_SIZE, .daemon = true };
+        Spawn(daemonConfig, [this, shard](Context* s)
         {
             s->Detach();
             StealerLoop(s, shard);

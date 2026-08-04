@@ -5,12 +5,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstring>
 #include <strings.h>
 
 #include "coop/context.h"
 #include "coop/cooperator.h"
 #include "coop/self.h"
+#include "coop/io/splice.h"
+#include "coop/io/uring.h"
+#include "coop/io/write.h"
 
 namespace coop
 {
@@ -715,6 +719,112 @@ Chunk* ConnectionImpl<Derived>::ReadBody()
     }
 
     return &m_chunk;
+}
+
+// Write the full span to the file, riding out short writes. All writes go through the ring.
+//
+static bool WriteAllToFile(io::Descriptor& file, const void* data, size_t size, off_t offset)
+{
+    const char* p = static_cast<const char*>(data);
+    size_t remaining = size;
+    while (remaining > 0)
+    {
+        int n = io::Write(file, p, remaining, static_cast<uint64_t>(offset));
+        if (n <= 0) return false;
+        p += n;
+        offset += n;
+        remaining -= n;
+    }
+    return true;
+}
+
+template<typename Derived>
+int64_t ConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
+{
+    if (m_phase < BODY)
+    {
+        if (!AdvanceToPhase(BODY)) return -EPROTO;
+    }
+    if (m_phase != BODY) return 0;
+
+    int64_t total = 0;
+    io::Descriptor file(io::borrowed, fileFd, m_desc.m_ring);
+
+    // Chunked framing interleaves size lines with payload, so chunks bounce through the
+    // parser buffer. (Splicing the known-size payload runs is a future refinement.)
+    //
+    if (m_chunkedBody)
+    {
+        while (auto* chunk = ReadBody())
+        {
+            if (!WriteAllToFile(file, chunk->data, chunk->size, offset + total)) return -EIO;
+            total += chunk->size;
+        }
+        return m_chunkedDone ? total : -ECONNRESET;
+    }
+
+    if (m_contentLength <= 0)
+    {
+        m_phase = DONE;
+        return 0;
+    }
+    if (m_bodyRemaining == 0)
+    {
+        m_bodyRemaining = static_cast<size_t>(m_contentLength);
+    }
+
+    // Body bytes already pulled into the recv buffer during header parsing go out first
+    //
+    size_t buffered = std::min(m_bufLen - m_parsePos, m_bodyRemaining);
+    if (buffered > 0)
+    {
+        if (!WriteAllToFile(file, RecvBuf() + m_parsePos, buffered, offset + total)) return -EIO;
+        m_parsePos += buffered;
+        m_bodyRemaining -= buffered;
+        total += buffered;
+    }
+
+    if (m_bodyRemaining > 0)
+    {
+        if constexpr (Derived::kSpliceable)
+        {
+            // The framed remainder moves socket -> pipe -> page cache without visiting
+            // userspace. The splice length is bounded by the bytes remaining, so pipelined
+            // data beyond the body stays in the socket for the next request.
+            //
+            io::PipeLease pipe(m_desc.m_ring->GetPipePool());
+            if (!pipe) return -EMFILE;
+
+            while (m_bodyRemaining > 0)
+            {
+                int n = io::SpliceToFile(m_desc, fileFd, offset + total, pipe.Fds(),
+                                         m_bodyRemaining);
+                if (n <= 0)
+                {
+                    pipe.MarkDirty();
+                    m_phase = DONE;
+                    return n == 0 ? -ECONNRESET : n;
+                }
+                total += n;
+                m_bodyRemaining -= n;
+            }
+        }
+        else
+        {
+            while (auto* chunk = ReadBody())
+            {
+                if (!WriteAllToFile(file, chunk->data, chunk->size, offset + total))
+                {
+                    return -EIO;
+                }
+                total += chunk->size;
+            }
+            if (m_bodyRemaining > 0) return -ECONNRESET;
+        }
+    }
+
+    m_phase = DONE;
+    return total;
 }
 
 template<typename Derived>

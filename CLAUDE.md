@@ -218,8 +218,12 @@ All IO goes through io_uring. Each operation has 4 variants:
 3. `int Op(Descriptor&, ...)` — blocking (creates Coordinator internally)
 4. `int Op(Descriptor&, ..., time::Interval)` — blocking + timeout
 
-Key operations: `Accept`, `Recv`, `Send`, `Read`, `ReadFile`, `Open`, `Close`, `Shutdown`,
-`Connect`, `Sendfile`, `Splice`
+Key operations: `Accept`, `Recv`, `Send`, `Read`, `Write`, `ReadFile`, `Open`, `Close`,
+`Shutdown`, `Connect`, `Sendfile`, `Splice`, `SpliceToFile`, `Statx`/`StatxFd`, `Fsync`
+
+`SpliceToFile` moves socket bytes into a file via a kernel pipe (zero userspace copies) using
+per-uring pooled pipes (`PipePool`/`PipeLease`). `Statx` is the through-the-ring stat for
+open->stat->sendfile chains.
 
 Blocking variants use `COOP_IO_IMPLEMENTATIONS` macros or `COOP_IO_IMPLEMENTATIONS_FASTPATH`
 (tries a nonblocking direct syscall before io_uring — used by Recv and Send). See
@@ -343,6 +347,11 @@ pre-compiled table are formatted at runtime with the given reason (e.g. an upstr
 phrase) or a status-class default. `ForceClose()` makes the response close-framed and exits
 the keep-alive loop. `RequestLine` exposes `target`/`query` (raw request-target, verbatim)
 for upstream forwarding alongside the parsed `path`.
+
+**Disk data paths**: `ReadBodyToFile(fd, offset)` on both server connection and client
+receives a body straight to a file — buffered bytes first, then splice (plaintext) or a
+parser-buffer bounce (TLS/chunked); keep-alive framing is preserved. `Sendfile` (server) and
+`SendBodyFromFile` (client) serve/upload straight from a file. See `coop/http/CLAUDE.md`.
 
 `RunServer` accepts connections in a loop, launches an `HttpConnection` (Launchable, 32KB stack)
 per client. No method filtering in framework — handlers decide.

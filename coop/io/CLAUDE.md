@@ -218,6 +218,27 @@ entirely in-kernel without entering userspace. The example now pairs plain `Spli
 `ShutdownOnKillGuard` to keep the hot relay loop on the cheap blocking path while still waking
 promptly on kill.
 
+The file-leg sibling `SpliceToFile(in, fileFd, offset, pipefd, len)` moves socket bytes into a
+regular file at an offset (socket -> pipe -> page cache, zero userspace copies). The socket leg
+waits cooperatively; the file leg completes synchronously against the page cache (the same
+dirty-throttling trade a buffered write makes). On any negative return the pipe may hold
+undrained bytes — `PipeLease::MarkDirty()` it.
+
+## Pipe pool (`pipe_pool.h`)
+
+Splice hops need a pipe, and `pipe2()` per transfer is two fds and a syscall on the hot path.
+Each `Uring` owns a `PipePool` (`GetUring()->GetPipePool()`) caching up to 8 pipe pairs per
+thread, filled lazily, closed with the uring. `PipeLease` is the RAII lease: clean release
+returns the pipe to the cache; `MarkDirty()` (after an abort between a splice's fill and drain
+phases) closes it instead — a pipe with residual bytes would corrupt its next user.
+
+## Statx (`statx.h`)
+
+File metadata through the ring (IORING_OP_STATX) — the cooperative replacement for blocking
+`fstat`/`stat` in open->stat->sendfile chains. `Statx(path, flags, mask, &stx)` by path,
+`StatxFd(fd, mask, &stx)` by descriptor (AT_EMPTY_PATH). Metadata is usually dentry-cache hot;
+the point is that a cold inode only blocks the calling context, not the cooperator.
+
 ## Buffer ring + multishot recv (`buffer_ring.h`, `armed_handle.{h,cpp}`)
 
 Opt-in. Classic recv is caller-owned: every recv pins a userspace buffer at submit time, so an armed

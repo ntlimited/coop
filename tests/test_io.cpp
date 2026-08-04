@@ -25,6 +25,7 @@
 #include "coop/io/recv.h"
 #include "coop/io/resolve.h"
 #include "coop/io/send.h"
+#include "coop/io/block_limits.h"
 #include "coop/io/pipe_pool.h"
 #include "coop/io/sendfile.h"
 #include "coop/io/splice.h"
@@ -1024,4 +1025,35 @@ TEST(IoTest, SendfileAllYieldsUnderFastReader)
 
         ::close(fileFd);
     });
+}
+
+// -------------------------------------------------------------------------------------
+// Block limits + io-wq observability
+// -------------------------------------------------------------------------------------
+
+TEST(IoTest, ProbeBlockLimits)
+{
+    // /tmp is backed by some device or tmpfs; either real limits or a clean
+    // all-unknown result — never a crash or partial garbage.
+    //
+    auto limits = coop::io::ProbeBlockLimits("/tmp");
+    if (limits.maxHwSectorsKb >= 0)
+    {
+        EXPECT_GT(limits.maxHwSectorsKb, 0);
+    }
+
+    auto missing = coop::io::ProbeBlockLimits("/definitely/not/a/path");
+    EXPECT_EQ(missing.maxHwSectorsKb, -1);
+    EXPECT_EQ(missing.nrRequests, -1);
+    EXPECT_EQ(missing.maxSegments, -1);
+}
+
+TEST(IoTest, IowqWorkerCount)
+{
+    // Healthy steady state for a socket-driven test process: no io-wq workers.
+    // The assertion allows some (buffered file IO from other tests may punt) but
+    // the call itself must succeed.
+    //
+    int count = coop::io::IowqWorkerCount();
+    EXPECT_GE(count, 0);
 }

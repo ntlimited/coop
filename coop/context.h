@@ -131,19 +131,36 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     int64_t RemainingUs() const;
 
     // Kill hook: fn(arg) runs when this context is killed (during kill propagation,
-    // before waiters wake), in kill-traversal order. The node is caller-owned and
-    // stack-resident; the RAII guard deregisters on scope exit. Generalizes the
-    // watcher-context pattern (io::ShutdownOnKillGuard) for cheap cases: no context,
-    // no coordinator — one intrusive node. Hooks must not block.
+    // before waiters wake). The node is caller-owned and stack-resident. Generalizes the
+    // watcher-context pattern (io::ShutdownOnKillGuard) for cheap cases: no context, no
+    // coordinator — one intrusive node. Hooks must not block. A plain intrusive
+    // singly-linked stack (not an EmbeddedList) so a context that registers no hook —
+    // the universal case — pays only a nullptr-initialized head pointer at spawn, not a
+    // sentinel construction.
     //
-    struct KillHook : EmbeddedListHookups<KillHook>
+    struct KillHook
     {
         void (*fn)(void*) = nullptr;
         void* arg = nullptr;
+        KillHook* next = nullptr;
     };
 
-    void OnKill(KillHook* hook) { m_killHooks.Push(hook); }
-    void RemoveKillHook(KillHook* hook) { m_killHooks.Remove(hook); }
+    void OnKill(KillHook* hook)
+    {
+        hook->next = m_killHooks;
+        m_killHooks = hook;
+    }
+    void RemoveKillHook(KillHook* hook)
+    {
+        for (KillHook** p = &m_killHooks; *p; p = &(*p)->next)
+        {
+            if (*p == hook)
+            {
+                *p = hook->next;
+                return;
+            }
+        }
+    }
 
     // Kill this context's own subtree with a cause — the self-abort entry a
     // deadline-expiring wait uses. Runs on this cooperator (this == running context or
@@ -162,20 +179,16 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     }
     void FireKillHooks()
     {
-        // Fire once (a context can be reached by more than one Kill — parent tree kill
-        // then a deadline). Non-destructive: hooks stay linked so their owner's
-        // RemoveKillHook / scope-exit deregistration remains valid.
+        // Common case first: no hooks registered — a single load-and-branch. Fire once
+        // (a context can be reached by more than one Kill — parent tree kill then a
+        // deadline); non-destructive so an owner's RemoveKillHook stays valid.
         //
-        if (m_killHooksFired)
+        if (m_killHooks == nullptr || m_killHooksFired)
         {
             return;
         }
         m_killHooksFired = true;
-        // Peek() on an empty list returns the (garbage) sentinel cast, not null — guard
-        // with IsEmpty(); Next() correctly returns null at the sentinel.
-        //
-        for (auto* hook = m_killHooks.IsEmpty() ? nullptr : m_killHooks.Peek();
-             hook; hook = m_killHooks.Next(hook))
+        for (KillHook* hook = m_killHooks; hook; hook = hook->next)
         {
             hook->fn(hook->arg);
         }
@@ -255,7 +268,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     KillCause m_killCause{KillCause::None};
     bool m_killHooksFired{false};
     int64_t m_deadlineUs{0};
-    EmbeddedList<KillHook> m_killHooks;
+    KillHook* m_killHooks{nullptr};
     ContextChildrenList m_children;
     Coordinator m_lastChild;
     const char* m_name;

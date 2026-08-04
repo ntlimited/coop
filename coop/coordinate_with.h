@@ -235,6 +235,40 @@ CoordinationResult CoordinateWith(Args... args)
     return CoordinateWith(Self(), std::forward<Args>(args)...);
 }
 
+// The deadline-taken path: only reached when a context actually carries a deadline.
+// Marked cold/noinline so its body (the timeout-append instantiation, which pulls in
+// io::Handle + Timeout) never bloats the hot CoordinateWithKill body — inlining it there
+// doubled the uncontended kill-aware wait in microbenchmarks. The no-deadline case (the
+// universal case today) pays only one predicted-not-taken branch on m_deadlineUs.
+//
+template<typename... Args>
+[[gnu::noinline, gnu::cold]]
+CoordinationResult CoordinateWithKillDeadline(Context* ctx, Args... args)
+{
+    int64_t remainingUs = ctx->RemainingUs();
+    auto budget = std::chrono::microseconds(remainingUs);
+    auto result = CoordinateWith(ctx, ctx->GetKilledSignal(),
+                                 std::forward<Args>(args)..., time::Interval(budget));
+    if (result.index == 0)
+    {
+        return CoordinationResult { static_cast<size_t>(-1), nullptr };
+    }
+    if (result.TimedOut())
+    {
+        // The budget expired — kill the tree and report Killed, not TimedOut, so the
+        // caller sees a single "aborted" outcome with a cause.
+        //
+        ctx->KillSelf(KillCause::Deadline);
+        return CoordinationResult { static_cast<size_t>(-1), nullptr };
+    }
+    if (result.coordinator == nullptr)
+    {
+        return result;
+    }
+    result.index -= 1;
+    return result;
+}
+
 // CoordinateWithKill: kill-aware convenience wrapper. Prepends the context's kill signal as the
 // first argument, delegates to CoordinateWith, and translates index 0 (kill) to the Killed()
 // sentinel while shifting user indices down by 1.
@@ -266,69 +300,38 @@ CoordinationResult CoordinateWithKill(Context* ctx, Args... args)
         }
     }
 
-    // Deadline enforcement, zero-cost when unset. When the context carries a deadline
-    // and the caller did NOT already pass a trailing timeout, the remaining budget
-    // becomes this wait's timeout. A timeout win that is actually the deadline expiring
-    // kills the context tree with KillCause::Deadline and reports Killed — so a whole
-    // request's DNS + connect + TLS + read draw from one inherited budget without any
-    // per-call timeout arithmetic. The `constexpr` gate means a caller with no deadline
-    // (m_deadlineUs == 0) takes exactly the original path.
-    //
-    // Same predicate CoordinateWith uses to recognize a trailing timeout — any chrono
-    // duration, not just time::Interval — so a caller who already passed a timeout is
-    // not double-appended a deadline one.
+    // Deadline enforcement, zero-cost when unset: one predicted-not-taken branch on the
+    // context's deadline field, and the whole deadline body lives out-of-line (above).
+    // When a deadline is set and the caller passed no timeout of its own, the remaining
+    // budget bounds the wait so a request's DNS + connect + TLS + read draw from one
+    // inherited budget. The constexpr gate uses the same trailing-timeout predicate as
+    // CoordinateWith (any chrono duration) so a caller-supplied timeout is not
+    // double-appended a deadline one.
     //
     constexpr bool kHasTrailingTimeout =
         sizeof...(Args) > 0 &&
         std::is_convertible_v<detail::LastType<Args...>, time::Interval>;
-
     if constexpr (!kHasTrailingTimeout)
     {
-        if (ctx->DeadlineUs() != 0)
+        if (ctx->DeadlineUs() != 0) [[unlikely]]
         {
-            int64_t remainingUs = ctx->RemainingUs();
-            auto budget = std::chrono::microseconds(remainingUs);
-            auto result = CoordinateWith(ctx, ctx->GetKilledSignal(),
-                                         std::forward<Args>(args)..., time::Interval(budget));
-            if (result.index == 0)
-            {
-                return CoordinationResult { static_cast<size_t>(-1), nullptr };
-            }
-            if (result.TimedOut())
-            {
-                // The budget expired — kill the tree and report Killed, not TimedOut,
-                // so the caller sees a single "aborted" outcome with a cause.
-                //
-                ctx->KillSelf(KillCause::Deadline);
-                return CoordinationResult { static_cast<size_t>(-1), nullptr };
-            }
-            if (result.coordinator == nullptr)
-            {
-                return result;
-            }
-            result.index -= 1;
-            return result;
+            return CoordinateWithKillDeadline(ctx, std::forward<Args>(args)...);
         }
     }
 
+    // Fallthrough: the original inline path — MultiCoordinator over the kill signal plus
+    // the caller's coordinators, with index translation past the prepended kill signal.
+    //
     auto result = CoordinateWith(ctx, ctx->GetKilledSignal(), std::forward<Args>(args)...);
 
-    // Kill signal fired (index 0)
-    //
     if (result.index == 0)
     {
         return CoordinationResult { static_cast<size_t>(-1), nullptr };
     }
-
-    // Sentinel passthrough (timeout, error)
-    //
     if (result.coordinator == nullptr)
     {
         return result;
     }
-
-    // Normal result — shift past the prepended kill signal
-    //
     result.index -= 1;
     return result;
 }

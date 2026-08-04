@@ -186,3 +186,16 @@ but the verb's object is the *operation* ("wait for the recv"), not the bytes �
 read, you do not await the data — so it stays `Wait`, the `int` being the operation's outcome. A
 `Wait` whose return you would naturally *name* (a value, not a status or outcome) is the signal to
 rename it `Await`.
+
+## YieldBudget: the fairness governor for syscall-loop data paths
+
+Blocking ring ops pass through the scheduler on every call, so loops built on them are
+fair by construction. Syscall-loop data paths (splice, sendfile) only reach the scheduler
+through Poll on EAGAIN — a peer that never pushes back keeps them succeeding
+indefinitely, and one bulk transfer can hold a cooperative slot for its whole body.
+
+The idiom: every such loop owns an `io::detail::YieldBudget` and `Charge(n)`s its
+progress; the budget forces a `Yield(true)` per 2MB of unblocked movement (nginx's
+`sendfile_max_chunk` lesson — the same default — at a granularity where the scheduler
+round trip is noise). Any new syscall-loop transfer path must either charge a budget or
+document why its per-iteration bound makes one unnecessary.

@@ -14,7 +14,7 @@ namespace io
 struct Descriptor;
 struct Handle;
 
-#define READ_ARGS(F) F(void*, buf, ) F(size_t, size, ) F(uint64_t, offset, = 0)
+#define READ_ARGS(F) F(void*, buf, ) F(size_t, size, ) F(uint64_t, offset, = 0) F(int, rwFlags, = 0)
 COOP_IO_DECLARATIONS(Read, READ_ARGS)
 
 // Fixed-buffer overloads (READ_FIXED): same names, selected by the buffer type.

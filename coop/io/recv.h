@@ -19,6 +19,13 @@ struct Handle;
 COOP_IO_DECLARATIONS(Recv, RECV_ARGS)
 COOP_IO_DECLARATIONS(RecvFastpath, RECV_ARGS)
 
+// PollFirst variant: tells the kernel to arm the poll BEFORE attempting the receive
+// (IORING_RECVSEND_POLL_FIRST, 5.17+) — the ring-native inverse of the speculative
+// fastpath, for call sites where data is known-absent (request/response turnaround:
+// a client that just sent a request). Saves the guaranteed-empty receive attempt.
+//
+COOP_IO_DECLARATIONS(RecvPollFirst, RECV_ARGS)
+
 } // end namespace coop::io
 } // end namespace coop
 

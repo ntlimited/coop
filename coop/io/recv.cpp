@@ -45,5 +45,14 @@ static inline int TryRecv(int fd, void* buf, size_t size, int flags)
 COOP_IO_IMPLEMENTATIONS(Recv, io_uring_prep_recv, RECV_ARGS)
 COOP_IO_IMPLEMENTATIONS_FASTPATH(RecvFastpath, io_uring_prep_recv, TryRecv, RECV_ARGS)
 
+static inline void PrepRecvPollFirst(struct io_uring_sqe* sqe, int fd, void* buf,
+                                     size_t size, int flags)
+{
+    io_uring_prep_recv(sqe, fd, buf, size, flags);
+    sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
+}
+
+COOP_IO_IMPLEMENTATIONS(RecvPollFirst, PrepRecvPollFirst, RECV_ARGS)
+
 } // end namespace coop::io
 } // end namespace coop

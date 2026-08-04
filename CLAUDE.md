@@ -354,7 +354,11 @@ parser-buffer bounce (TLS/chunked); keep-alive framing is preserved. `Sendfile` 
 `SendBodyFromFile` (client) serve/upload straight from a file. See `coop/http/CLAUDE.md`.
 
 `RunServer` accepts connections in a loop, launches an `HttpConnection` (Launchable, 32KB stack)
-per client. No method filtering in framework — handlers decide.
+per client. No method filtering in framework — handlers decide. `ServerConfiguration`
+declares the topology: `reusePort` (one-listener-per-cooperator sharding), `backlog`,
+`multishotAccept` (ArmedAccept path with bounded pending queue), `maxPendingAccepts`.
+Both Run*Server variants return bool — bind/listen failures are checked and logged, never
+asserted away.
 
 **Keep-alive**: HTTP/1.1 keep-alive is enabled by default. `HttpConnection::Launch` loops over
 requests on the same connection. `Connection::Reset()` reinitializes parser state between

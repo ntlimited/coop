@@ -4,6 +4,7 @@
 #include "tls_transport.h"
 
 #include <cerrno>
+#include <optional>
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -16,6 +17,9 @@
 
 #include "coop/coordinator.h"
 #include "coop/io/armed_accept.h"
+#include "coop/io/buffer_ring.h"
+#include "coop/io/recv_source.h"
+#include "coop/io/uring.h"
 #include "coop/io/shutdown_on_kill.h"
 
 #include "coop/alloc.h"
@@ -153,7 +157,8 @@ struct HttpConnection : Launchable
     HttpConnection(Context* ctx, int fd, Cooperator* co,
                    const Route* routes, int routeCount,
                    const char* const* searchPaths,
-                   time::Interval timeout)
+                   time::Interval timeout,
+                   bool pbufRecv = false)
     : Launchable(ctx)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd)
@@ -162,6 +167,7 @@ struct HttpConnection : Launchable
     , m_routeCount(routeCount)
     , m_searchPaths(searchPaths)
     , m_timeout(timeout)
+    , m_pbufRecv(pbufRecv)
     {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
         ctx->SetName("HttpConnection");
@@ -175,6 +181,18 @@ struct HttpConnection : Launchable
             Conn::ExtraBytes(), transport, GetContext(), m_co,
             ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
             m_timeout);
+
+        // Pbuf mode: one armed multishot recv serves the connection's lifetime; the
+        // parser windows over kernel-selected chunks. Falls back to classic recv when
+        // the uring carries no buffer ring.
+        //
+        io::BufferRing* ring = m_pbufRecv ? m_fd.m_ring->GetBufferRing() : nullptr;
+        std::optional<io::RecvSource> source;
+        if (ring)
+        {
+            source.emplace(GetContext(), m_fd, ring);
+            conn->AttachRecvSource(&*source);
+        }
 
         while (!GetContext()->IsKilled())
         {
@@ -200,6 +218,7 @@ struct HttpConnection : Launchable
     int                 m_routeCount;
     const char* const*  m_searchPaths;
     time::Interval      m_timeout;
+    bool                m_pbufRecv;
 };
 
 // -------------------------------------------------------------------------------------
@@ -391,7 +410,8 @@ bool RunServer(
     {
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 32768};
         co->Launch<HttpConnection>(spawn, fd, co, routes, routeCount,
-                                   config.searchPaths, config.timeout);
+                                   config.searchPaths, config.timeout,
+                                   config.pbufRecv);
     });
     return true;
 }

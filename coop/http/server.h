@@ -37,6 +37,14 @@ struct ServerConfiguration
     bool reusePort = true;
     bool multishotAccept = false;
     uint32_t maxPendingAccepts = 64;
+
+    // Parse requests from provided-buffer-ring chunks (multishot recv) instead of a
+    // per-connection one-shot recv. Requires the cooperator's uring to carry a
+    // BufferRing (UringConfiguration::bufferRingEntries); silently classic otherwise.
+    // Plaintext connections only — TLS bytes need the SSL layer's decrypt path, and
+    // splice-to-disk bodies bounce in this mode (armed recv already drained the socket).
+    //
+    bool pbufRecv = false;
     const char* name = "HttpServer";
     const char* const* searchPaths = nullptr;
     time::Interval timeout = std::chrono::seconds(30);

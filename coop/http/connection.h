@@ -172,7 +172,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
 
     const char* LeftoverData() override
     {
-        return static_cast<Derived*>(this)->m_buf + m_parsePos;
+        return this->Win() + m_parsePos;
     }
     size_t LeftoverSize() override
     {
@@ -235,6 +235,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     using detail::ParserBuffer<Derived>::m_bufEpoch;
     using detail::ParserBuffer<Derived>::RecvMore;
     using detail::ParserBuffer<Derived>::Compact;
+    using detail::ParserBuffer<Derived>::Win;
 
     bool RecvAborted() const;
 

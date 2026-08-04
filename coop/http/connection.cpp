@@ -120,10 +120,10 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
     {
         size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
         char* cr = avail > 0
-            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+            ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
             : nullptr;
 
-        if (cr && cr + 1 < RecvBuf() + m_bufLen && cr[1] == '\n')
+        if (cr && cr + 1 < Win() + m_bufLen && cr[1] == '\n')
         {
             if (!ParseRequestLine()) return nullptr;
             m_requestLineEpoch = m_bufEpoch;
@@ -139,7 +139,7 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
 template<typename Derived>
 bool ConnectionImpl<Derived>::ParseRequestLine()
 {
-    char* base = RecvBuf();
+    char* base = Win();
     char* end = base + m_bufLen;
     char* p = base + m_parsePos;
 
@@ -160,7 +160,7 @@ bool ConnectionImpl<Derived>::ParseRequestLine()
 
     m_requestLine.path = std::string_view(base + pathStart, i - pathStart);
 
-    if (RecvBuf()[i] == '?')
+    if (Win()[i] == '?')
     {
         // Capture the raw query for target reconstruction. The caller (GetRequestLine)
         // guarantees the full request line is buffered, so the terminating space/CR is
@@ -225,12 +225,12 @@ void ConnectionImpl<Derived>::SkipToHeaders()
     {
         size_t avail = m_bufLen - m_parsePos;
         char* nl = avail > 0
-            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\n', avail))
+            ? static_cast<char*>(memchr(Win() + m_parsePos, '\n', avail))
             : nullptr;
 
         if (nl)
         {
-            m_parsePos = (nl - RecvBuf()) + 1;
+            m_parsePos = (nl - Win()) + 1;
             m_phase = HEADERS;
             m_valueConsumed = true;
             return;
@@ -263,7 +263,7 @@ const char* ConnectionImpl<Derived>::NextArgName()
         SkipArgValue();
     }
 
-    if (m_parsePos >= m_bufLen || RecvBuf()[m_parsePos] == ' ' || RecvBuf()[m_parsePos] == '\r')
+    if (m_parsePos >= m_bufLen || Win()[m_parsePos] == ' ' || Win()[m_parsePos] == '\r')
     {
         SkipToHeaders();
         return nullptr;
@@ -275,11 +275,11 @@ const char* ConnectionImpl<Derived>::NextArgName()
     {
         for (size_t i = (nameStart == m_parsePos ? m_parsePos : m_parsePos); i < m_bufLen; i++)
         {
-            char c = RecvBuf()[i];
+            char c = Win()[i];
             if (c == '=' || c == '&' || c == ' ' || c == '\r')
             {
-                RecvBuf()[i] = '\0';
-                const char* name = RecvBuf() +nameStart;
+                Win()[i] = '\0';
+                const char* name = Win() +nameStart;
                 m_parsePos = i;
 
                 if (c == '=')
@@ -312,10 +312,10 @@ Chunk* ConnectionImpl<Derived>::ReadArgValue()
 
     for (size_t i = m_parsePos; i < m_bufLen; i++)
     {
-        char c = RecvBuf()[i];
+        char c = Win()[i];
         if (c == '&' || c == ' ' || c == '\r')
         {
-            m_chunk.data = RecvBuf() +valueStart;
+            m_chunk.data = Win() +valueStart;
             m_chunk.size = i - valueStart;
             m_chunk.complete = true;
 
@@ -329,7 +329,7 @@ Chunk* ConnectionImpl<Derived>::ReadArgValue()
     size_t available = m_bufLen - valueStart;
     if (available > 0)
     {
-        m_chunk.data = RecvBuf() +valueStart;
+        m_chunk.data = Win() +valueStart;
         m_chunk.size = available;
         m_chunk.complete = false;
 
@@ -356,7 +356,7 @@ void ConnectionImpl<Derived>::SkipArgValue()
     {
         for (size_t i = m_parsePos; i < m_bufLen; i++)
         {
-            char c = RecvBuf()[i];
+            char c = Win()[i];
             if (c == '&' || c == ' ' || c == '\r')
             {
                 m_parsePos = i;
@@ -413,7 +413,7 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
             if (RecvMore() <= 0) return nullptr;
         }
 
-        if (RecvBuf()[m_parsePos] == '\r' && RecvBuf()[m_parsePos + 1] == '\n')
+        if (Win()[m_parsePos] == '\r' && Win()[m_parsePos + 1] == '\n')
         {
             m_parsePos += 2;
             m_phase = BODY;
@@ -426,7 +426,7 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
         {
             size_t avail = m_bufLen - m_parsePos;
             char* colon = avail > 0
-                ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, ':', avail))
+                ? static_cast<char*>(memchr(Win() + m_parsePos, ':', avail))
                 : nullptr;
 
             if (colon)
@@ -434,21 +434,21 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
                 // Check for \r before the colon (malformed)
                 //
                 char* cr = static_cast<char*>(
-                    memchr(RecvBuf() + m_parsePos, '\r',
-                           colon - (RecvBuf() + m_parsePos)));
+                    memchr(Win() + m_parsePos, '\r',
+                           colon - (Win() + m_parsePos)));
                 if (cr)
                 {
                     m_phase = DONE;
                     return nullptr;
                 }
 
-                size_t i = colon - RecvBuf();
+                size_t i = colon - Win();
                 size_t nameEnd = i;
-                RecvBuf()[i] = '\0';
-                const char* name = RecvBuf() + nameStart;
+                Win()[i] = '\0';
+                const char* name = Win() + nameStart;
                 m_parsePos = i + 1;
 
-                while (m_parsePos < m_bufLen && RecvBuf()[m_parsePos] == ' ')
+                while (m_parsePos < m_bufLen && Win()[m_parsePos] == ' ')
                 {
                     m_parsePos++;
                 }
@@ -477,7 +477,7 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
             // No colon — check for \r
             //
             char* cr = avail > 0
-                ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+                ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
                 : nullptr;
             if (cr)
             {
@@ -501,13 +501,13 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
 
     size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
     char* cr = avail > 0
-        ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+        ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
         : nullptr;
 
     if (cr)
     {
-        size_t i = cr - RecvBuf();
-        m_chunk.data = RecvBuf() + valueStart;
+        size_t i = cr - Win();
+        m_chunk.data = Win() + valueStart;
         m_chunk.size = i - valueStart;
         m_chunk.complete = true;
 
@@ -544,7 +544,7 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
         }
 
         m_parsePos = i;
-        if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
+        if (m_parsePos + 1 < m_bufLen && Win()[m_parsePos + 1] == '\n')
         {
             m_parsePos += 2;
         }
@@ -555,7 +555,7 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
     size_t available = m_bufLen - valueStart;
     if (available > 0)
     {
-        m_chunk.data = RecvBuf() +valueStart;
+        m_chunk.data = Win() +valueStart;
         m_chunk.size = available;
         m_chunk.complete = false;
 
@@ -595,13 +595,13 @@ void ConnectionImpl<Derived>::SkipHeaderValue()
     {
         size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
         char* cr = avail > 0
-            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+            ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
             : nullptr;
 
         if (cr)
         {
-            m_parsePos = cr - RecvBuf();
-            if (m_parsePos + 1 < m_bufLen && RecvBuf()[m_parsePos + 1] == '\n')
+            m_parsePos = cr - Win();
+            if (m_parsePos + 1 < m_bufLen && Win()[m_parsePos + 1] == '\n')
             {
                 m_parsePos += 2;
             }
@@ -695,7 +695,7 @@ Chunk* ConnectionImpl<Derived>::ReadBody()
     }
 
     size_t toDeliver = std::min(available, m_bodyRemaining);
-    m_chunk.data = RecvBuf() +m_parsePos;
+    m_chunk.data = Win() +m_parsePos;
     m_chunk.size = toDeliver;
     m_bodyRemaining -= toDeliver;
     m_chunk.complete = (m_bodyRemaining == 0);
@@ -766,7 +766,7 @@ int64_t ConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
     size_t buffered = std::min(m_bufLen - m_parsePos, m_bodyRemaining);
     if (buffered > 0)
     {
-        if (!WriteAllToFile(file, RecvBuf() + m_parsePos, buffered, offset + total)) return -EIO;
+        if (!WriteAllToFile(file, Win() + m_parsePos, buffered, offset + total)) return -EIO;
         m_parsePos += buffered;
         m_bodyRemaining -= buffered;
         total += buffered;
@@ -774,7 +774,11 @@ int64_t ConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
 
     if (m_bodyRemaining > 0)
     {
-        if constexpr (Derived::kSpliceable)
+        // Pbuf mode excludes splice: the armed multishot recv continuously drains the
+        // socket into pool chunks, so the body bytes are never in the socket for splice
+        // to move — they flow through the window bounce instead.
+        //
+        if (Derived::kSpliceable && !this->m_source)
         {
             // The framed remainder moves socket -> pipe -> page cache without visiting
             // userspace. The splice length is bounded by the bytes remaining, so pipelined
@@ -856,7 +860,7 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
         }
 
         size_t toDeliver = std::min(available, m_bodyRemaining);
-        m_chunk.data = RecvBuf() +m_parsePos;
+        m_chunk.data = Win() +m_parsePos;
         m_chunk.size = toDeliver;
         m_bodyRemaining -= toDeliver;
         m_parsePos += toDeliver;
@@ -885,16 +889,16 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
     {
         size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
         char* cr = avail > 0
-            ? static_cast<char*>(memchr(RecvBuf() + m_parsePos, '\r', avail))
+            ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
             : nullptr;
 
-        if (cr && cr + 1 < RecvBuf() + m_bufLen && cr[1] == '\n')
+        if (cr && cr + 1 < Win() + m_bufLen && cr[1] == '\n')
         {
-            size_t i = cr - RecvBuf();
+            size_t i = cr - Win();
             size_t chunkSize = 0;
             for (size_t j = m_parsePos; j < i; j++)
             {
-                char c = RecvBuf()[j];
+                char c = Win()[j];
                 if (c == ';') break;
 
                 chunkSize <<= 4;

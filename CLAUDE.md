@@ -356,7 +356,9 @@ parser-buffer bounce (TLS/chunked); keep-alive framing is preserved. `Sendfile` 
 `RunServer` accepts connections in a loop, launches an `HttpConnection` (Launchable, 32KB stack)
 per client. No method filtering in framework — handlers decide. `ServerConfiguration`
 declares the topology: `reusePort` (one-listener-per-cooperator sharding), `backlog`,
-`multishotAccept` (ArmedAccept path with bounded pending queue), `maxPendingAccepts`.
+`multishotAccept` (ArmedAccept path with bounded pending queue), `maxPendingAccepts`,
+and `pbufRecv` (parse from provided-buffer-ring chunks via one armed multishot recv per
+connection — zero-copy heads, classic recv otherwise; see coop/http/CLAUDE.md).
 Both Run*Server variants return bool — bind/listen failures are checked and logged, never
 asserted away.
 

@@ -8,11 +8,22 @@
 #include "descriptor.h"
 #include "poll.h"
 
+#include "coop/context.h"
+#include "coop/self.h"
+
 namespace coop
 {
 
 namespace io
 {
+
+// A peer that never blocks us (fast reader, loopback) keeps sendfile succeeding without
+// ever reaching the scheduler through Poll, letting one connection monopolize the
+// cooperator. Yield after each budget of unblocked progress — nginx's sendfile_max_chunk
+// lesson (its default is likewise 2MB), at a granularity where the scheduler round trip
+// is noise.
+//
+static constexpr size_t kYieldBudgetBytes = 2 * 1024 * 1024;
 
 static int WaitForSendfileWritable(Descriptor& desc, bool killAware)
 {
@@ -63,6 +74,7 @@ int SendfileKill(Descriptor& desc, int in_fd, off_t offset, size_t count)
 static int SendfileAllImpl(Descriptor& desc, int in_fd, off_t offset, size_t count, bool killAware)
 {
     size_t total = 0;
+    size_t sinceYield = 0;
     while (total < count)
     {
         int sent = killAware
@@ -70,6 +82,13 @@ static int SendfileAllImpl(Descriptor& desc, int in_fd, off_t offset, size_t cou
             : Sendfile(desc, in_fd, offset + (off_t)total, count - total);
         if (sent <= 0) return sent;
         total += sent;
+
+        sinceYield += sent;
+        if (sinceYield >= kYieldBudgetBytes && total < count)
+        {
+            sinceYield = 0;
+            Self()->Yield(true);
+        }
     }
     return (int)count;
 }

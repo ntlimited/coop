@@ -9,6 +9,8 @@
 #include <cstring>
 #include <strings.h>
 
+#include "coop/context.h"
+#include "coop/self.h"
 #include "coop/io/splice.h"
 #include "coop/io/uring.h"
 #include "coop/io/write.h"
@@ -617,6 +619,13 @@ int64_t ClientConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
             io::PipeLease pipe(m_desc.m_ring->GetPipePool());
             if (!pipe) return -EMFILE;
 
+            // A server that always has bytes ready never blocks us through Poll —
+            // yield after each budget of unblocked progress so one body cannot
+            // monopolize the cooperator (nginx's sendfile_max_chunk lesson).
+            //
+            constexpr size_t kYieldBudgetBytes = 2 * 1024 * 1024;
+            size_t sinceYield = 0;
+
             while (m_bodyRemaining > 0)
             {
                 int n = io::SpliceToFile(m_desc, fileFd, offset + total, pipe.Fds(),
@@ -629,6 +638,13 @@ int64_t ClientConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
                 }
                 total += n;
                 m_bodyRemaining -= n;
+
+                sinceYield += static_cast<size_t>(n);
+                if (sinceYield >= kYieldBudgetBytes && m_bodyRemaining > 0)
+                {
+                    sinceYield = 0;
+                    Self()->Yield(true);
+                }
             }
         }
         else

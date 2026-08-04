@@ -168,6 +168,36 @@ Mutex facsimile — one context holds, others block in a FIFO queue.
 - `Release(ctx)` — unblocks head of wait list
 - `Flash(ctx)` — barrier: wait, acquire, release (serialization point)
 
+### Semaphore (`coop/semaphore.h`)
+Counting admission gate, and the reference pattern for layering coordination on
+`Coordinator`: each blocked acquirer parks on its own stack-resident Coordinator (as
+`io::Handle` does), and `Release` grants strictly FIFO — no barging (a large waiter at
+the head is not passed by smaller acquires). `Acquire(ctx, n)` / `AcquireKill(ctx, n[,
+timeout])` / `TryAcquire(n)` return an RAII `Permit`; abandonment (kill/timeout) withdraws
+the reservation cleanly. `Permit` is movable — including into a spawned child
+(`[p = std::move(permit)]`), which is how bounded fan-out hands admission to children.
+Single-cooperator, atomic-free. Zero cost unused (two words + empty list; the uncontended
+acquire is a counter check).
+
+### Group (`coop/group.h`)
+Structured-concurrency scope (errgroup / JoinSet / gate). `Go(fn)` spawns a child under
+the group; the destructor (or `Wait()`) joins all children so none outlive the scope.
+Fail-fast: the first child returning `false` cancels its siblings via `Handle::Kill`
+(which they observe through kill-aware waits) and makes `Wait()` return false.
+`SetLimit(n)` bounds in-flight children through a Semaphore — `Go` blocks the owner at the
+limit. Child fns return `bool` (true = ok) or `void` (always ok) and must be kill-aware
+for cancellation to reach them. Complementary to kill trees: a kill tree propagates
+termination down; a Group drains up and can refuse/cancel work.
+
+### Deadlines & kill cause (`coop/context.h`)
+`Context` carries an optional deadline (`SetDeadlineIn`/`SetDeadline`, absolute
+monotonic-us; children inherit at spawn, tightening-only) enforced at the
+`CoordinateWithKill` chokepoint: a wait past the budget kills the tree and reports
+`Killed()`. `WhyKilled()` returns the cause (`Kill`/`Deadline`/`Drain`) — the distinction
+that picks the HTTP status and metric bucket. `OnKill(hook)` registers a stack-resident
+kill hook (a cheap `ShutdownOnKillGuard` for the no-context case). All zero cost when
+unset (one predicted-not-taken branch; the deadline body is out-of-line).
+
 ### CoordinateWith / CoordinateWithKill (`coop/coordinate_with.h`)
 `CoordinateWith` blocks the calling context until one of the given coordinators or signals is
 released. Arguments may be `Coordinator*` or `Signal*` in any combination, with an optional

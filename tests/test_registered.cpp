@@ -3,6 +3,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <tuple>
 #include <unistd.h>
@@ -16,6 +17,7 @@
 #include "coop/io/buffer_arena.h"
 #include "coop/io/fixed_buffer.h"
 #include "coop/io/read.h"
+#include "coop/io/send_zc.h"
 #include "coop/io/write.h"
 #include "coop/io/descriptor.h"
 #include "coop/io/recv.h"
@@ -44,6 +46,42 @@ struct RawPair
     }
 
     ~RawPair()
+    {
+        if (fds[0] >= 0) close(fds[0]);
+        if (fds[1] >= 0) close(fds[1]);
+    }
+};
+
+// SEND_ZC does not support AF_UNIX — zc tests need a real TCP pair.
+//
+struct TcpPair
+{
+    int fds[2] = { -1, -1 };
+
+    TcpPair()
+    {
+        int listenFd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(listenFd >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        int ret = bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        assert(ret == 0);
+        ret = listen(listenFd, 1);
+        assert(ret == 0);
+        socklen_t len = sizeof(addr);
+        getsockname(listenFd, reinterpret_cast<sockaddr*>(&addr), &len);
+        fds[0] = socket(AF_INET, SOCK_STREAM, 0);
+        ret = connect(fds[0], reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        assert(ret == 0);
+        fds[1] = accept(listenFd, nullptr, nullptr);
+        assert(fds[1] >= 0);
+        close(listenFd);
+        std::ignore = ret;
+    }
+
+    ~TcpPair()
     {
         if (fds[0] >= 0) close(fds[0]);
         if (fds[1] >= 0) close(fds[1]);
@@ -237,5 +275,95 @@ TEST(RegisteredTest, NoArenaWithoutConfig)
         // Default configuration: no arena, and that is a clean, queryable state
         //
         EXPECT_EQ(coop::GetUring()->GetBufferArena(), nullptr);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// SendZC: two-CQE zero-copy send (result + F_NOTIF), plain and arena-fixed
+// -------------------------------------------------------------------------------------
+
+TEST(RegisteredTest, SendZCRoundtrip)
+{
+    test::RunInCooperator([](coop::Context*)
+    {
+        TcpPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor sender(coop::io::borrowed, sp.fds[0], uring);
+        coop::io::Descriptor peer(coop::io::borrowed, sp.fds[1], uring);
+
+        // Loopback silently copies (no real zero copy), but the two-CQE lifecycle —
+        // and the F_NOTIF result-preservation guard in Handle::Complete — is identical.
+        //
+        std::vector<char> payload(8192, 'z');
+        int sent = coop::io::SendZC(sender, payload.data(), payload.size());
+        ASSERT_EQ(sent, (int)payload.size());
+
+        std::vector<char> got(payload.size());
+        size_t total = 0;
+        while (total < got.size())
+        {
+            int n = coop::io::Recv(peer, got.data() + total, got.size() - total);
+            ASSERT_GT(n, 0);
+            total += static_cast<size_t>(n);
+        }
+        EXPECT_EQ(memcmp(got.data(), payload.data(), payload.size()), 0);
+    });
+}
+
+TEST(RegisteredTest, SendZCFixedFromArena)
+{
+    coop::CooperatorConfiguration cfg;
+    cfg.uring.registeredBufferBytes = 1 << 20;
+
+    coop::Cooperator cooperator(cfg);
+    coop::Thread thread(&cooperator);
+
+    cooperator.SubmitSync([&](coop::Context*)
+    {
+        auto* uring = coop::GetUring();
+        auto* arena = uring->GetBufferArena();
+        ASSERT_NE(arena, nullptr);
+
+        TcpPair sp;
+        coop::io::Descriptor sender(coop::io::borrowed, sp.fds[0], uring);
+        coop::io::Descriptor peer(coop::io::borrowed, sp.fds[1], uring);
+
+        char* lease = arena->Acquire(4096);
+        ASSERT_NE(lease, nullptr);
+        memset(lease, 'f', 4096);
+
+        coop::io::FixedBuffer fb{lease, arena->Index()};
+        int sent = coop::io::SendZC(sender, fb, 4096);
+        ASSERT_EQ(sent, 4096);
+
+        std::vector<char> got(4096);
+        size_t total = 0;
+        while (total < got.size())
+        {
+            int n = coop::io::Recv(peer, got.data() + total, got.size() - total);
+            ASSERT_GT(n, 0);
+            total += static_cast<size_t>(n);
+        }
+        EXPECT_EQ(memcmp(got.data(), lease, 4096), 0);
+
+        arena->Release(lease, 4096);
+        cooperator.Shutdown();
+    });
+}
+
+// A failed zero-copy send (AF_UNIX is unsupported) posts a single CQE with no
+// notification — the handle must not wait forever for the second one.
+//
+TEST(RegisteredTest, SendZCFailureDoesNotHang)
+{
+    test::RunInCooperator([](coop::Context*)
+    {
+        RawPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor sender(coop::io::borrowed, sp.fds[0], uring);
+
+        char buf[64] = {};
+        int ret = coop::io::SendZC(sender, buf, sizeof(buf));
+        EXPECT_LT(ret, 0);
     });
 }

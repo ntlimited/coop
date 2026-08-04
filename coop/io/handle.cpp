@@ -63,12 +63,18 @@ Handle::~Handle()
 
 void Handle::Submit(struct io_uring_sqe* sqe)
 {
+    Submit(sqe, 1);
+}
+
+void Handle::Submit(struct io_uring_sqe* sqe, int pendingCqes)
+{
     SPDLOG_TRACE("handle submit ctx={}", m_context->GetName());
 
     COOP_PERF_INC(m_context->GetCooperator()->GetPerfCounters(), perf::Counter::IoSubmit);
     ++m_context->m_statistics.ioSubmits;
     m_timedOut = false;
-    m_pendingCqes = 1;
+    m_pendingCqes = pendingCqes;
+    m_expectNotif = pendingCqes > 1;
     m_ring->m_pendingOps++;
     m_coord->TryAcquire(m_context);
     if (m_descriptor)
@@ -288,7 +294,26 @@ void Handle::Complete(struct io_uring_cqe* cqe)
 {
     COOP_PERF_INC(m_context->GetCooperator()->GetPerfCounters(), perf::Counter::IoComplete);
     ++m_context->m_statistics.ioCompletes;
-    m_result = cqe->res;
+
+    // A zero-copy send completes twice: the result CQE (F_MORE set), then the F_NOTIF
+    // buffer-release CQE — the notification must not overwrite the transfer result. A
+    // FAILED zc send posts a single CQE with neither flag and NO notification follows;
+    // detecting that here drains the expected-but-never-coming second count, or the
+    // handle would wait forever.
+    //
+    if (cqe->flags & IORING_CQE_F_NOTIF)
+    {
+        m_expectNotif = false;
+    }
+    else
+    {
+        m_result = cqe->res;
+        if (m_expectNotif && !(cqe->flags & IORING_CQE_F_MORE))
+        {
+            m_expectNotif = false;
+            m_pendingCqes--;
+        }
+    }
     SPDLOG_TRACE("handle complete result={}", m_result);
     Finalize(cqe->res, reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
 }

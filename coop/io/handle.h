@@ -112,6 +112,13 @@ struct Handle : EmbeddedListHookups<Handle>
 
     void Submit(struct io_uring_sqe*);
 
+    // Multi-CQE submission for operations that complete in a fixed number of CQEs
+    // (SEND_ZC: the result CQE plus its F_NOTIF buffer-release CQE). The coordinator
+    // releases only after all of them drain — a blocking wrapper therefore also
+    // guarantees the buffer is kernel-released before the caller regains it.
+    //
+    void Submit(struct io_uring_sqe*, int pendingCqes);
+
     // Submit with a linked timeout. Converts the interval to a __kernel_timespec stored in
     // m_timeout, marks the operation SQE with IOSQE_IO_LINK, appends a linked timeout SQE,
     // and sets m_pendingCqes to 2.
@@ -163,6 +170,7 @@ private:
 
     int     m_result;
     int     m_pendingCqes;
+    bool    m_expectNotif{false};
     bool    m_timedOut;
 
     struct __kernel_timespec m_timeout;

@@ -318,13 +318,13 @@ Debug-only guard: suspending (Yield/Block) inside a Thunk asserts (`detail::Thun
 release. See `docs/cross_thread_substrate_01.md` for the design, covenants, and the performance comparison.
 
 ### HTTP Server (`coop/http/`)
-Route table maps paths to handler functions that receive a `ConnectionBase&`:
+coop does no routing. The server parses each request and calls one handler that owns dispatch:
 ```cpp
-struct Route {
-    const char* path;
-    void (*handler)(ConnectionBase&);
-};
+using RequestHandler = void (*)(ConnectionBase& conn, void* userData);
 ```
+The handler inspects `conn.GetRequestLine()->path` and does its own matching, static serving (via
+the `ServeFile(conn, path, searchPaths)` helper), and 404s. There is no `Route` table in coop:
+consumers (including the built-in status dashboard's `StatusDispatch`) carry their own.
 
 **Connection architecture** (`coop/http/connection.h`): Three-level CRTP hierarchy following
 the Interface → CRTP → Final pattern (see `DESIGN_IDIOMS.md`):
@@ -383,8 +383,9 @@ receives a body straight to a file — buffered bytes first, then splice (plaint
 parser-buffer bounce (TLS/chunked); keep-alive framing is preserved. `Sendfile` (server) and
 `SendBodyFromFile` (client) serve/upload straight from a file. See `coop/http/CLAUDE.md`.
 
-`RunServer` accepts connections in a loop, launches an `HttpConnection` (Launchable, 32KB stack)
-per client. No method filtering in framework — handlers decide. `ServerConfiguration`
+`RunServer(ctx, config)` accepts connections in a loop, launches an `HttpConnection` (Launchable,
+32KB stack) per client, and calls `config.handler` (non-null required, else it logs and returns
+false). No method filtering, no path matching — handlers decide. `ServerConfiguration`
 declares the topology: `reusePort` (one-listener-per-cooperator sharding), `backlog`,
 `multishotAccept` (ArmedAccept path with bounded pending queue), `maxPendingAccepts`,
 and `pbufRecv` (parse from provided-buffer-ring chunks via one armed multishot recv per
@@ -398,8 +399,7 @@ requests, preserving leftover buffer data for pipelining. The loop exits on send
 or when the client sends `Connection: close`. The `Connection` header detection piggybacks on
 the existing special-header mechanism (alongside Content-Length / Transfer-Encoding).
 `KeepAlive()` returns the current keep-alive state. `SkipBody()` drains unconsumed body bytes
-before `Reset()` to keep the parser positioned correctly.
-Optional `searchPaths` for static file fallback, optional `timeout` (default 30s).
+before `Reset()` to keep the parser positioned correctly. Optional `timeout` (default 30s).
 
 **Graceful drain** (`coop/http/server_handle.h`): pass a `ServerHandle*` as
 `ServerConfiguration::control` (nullptr = no drain machinery, identical behavior). In drain

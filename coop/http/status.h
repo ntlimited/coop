@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 namespace coop
 {
 
@@ -9,18 +11,20 @@ struct Context;
 namespace http
 {
 
-struct Route;
+struct ConnectionBase;
 
-// Return the built-in status/perf API route table (/api/status, /api/perf, /api/perf/enable,
-// /api/perf/disable). These can be appended to an application's own route table so that the
-// status dashboard shares the same port as the application server.
+// Handle the built-in status/perf/sampler/epoch JSON API if `path` names one of its endpoints
+// (/api/status, /api/perf[...], /api/sampler[...], /api/cooperators[...], /api/epoch[...]). Returns
+// true if it wrote a response, false if the path is none of them. This is a composable handler, not
+// a route table: an application drops it into its own RequestHandler
+// (`if (http::StatusDispatch(conn, path)) return;`) to expose the dashboard API alongside its own
+// endpoints, and coop keeps no matching machinery of its own.
 //
-const Route* StatusRoutes();
-int StatusRouteCount();
+bool StatusDispatch(ConnectionBase& conn, std::string_view path);
 
-// Spawn an HTTP status server on the given port. Provides a JSON API at GET /api/status with the
-// cooperator's context tree. Static files (including the dashboard at index.html) are served from
-// the search paths (null-terminated array). Call from within a coop context.
+// Spawn a standalone HTTP status server on the given port: a RequestHandler that runs StatusDispatch
+// and then falls back to static files under `searchPaths` (null-terminated; the dashboard's
+// index.html etc.), else 404. Call from within a coop context.
 //
 void SpawnStatusServer(Cooperator* co, int port,
                        const char* const* searchPaths = nullptr);

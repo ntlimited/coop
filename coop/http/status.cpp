@@ -815,7 +815,13 @@ void HandleEpochAll(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
-Route s_statusRoutes[] = {
+// The status app's own private route table -- exact path to handler. Not exposed; StatusDispatch
+// walks it. Keeping it here (rather than in coop's server) is the point of the strip: routing is the
+// application's, and the dashboard is just another application.
+//
+struct StatusRoute { const char* path; void (*handler)(ConnectionBase&); };
+
+StatusRoute s_statusRoutes[] = {
     {"/api/status",         HandleStatus},
     {"/api/perf",           HandlePerf},
     {"/api/perf/enable",    HandlePerfEnable},
@@ -831,18 +837,35 @@ Route s_statusRoutes[] = {
     {"/api/epoch/all",         HandleEpochAll},
 };
 
-static constexpr int STATUS_ROUTE_COUNT = sizeof(s_statusRoutes) / sizeof(s_statusRoutes[0]);
+// Top-level handler for the standalone status server: the dashboard API, then static files, then
+// 404. searchPaths (a null-terminated const char* array) rides through userData.
+//
+void StatusServerHandler(ConnectionBase& conn, void* userData)
+{
+    auto* req = conn.GetRequestLine();
+    std::string_view path = req->path;
+
+    if (StatusDispatch(conn, path)) return;
+
+    auto* searchPaths = static_cast<const char* const*>(userData);
+    if (searchPaths && ServeFile(conn, path, searchPaths)) return;
+
+    conn.Send(404, "text/plain", "Not Found\n");
+}
 
 } // end anonymous namespace
 
-const Route* StatusRoutes()
+bool StatusDispatch(ConnectionBase& conn, std::string_view path)
 {
-    return s_statusRoutes;
-}
-
-int StatusRouteCount()
-{
-    return STATUS_ROUTE_COUNT;
+    for (auto& route : s_statusRoutes)
+    {
+        if (path == route.path)
+        {
+            route.handler(conn);
+            return true;
+        }
+    }
+    return false;
 }
 
 void SpawnStatusServer(Cooperator* co, int port,
@@ -850,7 +873,12 @@ void SpawnStatusServer(Cooperator* co, int port,
 {
     co->Spawn([=](Context* ctx)
     {
-        RunServer(ctx, port, s_statusRoutes, STATUS_ROUTE_COUNT, "HttpStatusServer", searchPaths);
+        ServerConfiguration config;
+        config.port = port;
+        config.name = "HttpStatusServer";
+        config.handler = &StatusServerHandler;
+        config.userData = const_cast<void*>(static_cast<const void*>(searchPaths));
+        RunServer(ctx, config);
     });
 }
 

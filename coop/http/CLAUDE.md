@@ -1,8 +1,13 @@
 # coop/http/ — HTTP Internals
 
-For the API surface (Route, Connection pull API, response methods, RunServer), see the
+For the API surface (RequestHandler, Connection pull API, response methods, RunServer), see the
 top-level `CLAUDE.md`. This file covers parser internals, buffer management, the client,
 and performance characteristics.
+
+Dispatch note: coop does no routing. `RunServer` parses each request and calls the single
+`ServerConfiguration::handler` (a `RequestHandler = void(*)(ConnectionBase&, void*)`); the handler
+owns all matching, static serving (via the `ServeFile` helper), and 404s. There is no `Route` table
+in coop — the status dashboard (`StatusDispatch`) and benchmarks each carry their own.
 
 ## Connection Buffer Management (`connection.cpp`)
 

@@ -43,12 +43,10 @@ namespace
 
 constexpr int kDriverThreads = 4;
 
-void OkHandler(coop::http::ConnectionBase& conn)
+void OkHandler(coop::http::ConnectionBase& conn, void*)
 {
     conn.Send(200, "text/plain", "OK");
 }
-
-const coop::http::Route kRoutes[] = { { "/ok", &OkHandler } };
 
 int ConnectTo(int port)
 {
@@ -242,7 +240,8 @@ int main(int argc, char** argv)
             config.port = port;
             config.pbufRecv = (mode == 1);
             config.name = mode == 1 ? "PbufServer" : "ClassicServer";
-            coop::http::RunServer(ctx, config, kRoutes, 1);
+            config.handler = &OkHandler;
+            coop::http::RunServer(ctx, config);
         }, {.priority = 0, .stackSize = 65536});
     }
 

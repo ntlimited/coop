@@ -1192,7 +1192,8 @@ void Cooperator::EnterContext(Context* ctx)
 // BoundarySafeKill is invoked by Handles, which can be called within the cooperator's thread or
 // from outside of it (boundary crossing).
 //
-void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /* = false */)
+void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /* = false */,
+                                  KillCause cause /* = KillCause::Kill */)
 {
     if (this != Cooperator::thread_cooperator)
     {
@@ -1201,9 +1202,9 @@ void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /*
         // Cross the thread boundary: submit work onto the cooperator and block until it
         // completes. SubmitSync guarantees the kill logic runs before we return.
         //
-        if (!SubmitSync([handle](Context* ctx)
+        if (!SubmitSync([handle, cause](Context* ctx)
         {
-            ctx->GetCooperator()->BoundarySafeKill(handle, true /* crossed */);
+            ctx->GetCooperator()->BoundarySafeKill(handle, true /* crossed */, cause);
         }))
         {
             // Cooperator is shutting down; the kill will be handled by the shutdown sweep
@@ -1256,7 +1257,7 @@ void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /*
         // We were called originally from the cooperator's thread, so this is guaranteed
         // safe
         //
-        m_scheduled->Kill(handle->m_context);
+        m_scheduled->Kill(handle->m_context, true, cause);
     }
     else
     {
@@ -1265,7 +1266,7 @@ void Cooperator::BoundarySafeKill(Context::Handle* handle, const bool crossed /*
         //
         std::ignore = Spawn([&](Context* ctx)
         {
-            ctx->Kill(handle->m_context);
+            ctx->Kill(handle->m_context, true, cause);
         });
     }
 }

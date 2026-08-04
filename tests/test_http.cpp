@@ -1,6 +1,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -15,6 +16,7 @@
 #include "coop/io/send.h"
 #include "coop/http/connection.h"
 #include "coop/http/client.h"
+#include "coop/http/server.h"
 #include "coop/http/transport.h"
 
 using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
@@ -1672,5 +1674,82 @@ TEST(HttpClientTest, SendBodyFromFile)
         EXPECT_EQ(bodyOnWire, content);
 
         ::close(fileFd);
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// RunServer with declared configuration: multishot accept path, roundtrip, kill exit
+// -------------------------------------------------------------------------------------
+
+namespace
+{
+
+void OkHandler(coop::http::ConnectionBase& conn)
+{
+    conn.Send(200, "text/plain", "OK");
+}
+
+const coop::http::Route kOkRoutes[] = { { "/ok", &OkHandler } };
+
+} // end anonymous namespace
+
+TEST(HttpTest, RunServerMultishotAcceptRoundtrip)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        // Fixed port with pid salt — the test host is shared
+        //
+        int port = 40000 + (getpid() % 20000);
+
+        coop::Context::Handle serverHandle;
+        bool serverReturned = false;
+        ctx->GetCooperator()->Spawn(
+            {.priority = 0, .stackSize = 65536},
+            [&, port](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = port;
+            config.multishotAccept = true;
+            config.maxPendingAccepts = 8;
+            config.name = "TestMultishotServer";
+            coop::http::RunServer(serverCtx, config, kOkRoutes, 1);
+            serverReturned = true;
+        }, &serverHandle);
+
+        // Let the server bind and arm
+        //
+        for (int i = 0; i < 10; i++)
+        {
+            ctx->Yield(true);
+        }
+
+        for (int round = 0; round < 2; round++)
+        {
+            int cfd = socket(AF_INET, SOCK_STREAM, 0);
+            ASSERT_GE(cfd, 0);
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = htons(port);
+            ASSERT_EQ(connect(cfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0)
+                << "round " << round << ": " << strerror(errno);
+
+            coop::io::Descriptor client(cfd, coop::GetUring());
+            const char* req = "GET /ok HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+            ASSERT_GT(coop::io::SendAll(client, req, strlen(req)), 0);
+
+            std::string resp = RecvAll(client, 4096);
+            EXPECT_NE(resp.find("HTTP/1.1 200 OK"), std::string::npos);
+            EXPECT_NE(resp.find("OK"), std::string::npos);
+        }
+
+        // Kill exits the armed accept loop via the listener shutdown guard
+        //
+        serverHandle.Kill();
+        for (int i = 0; i < 200 && !serverReturned; i++)
+        {
+            ctx->Yield(true);
+        }
+        EXPECT_TRUE(serverReturned);
     });
 }

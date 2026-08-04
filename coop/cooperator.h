@@ -68,12 +68,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // actually the entry point for all contexts.
     //
     template<typename Fn>
-    bool Spawn(Fn const& fn, Context::Handle* handle = nullptr);
+    bool Spawn(Fn&& fn, Context::Handle* handle = nullptr);
 
     template<typename Fn>
     bool Spawn(
         SpawnConfiguration const& config,
-        Fn const& fn,
+        Fn&& fn,
         Context::Handle* handle = nullptr);
 
     // Launch is an alternative, in-context API where Launchable types can be constructed and

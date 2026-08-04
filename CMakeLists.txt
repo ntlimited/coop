@@ -197,6 +197,7 @@ add_executable(coop_tests
     tests/test_coordinator.cpp
     tests/test_continuation.cpp
     tests/test_registered.cpp
+    tests/test_semaphore.cpp
     tests/test_direct_yield.cpp
     tests/test_timer.cpp
     tests/test_work_deque.cpp

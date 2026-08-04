@@ -40,7 +40,7 @@ void LaunchCleanup(Context* ctx)
 }
 
 template<typename Fn>
-bool Cooperator::Spawn(Fn const& fn, Context::Handle* handle /* = nullptr */)
+bool Cooperator::Spawn(Fn&& fn, Context::Handle* handle /* = nullptr */)
 {
     // Inherit the parent context's config when no explicit config is given.
     // This ensures child contexts get the same stack size as their parent,
@@ -53,14 +53,19 @@ bool Cooperator::Spawn(Fn const& fn, Context::Handle* handle /* = nullptr */)
             .priority = m_scheduled->m_priority,
             .stackSize = m_scheduled->m_segment.Size()
         };
-        return Spawn(inherited, fn, handle);
+        return Spawn(inherited, std::forward<Fn>(fn), handle);
     }
-    return Spawn(s_defaultConfiguration, fn, handle);
+    return Spawn(s_defaultConfiguration, std::forward<Fn>(fn), handle);
 }
 
 template<typename Fn>
-bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::Handle* handle /* = nullptr */)
+bool Cooperator::Spawn(SpawnConfiguration const& config, Fn&& fn, Context::Handle* handle /* = nullptr */)
 {
+    // The lambda is placement-constructed onto the new context's stack; forwarding
+    // (rather than copying from const&) lets move-only captures — a semaphore Permit,
+    // a unique resource — travel into the spawned context.
+    //
+    using Decayed = std::decay_t<Fn>;
     if (m_scheduled && m_scheduled->IsKilled())
     {
         return false;
@@ -82,16 +87,16 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn const& fn, Context::
     size_t varSize = ContextVarTotalSize();
     void* launchBase = static_cast<char*>(spawnCtx->m_segment.Bottom()) + varSize;
 
-    assert(varSize + sizeof(Fn) <= actual.stackSize);
+    assert(varSize + sizeof(Decayed) <= actual.stackSize);
     detail::ContextVarRegistry::Instance().ConstructAll(spawnCtx->m_segment.Bottom());
-    new (launchBase) Fn(fn);
+    new (launchBase) Decayed(std::forward<Fn>(fn));
 
-    uintptr_t heapStart = reinterpret_cast<uintptr_t>(launchBase) + sizeof(Fn);
+    uintptr_t heapStart = reinterpret_cast<uintptr_t>(launchBase) + sizeof(Decayed);
     heapStart = (heapStart + 15) & ~uintptr_t(15);
     spawnCtx->m_heapTop = reinterpret_cast<void*>(heapStart);
 
-    spawnCtx->m_entry = &SpawnTrampoline<Fn>;
-    spawnCtx->m_cleanup = &LaunchCleanup<Fn>;
+    spawnCtx->m_entry = &SpawnTrampoline<Decayed>;
+    spawnCtx->m_cleanup = &LaunchCleanup<Decayed>;
     EnterContext(spawnCtx);
     return true;
 }
@@ -244,15 +249,15 @@ bool Cooperator::SubmitSync(Fn&& fn, SpawnConfiguration const& config)
 // Free-function convenience wrappers that forward to the thread-local cooperator.
 //
 template<typename Fn>
-bool Spawn(Fn const& fn, Context::Handle* handle = nullptr)
+bool Spawn(Fn&& fn, Context::Handle* handle = nullptr)
 {
-    return Cooperator::thread_cooperator->Spawn(fn, handle);
+    return Cooperator::thread_cooperator->Spawn(std::forward<Fn>(fn), handle);
 }
 
 template<typename Fn>
-bool Spawn(SpawnConfiguration const& config, Fn const& fn, Context::Handle* handle = nullptr)
+bool Spawn(SpawnConfiguration const& config, Fn&& fn, Context::Handle* handle = nullptr)
 {
-    return Cooperator::thread_cooperator->Spawn(config, fn, handle);
+    return Cooperator::thread_cooperator->Spawn(config, std::forward<Fn>(fn), handle);
 }
 
 template<typename T, typename... Args>

@@ -24,6 +24,7 @@ struct Context;
 namespace io
 {
 
+struct BufferArena;
 struct BufferRing;
 
 // the coop::io::Uring serves as a wrapper around io_uring, as wrapped by liburing. It is not
@@ -43,6 +44,7 @@ struct Uring
 
     int PendingOps() const { return m_pendingOps; }
     int RingFd() const { return m_ring.ring_fd; }
+    struct io_uring* Ring() { return &m_ring; }
 
     // The default provided buffer ring registered by Init when UringConfiguration::bufferRingEntries
     // is set and the kernel supports pbuf rings; nullptr otherwise (feature absent or not requested).
@@ -52,6 +54,11 @@ struct Uring
     // Per-thread pipes for splice data paths (fills lazily; closed with the uring).
     //
     PipePool& GetPipePool() { return m_pipePool; }
+
+    // The optional registered buffer arena (UringConfiguration::registeredBufferBytes);
+    // nullptr when not configured or registration failed (probe idiom).
+    //
+    BufferArena* GetBufferArena() const { return m_bufferArena.get(); }
 
     // True when io_uring has completions waiting to be harvested -- either CQEs already sitting in
     // the completion ring, or, under COOP_TASKRUN, kernel task_work that will materialize CQEs on
@@ -166,6 +173,7 @@ struct Uring
     // Held by pointer so its registration outlives Init and is torn down with the Uring.
     //
     std::unique_ptr<BufferRing> m_bufferRing;
+    std::unique_ptr<BufferArena> m_bufferArena;
     PipePool m_pipePool;
 };
 

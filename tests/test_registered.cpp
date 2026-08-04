@@ -11,6 +11,12 @@
 #include <gtest/gtest.h>
 
 #include "coop/self.h"
+#include "coop/cooperator.h"
+#include "coop/thread.h"
+#include "coop/io/buffer_arena.h"
+#include "coop/io/fixed_buffer.h"
+#include "coop/io/read.h"
+#include "coop/io/write.h"
 #include "coop/io/descriptor.h"
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
@@ -167,5 +173,69 @@ TEST(RegisteredTest, ExhaustionDegradesToPlainFd)
         {
             ::close(fd);
         }
+    });
+}
+
+// -------------------------------------------------------------------------------------
+// BufferArena + fixed-buffer ops
+// -------------------------------------------------------------------------------------
+
+TEST(RegisteredTest, BufferArenaFixedWriteRead)
+{
+    coop::CooperatorConfiguration cfg;
+    cfg.uring.registeredBufferBytes = 1 << 20;
+
+    coop::Cooperator cooperator(cfg);
+    coop::Thread thread(&cooperator);
+
+    cooperator.SubmitSync([&](coop::Context*)
+    {
+        auto* uring = coop::GetUring();
+        auto* arena = uring->GetBufferArena();
+        ASSERT_NE(arena, nullptr) << "arena registration failed (RLIMIT_MEMLOCK?)";
+        ASSERT_TRUE(arena->Available());
+
+        char* lease = arena->Acquire(8192);
+        ASSERT_NE(lease, nullptr);
+        memset(lease, 'x', 8192);
+        memcpy(lease, "fixed-path", 10);
+
+        char tmpPath[] = "/tmp/coop_fixed_XXXXXX";
+        int fileFd = mkstemp(tmpPath);
+        ASSERT_GE(fileFd, 0);
+        unlink(tmpPath);
+
+        coop::io::Descriptor file(coop::io::borrowed, fileFd, uring);
+
+        // WRITE_FIXED via the overload — same op name, fixed-ness from the buffer type
+        //
+        coop::io::FixedBuffer fb{lease, arena->Index()};
+        int written = coop::io::Write(file, fb, 8192, 0);
+        ASSERT_EQ(written, 8192);
+
+        // READ_FIXED back into a second lease
+        //
+        char* lease2 = arena->Acquire(8192);
+        ASSERT_NE(lease2, nullptr);
+        coop::io::FixedBuffer fb2{lease2, arena->Index()};
+        int readBack = coop::io::Read(file, fb2, 8192, 0);
+        ASSERT_EQ(readBack, 8192);
+        EXPECT_EQ(memcmp(lease2, lease, 8192), 0);
+
+        arena->Release(lease2, 8192);
+        arena->Release(lease, 8192);
+        ::close(fileFd);
+
+        cooperator.Shutdown();
+    });
+}
+
+TEST(RegisteredTest, NoArenaWithoutConfig)
+{
+    test::RunInCooperator([](coop::Context*)
+    {
+        // Default configuration: no arena, and that is a clean, queryable state
+        //
+        EXPECT_EQ(coop::GetUring()->GetBufferArena(), nullptr);
     });
 }

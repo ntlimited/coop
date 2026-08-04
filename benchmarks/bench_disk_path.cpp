@@ -16,6 +16,11 @@
 // this deliberately measures the copy path, not device speed — exactly the axis on which
 // the engines differ.
 //
+// Engine 3 (wfixed) is the registered-buffer rematch the survey demanded: recv into an
+// arena lease, then WRITE_FIXED — the kernel skips per-IO get_user_pages using the
+// registration's pre-built page list. Whether that beats splice's copy-avoidance is the
+// question this harness answers.
+//
 // Run pinned and in release mode: build/release/bin/bench_disk_path
 
 #include <algorithm>
@@ -42,7 +47,9 @@
 #include "coop/self.h"
 #include "coop/thread.h"
 
+#include "coop/io/buffer_arena.h"
 #include "coop/io/descriptor.h"
+#include "coop/io/fixed_buffer.h"
 #include "coop/io/pipe_pool.h"
 #include "coop/io/recv.h"
 #include "coop/io/splice.h"
@@ -186,6 +193,34 @@ bool BounceRound(coop::io::Descriptor& in, coop::io::Descriptor& file, size_t si
     return true;
 }
 
+// The bounce with the write leg on WRITE_FIXED: identical recv side, registered-buffer
+// disk side.
+//
+bool WFixedRound(coop::io::Descriptor& in, coop::io::Descriptor& file, size_t size,
+                 char* arenaBuf, uint16_t arenaIndex)
+{
+    size_t remaining = size;
+    off_t off = 0;
+    while (remaining > 0)
+    {
+        int n = coop::io::RecvFastpath(in, arenaBuf, std::min(kBounceBuf, remaining), 0);
+        if (n <= 0) return false;
+
+        int done = 0;
+        while (done < n)
+        {
+            coop::io::FixedBuffer fb{arenaBuf + done, arenaIndex};
+            int w = coop::io::Write(file, fb, static_cast<size_t>(n - done),
+                                    static_cast<uint64_t>(off + done));
+            if (w <= 0) return false;
+            done += w;
+        }
+        off += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
 double CpuSeconds()
 {
     rusage ru;
@@ -223,19 +258,22 @@ int main()
 
     // Total byte budget across all sizes, warmup and measured rounds alike
     //
+    constexpr int kEngines = 3;
     size_t totalBytes = 0;
     for (size_t size : kSizes)
     {
-        totalBytes += (kWarmup + kRounds) * 2 * ItersFor(size) * size;
+        totalBytes += (kWarmup + kRounds) * kEngines * ItersFor(size) * size;
     }
 
     std::thread producer(Produce, clientFd, totalBytes);
 
     // Sample slots: [size][engine]
     //
-    Sample samples[std::size(kSizes)][2];
+    Sample samples[std::size(kSizes)][3];
 
-    coop::Cooperator cooperator;
+    coop::CooperatorConfiguration cfg;
+    cfg.uring.registeredBufferBytes = 1 << 20;
+    coop::Cooperator cooperator(cfg);
     coop::Thread thread(&cooperator);
 
     cooperator.SubmitSync([&](coop::Context*)
@@ -245,18 +283,26 @@ int main()
         coop::io::Descriptor file(coop::io::borrowed, fileFd, uring);
         std::vector<char> bounceBuf(kBounceBuf);
 
+        auto* arena = uring->GetBufferArena();
+        char* arenaBuf = arena ? arena->Acquire(kBounceBuf) : nullptr;
+        if (!arenaBuf)
+        {
+            fprintf(stderr, "buffer arena unavailable; wfixed engine cannot run\n");
+            exit(1);
+        }
+
         for (size_t si = 0; si < std::size(kSizes); si++)
         {
             size_t size = kSizes[si];
             size_t iters = ItersFor(size);
 
-            // Interleaved: alternate splice/bounce per round so ambient load skews both
-            // engines equally. Engine index 0 = splice, 1 = bounce. The leading kWarmup
-            // pairs are executed but not recorded.
+            // Interleaved: rotate splice/bounce/wfixed per round so ambient load skews
+            // all engines equally. Engine 0 = splice, 1 = bounce, 2 = wfixed. The
+            // leading kWarmup rotations are executed but not recorded.
             //
-            for (int r = 0; r < (kWarmup + kRounds) * 2; r++)
+            for (int r = 0; r < (kWarmup + kRounds) * 3; r++)
             {
-                int engine = r & 1;
+                int engine = r % 3;
                 double cpu0 = CpuSeconds();
                 auto t0 = std::chrono::steady_clock::now();
 
@@ -265,7 +311,9 @@ int main()
                 {
                     ok = engine == 0
                         ? SpliceRound(in, fileFd, size, uring->GetPipePool())
-                        : BounceRound(in, file, size, bounceBuf.data());
+                        : engine == 1
+                            ? BounceRound(in, file, size, bounceBuf.data())
+                            : WFixedRound(in, file, size, arenaBuf, arena->Index());
                 }
 
                 auto wall = std::chrono::duration<double>(
@@ -278,7 +326,7 @@ int main()
                     exit(1);
                 }
 
-                if (r < kWarmup * 2) continue;
+                if (r < kWarmup * 3) continue;
 
                 samples[si][engine].wallSec += wall;
                 samples[si][engine].cpuSec  += cpu;
@@ -293,21 +341,20 @@ int main()
     close(clientFd);
     close(fileFd);
 
-    printf("\nreceive-to-disk: SpliceToFile vs recv+write bounce "
+    printf("\nreceive-to-disk: splice vs bounce vs wfixed "
            "(%d rounds/engine, interleaved, TCP loopback)\n\n", kRounds);
     printf("%-6s %-8s %12s %16s\n", "size", "engine", "MiB/s", "cpu-sec/GiB");
+    const char* names[3] = { "splice", "bounce", "wfixed" };
     for (size_t si = 0; si < std::size(kSizes); si++)
     {
-        for (int engine = 0; engine < 2; engine++)
+        for (int engine = 0; engine < 3; engine++)
         {
             const Sample& s = samples[si][engine];
             double mib = s.bytes / (1024.0 * 1024.0);
             double gib = s.bytes / (1024.0 * 1024.0 * 1024.0);
             printf("%-6s %-8s %12.1f %16.3f\n",
-                   SizeLabel(kSizes[si]),
-                   engine == 0 ? "splice" : "bounce",
-                   mib / s.wallSec,
-                   s.cpuSec / gib);
+                   SizeLabel(kSizes[si]), names[engine],
+                   mib / s.wallSec, s.cpuSec / gib);
         }
     }
     printf("\ncpu-sec/GiB includes the in-process producer thread (identical work for "

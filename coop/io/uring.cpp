@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <spdlog/spdlog.h>
 
+#include "buffer_arena.h"
 #include "buffer_ring.h"
 #include "handle.h"
 
@@ -374,6 +375,22 @@ void Uring::Init()
     // fails, and we warn and continue with no default ring -- classic recv is untouched -- exactly
     // as the registered-ring-fd path above degrades. Entries must be a power of two; round up.
     //
+    if (m_config.registeredBufferBytes > 0)
+    {
+        auto arena = std::make_unique<BufferArena>(m_config.registeredBufferBytes);
+        int err = arena->Register(*this);
+        if (err < 0)
+        {
+            spdlog::warn("uring buffer-arena register failed ret={} (RLIMIT_MEMLOCK?), "
+                         "fixed-buffer ops unavailable", err);
+        }
+        else
+        {
+            spdlog::info("uring buffer-arena registered bytes={}", arena->Size());
+            m_bufferArena = std::move(arena);
+        }
+    }
+
     if (m_config.bufferRingEntries > 0)
     {
         uint32_t entries = 1;

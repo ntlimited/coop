@@ -83,6 +83,14 @@ struct UringConfiguration
     //
     uint32_t iowqMaxBoundedWorkers = 0;
     uint32_t iowqMaxUnboundedWorkers = 0;
+
+    // Registered buffer arena (IORING_REGISTER_BUFFERS): one anonymous slab registered
+    // as fixed buffer 0, for READ_FIXED/WRITE_FIXED disk legs and SEND_ZC. 0 = off.
+    // Registration doubles as the probe (RLIMIT_MEMLOCK, kernel support): on failure,
+    // warn and continue with no arena. There is no registered-buffer recv in any
+    // released kernel — this axis is unrelated to the provided buffer ring above.
+    //
+    size_t registeredBufferBytes = 0;
 };
 
 static const UringConfiguration s_defaultUringConfiguration = {

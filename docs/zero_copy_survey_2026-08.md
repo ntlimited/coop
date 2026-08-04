@@ -113,8 +113,15 @@ research time; items flagged unverified should be confirmed before entering a de
    bounce as fully-inline io_uring ops with ~0 amortized syscalls. coop's bounce today
    is blocking-style ops — a fastpath recv plus a full ring round trip per `io::Write`
    — so its syscall budget matches splice's two-per-hop while paying both memcpys.
-   Revisit the comparison if/when registered-buffer `WRITE_FIXED` batching lands; until
-   then the survey's table row does not describe coop's actual bounce.
+
+   **Rematch run** (same harness, third engine: recv into a registered BufferArena
+   lease + WRITE_FIXED): the fixed-buffer write beats the plain bounce by 8-20% at
+   64K-16M (e.g. 64K: 3.0 vs 2.5 GiB/s; 1M: 3.2 vs 2.9) and nothing at 4K — matching
+   the VLDB ~11%-class attribution for registered buffers — but splice still wins
+   roughly 2x against BOTH bounce variants at every size. Splice is confirmed as the
+   default engine under ReadBodyToFile; the registered-buffer path is the right
+   substrate for workloads that must land in userspace anyway (TLS bodies, inspected
+   payloads) and for the future SEND_ZC leg.
 2. Serve-after-fill hit-rate window for real traffic — decides buffered+DONTCACHE vs
    O_DIRECT for the cache tier.
 3. MSG_MORE / writev-first-chunk / cork for header+body coalescing.

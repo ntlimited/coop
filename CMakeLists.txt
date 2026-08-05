@@ -148,6 +148,10 @@ target_link_libraries(tcp_proxy PRIVATE coop)
 add_executable(pipeline examples/pipeline.cpp)
 target_link_libraries(pipeline PRIVATE coop)
 
+add_executable(context_dump examples/context_dump.cpp)
+target_link_libraries(context_dump PRIVATE coop)
+target_link_options(context_dump PRIVATE -rdynamic)   # symbol names in the dump
+
 # curl-multi-under-coop example + benchmark (optional: only if libcurl is present)
 find_package(CURL)
 if(CURL_FOUND)
@@ -217,6 +221,7 @@ add_executable(coop_tests
     tests/test_virtual_time.cpp
     tests/test_stall_detector.cpp
     tests/test_reactor.cpp
+    tests/test_introspect.cpp
     tests/test_drain.cpp
     tests/test_direct_yield.cpp
     tests/test_timer.cpp
@@ -241,6 +246,7 @@ add_executable(coop_tests
     tests/test_ws.cpp
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
+target_link_options(coop_tests PRIVATE -rdynamic)   # dladdr symbol names for the introspection test
 include(GoogleTest)
 gtest_discover_tests(coop_tests)
 

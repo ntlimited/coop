@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 
 #include "coop/cooperator.h"
 #include "coop/context.h"
@@ -895,6 +896,82 @@ void HandleContextDump(ConnectionBase& conn)
     free(buf);
 }
 
+// ---- Health ----
+//
+// The one-glance endpoint: is this cooperator alive and what is it doing. `loops` is the scheduler
+// heartbeat — poll twice and if it moved, the loop is progressing; if it is frozen while `blocked`
+// is high, something is wedging the thread (pair with /api/contexts/dump to see what).
+//
+void HandleHealth(ConnectionBase& conn)
+{
+    Cooperator* co = conn.GetCooperator();
+    Context* sched = co->Scheduled();
+
+    std::string out;
+    out.reserve(512);
+    JsonWriter w(out);
+
+    w.BeginObject();
+    w.Key("cooperator"); w.String(co->GetName());
+    w.Key("cpu");        w.Int(co->CpuId());
+    w.Key("numa");       w.Int(co->NumaNode());
+    w.Key("loops");      w.UInt(co->Loops());
+    w.Key("scheduled");
+    if (sched && sched->GetName()) w.String(sched->GetName()); else w.Null();
+
+    w.Key("contexts");
+    w.BeginObject();
+    w.Key("total");     w.UInt(co->ContextsCount());
+    w.Key("yielded");   w.UInt(co->YieldedCount());
+    w.Key("blocked");   w.UInt(co->BlockedCount());
+    w.Key("running");   w.UInt(sched ? 1 : 0);
+    w.Key("nonDaemon"); w.UInt(co->NonDaemonContexts());
+    w.EndObject();
+
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
+// ---- Sampler: folded-stack export ----
+//
+// Emit the sampler's stack ring as Brendan-Gregg collapsed/folded stacks (root;...;leaf<space>count),
+// the input format for flamegraph.pl and speedscope. Turns the built-in profiler into standard
+// tooling: /api/sampler/start?stacks=1, apply load, then curl /api/sampler/folded > out.folded.
+// Symbolizing raw PCs is safe even for since-exited contexts — code addresses do not move.
+//
+void HandleSamplerFolded(ConnectionBase& conn)
+{
+    static constexpr size_t MAX_READ = 2048;
+    auto* samples = new perf::StackSample[MAX_READ];
+    size_t count = perf::ReadStackSamples(samples, MAX_READ);
+
+    std::map<std::string, uint64_t> folded;
+    char sym[256];
+    for (size_t i = 0; i < count; i++)
+    {
+        std::string line;
+        for (int f = samples[i].depth - 1; f >= 0; f--)   // root (outermost) to leaf
+        {
+            debug::Symbolize(samples[i].frames[f], sym, sizeof(sym));
+            if (!line.empty()) line += ';';
+            line += sym;
+        }
+        if (!line.empty()) folded[line]++;
+    }
+    delete[] samples;
+
+    std::string out;
+    out.reserve(folded.size() * 64);
+    for (auto& kv : folded)
+    {
+        out += kv.first;
+        out += ' ';
+        out += std::to_string(kv.second);
+        out += '\n';
+    }
+    conn.Send(200, "text/plain", out.data(), out.size());
+}
+
 // The status app's own private route table -- exact path to handler. Not exposed; StatusDispatch
 // walks it. Keeping it here (rather than in coop's server) is the point of the strip: routing is the
 // application's, and the dashboard is just another application.
@@ -910,7 +987,9 @@ StatusRoute s_statusRoutes[] = {
     {"/api/sampler/start",  HandleSamplerStart},
     {"/api/sampler/stop",   HandleSamplerStop},
     {"/api/sampler/samples", HandleSamplerSamples},
+    {"/api/sampler/folded",  HandleSamplerFolded},
     {"/api/sampler/symbolize", HandleSymbolize},
+    {"/api/health",          HandleHealth},
     {"/api/cooperators",       HandleCooperators},
     {"/api/cooperators/perf",  HandleCooperatorsPerf},
     {"/api/epoch",             HandleEpoch},

@@ -524,6 +524,8 @@ void Cooperator::Launch()
                                  || !m_pendingContinuations.IsEmpty()
                                  || m_uring.PendingOps() > 0)
     {
+        ++m_loops;   // scheduler heartbeat (Cooperator::Loops)
+
         if (m_hasSubmissions.load(std::memory_order_acquire))
         {
             DrainSubmissions();

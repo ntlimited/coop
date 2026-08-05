@@ -72,3 +72,16 @@ TEST(IntrospectTest, WalksRunningContext)
         EXPECT_GE(depth, 1);
     });
 }
+
+// The scheduler heartbeat (Cooperator::Loops, behind /api/health) advances as the loop runs.
+//
+TEST(IntrospectTest, LoopHeartbeatAdvances)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        auto* co = ctx->GetCooperator();
+        uint64_t before = co->Loops();
+        for (int i = 0; i < 32; i++) ctx->Yield(true);   // drive outer-loop passes
+        EXPECT_GT(co->Loops(), before);
+    });
+}

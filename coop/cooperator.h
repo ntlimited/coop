@@ -332,6 +332,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     //
     int Tid() const { return m_tid.load(std::memory_order_acquire); }
 
+    // Monotonic count of scheduler-loop iterations — a liveness heartbeat. Advances once per outer
+    // loop pass (per work batch / wakeup), so polling it twice tells you the loop is progressing.
+    // Unconditional but negligible: one increment per batch, dwarfed by the batch's own work.
+    //
+    uint64_t Loops() const { return m_loops; }
+
     void StallEnter()
     {
         if (m_stallArmed) [[unlikely]]
@@ -457,6 +463,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     uint64_t m_stallGen{0};
     std::atomic<uint64_t> m_stallState{0};
     std::atomic<int> m_tid{0};
+    uint64_t m_loops{0};
 
     std::atomic<bool> m_shutdown;
     Context*        m_scheduled;

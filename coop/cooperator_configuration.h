@@ -68,6 +68,14 @@ struct CooperatorConfiguration
     //
     bool virtualTime = false;
 
+    // Deterministic RNG seed for Cooperator::Rng(). 0 (default) seeds the PRNG from OS entropy —
+    // a good fast RNG for production. A non-zero value seeds it deterministically: the same seed
+    // reproduces the same stream, so a simulation (pair with virtualTime) is fully replayable from
+    // its seed. The seed actually used is readable via Cooperator::Seed() — log it on a failing run,
+    // pass it back here to reproduce.
+    //
+    uint64_t rngSeed = 0;
+
     // Per-context CPU-cycle accounting. When set, every resume reads the timestamp counter and
     // charges the elapsed cycles to the running context's m_statistics.ticks (surfaced by the
     // status server's per-context view). It is pure observability — nothing on a scheduling or

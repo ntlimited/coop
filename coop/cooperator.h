@@ -17,6 +17,7 @@
 #include "spawn_configuration.h"
 #include "stack_pool.h"
 #include "perf/counters.h"
+#include "prng.h"
 #include "io/uring.h"
 #include "time/now.h"
 #include "time/timer_queue.h"
@@ -315,6 +316,13 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     bool VirtualTime() const { return m_virtualTime; }
     int64_t VirtualNowUs() const { return m_virtualNowUs; }
 
+    // The cooperator's deterministic PRNG and the seed it was constructed with. In a simulation
+    // (CooperatorConfiguration::rngSeed set, alongside virtualTime) all randomness draws from here,
+    // so a run is reproducible from Seed(). See prng.h.
+    //
+    Prng& Rng() { return m_prng; }
+    uint64_t Seed() const { return m_seed; }
+
     // Stall-detection seam. A StallDetector arms this and watches m_stallState from a sibling
     // thread. The state packs a switch generation in the high bits with a running bit in bit 0:
     // every switch INTO a context bumps the generation and sets the bit; every return to the loop
@@ -455,6 +463,9 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     CooperatorConfiguration m_config;
     bool m_virtualTime{false};
     int64_t m_virtualNowUs{0};
+
+    uint64_t m_seed{0};
+    Prng m_prng{};
 
     // Stall-detection state (see StallEnter/StallLeave). m_stallGen is cooperator-thread-only;
     // m_stallState is the atomic the watchdog reads. Armed only while a StallDetector is attached.

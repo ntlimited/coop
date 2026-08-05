@@ -5,6 +5,7 @@
 #include <mutex>
 #include <new>
 #include <pthread.h>
+#include <random>
 #include <sys/eventfd.h>
 #include <thread>
 #include <unistd.h>
@@ -138,6 +139,19 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
         m_config.timerMode = TimerMode::UserspaceQueue;
         m_virtualNowUs = 1000000LL * 60 * 60 * 24 * 365;
     }
+
+    // Deterministic PRNG. A non-zero configured seed is used verbatim (reproducible); zero draws a
+    // real seed from the OS so production gets a good, distinct stream. Either way Seed() reports
+    // the seed actually in effect, so a failing simulation can be replayed from it.
+    //
+    m_seed = config.rngSeed;
+    if (m_seed == 0)
+    {
+        std::random_device rd;
+        m_seed = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+        if (m_seed == 0) m_seed = 0x9e3779b97f4a7c15ULL;   // never leave it zero
+    }
+    m_prng = Prng::Seeded(m_seed);
 
     auto& registry = detail::CooperatorVarRegistry::Instance();
     assert(registry.TotalSize() <= LOCAL_STORAGE_SIZE

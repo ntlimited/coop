@@ -148,6 +148,20 @@ target_link_libraries(tcp_proxy PRIVATE coop)
 add_executable(pipeline examples/pipeline.cpp)
 target_link_libraries(pipeline PRIVATE coop)
 
+# curl-multi-under-coop example + benchmark (optional: only if libcurl is present)
+find_package(CURL)
+if(CURL_FOUND)
+    add_executable(curl_fetch examples/curl_fetch.cpp)
+    target_link_libraries(curl_fetch PRIVATE coop CURL::libcurl)
+    target_link_options(curl_fetch PRIVATE -rdynamic)
+
+    add_executable(bench_curl benchmarks/bench_curl.cpp)
+    target_link_libraries(bench_curl PRIVATE coop CURL::libcurl)
+    target_link_options(bench_curl PRIVATE -rdynamic)
+else()
+    message(STATUS "coop: libcurl not found — skipping curl_fetch / bench_curl")
+endif()
+
 # Generate a self-signed TLS certificate for testing if one doesn't already exist
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/bin/cert.pem ${CMAKE_BINARY_DIR}/bin/key.pem

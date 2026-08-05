@@ -264,6 +264,14 @@ fast-path details, and zero-copy operation internals.
 via `Resolve4` (DNS over UDP through io_uring). `PlaintextStream` wraps a `Descriptor` for
 socket IO (`Recv`, `Send`, `SendAll`). `ReadFile(path, buf, bufSize)` reads an entire file.
 
+**Reactor** (`coop/io/reactor.h`) is a readiness/timer event-loop surface backed by io_uring, for
+bridging foreign libraries that expect an epoll-style reactor (libcurl multi, c-ares, libpq async).
+`Watch(fd, mask)`/`Unwatch(fd)`/`SetTimeout(ms)` with fn-ptr callbacks; it owns one POLL_ADD watcher
+context per fd (transient, self-retiring) and the yield-off-stack deferral that keeps a callback from
+re-entering a non-reentrant foreign API. Opt-in, zero-cost when unused. Consumers drive readiness
+edge-triggered — a callback must drain its fd or it re-fires. See `examples/curl_coop.h` for a
+complete libcurl driver on top of it, and its header for the curl-vs-native benchmark context.
+
 ### SSL/TLS (`coop/io/ssl/`)
 Two BIO modes: **Memory BIO** (default, staging buffer) and **Socket BIO** (real fd, enables
 kTLS). See `coop/io/ssl/CLAUDE.md` for BIO modes, kTLS activation, TCP_NODELAY rationale, and

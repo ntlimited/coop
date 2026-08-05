@@ -4,55 +4,52 @@
 //
 // libcurl's multi API is built for a foreign event loop: it hands you sockets to watch (via
 // CURLMOPT_SOCKETFUNCTION) and a single timeout to honor (CURLMOPT_TIMERFUNCTION), and you call
-// curl_multi_socket_action whenever one of those fires. That interface is *readiness*-shaped
-// (epoll-style "tell me when fd X is writable"); io_uring is *completion*-shaped. The bridge is
-// one io_uring POLL_ADD per socket, wrapped as a coop context that blocks on readiness — coop's
-// io::Poll. curl owns every byte of protocol (HTTP/1.1, HTTP/2, ...); coop is pure substrate.
+// curl_multi_socket_action whenever one of those fires. That is exactly the shape coop::io::Reactor
+// bridges — so this whole driver is a thin adapter: curl's socket/timer callbacks forward to the
+// Reactor, and the Reactor's readiness/timeout callbacks call back into curl. curl owns every byte
+// of protocol (HTTP/1.1, HTTP/2, ...); coop is pure substrate. HTTP/2 comes for free against a
+// server that offers it — coop implements none of it.
 //
-// This is a demo/example driver: one CURLM on one cooperator (curl-multi is not thread-safe, and a
-// cooperator is single-threaded, so every curl call here is naturally serialized). It leans on one
-// property of the socket-action model: curl drops a socket from the active set the moment its
-// transfer finishes (CURL_POLL_REMOVE), so a per-socket watcher is transient and self-terminating —
-// no cross-context kill, no Handle bookkeeping. A driver that had to survive cross-socket interest
-// changes (curl re-arming socket A because of activity on B) would upgrade the watcher to a
-// select over (poll, interest-changed signal); that case does not arise for independent transfers.
+// One CURLM per cooperator: curl-multi is not thread-safe, and a cooperator is single-threaded, so
+// every curl call here is naturally serialized. The Reactor guarantees our socket_action calls
+// never nest inside a curl callback (the CURLM_RECURSIVE_API_CALL trap), so this file carries no
+// event-loop machinery of its own.
+//
+// ---------------------------------------------------------------------------------------------
+// Benchmark context (benchmarks/bench_curl.cpp; loopback, 64 keep-alive connections, HTTP/1.1):
+//
+//     coop native client   ~180k req/s
+//     curl via coop         ~79k req/s   (~2.3x slower)
+//
+// The gap is expected and worth understanding. coop's native client is a tight zero-copy pull
+// parser on a persistent socket; curl carries a full protocol state machine plus this bridge's
+// per-edge overhead (a poll SQE per readiness change, extra context hops). So: reach for the native
+// client on the hot path of a protocol coop speaks. Reach for curl when you want what curl *is* —
+// HTTP/2 and HTTP/3, proxies, redirects, cookies, auth schemes, content decoding, a mountain of
+// battle-tested edge cases — none of which coop has to own. The ~2.3x buys all of that, unmodified.
+// ---------------------------------------------------------------------------------------------
 
 #include <curl/curl.h>
 #include <poll.h>
-
-#include <memory>
-#include <unordered_map>
-
-#include <cstdio>
-#include <cstdlib>
 
 #include "coop/context.h"
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"
 #include "coop/coordinate_with.h"
-#include "coop/self.h"
-#include "coop/io/descriptor.h"
-#include "coop/io/poll.h"
-#include "coop/time/sleep.h"
-
-#ifndef CURLCOOP_TRACE
-#define CURLCOOP_TRACE 0
-#endif
-#define CURLCOOP_LOG(...) do { if (CURLCOOP_TRACE) fprintf(stderr, "[curlcoop] " __VA_ARGS__); } while (0)
+#include "coop/io/reactor.h"
 
 namespace curlcoop
 {
 
 using namespace coop;
 
-// Per-transfer completion latch. The caller of Perform sets this as the easy handle's private
-// pointer, then blocks on `done`; the driver's CheckInfo fires it when curl reports the transfer
-// finished. Signal is one-shot and already-signaled-safe, so there is no missed-wake race even if
-// the transfer somehow completes before the caller waits.
+// Per-transfer completion latch. Perform sets this as the easy handle's private pointer and parks
+// on `done`; CheckInfo releases it when curl reports the transfer finished. This is the semaphore
+// park/wake idiom — a stack Coordinator held by the waiter, released by another context.
 //
 struct Transfer
 {
-    Coordinator done;          // parked by the caller, released by CheckInfo (semaphore idiom)
+    Coordinator done;
     CURLcode    result   = CURLE_OK;
     long        status   = 0;
     bool        finished = false;
@@ -61,7 +58,8 @@ struct Transfer
 class Driver
 {
 public:
-    explicit Driver(Cooperator* co) : m_co(co)
+    explicit Driver(Cooperator* co)
+        : m_reactor(co, &Driver::OnReady, &Driver::OnTimeout, this)
     {
         m_multi = curl_multi_init();
         curl_multi_setopt(m_multi, CURLMOPT_SOCKETFUNCTION, &Driver::SocketCb);
@@ -75,162 +73,73 @@ public:
     Driver(const Driver&) = delete;
     Driver& operator=(const Driver&) = delete;
 
-    // Run one easy handle to completion, blocking `ctx` (but not the thread). Adds the handle to
-    // the multi; curl's timer callback kicks the first socket_action, watcher contexts drive the
-    // IO, and CheckInfo wakes us on CURLMSG_DONE. Returns the transfer's CURLcode; *statusOut, if
-    // given, gets the HTTP response code.
+    // Run one easy handle to completion, blocking `ctx` (but not the thread). curl's timer callback
+    // kicks the first socket_action via the reactor; readiness callbacks drive the IO; CheckInfo
+    // wakes us on CURLMSG_DONE. Returns the transfer's CURLcode; *statusOut, if given, gets the HTTP
+    // response code.
     //
     CURLcode Perform(Context* ctx, CURL* easy, long* statusOut = nullptr)
     {
         Transfer t;
         curl_easy_setopt(easy, CURLOPT_PRIVATE, reinterpret_cast<char*>(&t));
-        t.done.TryAcquire(ctx);                       // park latch (held until CheckInfo releases)
+        t.done.TryAcquire(ctx);
         curl_multi_add_handle(m_multi, easy);
-        CURLCOOP_LOG("added handle %p\n", (void*)easy);
 
         if (!t.finished)
         {
-            CoordinateWith(ctx, &t.done);             // block until the transfer completes
+            CoordinateWith(ctx, &t.done);
         }
         if (statusOut) *statusOut = t.status;
         return t.result;
     }
 
 private:
-    struct Sock
-    {
-        curl_socket_t fd;
-        unsigned      mask;      // poll(2) events curl currently wants
-        bool          removed = false;
-    };
-
-    // ---- curl callbacks (static thunks → member handlers) ----
+    // ---- curl → reactor ----
 
     static int SocketCb(CURL*, curl_socket_t s, int what, void* userp, void*)
     {
-        static_cast<Driver*>(userp)->OnSocket(s, what);
+        auto* d = static_cast<Driver*>(userp);
+        if (what == CURL_POLL_REMOVE)
+        {
+            d->m_reactor.Unwatch(static_cast<int>(s));
+        }
+        else
+        {
+            unsigned mask = 0;
+            if (what == CURL_POLL_IN)         mask = POLLIN;
+            else if (what == CURL_POLL_OUT)   mask = POLLOUT;
+            else if (what == CURL_POLL_INOUT) mask = POLLIN | POLLOUT;
+            d->m_reactor.Watch(static_cast<int>(s), mask);
+        }
         return 0;
     }
 
     static int TimerCb(CURLM*, long timeoutMs, void* userp)
     {
-        static_cast<Driver*>(userp)->OnTimer(timeoutMs);
+        static_cast<Driver*>(userp)->m_reactor.SetTimeout(timeoutMs);
         return 0;
     }
 
-    void OnSocket(curl_socket_t s, int what)
+    // ---- reactor → curl ----
+
+    static void OnReady(int fd, unsigned revents, void* user)
     {
-        CURLCOOP_LOG("OnSocket fd=%d what=%d\n", (int)s, what);
-        if (what == CURL_POLL_REMOVE)
-        {
-            auto it = m_socks.find(s);
-            if (it != m_socks.end())
-            {
-                it->second->removed = true;   // its watcher sees this and self-exits + erases
-            }
-            return;
-        }
+        int ev = 0;
+        if (revents & (POLLIN | POLLHUP | POLLERR)) ev |= CURL_CSELECT_IN;
+        if (revents & POLLOUT)                      ev |= CURL_CSELECT_OUT;
 
-        unsigned mask = 0;
-        if (what == CURL_POLL_IN)         mask = POLLIN;
-        else if (what == CURL_POLL_OUT)   mask = POLLOUT;
-        else if (what == CURL_POLL_INOUT) mask = POLLIN | POLLOUT;
-
-        auto it = m_socks.find(s);
-        if (it == m_socks.end())
-        {
-            auto st  = std::make_unique<Sock>(Sock{s, mask, false});
-            Sock* raw = st.get();
-            m_socks.emplace(s, std::move(st));
-            SpawnWatcher(raw);
-        }
-        else
-        {
-            // Same socket, new interest. The watcher re-reads mask each loop; changes here are
-            // triggered by this socket's own activity (inside its watcher's socket_action call),
-            // so it re-arms with the new mask on its very next iteration.
-            //
-            it->second->mask = mask;
-        }
+        auto* d = static_cast<Driver*>(user);
+        int running = 0;
+        curl_multi_socket_action(d->m_multi, fd, ev, &running);
+        d->CheckInfo();
     }
 
-    void SpawnWatcher(Sock* st)
+    static void OnTimeout(void* user)
     {
-        m_co->Spawn([this, st](Context* c)
-        {
-            c->SetName("curl-sock");
-            c->Detach();
-
-            // Defer off the curl call stack. Eager Spawn runs us synchronously inside the
-            // curl_multi_socket_action that registered this socket; io::Poll can even complete
-            // inline for an already-ready loopback fd, which would drive socket_action reentrantly
-            // (CURLM_RECURSIVE_API_CALL). Yield once so our socket_action calls only ever originate
-            // from the scheduler loop, never nested in another curl_multi call.
-            //
-            c->Yield(true);
-
-            io::Descriptor desc(io::borrowed, st->fd);   // curl owns the fd — do not close it
-
-            while (!st->removed)
-            {
-                unsigned mask = st->mask;
-                int rev = io::Poll(desc, mask);
-                if (st->removed) break;
-
-                int ev = 0;
-                if (rev < 0)
-                {
-                    ev = CURL_CSELECT_ERR;
-                }
-                else
-                {
-                    if (rev & (POLLIN | POLLHUP | POLLERR)) ev |= CURL_CSELECT_IN;
-                    if (rev & POLLOUT)                      ev |= CURL_CSELECT_OUT;
-                }
-
-                int running = 0;
-                CURLMcode mc = curl_multi_socket_action(m_multi, st->fd, ev, &running);
-                CURLCOOP_LOG("watcher fd=%d rev=0x%x ev=0x%x -> mc=%d running=%d mask=0x%x\n",
-                             (int)st->fd, rev, ev, mc, running, st->mask);
-                CheckInfo();
-                // Loop condition re-checks st->removed: a transfer that just finished (or whose
-                // socket curl dropped) set it inside the socket_action above.
-            }
-
-            m_socks.erase(st->fd);   // frees the Sock; st dangles after this — do not touch
-        });
-    }
-
-    void OnTimer(long timeoutMs)
-    {
-        long gen = ++m_timerGen;          // supersede any pending timer
-        if (timeoutMs < 0) return;        // curl wants no timer
-
-        m_co->Spawn([this, gen, timeoutMs](Context* c)
-        {
-            c->SetName("curl-timer");
-            c->Detach();
-
-            // Defer off the curl call stack: curl-multi is not reentrant, and eager Spawn runs us
-            // synchronously inside the curl_multi_* call that armed this timer. Sleeping (or, for a
-            // 0ms timer, a bare yield) returns control to that call first; we drive socket_action
-            // only once it has returned.
-            //
-            if (timeoutMs > 0)
-            {
-                time::Sleep(c, std::chrono::milliseconds(timeoutMs));
-            }
-            else
-            {
-                c->Yield(true);
-            }
-            if (gen != m_timerGen) return;   // a newer timeout replaced us
-
-            CURLCOOP_LOG("timer fire ms=%ld gen=%ld\n", timeoutMs, gen);
-            int running = 0;
-            curl_multi_socket_action(m_multi, CURL_SOCKET_TIMEOUT, 0, &running);
-            CheckInfo();
-        });
+        auto* d = static_cast<Driver*>(user);
+        int running = 0;
+        curl_multi_socket_action(d->m_multi, CURL_SOCKET_TIMEOUT, 0, &running);
+        d->CheckInfo();
     }
 
     void CheckInfo()
@@ -254,16 +163,13 @@ private:
                 t->result = res;
                 curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &t->status);
                 t->finished = true;
-                CURLCOOP_LOG("DONE easy=%p status=%ld res=%d\n", (void*)easy, t->status, res);
                 t->done.Release(nullptr, false);   // wake the context blocked in Perform
             }
         }
     }
 
-    Cooperator* m_co;
+    io::Reactor m_reactor;
     CURLM*      m_multi;
-    std::unordered_map<curl_socket_t, std::unique_ptr<Sock>> m_socks;
-    long        m_timerGen = 0;
 };
 
 } // namespace curlcoop

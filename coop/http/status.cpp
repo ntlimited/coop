@@ -7,8 +7,12 @@
 #include <dlfcn.h>
 #include <string>
 
+#include <cstdio>
+#include <cstring>
+
 #include "coop/cooperator.h"
 #include "coop/context.h"
+#include "coop/debug/introspect.h"
 #include "coop/detail/scheduler_state.h"
 #include "coop/epoch/epoch.h"
 #include "coop/perf/counters.h"
@@ -815,6 +819,82 @@ void HandleEpochAll(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
+// ---- Context stacks ----
+//
+// The stackful payoff over HTTP: every context on this cooperator, with the call stack it is
+// currently parked in. For a blocked context that stack names the exact wait it is stuck on — curl
+// this on a wedged server and it explains itself. Two shapes: JSON for tooling, plaintext for eyes.
+
+void HandleContextStacks(ConnectionBase& conn)
+{
+    Cooperator* co = conn.GetCooperator();
+
+    std::string out;
+    out.reserve(16384);
+    JsonWriter w(out);
+
+    w.BeginObject();
+    w.Key("cooperator");
+    w.String(co->GetName());
+    w.Key("contexts");
+    w.BeginArray();
+
+    co->VisitContexts([&](Context* ctx) -> bool
+    {
+        w.BeginObject();
+        w.Key("name");
+        w.String(ctx->GetName() ? ctx->GetName() : "(unnamed)");
+        w.Key("state");
+        w.String(StateString(ctx->m_state));
+
+        w.Key("frames");
+        w.BeginArray();
+
+        uintptr_t frames[64];
+        int depth = debug::CaptureStack(ctx, frames, 64);
+        char sym[256];
+        for (int i = 0; i < depth; i++)
+        {
+            debug::Symbolize(frames[i], sym, sizeof(sym));
+            w.BeginObject();
+            char pc[20];
+            snprintf(pc, sizeof(pc), "0x%lx", static_cast<unsigned long>(frames[i]));
+            w.Key("pc");
+            w.String(pc);
+            w.Key("fn");
+            w.String(sym);
+            w.EndObject();
+            if (strstr(sym, "CoopContextEntry")) break;   // stack base; drop the sentinel above it
+        }
+
+        w.EndArray();
+        w.EndObject();
+        return true;
+    });
+
+    w.EndArray();
+    w.EndObject();
+    conn.Send(200, "application/json", out.data(), out.size());
+}
+
+void HandleContextDump(ConnectionBase& conn)
+{
+    char* buf = nullptr;
+    size_t sz = 0;
+    FILE* f = open_memstream(&buf, &sz);
+    if (!f)
+    {
+        conn.Send(500, "text/plain", "open_memstream failed\n");
+        return;
+    }
+
+    debug::DumpContexts(conn.GetCooperator(), f);
+    fclose(f);
+
+    conn.Send(200, "text/plain", buf, sz);
+    free(buf);
+}
+
 // The status app's own private route table -- exact path to handler. Not exposed; StatusDispatch
 // walks it. Keeping it here (rather than in coop's server) is the point of the strip: routing is the
 // application's, and the dashboard is just another application.
@@ -835,6 +915,8 @@ StatusRoute s_statusRoutes[] = {
     {"/api/cooperators/perf",  HandleCooperatorsPerf},
     {"/api/epoch",             HandleEpoch},
     {"/api/epoch/all",         HandleEpochAll},
+    {"/api/contexts/stacks",   HandleContextStacks},
+    {"/api/contexts/dump",     HandleContextDump},
 };
 
 // Top-level handler for the standalone status server: the dashboard API, then static files, then

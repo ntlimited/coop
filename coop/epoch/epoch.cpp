@@ -99,9 +99,22 @@ Epoch Manager::Enter(Context* ctx)
     assert(ctx != nullptr && "epoch::Manager::Enter requires a non-null context");
     assert(ctx->m_epochState.traversal.IsUnpinned()
            && "traversal epoch already pinned; nested Guard/Enter is not allowed");
-    ctx->m_epochState.traversal = m_current;
+    // Traversal pins are domain-independent quiescence markers, not snapshot
+    // versions. Managers on different cooperators advance independently, so
+    // publishing m_current here would make their numeric values incomparable:
+    // a reader at local epoch 100 could otherwise fail to protect a node
+    // unlinked by a writer at local epoch 5. Epoch 1 is below every valid
+    // retire/unlink epoch and therefore conservatively blocks reclamation
+    // while any traversal is active, regardless of manager skew.
+    //
+    ctx->m_epochState.traversal = Epoch{1};
     PublishWatermark();
-    return m_current;
+    // EBR entry handshake: publish the pin before the caller can load a
+    // structure pointer. SafeEpoch's matching post-unlink fence prevents the
+    // reader and reclaimer from both missing each other's publication.
+    //
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return ctx->m_epochState.traversal;
 }
 
 void Manager::Exit()
@@ -134,6 +147,7 @@ void Manager::Pin(Context* ctx, Epoch epoch)
            && "application epoch already pinned; missing Unpin before Pin");
     ctx->m_epochState.application = epoch;
     PublishWatermark();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),
         perf::Counter::EpochPin);
 }
@@ -211,6 +225,13 @@ Manager::PinSnapshot Manager::SnapshotPins()
 
 Epoch Manager::SafeEpoch()
 {
+    // EBR reclaim handshake: callers physically unlink with release stores
+    // before scanning. Paired with the reader's post-pin fence, this forbids
+    // the store-buffering outcome where the reader obtains the old pointer
+    // while this scan misses its pin.
+    //
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+
     // Read the published watermark from every cooperator in the registry. Each watermark is
     // the minimum pinned epoch across all contexts on that cooperator, or Alive() if none
     // are pinned. We take the global minimum — reclamation is blocked by the oldest reader

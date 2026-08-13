@@ -24,8 +24,9 @@ Each context carries a `State` in its `ContextVar` slot (file-scope `s_state` in
 Two independent slots, each pinned at an epoch value or zero (unpinned):
 
 - `traversal` — short-lived, managed by `Manager::Enter`/`Exit` or `Guard`. Held for the
-  duration of a single data-structure traversal. Set to the current epoch on entry, cleared
-  to zero on exit.
+  duration of a single data-structure traversal. Set to the domain floor (epoch 1) on entry,
+  cleared to zero on exit. This is intentionally a conservative quiescence marker because
+  manager-local current counters are not a shared numeric epoch domain.
 
 - `application` — long-lived, managed explicitly by the application. Held for the duration
   of a transaction or snapshot. Set to an epoch supplied by the caller (`Pin`), cleared by
@@ -61,8 +62,11 @@ decision — typically once per scheduler loop iteration or per commit.
 
 ### Guard (RAII traversal pin)
 
-`Guard` pins the traversal slot on construction and unpins on destruction. Captures the
-pinned epoch in `Epoch()` for consumers that need to pass it to lock-free operations.
+`Guard` pins the traversal slot on construction and unpins on destruction. Traversal is a
+quiescence contract, not an MVCC snapshot: it publishes epoch 1, the minimum valid epoch.
+This deliberately blocks reclamation while any traversal is active and stays correct when
+different cooperators' local `Manager::m_current` counters have advanced by different amounts.
+Application pins retain their caller-supplied snapshot epoch.
 
 ```cpp
 {
@@ -85,12 +89,13 @@ manager.Reclaim();                    // may now free node if retired
 1. Scan all contexts on the local cooperator — `State` fields are non-atomic (same thread).
 2. Compute `min(traversal, application)` across all contexts, defaulting to `Alive()`.
 3. `release`-store the result into `Cooperator::m_epochWatermark`.
+4. On reader entry, execute a `seq_cst` fence before the caller may load a structure pointer.
 
-Since only the cooperator's own thread ever writes the watermark, no CAS is needed —
-a plain `store(release)` is sufficient. Other threads `load(acquire)` it in `SafeEpoch`.
+Since only the cooperator's own thread ever writes the watermark, no CAS is needed. The release
+store and acquire scan carry the pin value; the fences provide the ordering across the distinct
+watermark and structure-pointer atomics.
 
-The publish happens before the Coordinator or semaphore signal that lets a remote writer
-proceed, establishing the happens-before chain:
+An explicit Coordinator or semaphore signal still establishes an ordinary happens-before chain:
 
 ```
 B: watermark.store(E, release)
@@ -103,6 +108,9 @@ A: watermark.load(acquire)  → sees E
 
 O(cooperators) atomic reads. Returns the global minimum across all cooperator watermarks.
 A cooperator whose Manager has been destroyed resets its watermark to `Alive()` in `~Manager`.
+`SafeEpoch` executes a `seq_cst` fence after the caller's physical unlink and before loading
+watermarks. Together with the post-pin reader fence, this closes the unsignalled store-buffering
+race: the reader cannot obtain the pre-unlink pointer while the reclaimer also misses its pin.
 
 ### State fields
 

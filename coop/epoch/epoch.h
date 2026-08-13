@@ -126,8 +126,10 @@ struct Manager
 
     // ---- Traversal pins (coop-managed, short-lived) ----
 
-    // Pin the calling context at the current epoch. Returns the pinned epoch value.
-    // Use Guard for RAII.
+    // Publish a domain-independent traversal pin. Traversal pins use the
+    // minimum valid epoch (1), rather than this manager's local Current(), so
+    // independently advancing cooperators remain comparable for reclamation.
+    // Returns the pinned epoch value. Use Guard for RAII.
     //
     Epoch Enter();
     Epoch Enter(Context* ctx);
@@ -238,8 +240,8 @@ private:
     size_t          m_retireCount{0};
 };
 
-// RAII traversal guard. Pins the current context's traversal slot on construction,
-// unpins on destruction.
+// RAII traversal guard. Pins the current context's traversal slot at the
+// domain-independent floor on construction, unpins on destruction.
 //
 //   {
 //       epoch::Guard guard(manager);

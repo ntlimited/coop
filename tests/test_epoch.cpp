@@ -92,8 +92,8 @@ TEST(EpochTest, TraversalPinAfterAdvance)
         mgr.Advance();  // epoch = 2
 
         auto ep = mgr.Enter(ctx);
-        EXPECT_EQ(ep, Epoch{2});
-        EXPECT_EQ(mgr.SafeEpoch(), Epoch{2});
+        EXPECT_EQ(ep, Epoch{1});
+        EXPECT_EQ(mgr.SafeEpoch(), Epoch{1});
 
         mgr.Exit(ctx);
         EXPECT_EQ(mgr.SafeEpoch(), Epoch::Alive());
@@ -148,6 +148,23 @@ TEST(EpochTest, BothPinsTakenMinimum)
 
         mgr.Unpin(ctx);
         EXPECT_EQ(mgr.SafeEpoch(), Epoch::Alive());
+    });
+}
+
+TEST(EpochTest, TraversalPinRemainsComparableAcrossManagerSkew)
+{
+    RunWithEpoch([](coop::Context* ctx, coop::epoch::Manager& mgr)
+    {
+        for (uint32_t i = 0; i < 100; ++i)
+            mgr.Advance();
+
+        // A traversal is a quiescence marker, not a local snapshot version.
+        // Pinning at the domain floor keeps it comparable with a writer whose
+        // independently-owned manager may still be at a much smaller epoch.
+        //
+        EXPECT_EQ(mgr.Enter(ctx), Epoch{1});
+        EXPECT_EQ(mgr.SafeEpoch(), Epoch{1});
+        mgr.Exit(ctx);
     });
 }
 
@@ -286,9 +303,10 @@ TEST(EpochTest, BlockedContextPinVisibleInSafeEpoch)
 
 // ---- Cross-cooperator pin visibility ----
 
-// Two cooperators, each with its own epoch::Manager. A reader on cooperator B pins at epoch 1
-// while the writer on cooperator A tries to reclaim. The writer's SafeEpoch() must see the
-// reader's pin via the published watermark and block reclamation until the reader exits.
+// Two cooperators, each with its own independently advancing epoch::Manager. A reader on
+// cooperator B publishes the domain-floor traversal pin while the writer on cooperator A
+// tries to reclaim. The writer's SafeEpoch() must see that watermark and block reclamation
+// until the reader exits even when B's local counter is far ahead of A's.
 //
 // Coordinators are not safe across cooperators (they manipulate a single cooperator's context
 // queues). Cross-thread synchronization uses std::binary_semaphore instead — each cooperator
@@ -319,7 +337,13 @@ TEST(EpochTest, CrossCooperatorPinBlocksReclaim)
         coop::epoch::Manager mgrB;
         coop::epoch::SetManager(&mgrB);
 
-        mgrB.Enter(ctx);   // pin at epoch 1 — watermark published to coopB->m_epochWatermark
+        // Deliberately skew the reader's independently-owned local counter far
+        // beyond the writer's. A traversal pin must remain a comparable
+        // quiescence marker rather than publishing this unrelated value.
+        //
+        for (uint32_t i = 0; i < 100; ++i)
+            mgrB.Advance();
+        EXPECT_EQ(mgrB.Enter(ctx), Epoch{1});
         pinned.release();  // happens-before A's pinned.acquire() → A sees watermark
 
         reclaim.acquire(); // block until A has attempted reclaim

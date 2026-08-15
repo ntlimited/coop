@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -56,8 +57,8 @@ private:
 //                managed entirely by the application. Coop never touches this slot. Prevents
 //                reclamation of versions that a transaction's snapshot can still see.
 //
-// Epoch::Unpinned() means "not pinned." SafeEpoch scans both slots across all contexts;
-// reclamation is blocked by the minimum non-Unpinned pin regardless of which slot holds it.
+// Epoch::Unpinned() means "not pinned." SafeEpoch scans both slots across all contexts
+// plus manager-owned application pins; reclamation is blocked by the minimum live pin.
 //
 struct State
 {
@@ -86,6 +87,35 @@ struct RetireEntry
     RetireEntry*    m_next{nullptr};
     Epoch           m_retiredAt{Epoch::Unpinned()};
     void            (*reclaim)(RetireEntry*);
+};
+
+struct Manager;
+
+// Context-independent application pin. The object is intrusive so a Manager
+// can publish long-lived application ownership without allocating and without
+// tying the pin to the lifetime of whichever Context established it.
+//
+// ManagedPin does not unpin itself: its owner must release it through the same
+// Manager before either object is destroyed.
+//
+struct ManagedPin
+{
+    ManagedPin() = default;
+    ManagedPin(ManagedPin const&) = delete;
+    ManagedPin& operator=(ManagedPin const&) = delete;
+    ManagedPin(ManagedPin&&) = delete;
+    ManagedPin& operator=(ManagedPin&&) = delete;
+    ~ManagedPin() { assert(m_owner == nullptr && "destroying a live managed epoch pin"); }
+
+    bool IsPinned() const { return m_owner != nullptr; }
+    Epoch PinnedEpoch() const { return m_epoch; }
+
+private:
+    friend struct Manager;
+    ManagedPin* m_next{nullptr};
+    ManagedPin* m_prev{nullptr};
+    Manager*    m_owner{nullptr};
+    Epoch       m_epoch{Epoch::Unpinned()};
 };
 
 // Per-cooperator epoch manager. One instance per cooperator thread, accessed via __thread
@@ -118,6 +148,11 @@ struct Manager
     // Current global epoch for this cooperator.
     //
     Epoch Current() const { return m_current; }
+
+    // True only while called on this manager's owning cooperator thread with
+    // this manager installed as the thread-local epoch manager.
+    //
+    bool IsCurrentThreadManager() const;
 
     // Advance the global epoch. Returns the new value. Typically called once per scheduler
     // loop iteration or once per transaction commit — the right cadence depends on the consumer.
@@ -158,6 +193,12 @@ struct Manager
     //
     void TryUnpin();
 
+    // Pin application ownership independently of a Context. The caller owns
+    // the intrusive ManagedPin storage and must keep it alive until Unpin().
+    //
+    void Pin(ManagedPin& pin, Epoch epoch);
+    void Unpin(ManagedPin& pin);
+
     // ---- Retirement ----
 
     // Retire an entry for later reclamation. Sets retiredAt to the current epoch and
@@ -168,8 +209,8 @@ struct Manager
 
     // ---- Reclamation ----
 
-    // Compute the minimum epoch across all pinned contexts on this cooperator. Returns
-    // Epoch::Alive() if no context is pinned (everything is reclaimable).
+    // Compute the minimum epoch across all context and manager-owned pins on
+    // this cooperator. Returns Epoch::Alive() if nothing is pinned.
     //
     Epoch SafeEpoch();
 
@@ -191,8 +232,8 @@ struct Manager
 
     // ---- Observability ----
 
-    // Snapshot of pin state across all contexts on this cooperator. O(contexts) walk.
-    // Read-only observation — does not publish or modify anything.
+    // Snapshot of pin state across all contexts and manager-owned application
+    // pins on this cooperator. Read-only observation.
     //
     struct PinSnapshot
     {
@@ -223,6 +264,11 @@ private:
     // SetExternalWatermark(). Null means standalone mode (existing behavior).
     //
     std::atomic<Epoch>* m_externalWatermark{nullptr};
+
+    // Context-independent application pins owned by longer-lived consumers.
+    // Mutated only on this manager's cooperator thread.
+    //
+    ManagedPin* m_managedPinHead{nullptr};
 
 public:
     // Set the external watermark publication target. Called by Bedrock before the

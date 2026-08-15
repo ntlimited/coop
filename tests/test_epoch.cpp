@@ -133,6 +133,47 @@ TEST(EpochTest, ApplicationPinSetsSafeEpoch)
     });
 }
 
+TEST(EpochTest, ManagedApplicationPinSurvivesCreatorContextExit)
+{
+    RunWithEpoch([](coop::Context*, coop::epoch::Manager& mgr)
+    {
+        coop::epoch::ManagedPin pin;
+        std::atomic<bool> pinned{false};
+        std::atomic<Epoch> externalWatermark{Epoch::Alive()};
+        mgr.SetExternalWatermark(&externalWatermark);
+
+        coop::GetCooperator()->Spawn([&](coop::Context*)
+        {
+            mgr.Pin(pin, mgr.Current());
+            pinned.store(true, std::memory_order_release);
+        });
+        while (!pinned.load(std::memory_order_acquire))
+            coop::Yield();
+
+        // The creating context has returned. The manager-owned application
+        // pin must remain in the published minimum until explicitly released.
+        auto snapshot = mgr.SnapshotPins();
+        EXPECT_EQ(snapshot.applicationPins, 1u);
+        EXPECT_EQ(snapshot.oldestApplication, Epoch{1});
+        EXPECT_EQ(mgr.SafeEpoch(), Epoch{1});
+        EXPECT_EQ(externalWatermark.load(std::memory_order_acquire), Epoch{1});
+
+        bool reclaimed = false;
+        TestEntry entry;
+        entry.Init(&reclaimed);
+        mgr.Retire(&entry);
+        mgr.Advance();
+        EXPECT_EQ(mgr.Reclaim(), 0u);
+        EXPECT_FALSE(reclaimed);
+
+        mgr.Unpin(pin);
+        EXPECT_EQ(externalWatermark.load(std::memory_order_acquire), Epoch::Alive());
+        EXPECT_EQ(mgr.Reclaim(), 1u);
+        EXPECT_TRUE(reclaimed);
+        mgr.SetExternalWatermark(nullptr);
+    });
+}
+
 TEST(EpochTest, BothPinsTakenMinimum)
 {
     RunWithEpoch([](coop::Context* ctx, coop::epoch::Manager& mgr)

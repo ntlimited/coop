@@ -19,6 +19,12 @@ void SetManager(Manager* mgr)
     t_manager = mgr;
 }
 
+bool Manager::IsCurrentThreadManager() const
+{
+    return t_manager == this
+        && Cooperator::thread_cooperator == m_cooperator;
+}
+
 // ---- Manager ----
 
 Manager::Manager()
@@ -36,6 +42,8 @@ Manager::Manager(Cooperator* co)
 
 Manager::~Manager()
 {
+    assert(m_managedPinHead == nullptr &&
+           "epoch::Manager destroyed with live managed application pins");
     // Reset both watermarks so SafeEpoch() doesn't block on a dead manager.
     //
     m_cooperator->m_epochWatermark.store(Epoch::Alive(), std::memory_order_release);
@@ -66,6 +74,12 @@ void Manager::PublishWatermark()
         }
         return true;
     });
+
+    for (ManagedPin* pin = m_managedPinHead; pin; pin = pin->m_next)
+    {
+        if (pin->m_epoch < safe)
+            safe = pin->m_epoch;
+    }
 
     // Always write to m_epochWatermark so SafeEpoch() (which reads m_epochWatermark
     // via the cooperator registry) returns correct values even in mixed mode. Without
@@ -178,6 +192,48 @@ void Manager::TryUnpin()
     Unpin(ctx);
 }
 
+void Manager::Pin(ManagedPin& pin, Epoch epoch)
+{
+    assert(t_manager == this && "epoch::Manager not set for this cooperator; was bootstrap skipped?");
+    assert(!epoch.IsUnpinned() && "pin epoch must be non-zero");
+    assert(epoch <= m_current && "cannot pin at a future epoch");
+    assert(pin.m_owner == nullptr && "managed application epoch already pinned");
+
+    pin.m_owner = this;
+    pin.m_epoch = epoch;
+    pin.m_prev = nullptr;
+    pin.m_next = m_managedPinHead;
+    if (m_managedPinHead)
+        m_managedPinHead->m_prev = &pin;
+    m_managedPinHead = &pin;
+
+    PublishWatermark();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),
+        perf::Counter::EpochPin);
+}
+
+void Manager::Unpin(ManagedPin& pin)
+{
+    assert(t_manager == this && "epoch::Manager not set for this cooperator; was bootstrap skipped?");
+    assert(pin.m_owner == this && "managed pin belongs to another manager or is unpinned");
+
+    if (pin.m_prev)
+        pin.m_prev->m_next = pin.m_next;
+    else
+        m_managedPinHead = pin.m_next;
+    if (pin.m_next)
+        pin.m_next->m_prev = pin.m_prev;
+
+    pin.m_next = nullptr;
+    pin.m_prev = nullptr;
+    pin.m_owner = nullptr;
+    pin.m_epoch = Epoch::Unpinned();
+    PublishWatermark();
+    COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(),
+        perf::Counter::EpochUnpin);
+}
+
 void Manager::Retire(RetireEntry* entry)
 {
     assert(t_manager == this && "epoch::Manager not set for this cooperator; was bootstrap skipped?");
@@ -219,6 +275,13 @@ Manager::PinSnapshot Manager::SnapshotPins()
         }
         return true;
     });
+
+    for (ManagedPin* pin = m_managedPinHead; pin; pin = pin->m_next)
+    {
+        snap.applicationPins++;
+        if (pin->m_epoch < snap.oldestApplication)
+            snap.oldestApplication = pin->m_epoch;
+    }
 
     return snap;
 }

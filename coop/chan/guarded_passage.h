@@ -82,9 +82,14 @@ struct GuardedPassage
 
     bool IsShutdown() const { return State() == GuardedPassageState::Shutdown; }
 
-    void TransitionTo(GuardedPassageState expected, GuardedPassageState next)
+    // Returns whether this call performed the transition. A false return means
+    // the state was not `expected` -- either a peer moved it first, or the
+    // caller's pairing assumption is wrong. Side destructors below re-read and
+    // retry on false; other callers are free to ignore the result.
+    //
+    bool TransitionTo(GuardedPassageState expected, GuardedPassageState next)
     {
-        m_state.compare_exchange_strong(expected, next,
+        return m_state.compare_exchange_strong(expected, next,
             std::memory_order_acq_rel);
     }
 
@@ -186,16 +191,45 @@ struct RecvSide
         core.TransitionTo(GuardedPassageState::Created, GuardedPassageState::RecvOnly);
     }
 
+    // The peer side can be tearing down concurrently on another thread -- that is
+    // the normal case for a passage bridging two cooperators. Reading the state
+    // once and issuing a single CAS loses that race: both sides observe SendRecv,
+    // one CAS wins, and the loser's CAS silently fails, leaving the passage parked
+    // at SendShutdown/RecvShutdown with no side left alive to move it to Shutdown.
+    // Re-read and retry until this side's transition actually lands.
+    //
     ~RecvSide()
     {
         if (!m_core) return;
-        auto s = m_core->State();
-        if (s == GuardedPassageState::RecvOnly)
-            m_core->TransitionTo(GuardedPassageState::RecvOnly, GuardedPassageState::Shutdown);
-        else if (s == GuardedPassageState::SendRecv)
-            m_core->TransitionTo(GuardedPassageState::SendRecv, GuardedPassageState::RecvShutdown);
-        else if (s == GuardedPassageState::SendShutdown)
-            m_core->TransitionTo(GuardedPassageState::SendShutdown, GuardedPassageState::Shutdown);
+        while (true)
+        {
+            auto s = m_core->State();
+            if (s == GuardedPassageState::RecvOnly)
+            {
+                if (m_core->TransitionTo(GuardedPassageState::RecvOnly,
+                                         GuardedPassageState::Shutdown))
+                    return;
+            }
+            else if (s == GuardedPassageState::SendRecv)
+            {
+                if (m_core->TransitionTo(GuardedPassageState::SendRecv,
+                                         GuardedPassageState::RecvShutdown))
+                    return;
+            }
+            else if (s == GuardedPassageState::SendShutdown)
+            {
+                if (m_core->TransitionTo(GuardedPassageState::SendShutdown,
+                                         GuardedPassageState::Shutdown))
+                    return;
+            }
+            else
+            {
+                // RecvShutdown/Shutdown/Created: this side is already accounted
+                // for (or was never paired), and no transition is owed.
+                //
+                return;
+            }
+        }
     }
 
     RecvSide(RecvSide const&) = delete;
@@ -241,14 +275,37 @@ struct SendSide
         core.TransitionTo(GuardedPassageState::RecvOnly, GuardedPassageState::SendRecv);
     }
 
+    // Retries for the same reason ~RecvSide does: a single read-then-CAS loses a
+    // concurrent teardown race against the peer side and parks the passage one
+    // transition short of Shutdown.
+    //
     ~SendSide()
     {
         if (!m_core) return;
-        auto s = m_core->State();
-        if (s == GuardedPassageState::SendRecv)
-            m_core->TransitionTo(GuardedPassageState::SendRecv, GuardedPassageState::SendShutdown);
-        else if (s == GuardedPassageState::RecvShutdown)
-            m_core->TransitionTo(GuardedPassageState::RecvShutdown, GuardedPassageState::Shutdown);
+        while (true)
+        {
+            auto s = m_core->State();
+            if (s == GuardedPassageState::SendRecv)
+            {
+                if (m_core->TransitionTo(GuardedPassageState::SendRecv,
+                                         GuardedPassageState::SendShutdown))
+                    return;
+            }
+            else if (s == GuardedPassageState::RecvShutdown)
+            {
+                if (m_core->TransitionTo(GuardedPassageState::RecvShutdown,
+                                         GuardedPassageState::Shutdown))
+                    return;
+            }
+            else
+            {
+                // SendShutdown/Shutdown: already accounted for. RecvOnly/Created:
+                // this side's constructor never committed the handshake, so it
+                // owes nothing.
+                //
+                return;
+            }
+        }
     }
 
     SendSide(SendSide const&) = delete;

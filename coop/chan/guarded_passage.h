@@ -14,7 +14,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <new>
 #include <unistd.h>
@@ -86,15 +88,55 @@ struct GuardedPassage
             std::memory_order_acq_rel);
     }
 
-    // Destructor waits for Shutdown.
+    // Destructor waits for Shutdown -- the terminal state only reached once both
+    // RecvSide and SendSide have run their destructors. On the healthy path that
+    // handshake completes within microseconds of the second side tearing down.
+    //
+    // A caller can drop the last reference to a passage whose peer side never ran
+    // its destructor at all (e.g. a context torn down before constructing its
+    // side, or one whose side object was destroyed without transitioning state --
+    // both are pairing bugs at the call site, not something this destructor can
+    // detect ahead of time). Waiting unboundedly for that peer turns a call-site
+    // bug into a permanently wedged thread -- worse than the bug itself, and it
+    // masks the bug rather than surfacing it. So the wait is bounded: 5 seconds
+    // (no existing coop precedent covers a destructor spin; this is a generous
+    // multiple of the healthy-path handshake latency, chosen purely as a hang
+    // backstop) with the same doubling backoff as the healthy wait. On expiry,
+    // in debug builds this is an invariant violation and aborts loudly, matching
+    // coop's existing assert(false) idiom for invariant violations elsewhere
+    // (cooperator.cpp, embedded_list.h, multi_coordinator.h) -- coop has no
+    // runtime logging facility to route a non-fatal report through, so under
+    // NDEBUG (where assert compiles out) this falls back to stderr and proceeds
+    // with destruction rather than hanging forever; the passage may be a
+    // half-torn UAF risk for whichever side never ran, but that risk is strictly
+    // better than wedging the thread that dropped the last reference.
     //
     ~GuardedPassage()
     {
         if (m_state.load(std::memory_order_acquire) == GuardedPassageState::Created)
             return;
+
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         int backoffUs = 10;
         while (m_state.load(std::memory_order_acquire) != GuardedPassageState::Shutdown)
         {
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                GuardedPassageState stuck = m_state.load(std::memory_order_acquire);
+                (void)stuck;
+                assert(false &&
+                    "GuardedPassage destructor timed out waiting for Shutdown -- "
+                    "the peer side (RecvSide/SendSide) never ran its destructor; "
+                    "state parked at RecvShutdown or SendShutdown");
+#ifdef NDEBUG
+                fprintf(stderr,
+                    "coop::chan::GuardedPassage: destructor timed out waiting for "
+                    "Shutdown, state stuck at %d (peer side's destructor never ran); "
+                    "proceeding with destruction -- half-torn passage may leak or UAF\n",
+                    static_cast<int>(stuck));
+#endif
+                break;
+            }
             usleep(backoffUs);
             if (backoffUs < 10000)
                 backoffUs *= 2;

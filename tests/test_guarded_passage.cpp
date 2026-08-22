@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <thread>
 
 #include "coop/chan/guarded_passage.h"
 
@@ -64,3 +66,58 @@ TEST(GuardedPassageTest, DestructorAbortsWhenPeerSideNeverTearsDown)
         "the peer side \\(RecvSide/SendSide\\) never ran its destructor");
 }
 #endif
+
+// A passage normally bridges two cooperators, so its two sides are routinely
+// destroyed on two different threads at the same time. Both destructors used to
+// read the state once and issue a single CAS: when both observed SendRecv, one
+// CAS won and the loser's failed silently, parking the passage at SendShutdown
+// or RecvShutdown with no side left alive to finish the handshake. The next
+// ~GuardedPassage then waited out its full bound and failed loud -- a pairing
+// bug reported against call sites that had paired correctly.
+//
+// Red calibration (single read-then-CAS): ~1700 of 20000 iterations park
+// off-Shutdown on this host. Green (retrying destructors): zero. A parked
+// passage is deliberately leaked rather than deleted -- deleting it would spend
+// the destructor's full bound and then abort, hiding the count this test
+// reports.
+//
+TEST(GuardedPassageTest, ConcurrentSideTeardownAlwaysReachesShutdown)
+{
+    constexpr int kIterations = 20000;
+    int parked = 0;
+
+    for (int i = 0; i < kIterations; i++)
+    {
+        auto* passage = new FixedGuardedPassage<int, 4>();
+        auto* recv = new RecvSide<int>(*passage);   // Created  -> RecvOnly
+        auto* send = new SendSide<int>(*passage);   // RecvOnly -> SendRecv
+
+        std::atomic<int> ready{0};
+        std::thread recvThread([&]
+        {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (ready.load(std::memory_order_acquire) < 2) {}
+            delete recv;
+        });
+        std::thread sendThread([&]
+        {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (ready.load(std::memory_order_acquire) < 2) {}
+            delete send;
+        });
+        recvThread.join();
+        sendThread.join();
+
+        if (passage->State() != GuardedPassageState::Shutdown)
+        {
+            parked++;
+            continue;  // leaked on purpose; see comment above
+        }
+        delete passage;
+    }
+
+    EXPECT_EQ(parked, 0)
+        << parked << " of " << kIterations
+        << " concurrent teardowns lost a side transition and parked the passage "
+           "short of Shutdown";
+}

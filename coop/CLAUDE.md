@@ -105,6 +105,16 @@ every switch (`HasPendingSubmissions`, a field read); completions are sampled. C
 lateness under spinners from ~9.6ms to ~115µs at zero quiet-ring cost. See
 `docs/fast_context_switch_01.md`.
 
+**Seeded / adversarial selection** (opt-in, `CooperatorConfiguration::schedulingMode`): every site
+that takes a context off `m_yielded` goes through `Cooperator::NextRunnable`, whose default arm is
+the FIFO pop -- so the shipped policy is strict round-robin, and the reachable interleaving set has
+exactly one member. `SchedulingMode::Seeded` swaps in a per-cooperator splitmix64 draw
+(`PickRunnable`, out of line); `YieldPolicy::Adversarial` additionally suppresses the direct wake
+handoff in `Unblock`, so a `Release` goes through the runnable queue instead of switching straight
+into its waiter. Drivable without rebuilding via `COOP_SCHED_SEED` / `COOP_SCHED_POLICY`, which print
+the seed needed to replay. Off by default; the default path is one never-taken branch. See
+`docs/adversarial_scheduling_01.md`.
+
 ## Context Lifecycle (`context.cpp`)
 
 **Construction**: parent registers child in `m_children` list; first child `TryAcquire`s the

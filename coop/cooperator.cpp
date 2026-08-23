@@ -114,6 +114,94 @@ void CooperatorLedgerKillCheck(char const* site, Context const* ctx, bool killed
         killed ? 1 : 0);
 }
 
+// Environment resolution for seeded scheduling. A failure found by an adversarial schedule is only
+// useful if it can be replayed, and the run that found it is usually not the run someone is sitting
+// in front of -- it is a suite run on a build host. So the mode is drivable entirely from the
+// environment of an already-built binary, and whenever it is on the resolved seed is reported once
+// with the exact environment that reproduces it.
+//
+//   COOP_SCHED_SEED=<n>            seeded scheduling with that seed
+//   COOP_SCHED_SEED=random         seeded scheduling with a derived seed
+//   COOP_SCHED_POLICY=adversarial  adversarial selection (implies seeded)
+//   COOP_SCHED_POLICY=fifo         round-robin selection, mode otherwise live
+//
+// Resolution runs once per process, on the first Cooperator construction, and its result is applied
+// to every cooperator afterwards. Nothing here executes at all when neither variable is set beyond
+// the two getenv calls behind the function-local static.
+//
+struct SchedulingEnv
+{
+    bool           present = false;
+    SchedulingMode mode = SchedulingMode::Default;
+    YieldPolicy    policy = YieldPolicy::Fifo;
+    uint64_t       seed = 0;
+};
+
+SchedulingEnv const& ResolvedSchedulingEnv()
+{
+    static SchedulingEnv resolved = []() -> SchedulingEnv
+    {
+        SchedulingEnv env;
+
+        char const* seedVar = getenv("COOP_SCHED_SEED");
+        char const* policyVar = getenv("COOP_SCHED_POLICY");
+
+        if (policyVar && strcmp(policyVar, "adversarial") == 0)
+        {
+            env.present = true;
+            env.mode = SchedulingMode::Seeded;
+            env.policy = YieldPolicy::Adversarial;
+        }
+        else if (policyVar && strcmp(policyVar, "fifo") == 0)
+        {
+            env.present = true;
+            env.mode = SchedulingMode::Seeded;
+            env.policy = YieldPolicy::Fifo;
+        }
+
+        bool seedGiven = false;
+        if (seedVar && seedVar[0] != '\0')
+        {
+            env.present = true;
+            env.mode = SchedulingMode::Seeded;
+
+            if (strcmp(seedVar, "random") != 0)
+            {
+                env.seed = strtoull(seedVar, nullptr, 0);
+                seedGiven = true;
+            }
+        }
+
+        if (!env.present)
+        {
+            return env;
+        }
+
+        if (!seedGiven)
+        {
+            // No seed was named, so one is invented -- and immediately reported, because a seed
+            // nobody can read is the same as no seeded mode at all.
+            //
+            std::random_device rd;
+            env.seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        }
+
+        char const* policyName = env.policy == YieldPolicy::Adversarial ? "adversarial" : "fifo";
+        fprintf(stderr,
+                "[coop] seeded scheduling active: policy=%s seed=%llu"
+                " (replay: COOP_SCHED_SEED=%llu COOP_SCHED_POLICY=%s)\n",
+                policyName,
+                static_cast<unsigned long long>(env.seed),
+                static_cast<unsigned long long>(env.seed),
+                policyName);
+        fflush(stderr);
+
+        return env;
+    }();
+
+    return resolved;
+}
+
 } // end anonymous namespace
 
 Cooperator::Cooperator(CooperatorConfiguration const& config)
@@ -152,6 +240,21 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
         if (m_seed == 0) m_seed = 0x9e3779b97f4a7c15ULL;   // never leave it zero
     }
     m_prng = Prng::Seeded(m_seed);
+
+    // Seeded scheduling: environment overrides configuration, so a suite can be driven without
+    // rebuilding. Flattening the decision into two bools here is what keeps the scheduler's
+    // selection sites down to a single never-taken branch when the mode is off.
+    //
+    if (auto const& env = ResolvedSchedulingEnv(); env.present)
+    {
+        m_config.schedulingMode = env.mode;
+        m_config.yieldPolicy = env.policy;
+        m_config.schedulingSeed = env.seed;
+    }
+
+    m_schedControlled = m_config.schedulingMode == SchedulingMode::Seeded;
+    m_schedAdversarial = m_schedControlled && m_config.yieldPolicy == YieldPolicy::Adversarial;
+    m_schedState = m_config.schedulingSeed;
 
     auto& registry = detail::CooperatorVarRegistry::Instance();
     assert(registry.TotalSize() <= LOCAL_STORAGE_SIZE
@@ -664,7 +767,7 @@ void Cooperator::Launch()
             COOP_PERF_INC(m_perf, perf::Counter::SchedulerLoop);
             remainingIterations--;
 
-            auto* ctx = m_yielded.Pop();
+            auto* ctx = NextRunnable();
             Resume(ctx);
 
             // Was anything already runnable going into this reap? If not, and the reap then wakes a
@@ -798,7 +901,7 @@ void Cooperator::YieldFrom(Context* ctx)
 
         --m_directYieldsRemaining;
 
-        Context* next = m_yielded.Pop();
+        Context* next = NextRunnable();
 
         if (m_config.trackContextCycles)
         {
@@ -822,6 +925,57 @@ void Cooperator::YieldFrom(Context* ctx)
 
     auto ret = ContextSwitch(&ctx->m_sp, m_sp, static_cast<int>(SchedulerJumpResult::YIELDED));
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
+}
+
+Context* Cooperator::PickRunnable()
+{
+    if (!m_schedAdversarial)
+    {
+        // Seeded but round-robin: the control arm. The mode is live -- the seed was resolved and
+        // reported -- but the order is the one the default path produces, so anything that changes
+        // between "mode off" and "mode on, fifo" is the mode's own plumbing and not its policy.
+        //
+        Context* ctx = m_yielded.Pop();
+        m_schedLastRan = ctx;
+        return ctx;
+    }
+
+    const size_t count = m_yielded.Size();
+    if (count == 0)
+    {
+        return nullptr;
+    }
+
+    // Draw uniformly from the runnable set. One PRNG step per selection, taken before the
+    // anti-affinity adjustment below, so the stream advances the same way regardless of which
+    // context happens to have run last -- that is what makes the schedule a function of the seed and
+    // the selection history alone.
+    //
+    size_t index = static_cast<size_t>(NextSchedulingRandom() % count);
+
+    auto it = m_yielded.begin();
+    for (size_t i = 0; i < index; ++i)
+    {
+        ++it;
+    }
+
+    // Anti-affinity: never hand control back to whoever just had it while somebody else could look
+    // at the state they left behind. Stepping to the neighbour (wrapping to the head) keeps the
+    // choice deterministic.
+    //
+    if (count > 1 && *it == m_schedLastRan)
+    {
+        ++it;
+        if (it == m_yielded.end())
+        {
+            it = m_yielded.begin();
+        }
+    }
+
+    Context* ctx = *it;
+    m_yielded.Remove(ctx);
+    m_schedLastRan = ctx;
+    return ctx;
 }
 
 void Cooperator::Resume(Context* ctx)
@@ -881,7 +1035,7 @@ void Cooperator::Block(Context* ctx)
         ctx->m_state = SchedulerState::BLOCKED;
         m_blocked.Push(ctx);
 
-        Context* next = m_yielded.Pop();
+        Context* next = NextRunnable();
 
         if (m_config.trackContextCycles)
         {
@@ -923,10 +1077,19 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
 
     m_blocked.Remove(ctx);
 
+    // Adversarial policy: a scheduled wake hands control straight from the waker to the waiter, so
+    // no third context ever runs in the interval between the release and the waiter resuming. That
+    // interval is precisely where a two-step mutation guarded by the released coordinator is
+    // half-applied, so the handoff is the single largest blind spot in the runnable set. Routing the
+    // wake through the queue instead removes it -- and it removes it into a path the runtime already
+    // takes, since a CQE-driven release wakes with schedule=false anyway.
+    //
+    const bool handoff = schedule && !m_schedAdversarial;
+
     // If we are not scheduling it immediately, place it into the yielded state to be
     // scheduled organically later
     //
-    if (!schedule)
+    if (!handoff)
     {
         ctx->m_state = SchedulerState::YIELDED;
         m_yielded.Push(ctx);

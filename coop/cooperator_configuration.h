@@ -33,6 +33,47 @@ enum class TimerMode : uint8_t
     UserspaceQueue,
 };
 
+// Whether the cooperator's choice of "which runnable context runs next" is left to the default
+// policy or driven by a seeded pseudo-random stream.
+//
+// Default is the production path: the runnable list is a FIFO, so selection is strict round-robin
+// and costs a list pop. Seeded replaces the pop with a draw from a per-cooperator PRNG, making the
+// schedule a pure function of the seed and the scheduling history so far -- the same seed replays
+// the same interleaving.
+//
+// This exists for testing, not for production. A cooperative runtime only makes shared state
+// observable at suspension points, so the set of interleavings a program can ever exhibit is
+// decided entirely by which context is picked at each of them. Under round-robin that set has
+// exactly one member: one fixed rotation, explored on every run. A defect that needs a different
+// rotation is not rare under round-robin, it is unreachable -- and looks like a defect that does
+// not exist. Seeded selection turns the rotation into a parameter, and the seed turns any failure
+// it finds back into a one-command reproduction.
+//
+enum class SchedulingMode : uint8_t
+{
+    Default,
+    Seeded,
+};
+
+// Which context a seeded cooperator picks at a suspension point. Only consulted when
+// schedulingMode is Seeded.
+//
+// Fifo keeps the default round-robin order. It is the control: the mode's plumbing is live (the
+// seed is resolved and reported) but no scheduling decision changes, which is what makes "the mode
+// itself perturbs nothing" a testable claim rather than an assertion.
+//
+// Adversarial draws uniformly from the runnable set, excluding whichever context the policy picked
+// last so a suspending context never immediately resumes itself, and additionally routes a
+// scheduled wake through the runnable queue instead of handing control straight to the woken
+// waiter. Both changes serve one goal: maximize the number of distinct contexts that get to look at
+// shared state during the interval a multi-step mutation leaves it inconsistent.
+//
+enum class YieldPolicy : uint8_t
+{
+    Fifo,
+    Adversarial,
+};
+
 struct CooperatorConfiguration
 {
     io::UringConfiguration uring;
@@ -120,6 +161,27 @@ struct CooperatorConfiguration
     // A wall-clock floor for the short-list/expensive-task case is still future work (#23).
     //
     int ioPresentLimit = 8;
+
+    // Seeded scheduling (see SchedulingMode / YieldPolicy). Off by default: with schedulingMode
+    // Default the scheduler's selection sites take the same list pop they always did, and the
+    // policy fields are never read.
+    //
+    // The environment overrides these, so a binary built without any of them in mind can still be
+    // driven: COOP_SCHED_SEED=<n> selects Seeded with that seed, COOP_SCHED_SEED=random derives
+    // one, and COOP_SCHED_POLICY=adversarial|fifo selects the policy (adversarial implies Seeded).
+    // Whenever the mode ends up on, the resolved seed is reported once on stderr with the exact
+    // environment needed to replay it.
+    //
+    SchedulingMode schedulingMode = SchedulingMode::Default;
+    YieldPolicy    yieldPolicy    = YieldPolicy::Fifo;
+
+    // Seed for the per-cooperator selection stream. Every cooperator in the process seeds its
+    // stream from this same value; their streams diverge naturally because their runnable sets do.
+    // A single-cooperator program is therefore fully reproducible under a fixed seed. A
+    // multi-cooperator one gets reproducible per-cooperator streams, but the interleaving *between*
+    // cooperators is still the operating system's to decide.
+    //
+    uint64_t schedulingSeed = 0;
 };
 
 static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
@@ -131,6 +193,9 @@ static const CooperatorConfiguration s_defaultCooperatorConfiguration = {
     .directYield = false,
     .directYieldBudget = 64,
     .ioPresentLimit = 8,
+    .schedulingMode = SchedulingMode::Default,
+    .yieldPolicy = YieldPolicy::Fifo,
+    .schedulingSeed = 0,
 };
 
 } // end namespace coop

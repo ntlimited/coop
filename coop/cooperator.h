@@ -149,6 +149,25 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         void* arg = nullptr,
         SpawnConfiguration const& config = s_defaultConfiguration);
 
+    // The scheduler's single "which runnable context runs next" decision. Every site that takes a
+    // context off the runnable list goes through here, so the selection policy lives in exactly one
+    // place.
+    //
+    // The default path is the list pop it has always been: m_yielded is a FIFO, so popping the head
+    // and pushing the suspending context onto the tail is strict round-robin. m_schedControlled is
+    // false unless seeded scheduling was asked for, which makes this a single predictable
+    // never-taken branch on an already-hot Cooperator field -- no allocation, no atomic, no syscall,
+    // and the PRNG state is not even touched. See CooperatorConfiguration::schedulingMode.
+    //
+    Context* NextRunnable()
+    {
+        if (m_schedControlled) [[unlikely]]
+        {
+            return PickRunnable();
+        }
+        return m_yielded.Pop();
+    }
+
     // Internal API for passing control to the given context
     //
     void Resume(Context* ctx);
@@ -484,6 +503,42 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // loop resumes a context; decremented by each direct yield. Unused when directYield is off.
     //
     int m_directYieldsRemaining{0};
+
+    // Seeded-scheduling state (CooperatorConfiguration::schedulingMode). Flattened out of m_config
+    // into two bools so the hot-path guards are a single byte test rather than an enum compare
+    // against a field the default path otherwise never reads.
+    //
+    // m_schedControlled gates the selection indirection in NextRunnable; m_schedAdversarial
+    // additionally gates the wake-handoff suppression in Unblock. Both are false unless the mode was
+    // explicitly requested, by configuration or by environment.
+    //
+    bool m_schedControlled{false};
+    bool m_schedAdversarial{false};
+
+    // splitmix64 state for the selection stream. Advanced exactly once per adversarial selection, so
+    // the schedule is a pure function of the seed and the sequence of selections made so far.
+    // Integer arithmetic only -- no atomics, no architecture-specific anything.
+    //
+    uint64_t m_schedState{0};
+
+    uint64_t NextSchedulingRandom()
+    {
+        uint64_t z = (m_schedState += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    }
+
+    // The context the policy picked last, used to keep the next pick away from it (anti-affinity).
+    // Compared, never dereferenced: a context that has since exited leaves a stale address here,
+    // which at worst makes one selection prefer a different context than it otherwise would.
+    //
+    Context* m_schedLastRan{nullptr};
+
+    // Out-of-line body of NextRunnable's seeded branch, so the default path's inline cost stays the
+    // pop plus one never-taken branch.
+    //
+    Context* PickRunnable();
 
     io::Uring       m_uring;
 

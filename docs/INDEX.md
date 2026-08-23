@@ -38,6 +38,12 @@
   measured perf-neutrality once the mitigation cost is included, and an honest accounting of a
   misattributed LTO episode; with the negative covenants that no inline asm may hide the switch
   call and no TU may need a correctness-bearing codegen flag
+- `adversarial_scheduling_01.md`: opt-in seeded context selection and the adversarial yield
+  policy — turns the scheduler's single fixed rotation into a seeded, replayable parameter so
+  interleavings round-robin cannot reach (observer ordering inside a window, a third context
+  between a release and its waiter) become systematically explored, with the negative covenants
+  that the default path is untouched, that no seed goes unreported, and that the policy never
+  becomes a production dependency
 - `timer_slack_01.md`: opt-in deadline quantization on the `Sleep` path — collapses
   per-timer kernel wakeups for a fan-out of concurrent sleeps, with the negative
   covenant that correctness deadlines stay exact

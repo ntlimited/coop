@@ -20,6 +20,17 @@ if(COOP_COVERAGE)
     add_link_options(--coverage)
 endif()
 
+# AddressSanitizer. Worth a switch of its own because a cooperative runtime is not something ASan
+# can follow unaided: it tracks one stack per thread, and coop moves between many. The annotations
+# in coop/detail/asan_fiber.h keep its shadow pointed at whichever fiber is live, and they compile
+# to nothing unless this is on.
+#
+option(COOP_ASAN "Build with AddressSanitizer" OFF)
+if(COOP_ASAN)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+endif()
+
 # Link-time optimization, default-on for standalone release builds. Whole-program codegen is a
 # measured win on the hottest dispatch paths (continuation fire ~-25%, text ~-6%) and is safe
 # because the context switch is an ordinary out-of-line call the optimizer can model (see
@@ -213,6 +224,8 @@ enable_testing()
 
 add_executable(coop_tests
     tests/test_coordinator.cpp
+    tests/test_fiber_sanitizer.cpp
+    tests/test_signal_stack.cpp
     tests/test_continuation.cpp
     tests/test_registered.cpp
     tests/test_semaphore.cpp

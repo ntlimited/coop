@@ -6,6 +6,7 @@
 #include <mutex>
 #include <semaphore>
 
+#include "detail/asan_fiber.h"
 #include "detail/embedded_list.h"
 #include "detail/memory_order.h"
 #include "context.h"
@@ -568,6 +569,15 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // architectures (aarch64), where remote-line acquisition is costlier than on x86 TSO.
     //
     alignas(64) void*       m_sp{nullptr};
+
+#if COOP_HAVE_ASAN
+    // The bounds of the OS thread stack m_sp points into, resolved when the scheduler loop takes
+    // ownership of the thread. AddressSanitizer has to be told the bounds of whichever stack a
+    // switch is heading for, and half of every switch heads here — to a thread stack, which unlike
+    // a Context has no Segment to read them from.
+    //
+    detail::StackRegion     m_asanThreadStack{};
+#endif
 
     void PushSubmission(SubmissionEntry* entry);
     void WakeCooperator(char const* site = "Cooperator::WakeCooperator");

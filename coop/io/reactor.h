@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 namespace coop
 {
@@ -34,6 +35,16 @@ namespace io
 // previous watcher has drained is not supported (the foreign libraries this targets never do it —
 // a socket is removed when its transfer/connection ends, not mid-flight).
 //
+// Destruction is non-blocking and safe with work still parked. A Reactor may be destroyed while a
+// timeout is pending or watchers are blocked on their polls: destroying it is a cancellation, not a
+// join. It never waits for a parked context, so it can be destroyed from anywhere a destructor can
+// run — including from inside a ReadyFn/TimeoutFn callback, where waiting for the reactor's own
+// contexts would be waiting on the very callback that is running.
+//
+// The rule that makes that safe: the shared state the spawned contexts read is owned by a
+// shared_ptr that each of them holds, so it outlives the Reactor by construction, and ~Reactor
+// marks it dead so no callback can fire afterwards. See the invariant in reactor.cpp.
+//
 class Reactor
 {
 public:
@@ -62,7 +73,12 @@ public:
 
 private:
     struct Impl;
-    Impl* m_impl;
+
+    // Shared, not owned outright: contexts this Reactor spawned outlive it (see the covenant in
+    // reactor.cpp), and each holds a strong reference. ~Reactor drops one reference and sets the
+    // dead flag; the last parked context to retire frees the state.
+    //
+    std::shared_ptr<Impl> m_impl;
 };
 
 } // end namespace coop::io

@@ -137,3 +137,56 @@ TEST(ReactorTest, TimeoutCancel)
         EXPECT_EQ(st.timeoutCount, 0);
     });
 }
+
+// Destroying a Reactor with a timeout still parked is legal, non-blocking, and silent.
+//
+// This is the direct regression for a heap-use-after-free: the timer context is detached and holds
+// the reactor's shared state, so before the shared_ptr covenant in reactor.cpp it woke after
+// ~Reactor and read freed memory (reactor.cpp's timerGen). Two things are asserted at once —
+// that waking after destruction is memory-safe (ASan is the real assertion here), and that the
+// timeout does NOT fire, because the callback and `user` belong to an owner that is now gone.
+//
+TEST(ReactorTest, DestroyedWithTimerParked)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        State st;
+        {
+            coop::io::Reactor reactor(ctx->GetCooperator(), &OnReady, &OnTimeout, &st);
+            reactor.SetTimeout(40);
+        }                                                   // parked timer outlives the Reactor
+
+        coop::time::Sleep(ctx, std::chrono::milliseconds(90));   // sleep well past its deadline
+
+        EXPECT_EQ(st.timeoutCount, 0);                      // a dead Reactor never calls back
+    });
+}
+
+// The same covenant for the watcher, which is the timer's sibling: also detached, also holding the
+// reactor's shared state across a park (io::Poll rather than a sleep). Destroy the Reactor while a
+// watcher is blocked, then make the fd readable so the watcher actually wakes and re-reads the
+// state it captured — the point being that it wakes into live memory and declines to call back.
+//
+TEST(ReactorTest, DestroyedWithWatcherParked)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int fds[2];
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+        State st;
+        {
+            coop::io::Reactor reactor(ctx->GetCooperator(), &OnReady, &OnTimeout, &st);
+            reactor.Watch(fds[0], POLLIN);
+            for (int i = 0; i < 4; i++) ctx->Yield(true);    // let the watcher arm its poll
+        }                                                   // parked watcher outlives the Reactor
+
+        ASSERT_EQ(write(fds[1], "x", 1), 1);                // wake it after its Reactor is gone
+        for (int i = 0; i < 6; i++) ctx->Yield(true);
+
+        EXPECT_EQ(st.readyCount, 0);                        // a dead Reactor never calls back
+
+        close(fds[0]);
+        close(fds[1]);
+    });
+}

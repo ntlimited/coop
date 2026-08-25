@@ -6,6 +6,11 @@
 #include <thread>
 
 #include "coop/chan/guarded_passage.h"
+#include "coop/detail/asan_fiber.h"
+
+#if COOP_HAVE_ASAN
+extern "C" void __lsan_ignore_object(void const* p);
+#endif
 
 // GuardedPassage's destructor waits for both RecvSide and SendSide to have run
 // their destructors (the handshake that drives GuardedPassageState to
@@ -51,6 +56,16 @@ TEST(GuardedPassageTest, DestructorAbortsWhenPeerSideNeverTearsDown)
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
 
     auto* passage = new FixedGuardedPassage<int, 4>();
+
+    // The delete below happens in the death test's child, which is expected to abort partway
+    // through it. This process never deletes its own copy, and that is the design of the test rather
+    // than an oversight — so tell LeakSanitizer, which otherwise reports it at exit and turns an
+    // ASan run of the whole suite red on a deliberate abandonment.
+    //
+#if COOP_HAVE_ASAN
+    __lsan_ignore_object(passage);
+#endif
+
     auto* recv = new RecvSide<int>(*passage);              // Created -> RecvOnly
     alignas(SendSide<int>) unsigned char sendStorage[sizeof(SendSide<int>)];
     new (sendStorage) SendSide<int>(*passage);              // RecvOnly -> SendRecv

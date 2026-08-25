@@ -55,21 +55,47 @@ void RunWithDirectYield(int budget, std::function<void(coop::Context*)> fn)
     co.Shutdown();
 }
 
-// Spawn `count` contexts that spin on Yield until `stop` is set (or they are killed). They exist
-// only to monopolize the runnable set, exercising chains of direct yields long enough to repeatedly
-// cross the budget boundary.
+// Contexts that spin on Yield to monopolize the runnable set, so chains of direct yields run long
+// enough to repeatedly cross the budget boundary.
 //
-void SpawnSpinners(coop::Context* ctx, int count, std::atomic<bool>* stop)
+// Their state is grouped rather than passed as a bare flag pointer because the flag lives on the
+// stack of the context that spawns them, and that stack is recycled the moment that context exits.
+// Letting the spinners be killed at cooperator shutdown would leave them reading it afterwards; they
+// have to be stopped and drained while the frame that owns the flag is still standing.
+//
+struct Spinners
 {
+    std::atomic<bool> stop{false};
+    int               live{0};
+};
+
+void SpawnSpinners(coop::Context* ctx, int count, Spinners* spinners)
+{
+    spinners->live += count;
+
     for (int i = 0; i < count; ++i)
     {
-        ctx->GetCooperator()->Spawn([stop](coop::Context* c)
+        ctx->GetCooperator()->Spawn([spinners](coop::Context* c)
         {
-            while (!stop->load(std::memory_order_relaxed) && !c->IsKilled())
+            while (!spinners->stop.load(std::memory_order_relaxed) && !c->IsKilled())
             {
                 c->Yield(true /* force */);
             }
+            --spinners->live;
         });
+    }
+}
+
+// Stop the spinners and hand them the CPU until every one has run its exit. Returning before that
+// leaves a spinner scheduled against a dead frame.
+//
+void DrainSpinners(coop::Context* ctx, Spinners* spinners)
+{
+    spinners->stop.store(true, std::memory_order_relaxed);
+
+    while (spinners->live > 0)
+    {
+        ctx->Yield(true /* force */);
     }
 }
 
@@ -123,8 +149,8 @@ TEST(DirectYieldTest, BoundedPollServicesTimerUnderSpinners)
 {
     RunWithDirectYield(4, [](coop::Context* ctx)
     {
-        std::atomic<bool> stop{false};
-        SpawnSpinners(ctx, 4, &stop);
+        Spinners spinners;
+        SpawnSpinners(ctx, 4, &spinners);
 
         // Let the spinners reach their yield loops.
         //
@@ -134,7 +160,7 @@ TEST(DirectYieldTest, BoundedPollServicesTimerUnderSpinners)
         coop::time::SleepResult res = coop::time::Sleep(ctx, std::chrono::milliseconds(50));
         const auto elapsed = std::chrono::steady_clock::now() - t0;
 
-        stop.store(true, std::memory_order_relaxed);
+        DrainSpinners(ctx, &spinners);
 
         EXPECT_EQ(res, coop::time::SleepResult::Ok);
 
@@ -156,8 +182,8 @@ TEST(DirectYieldTest, KilledInflightRecvTearsDownUnderSpinners)
         int fds[2];
         ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 
-        std::atomic<bool> stop{false};
-        SpawnSpinners(ctx, 4, &stop);
+        Spinners spinners;
+        SpawnSpinners(ctx, 4, &spinners);
 
         auto* uring = coop::GetUring();
         coop::Coordinator ready;
@@ -185,7 +211,7 @@ TEST(DirectYieldTest, KilledInflightRecvTearsDownUnderSpinners)
             ctx->Yield(true);
         }
 
-        stop.store(true, std::memory_order_relaxed);
+        DrainSpinners(ctx, &spinners);
 
         EXPECT_EQ(result, -ECANCELED);
 

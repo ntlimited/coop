@@ -8,6 +8,7 @@
 
 #include "stack_pool.h"
 #include "context.h"
+#include "detail/asan_fiber.h"
 
 namespace coop
 {
@@ -53,6 +54,12 @@ void* StackPool::Allocate(size_t stackSize)
         bucket.count--;
         m_cachedBytes -= sizeof(Context) + stackSize;
         m_hits++;
+
+        // A recycled segment carries whatever shadow state its last tenant left. Freshly mapped or
+        // malloc'd memory arrives clean; memory that never went back to the allocator does not, and
+        // the pool exists precisely so that it does not. Hand it over clean.
+        //
+        COOP_ASAN_UNPOISON(node, sizeof(Context) + stackSize);
         return node;
     }
 
@@ -82,8 +89,12 @@ void StackPool::Free(void* ptr, size_t stackSize)
         RawFree(evict, stackSize);
     }
 
-    // Overlay a FreeNode at the start of the dead allocation
+    // Overlay a FreeNode at the start of the dead allocation. Unpoison first: a context torn down
+    // with frames still live leaves redzones behind, and one of them can sit exactly where the link
+    // pointer goes.
     //
+    COOP_ASAN_UNPOISON(ptr, sizeof(Context) + stackSize);
+
     auto* node = static_cast<FreeNode*>(ptr);
     node->next = bucket.head;
     bucket.head = node;

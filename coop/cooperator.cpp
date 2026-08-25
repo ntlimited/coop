@@ -27,6 +27,7 @@
 #include "perf/patch.h"
 #include "perf/probe.h"
 #include "perf/sampler.h"
+#include "signal_stack.h"
 #include "detail/timer_tag.h"
 #include "time/now.h"
 
@@ -556,6 +557,19 @@ void Cooperator::Launch()
     Cooperator::thread_cooperator = this;
     m_tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
     epoch::SetManager(&m_epochMgr);
+
+#if COOP_HAVE_ASAN
+    m_asanThreadStack = detail::CurrentThreadStack();
+#endif
+
+    // From here on this thread runs context stacks, which are the wrong place for a signal frame to
+    // land — they are small, and a handler arriving on a deep one runs off the end into the guard
+    // page. Give the thread somewhere else to put those frames for as long as the loop owns it.
+    // Handlers still have to be registered with SA_ONSTACK to use it; coop's are (see
+    // RegisterOnAltStack), and any the host process installs itself are its own responsibility.
+    //
+    SignalStack signalStack;
+
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
 
     // Pin this thread to a CPU core. If the config specifies a core, use it; otherwise
@@ -893,8 +907,10 @@ void Cooperator::YieldFrom(Context* ctx)
 
         if (m_directYieldsRemaining == 0)
         {
+            COOP_ASAN_SWITCH_BEGIN(m_asanThreadStack);
             auto ret = ContextSwitch(&ctx->m_sp, m_sp,
                                      static_cast<int>(SchedulerJumpResult::YIELDED));
+            COOP_ASAN_SWITCH_END();
             assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
             return;
         }
@@ -917,13 +933,17 @@ void Cooperator::YieldFrom(Context* ctx)
         m_scheduled = next;
         StallEnter();
 
+        COOP_ASAN_SWITCH_BEGIN(detail::StackOf(next));
         auto ret = ContextSwitch(&ctx->m_sp, next->m_sp,
                                  static_cast<int>(SchedulerJumpResult::RESUMED));
+        COOP_ASAN_SWITCH_END();
         assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
         return;
     }
 
+    COOP_ASAN_SWITCH_BEGIN(m_asanThreadStack);
     auto ret = ContextSwitch(&ctx->m_sp, m_sp, static_cast<int>(SchedulerJumpResult::YIELDED));
+    COOP_ASAN_SWITCH_END();
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
 }
 
@@ -996,7 +1016,9 @@ void Cooperator::Resume(Context* ctx)
     m_directYieldsRemaining = m_config.directYieldBudget;
 
     COOP_PERF_INC(m_perf, perf::Counter::ContextResume);
+    COOP_ASAN_SWITCH_BEGIN(detail::StackOf(ctx));
     auto ret = ContextSwitch(&m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
+    COOP_ASAN_SWITCH_END();
     HandleCooperatorResumption(static_cast<SchedulerJumpResult>(ret));
 }
 
@@ -1048,13 +1070,17 @@ void Cooperator::Block(Context* ctx)
         m_scheduled = next;
         StallEnter();
 
+        COOP_ASAN_SWITCH_BEGIN(detail::StackOf(next));
         auto ret = ContextSwitch(&ctx->m_sp, next->m_sp,
                                  static_cast<int>(SchedulerJumpResult::RESUMED));
+        COOP_ASAN_SWITCH_END();
         assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
         return;
     }
 
+    COOP_ASAN_SWITCH_BEGIN(m_asanThreadStack);
     auto ret = ContextSwitch(&ctx->m_sp, m_sp, static_cast<int>(SchedulerJumpResult::BLOCKED));
+    COOP_ASAN_SWITCH_END();
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
 }
 
@@ -1116,7 +1142,9 @@ void Cooperator::Unblock(Context* ctx, const bool schedule)
     m_scheduled = ctx;
     StallEnter();
 
+    COOP_ASAN_SWITCH_BEGIN(detail::StackOf(ctx));
     auto ret = ContextSwitch(&prev->m_sp, ctx->m_sp, static_cast<int>(SchedulerJumpResult::RESUMED));
+    COOP_ASAN_SWITCH_END();
     assert(static_cast<SchedulerJumpResult>(ret) == SchedulerJumpResult::RESUMED);
 }
 
@@ -1324,6 +1352,12 @@ void Cooperator::SanityCheck()
 
 extern "C" void CoopContextEntry(coop::Context* ctx)
 {
+    // First and only arrival on this stack. Every other landing in the runtime is a switch call
+    // returning; this one is a frame ContextInit wrote by hand, so it has to close the sanitizer's
+    // switch itself.
+    //
+    COOP_ASAN_SWITCH_FIRST_ENTRY();
+
     ctx->m_entry(ctx);
 
     // Run Launchable destructor (if any) while the context is still alive and schedulable,
@@ -1345,7 +1379,11 @@ extern "C" void CoopContextEntry(coop::Context* ctx)
     //
     ctx->~Context();
 
+    // The last switch this stack ever makes. It is not bracketed, because there is no return to
+    // bracket: the cooperator reclaims the segment on the far side.
+    //
     void* dummy;
+    COOP_ASAN_SWITCH_BEGIN_FINAL(coop::Cooperator::thread_cooperator->m_asanThreadStack);
     ContextSwitch(
         &dummy,
         coop::Cooperator::thread_cooperator->m_sp,
@@ -1391,7 +1429,9 @@ void Cooperator::EnterContext(Context* ctx)
     // Prepare the new context's stack for first entry via ContextSwitch
     //
     void* init_sp = ContextInit(ctx->m_segment.Top(), ctx);
+    COOP_ASAN_SWITCH_BEGIN(detail::StackOf(ctx));
     auto ret = ContextSwitch(save_sp, init_sp, 0);
+    COOP_ASAN_SWITCH_END();
 
     if (isSelf)
     {

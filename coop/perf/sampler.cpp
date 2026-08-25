@@ -8,6 +8,7 @@
 
 #include "coop/cooperator.h"
 #include "coop/context.h"
+#include "coop/signal_stack.h"
 
 namespace coop
 {
@@ -53,7 +54,13 @@ static inline uint64_t rdtsc()
 #endif
 }
 
-// SIGPROF handler — must be async-signal-safe.
+// SIGPROF handler — must be async-signal-safe, and must not run on the stack it is sampling.
+//
+// ITIMER_PROF is process-directed, so this lands on an arbitrary thread that does not block SIGPROF
+// — most often a cooperator thread, mid-context, at whatever depth the profiled workload happens to
+// have reached. That is the worst case for stack headroom and the one profiling is most likely to
+// visit, since sampling is aimed at busy code. It is registered with SA_ONSTACK (see StartSampling)
+// so the frame lands on the thread's alternate stack instead of the context segment.
 //
 // backtrace() is async-signal-safe on glibc/Linux. It uses DWARF .eh_frame unwind info,
 // so it works even without frame pointers (-fomit-frame-pointer, the default at -O2).
@@ -150,13 +157,13 @@ bool StartSampling(int hz /* = 99 */, bool stacks /* = false */)
 
     g_stackMode.store(stacks, std::memory_order_relaxed);
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = SigprofHandler;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-
-    if (sigaction(SIGPROF, &sa, &g_prevAction) != 0)
+    // SA_ONSTACK, via RegisterOnAltStack. It only takes effect on threads that have an alternate
+    // stack: cooperator threads install one for the life of their scheduler loop, so the case this
+    // is aimed at — a sample landing on a deep context — is covered. A host thread that runs no
+    // cooperator and installs no SignalStack still takes this handler on its own stack, which is an
+    // ordinary thread stack and has the room.
+    //
+    if (RegisterOnAltStack(SIGPROF, SigprofHandler, SA_RESTART, &g_prevAction) != 0)
     {
         return false;
     }

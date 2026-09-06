@@ -323,9 +323,16 @@ bool Cooperator::Submit(
     return Submit([func, arg](Context* ctx) { func(ctx, arg); }, config);
 }
 
-void Cooperator::PushSubmission(SubmissionEntry* entry)
+bool Cooperator::PushSubmission(SubmissionEntry* entry, bool completionNotification)
 {
+    // Callable construction can overlap the entire shutdown. Recheck under the same lock as
+    // the final drain, so a late producer cannot enqueue work after the consumer has exited.
+    //
     std::lock_guard<std::mutex> lock(m_submissionLock);
+    if (!completionNotification && m_shutdown.load(detail::kLoadFlag))
+    {
+        return false;
+    }
     entry->m_next = nullptr;
     if (m_submissionTail)
     {
@@ -337,6 +344,7 @@ void Cooperator::PushSubmission(SubmissionEntry* entry)
     }
     m_submissionTail = entry;
     m_hasSubmissions.store(true, std::memory_order_release);
+    return true;
 }
 
 void Cooperator::WakeCooperator(char const* site)
@@ -401,7 +409,7 @@ void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
                 {
                     handle->m_signal.Notify(ctx, false);
                 }, s_defaultConfiguration);
-            callerCoop->PushSubmission(notifEntry);
+            callerCoop->PushSubmission(notifEntry, true /* completionNotification */);
             callerCoop->WakeCooperator();
         }
         return;
@@ -465,7 +473,7 @@ void Cooperator::DrainRemainingSubmissions()
                     {
                         handle->m_signal.Notify(ctx, false);
                     }, s_defaultConfiguration);
-                callerCoop->PushSubmission(notifEntry);
+                callerCoop->PushSubmission(notifEntry, true /* completionNotification */);
                 callerCoop->WakeCooperator();
             }
 

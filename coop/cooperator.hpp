@@ -204,7 +204,11 @@ bool Cooperator::Cooperate(Fn&& fn, CooperateHandle* handle,
         entry->m_completionOk = reinterpret_cast<bool*>(thread_cooperator);
     }
 
-    PushSubmission(entry);
+    if (!PushSubmission(entry))
+    {
+        entry->m_destroy(entry);
+        return false;
+    }
     WakeCooperator();
     return true;
 }
@@ -219,7 +223,11 @@ bool Cooperator::Submit(Fn&& fn, SpawnConfiguration const& config)
 
     using DecayFn = std::decay_t<Fn>;
     auto* entry = new TypedSubmission<DecayFn>(std::forward<Fn>(fn), config);
-    PushSubmission(entry);
+    if (!PushSubmission(entry))
+    {
+        entry->m_destroy(entry);
+        return false;
+    }
     WakeCooperator();
     return true;
 }
@@ -239,7 +247,11 @@ bool Cooperator::SubmitSync(Fn&& fn, SpawnConfiguration const& config)
     auto* entry = new TypedSubmission<DecayFn>(std::forward<Fn>(fn), config);
     entry->m_completion = &done;
     entry->m_completionOk = &completionOk;
-    PushSubmission(entry);
+    if (!PushSubmission(entry))
+    {
+        entry->m_destroy(entry);
+        return false;
+    }
     WakeCooperator();
 
     done.acquire();

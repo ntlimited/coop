@@ -514,7 +514,10 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     //
     alignas(64) void*       m_sp{nullptr};
 
-    void PushSubmission(SubmissionEntry* entry);
+    // Public work must pass the shutdown gate. Completion notifications finish already-admitted
+    // Cooperate calls and must still be queued while their caller is shutting down.
+    //
+    bool PushSubmission(SubmissionEntry* entry, bool completionNotification = false);
     void WakeCooperator(char const* site = "Cooperator::WakeCooperator");
     void DrainSubmissions();
     void SpawnFromSubmission(SubmissionEntry* entry);

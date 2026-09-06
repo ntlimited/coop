@@ -120,6 +120,10 @@ Permit Semaphore::AcquireSlow(Context* ctx, size_t n, bool killAware,
     {
         coord.Release(ctx, false);
     }
+    // Removing the head can make the units already in the pool sufficient for the
+    // next waiter. It must not depend on an unrelated future Release to make progress.
+    //
+    GrantWaiters();
     return {};
 }
 

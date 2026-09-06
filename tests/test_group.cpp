@@ -141,6 +141,40 @@ TEST(GroupTest, GoAfterFailureRejected)
     });
 }
 
+TEST(GroupTest, FailureWhileWaitingForAdmissionRejectsChild)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Coordinator fail;
+        fail.TryAcquire(ctx);
+        coop::Group g(ctx);
+        g.SetLimit(1);
+
+        ASSERT_TRUE(g.Go([&](coop::Context* c) -> bool
+        {
+            fail.Acquire(c);
+            fail.Release(c, false);
+            return false;
+        }));
+
+        EXPECT_EQ(g.InFlight(), 1u);
+        EXPECT_FALSE(g.Failed());
+
+        // Queue the failure without switching: Go enters while the group is healthy,
+        // then blocks on the occupied slot. Only then can the first child fail.
+        //
+        fail.Release(ctx, false);
+        bool childRan = false;
+        bool accepted = g.Go([&](coop::Context*) { childRan = true; });
+
+        EXPECT_FALSE(accepted);
+        EXPECT_FALSE(g.Wait());
+        EXPECT_TRUE(g.Failed());
+        EXPECT_FALSE(childRan);
+        EXPECT_EQ(g.InFlight(), 0u);
+    });
+}
+
 TEST(GroupTest, EmptyGroupWaitsImmediately)
 {
     test::RunInCooperator([](coop::Context* ctx)

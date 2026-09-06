@@ -32,14 +32,15 @@ namespace chan
 //
 // Multiple producers may call Push() concurrently (wait-free CAS on m_tail).
 // Exactly one consumer calls Pop() and IsEmpty() (m_head is not atomic).
-// N must be a power of 2.
+// N must be a power of 2 and at least 2: with one slot, the published sequence
+// is indistinguishable from the next producer's free-slot sequence.
 // ---------------------------------------------------------------------------
 
 template<typename T, size_t N>
 struct MpscRing
 {
-    static_assert(N > 0 && (N & (N - 1)) == 0,
-        "MpscRing capacity N must be a power of 2.");
+    static_assert(N >= 2 && (N & (N - 1)) == 0,
+        "MpscRing capacity N must be a power of 2 and at least 2.");
     static_assert(std::is_default_constructible_v<T>,
         "Passage value type T must be default-constructible.");
     static_assert(std::is_move_assignable_v<T>,

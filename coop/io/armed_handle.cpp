@@ -50,10 +50,30 @@ ArmedHandle::~ArmedHandle()
 {
     TeardownDrain();
 
+    bool returnedBuffer = false;
     if (m_returnBid >= 0)
     {
-        m_bufferRing->ReturnAndPublish(uint32_t(m_returnBid));
+        m_bufferRing->Return(uint32_t(m_returnBid));
         m_returnBid = -1;
+        returnedBuffer = true;
+    }
+
+    // Unread chunks still own pool buffers. The pool can serve other connections after
+    // this handle is gone, so return queued buffers as well as the last consumed chunk.
+    // TeardownDrain has stopped callbacks before we walk the queue.
+    //
+    while (m_qCount > 0)
+    {
+        Slot s = DequeueSlot();
+        if (s.entry.bid >= 0)
+        {
+            m_bufferRing->Return(uint32_t(s.entry.bid));
+            returnedBuffer = true;
+        }
+    }
+    if (returnedBuffer)
+    {
+        m_bufferRing->Publish();
     }
 }
 

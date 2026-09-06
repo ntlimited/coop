@@ -257,6 +257,80 @@ TEST(ChannelTest, SendAllBlocks)
     });
 }
 
+TEST(ChannelTest, SendAllResumesWithoutWaitingForFinalValueToBeConsumed)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buffer[1];
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
+        ASSERT_TRUE(ch.TrySend(10));
+
+        bool finished = false;
+        ASSERT_TRUE(ctx->GetCooperator()->Spawn([&](coop::Context*)
+        {
+            const int data[] = {20};
+            EXPECT_TRUE(ch.SendAll(data, 1));
+            finished = true;
+        }));
+
+        EXPECT_FALSE(finished);
+        int value = 0;
+        // TryRecv releases m_send with schedule=true: the waiting sender runs
+        // immediately and has room for its complete batch.
+        //
+        EXPECT_TRUE(ch.TryRecv(value));
+        EXPECT_EQ(value, 10);
+        EXPECT_TRUE(finished);
+        EXPECT_TRUE(ch.IsFull());
+
+        // Consuming the final value also rescues the old implementation's extra
+        // acquire, so a regression reports failure without leaving a blocked sender.
+        //
+        EXPECT_TRUE(ch.TryRecv(value));
+        EXPECT_EQ(value, 20);
+        EXPECT_TRUE(finished);
+        ch.Shutdown();
+    });
+}
+
+TEST(ChannelTest, SendAllReleasesSpareCapacityAfterBatchedDrain)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buffer[2];
+        coop::chan::Channel<int> ch(ctx, buffer, 2);
+        ASSERT_TRUE(ch.TrySend(10));
+        ASSERT_TRUE(ch.TrySend(20));
+        coop::Coordinator sent;
+        sent.TryAcquire(ctx);
+
+        ASSERT_TRUE(ctx->GetCooperator()->Spawn([&](coop::Context* sender)
+        {
+            const int data[] = {30};
+            EXPECT_TRUE(ch.SendAll(data, 1));
+            sent.Release(sender, false);
+        }));
+
+        int drained[2]{};
+        EXPECT_EQ(ch.Drain(drained, 2), 2u);
+        EXPECT_EQ(drained[0], 10);
+        EXPECT_EQ(drained[1], 20);
+        sent.Flash(ctx);
+
+        // No sender remains and one slot is free. A send-select must be able to
+        // acquire the coordinator instead of waiting for another receive.
+        //
+        EXPECT_FALSE(ch.IsFull());
+        EXPECT_TRUE(ch.m_send.TryAcquire(ctx));
+        ch.m_send.Release(ctx, false);
+
+        int value = 0;
+        EXPECT_TRUE(ch.TryRecv(value));
+        EXPECT_EQ(value, 30);
+        ch.Shutdown();
+    });
+}
+
 // Drain pulls available items without blocking; returns 0 on empty channel.
 //
 TEST(ChannelTest, Drain)

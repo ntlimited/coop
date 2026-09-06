@@ -117,6 +117,13 @@ bool Group::Go(SpawnConfiguration const& config, Fn&& fn)
         {
             return false;   // owner killed while waiting for a slot
         }
+        // A child can fail while admission is blocked. Recheck before launching;
+        // the local permit returns the slot when this call is rejected.
+        //
+        if (m_failed)
+        {
+            return false;
+        }
     }
 
     if (m_live == 0)

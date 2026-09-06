@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "coop/cooperator.h"
+#include "coop/coordinator.h"
 #include "coop/semaphore.h"
 #include "coop/self.h"
 
@@ -144,6 +145,64 @@ TEST(SemaphoreTest, AcquireKillWokenByKill)
 
         EXPECT_TRUE(sawEmpty);
         EXPECT_EQ(sem.Waiters(), 0u);
+    });
+}
+
+TEST(SemaphoreTest, CancellingHeadGrantsEligibleNextWaiter)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Semaphore sem(1);
+        coop::Coordinator headDone;
+        coop::Coordinator finishNext;
+        coop::Coordinator nextDone;
+        headDone.TryAcquire(ctx);
+        finishNext.TryAcquire(ctx);
+        nextDone.TryAcquire(ctx);
+
+        coop::Context::Handle head;
+        ASSERT_TRUE(ctx->GetCooperator()->Spawn([&](coop::Context* c)
+        {
+            auto p = sem.AcquireKill(c, 2);
+            EXPECT_FALSE(static_cast<bool>(p));
+            headDone.Release(c, false);
+        }, &head));
+
+        bool nextAcquired = false;
+        bool nextSpawned = ctx->GetCooperator()->Spawn([&](coop::Context* c)
+        {
+            {
+                auto p = sem.Acquire(c, 1);
+                nextAcquired = static_cast<bool>(p);
+                finishNext.Acquire(c);
+                finishNext.Release(c, false);
+            }
+            nextDone.Release(c, false);
+        });
+        EXPECT_TRUE(nextSpawned);
+        EXPECT_EQ(sem.Waiters(), nextSpawned ? 2u : 1u);
+        EXPECT_EQ(sem.Available(), 1u);  // FIFO keeps the small request queued
+
+        head.Kill();
+        headDone.Flash(ctx);
+
+        if (nextSpawned)
+        {
+            // The next permit must be reserved as soon as the head withdraws, even
+            // if the next context has not resumed yet. It stays held until cleanup.
+            //
+            EXPECT_EQ(sem.Available(), 0u);
+
+            // Also unwind the broken implementation: explicitly reconsider the queue
+            // without adding units, so this regression fails instead of hanging.
+            //
+            sem.Release(0);
+            finishNext.Release(ctx, false);
+            nextDone.Flash(ctx);
+            EXPECT_TRUE(nextAcquired);
+        }
+        EXPECT_EQ(sem.Waiters(), 0u);
+        EXPECT_EQ(sem.Available(), 1u);
     });
 }
 

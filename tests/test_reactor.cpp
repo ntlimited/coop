@@ -5,6 +5,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <semaphore>
+#include <thread>
 
 #include "coop/context.h"
 #include "coop/cooperator.h"
@@ -189,4 +191,38 @@ TEST(ReactorTest, DestroyedWithWatcherParked)
         close(fds[0]);
         close(fds[1]);
     });
+}
+
+TEST(ReactorTest, DestroyedWithIdleWatcherDoesNotBlockShutdown)
+{
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    // Keep both sockets open through shutdown. A watchdog supplies readiness only if shutdown
+    // stalls, so a regression fails an assertion instead of hanging the entire test process.
+    //
+    std::binary_semaphore shutdownFinished{0};
+    bool forcedWake = false;
+    std::thread watchdog([&]
+    {
+        if (!shutdownFinished.try_acquire_for(std::chrono::seconds(2)))
+        {
+            forcedWake = true;
+            write(fds[1], "x", 1);
+        }
+    });
+
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        State st;
+        coop::io::Reactor reactor(ctx->GetCooperator(), &OnReady, &OnTimeout, &st);
+        reactor.Watch(fds[0], POLLIN);
+        coop::time::Sleep(ctx, std::chrono::milliseconds(5));
+    });
+
+    shutdownFinished.release();
+    watchdog.join();
+    EXPECT_FALSE(forcedWake) << "Idle reactor poll prevented cooperator shutdown";
+    close(fds[0]);
+    close(fds[1]);
 }

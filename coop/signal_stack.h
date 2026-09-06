@@ -48,7 +48,7 @@ struct SignalStack
 
     // The installed region, or {nullptr, 0} if this object adopted an existing stack.
     //
-    void const* Bottom() const { return m_memory; }
+    void const* Bottom() const;
     size_t      Size() const { return m_size; }
 
     // How much to reserve.

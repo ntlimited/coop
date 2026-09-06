@@ -100,14 +100,17 @@ struct Reactor::Impl
             Descriptor desc(io::borrowed, w->fd);   // foreign code owns the fd — never close it
 
             // `impl->dead` is re-read on every pass, next to `w->removed`: the Reactor can be
-            // destroyed while we are parked in Poll below, and firing onReady afterwards would
+            // destroyed while we are parked in PollKill below, and firing onReady afterwards would
             // call through a function pointer and a `user` that its owner has already destroyed.
             //
             while (!w->removed && !impl->dead)
             {
                 unsigned mask = w->mask;
-                int rev = Poll(desc, mask);
-                if (w->removed || impl->dead) break;
+                // An idle fd may never become ready. Shutdown must wake this wait so the Handle
+                // can cancel and drain its poll before the watcher releases its shared state.
+                //
+                int rev = PollKill(desc, mask);
+                if (w->removed || impl->dead || c->IsKilled()) break;
 
                 unsigned revents = (rev < 0) ? static_cast<unsigned>(POLLERR)
                                              : static_cast<unsigned>(rev);

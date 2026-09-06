@@ -248,6 +248,12 @@ add_executable(coop_tests
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 target_link_options(coop_tests PRIVATE -rdynamic)   # dladdr symbol names for the introspection test
+# The introspection fixture asserts that its named caller remains on the blocked stack.
+# noinline alone still permits a tail call, and coop's frame-pointer flags are PRIVATE.
+# Preserve the fixture's frames without changing codegen for the runtime or other tests.
+#
+set_source_files_properties(tests/test_introspect.cpp PROPERTIES
+    COMPILE_OPTIONS "-fno-omit-frame-pointer;-fno-optimize-sibling-calls")
 include(GoogleTest)
 gtest_discover_tests(coop_tests)
 

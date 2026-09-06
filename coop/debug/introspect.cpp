@@ -10,6 +10,7 @@
 #include "coop/context.h"
 #include "coop/cooperator.h"
 #include "coop/detail/scheduler_state.h"
+#include "coop/detail/stack_walk.h"
 
 namespace coop
 {
@@ -31,72 +32,35 @@ const char* StateName(SchedulerState s)
     return "unknown";
 }
 
-// Recover (pc, fp) for the top frame of a *suspended* context from its saved stack pointer. The
-// context switch (coop/detail/context_switch.S) pushes the callee-saved registers before storing
-// rsp, so the frame pointer and return address sit at fixed offsets from m_sp.
-//
-bool TopFrameOf(void* savedSp, uintptr_t& pc, uintptr_t& fp)
-{
-    if (!savedSp) return false;
-    auto* s = static_cast<uintptr_t*>(savedSp);
-#if defined(__x86_64__)
-    // pushed low->high: r15 r14 r13 r12 rbx rbp, then the call return address.
-    fp = s[5];   // rbp
-    pc = s[6];   // return address into the switch call site
-#elif defined(__aarch64__)
-    // stp x29,x30,[sp,#-96]! stores fp then lr at the lowest two slots.
-    fp = s[0];   // x29
-    pc = s[1];   // x30
-#else
-#error "Unsupported architecture for coop::debug::CaptureStack"
-#endif
-    return true;
-}
-
 } // namespace
 
 int CaptureStack(Context* ctx, uintptr_t* frames, int maxFrames)
 {
-    if (!ctx || maxFrames <= 0) return 0;
+    if (!ctx || !frames || maxFrames <= 0) return 0;
 
-    const uintptr_t lo = reinterpret_cast<uintptr_t>(ctx->m_segment.Bottom());
-    const uintptr_t hi = reinterpret_cast<uintptr_t>(ctx->m_segment.Top());
+    detail::StackBounds bounds{
+        reinterpret_cast<uintptr_t>(ctx->m_segment.Bottom()),
+        reinterpret_cast<uintptr_t>(ctx->m_segment.Top())};
 
     Cooperator* co = ctx->GetCooperator();
     const bool running = co && co->Scheduled() == ctx;
 
-    uintptr_t pc, fp;
     if (running)
     {
-        // The caller *is* this context — walk the live frame.
+        // Our frame already contains the return address into the caller. Prepending
+        // __builtin_return_address(0) would report that caller twice.
         //
-        pc = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-        fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-    }
-    else if (!TopFrameOf(ctx->m_sp, pc, fp))
-    {
-        return 0;
+        uintptr_t fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+        return detail::WalkFrameChain(fp, bounds, frames, maxFrames);
     }
 
-    int depth = 0;
-    frames[depth++] = pc;
+    uintptr_t pc, fp;
+    uintptr_t savedSp = reinterpret_cast<uintptr_t>(ctx->m_sp);
+    if (!detail::ReadSavedStack(savedSp, bounds, pc, fp)) return 0;
 
-    // Frame-pointer walk, bounded to the context's own stack segment so a stale or bogus frame
-    // pointer can never send us wandering through unrelated memory.
-    //
-    while (depth < maxFrames && fp >= lo && fp < hi && (fp & 0x7) == 0)
-    {
-        auto* frame = reinterpret_cast<uintptr_t*>(fp);
-        uintptr_t ret = frame[1];
-        if (ret == 0) break;
-        frames[depth++] = ret;
-
-        uintptr_t next = frame[0];
-        if (next <= fp) break;   // frame pointers march toward the stack base
-        fp = next;
-    }
-
-    return depth;
+    frames[0] = pc;
+    bounds.lo = savedSp;
+    return 1 + detail::WalkFrameChain(fp, bounds, frames + 1, maxFrames - 1);
 }
 
 size_t Symbolize(uintptr_t pc, char* buf, size_t bufSize)

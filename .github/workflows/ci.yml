@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev libssl-dev
+          sudo apt-get install -y liburing-dev libssl-dev gdb
 
       - name: Probe io_uring availability
         run: |
@@ -54,3 +54,9 @@ jobs:
 
       - name: Test
         run: ./build/bin/coop_tests
+
+      - name: GDB live and core inspection
+        if: matrix.lane == 'debug'
+        run: |
+          python3 tests/gdb_smoke.py build/bin/coop_gdb_fixture --bare
+          python3 tests/gdb_smoke.py build/bin/coop_gdb_fixture

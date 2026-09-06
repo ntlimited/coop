@@ -14,8 +14,11 @@ root = Path(__file__).resolve().parent.parent
 fixture = args.fixture.resolve()
 
 
-def quoted(path):
-    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+def load_python(path):
+    # GDB's source command treats quotes as part of the filename. Python repr
+    # safely preserves spaces and punctuation without relying on that parser.
+    filename = repr(str(path))
+    return "python exec(compile(open(%s).read(), %s, 'exec'))" % (filename, filename)
 
 
 with tempfile.TemporaryDirectory(prefix="coop-gdb-") as directory:
@@ -25,8 +28,8 @@ with tempfile.TemporaryDirectory(prefix="coop-gdb-") as directory:
         commands = ["set pagination off", "set confirm off", "set debuginfod enabled off"]
         if mode == "live":
             commands += ["break CoopGdbReady", "run" + (" --bare" if args.bare else "")]
-        commands += ["source " + quoted(root / "tools/coop_gdb.py"),
-                     "source " + quoted(root / "tests/gdb_checks.py")]
+        commands += [load_python(root / "tools/coop_gdb.py"),
+                     load_python(root / "tests/gdb_checks.py")]
         if mode == "live":
             commands += ["generate-core-file " + str(core)]
         commands += ["quit"]

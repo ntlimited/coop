@@ -70,6 +70,7 @@ TEST(IntrospectTest, WalksRunningContext)
         uintptr_t frames[32];
         int depth = coop::debug::CaptureStack(ctx, frames, 32);
         EXPECT_GE(depth, 1);
+        if (depth >= 2) EXPECT_NE(frames[0], frames[1]);
     });
 }
 

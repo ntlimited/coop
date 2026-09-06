@@ -3,7 +3,8 @@
 // Spawns a handful of named contexts parked on different things — a coordinator, a sleep, a nested
 // call chain — then walks and prints every one. The point: each blocked context shows exactly where
 // it is stuck and how it got there, recovered from its parked stack. Wire coop::debug::DumpContexts
-// into a status endpoint or a SIGQUIT handler and a wedged process explains itself.
+// into a status endpoint on the owning cooperator. It is not async-signal-safe: signals must
+// request a deferred dump, and a pinned cooperator needs the stall capture or an external debugger.
 //
 #include <cstdio>
 

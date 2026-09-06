@@ -38,9 +38,10 @@ int CaptureStack(Context* ctx, uintptr_t* frames, int maxFrames);
 size_t Symbolize(uintptr_t pc, char* buf, size_t bufSize);
 
 // Dump every context on `co` — name, scheduler state, and a symbolized backtrace — to `out` (or the
-// spdlog warn stream). Call it from a status endpoint, a stall hook, or a SIGQUIT-style handler to
-// get a Go-goroutine-dump-style snapshot of a wedged process, with real C++ stacks and, for blocked
-// contexts, the exact wait they are parked on.
+// spdlog warn stream). Call only from a context on this cooperator, e.g. its status endpoint.
+// This allocates, symbolizes, and writes output: it is NOT async-signal-safe and cannot run from
+// a watchdog hook on another thread. A signal handler must arrange a deferred request through an
+// async-signal-safe mechanism; a pinned cooperator needs the stall capture or an external debugger.
 //
 void DumpContexts(Cooperator* co, FILE* out);
 void DumpContexts(Cooperator* co);

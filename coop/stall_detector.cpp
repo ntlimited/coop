@@ -13,6 +13,8 @@
 
 #include "context.h"
 #include "cooperator.h"
+#include "detail/stack_walk.h"
+#include "detail/stall_capture.h"
 #include "time/now.h"
 
 namespace coop
@@ -26,29 +28,33 @@ namespace coop
 namespace
 {
 
-struct Capture
-{
-    std::atomic<bool> ready{false};
-    Context*          context{nullptr};
-    char              name[64]{};
-    uintptr_t         frames[StallDetector::kMaxFrames]{};
-    int               depth{0};
-};
-
-// One capture in flight process-wide. A watchdog holds g_captureMutex across signal + wait, so the
-// handler (which cannot lock) always writes into a slot owned by exactly one waiter.
+// A watchdog serializes requests and report copying; the generation-tagged mailbox also protects
+// against handlers that arrive or finish after that watchdog's bounded wait has expired.
 //
-Capture         g_capture;
-std::mutex      g_captureMutex;
+detail::StallCapture g_capture;
+std::mutex          g_captureMutex;
 
 std::mutex      g_installMutex;
 int             g_handlerRefs = 0;
 struct sigaction g_prevAction;
 
-void StallSignalHandler(int, siginfo_t*, void* uctx)
+void StallSignalHandler(int, siginfo_t* info, void* uctx)
 {
+    if (!g_capture.Claim(info)) return;
+    auto cookie = reinterpret_cast<detail::StallCapture::Cookie>(info->si_value.sival_ptr);
     Cooperator* co  = Cooperator::thread_cooperator;
-    Context*    ctx = co ? co->Scheduled() : nullptr;
+    // A delayed signal must not attribute a recovered stall to whichever context runs next.
+    // Read context data only here, while the interrupted cooperator cannot destroy it.
+    //
+    if (!co || co->StallState() != g_capture.stallState)
+    {
+        g_capture.context = nullptr;
+        g_capture.name[0] = '\0';
+        g_capture.depth = 0;
+        g_capture.Complete(cookie);
+        return;
+    }
+    Context* ctx = co->Scheduled();
 
     g_capture.context = ctx;
 
@@ -63,7 +69,7 @@ void StallSignalHandler(int, siginfo_t*, void* uctx)
     }
     g_capture.name[n] = '\0';
 
-    // Frame-pointer walk from the interrupted machine context -- no calls, no locks, no malloc.
+    // Bounded frame-pointer walk from the interrupted machine context -- no locks or allocation.
     // Valid because coop is built -fno-omit-frame-pointer; user frames unwind as far as they too
     // keep frame pointers, and the top PC is always recorded regardless.
     //
@@ -80,21 +86,16 @@ void StallSignalHandler(int, siginfo_t*, void* uctx)
 #error "Unsupported architecture for StallDetector"
 #endif
 
-    int depth = 0;
-    g_capture.frames[depth++] = pc;
-    while (depth < StallDetector::kMaxFrames && fp > sp && (fp & 7) == 0)
+    detail::StackBounds bounds{0, 0};
+    if (ctx)
     {
-        auto* frame = reinterpret_cast<uintptr_t*>(fp);
-        uintptr_t ret = frame[1];
-        if (ret == 0) break;
-        g_capture.frames[depth++] = ret;
-        uintptr_t nextFp = frame[0];
-        if (nextFp <= fp) break;
-        fp = nextFp;
+        bounds = {reinterpret_cast<uintptr_t>(ctx->m_segment.Bottom()),
+                  reinterpret_cast<uintptr_t>(ctx->m_segment.Top())};
     }
-    g_capture.depth = depth;
+    g_capture.depth = detail::WalkInterruptedStack(pc, fp, sp, bounds,
+                                                  g_capture.frames, StallDetector::kMaxFrames);
 
-    g_capture.ready.store(true, std::memory_order_release);
+    g_capture.Complete(cookie);
 }
 
 void InstallHandler()
@@ -212,20 +213,19 @@ void StallDetector::Watch()
         if (tid != 0)
         {
             std::lock_guard<std::mutex> cap(g_captureMutex);
-            g_capture.ready.store(false, std::memory_order_release);
-            g_capture.depth = 0;
-
-            if (syscall(SYS_tgkill, getpid(), tid, SIGURG) == 0)
+            auto cookie = g_capture.Begin(state);
+            if (cookie && detail::QueueStallSignal(tid, cookie))
             {
-                // Wait briefly for the handler to land. If the thread is wedged uninterruptibly or
-                // has since exited, proceed with whatever (possibly nothing) was captured.
+                // Wait briefly for the handler to finish. On timeout, cancel an unclaimed request;
+                // a handler already capturing retains the slot until it finishes. Neither case
+                // permits a later watchdog to read or overwrite an in-progress capture.
                 //
-                for (int i = 0; i < 500 && !g_capture.ready.load(std::memory_order_acquire); ++i)
+                for (int i = 0; i < 500 && !g_capture.Ready(cookie); ++i)
                 {
                     struct timespec ts{0, 100000};   // 100us
                     nanosleep(&ts, nullptr);
                 }
-                if (g_capture.ready.load(std::memory_order_acquire))
+                if (g_capture.Ready(cookie))
                 {
                     rep.context = g_capture.context;
                     rep.depth   = g_capture.depth;
@@ -234,6 +234,7 @@ void StallDetector::Watch()
                         rep.frames[i] = g_capture.frames[i];
                 }
             }
+            if (cookie) g_capture.Cancel(cookie);
         }
 
         m_stallCount.fetch_add(1, std::memory_order_relaxed);

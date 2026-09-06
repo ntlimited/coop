@@ -222,6 +222,7 @@ add_executable(coop_tests
     tests/test_stall_detector.cpp
     tests/test_reactor.cpp
     tests/test_introspect.cpp
+    tests/test_stack_walk.cpp
     tests/test_prng.cpp
     tests/test_drain.cpp
     tests/test_direct_yield.cpp

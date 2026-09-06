@@ -8,6 +8,7 @@
 
 #include "coop/cooperator.h"
 #include "coop/context.h"
+#include "coop/detail/stack_walk.h"
 
 namespace coop
 {
@@ -55,9 +56,6 @@ static inline uint64_t rdtsc()
 
 // SIGPROF handler — must be async-signal-safe.
 //
-// backtrace() is async-signal-safe on glibc/Linux. It uses DWARF .eh_frame unwind info,
-// so it works even without frame pointers (-fomit-frame-pointer, the default at -O2).
-//
 static void SigprofHandler(int, siginfo_t*, void* uctx)
 {
     Context* ctx = nullptr;
@@ -81,8 +79,8 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
     g_ring[pcIdx] = {pc, ctx, co, ts};
     g_total.fetch_add(1, std::memory_order_release);
 
-    // In stack mode, subsample backtrace() every Nth signal. The DWARF unwinder is expensive
-    // and pollutes the icache/dcache, so we limit its frequency while keeping full-rate PC data.
+    // In stack mode, subsample the frame walk every Nth signal to limit memory traffic while
+    // keeping full-rate PC data.
     //
     if (g_stackMode.load(std::memory_order_relaxed))
     {
@@ -91,8 +89,7 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
 
         bool doStack = (every > 0) && ((ord % every) == 0);
 
-        // Skip backtrace() during shutdown — context stacks may be partially torn down
-        // and the unwinder can crash on asm trampolines without .eh_frame info.
+        // Skip stack capture during shutdown — context stacks may be partially torn down.
         //
         if (doStack && co && co->IsShuttingDown())
         {
@@ -104,12 +101,9 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
             size_t idx = g_stackHead.fetch_add(1, std::memory_order_relaxed) & STACK_RING_MASK;
             auto& s = g_stackRing[idx];
 
-            // Manual frame pointer walk — no function calls, no locks, no malloc.
+            // Bounded frame pointer walk — no locks or allocation.
             // Requires -fno-omit-frame-pointer. Just a few memory loads per frame.
             //
-            s.frames[0] = pc;
-            int depth = 1;
-
 #if defined(__x86_64__)
             uintptr_t fp = u->uc_mcontext.gregs[REG_RBP];
             uintptr_t sp = u->uc_mcontext.gregs[REG_RSP];
@@ -118,17 +112,14 @@ static void SigprofHandler(int, siginfo_t*, void* uctx)
             uintptr_t sp = u->uc_mcontext.sp;
 #endif
 
-            while (depth < MAX_STACK_DEPTH && fp > sp && (fp & 7) == 0)
+            detail::StackBounds bounds{0, 0};
+            if (ctx)
             {
-                auto* frame = reinterpret_cast<uintptr_t*>(fp);
-                uintptr_t retAddr = frame[1];
-                if (retAddr == 0) break;
-                s.frames[depth++] = retAddr;
-
-                uintptr_t nextFp = frame[0];
-                if (nextFp <= fp) break; // must increase (unwinding toward stack base)
-                fp = nextFp;
+                bounds = {reinterpret_cast<uintptr_t>(ctx->m_segment.Bottom()),
+                          reinterpret_cast<uintptr_t>(ctx->m_segment.Top())};
             }
+            int depth = detail::WalkInterruptedStack(pc, fp, sp, bounds,
+                                                     s.frames, MAX_STACK_DEPTH);
 
             s.depth = static_cast<uint8_t>(depth);
             s.context = ctx;

@@ -82,13 +82,16 @@ struct GuardedPassage
 
     void TransitionTo(GuardedPassageState expected, GuardedPassageState next)
     {
-        m_state.compare_exchange_strong(expected, next,
-            std::memory_order_acq_rel);
+        TryTransition(expected, next);
     }
 
-    // Destructor waits for Shutdown.
+    ~GuardedPassage() { WaitForShutdown(); }
+
+protected:
+    // The storage owner must wait before its elements are destroyed. The base
+    // destructor alone runs too late to protect a derived class's members.
     //
-    ~GuardedPassage()
+    void WaitForShutdown()
     {
         if (m_state.load(std::memory_order_acquire) == GuardedPassageState::Created)
             return;
@@ -101,7 +104,6 @@ struct GuardedPassage
         }
     }
 
-protected:
     // Only constructed by FixedGuardedPassage.
     //
     explicit GuardedPassage(size_t capacity) : m_capacity(capacity) {}
@@ -114,6 +116,18 @@ protected:
     alignas(64) std::atomic<size_t> m_head{0};
     size_t                     m_capacity;
     T                          m_ring[0];  // flexible array — storage follows
+
+private:
+    template<typename> friend struct RecvSide;
+    template<typename> friend struct SendSide;
+
+    // On failure, expected receives the peer's transition so endpoint teardown
+    // can retry from the new state instead of dropping its own shutdown.
+    //
+    bool TryTransition(GuardedPassageState& expected, GuardedPassageState next)
+    {
+        return m_state.compare_exchange_strong(expected, next, std::memory_order_acq_rel);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -127,6 +141,7 @@ struct FixedGuardedPassage : GuardedPassage<T>
     static_assert(N > 0, "Capacity must be positive");
 
     FixedGuardedPassage() : GuardedPassage<T>(N) {}
+    ~FixedGuardedPassage() { this->WaitForShutdown(); }
 
 private:
     T m_storage[N];
@@ -148,12 +163,18 @@ struct RecvSide
     {
         if (!m_core) return;
         auto s = m_core->State();
-        if (s == GuardedPassageState::RecvOnly)
-            m_core->TransitionTo(GuardedPassageState::RecvOnly, GuardedPassageState::Shutdown);
-        else if (s == GuardedPassageState::SendRecv)
-            m_core->TransitionTo(GuardedPassageState::SendRecv, GuardedPassageState::RecvShutdown);
-        else if (s == GuardedPassageState::SendShutdown)
-            m_core->TransitionTo(GuardedPassageState::SendShutdown, GuardedPassageState::Shutdown);
+        for (;;)
+        {
+            GuardedPassageState next;
+            if (s == GuardedPassageState::RecvOnly || s == GuardedPassageState::SendShutdown)
+                next = GuardedPassageState::Shutdown;
+            else if (s == GuardedPassageState::SendRecv)
+                next = GuardedPassageState::RecvShutdown;
+            else
+                return;
+            if (m_core->TryTransition(s, next))
+                return;
+        }
     }
 
     RecvSide(RecvSide const&) = delete;
@@ -203,10 +224,18 @@ struct SendSide
     {
         if (!m_core) return;
         auto s = m_core->State();
-        if (s == GuardedPassageState::SendRecv)
-            m_core->TransitionTo(GuardedPassageState::SendRecv, GuardedPassageState::SendShutdown);
-        else if (s == GuardedPassageState::RecvShutdown)
-            m_core->TransitionTo(GuardedPassageState::RecvShutdown, GuardedPassageState::Shutdown);
+        for (;;)
+        {
+            GuardedPassageState next;
+            if (s == GuardedPassageState::SendRecv)
+                next = GuardedPassageState::SendShutdown;
+            else if (s == GuardedPassageState::RecvShutdown)
+                next = GuardedPassageState::Shutdown;
+            else
+                return;
+            if (m_core->TryTransition(s, next))
+                return;
+        }
     }
 
     SendSide(SendSide const&) = delete;

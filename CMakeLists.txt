@@ -233,6 +233,7 @@ add_executable(coop_tests
     tests/test_spawn.cpp
     tests/test_signal.cpp
     tests/test_channel.cpp
+    tests/test_guarded_passage.cpp
     tests/test_shutdown.cpp
     tests/test_uring_lifecycle.cpp
     tests/test_io.cpp

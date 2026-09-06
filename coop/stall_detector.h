@@ -27,6 +27,13 @@ class Context;
 // warning with the context name, the stalled duration, and the captured instruction addresses
 // (symbolize with addr2line / the perf symbolizer).
 //
+// Capture waits are bounded. A blocked or late signal, recovery before capture, or another handler
+// still using the process-wide capture slot produces an empty stack and name. Reports never borrow
+// another request's capture. SIGURG is reserved while detectors exist; its previous disposition is
+// restored when the last detector is destroyed. If a target still blocks SIGURG then, a pending
+// diagnostic signal can reach that restored disposition later. Applications sharing SIGURG with a
+// custom handler must quiesce and unblock their targets before destroying the last detector.
+//
 // Zero cost when absent. The cooperator's switch seam (Cooperator::StallEnter/StallLeave) is a
 // single predicted-not-taken branch that stays dead until a detector arms it. Attached but quiet,
 // the cooperator is never perturbed: the watchdog only reads one atomic, and signals the running
@@ -46,7 +53,7 @@ public:
         char        name[64];       // context name, snapshotted inside the capture signal
         int64_t     stalledForUs;   // how long it had held the thread when the stall was reported
         uintptr_t   frames[kMaxFrames];
-        int         depth;          // number of captured frames (0 if capture did not land)
+        int         depth;          // number of captured frames (0 if capture was unavailable)
     };
 
     using Hook = std::function<void(const Report&)>;

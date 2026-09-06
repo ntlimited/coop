@@ -52,7 +52,8 @@ struct StackSample
 // with periodic workloads). Installs SIGPROF handler and arms ITIMER_PROF. Safe to call
 // multiple times (updates frequency). When stacks=true, also captures call stacks via frame
 // pointer walking (every Nth signal, configurable via SetStackSubsample). Returns false on
-// error.
+// error. Walking is bounded to a known context stack; native/scheduler stacks and stack-switch
+// transitions without matching bounds produce only the interrupted instruction pointer.
 //
 bool StartSampling(int hz = 99, bool stacks = false);
 

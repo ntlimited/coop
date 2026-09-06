@@ -1,11 +1,17 @@
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <memory>
+#include <semaphore>
+#include <utility>
+#include <unistd.h>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "coop/cooperator.h"
+#include "coop/cooperate.h"
 #include "coop/context.h"
 #include "coop/coordinator.h"
 #include "coop/signal.h"
@@ -13,6 +19,134 @@
 #include "coop/time/sleep.h"
 #include "coop/time/interval.h"
 #include "test_helpers.h"
+
+namespace
+{
+
+enum class SubmissionMode { Async, Sync, Cooperate };
+
+struct SubmissionGate
+{
+    std::binary_semaphore m_entered{0};
+    std::binary_semaphore m_resume{0};
+    std::atomic<int> m_destroyed{0};
+    std::atomic<bool> m_ran{false};
+};
+
+// Hold callable construction after the public API's initial shutdown check. This is a test-only
+// blocking seam: the target must finish Launch before construction is allowed to return.
+//
+struct GatedSubmission
+{
+    SubmissionGate* m_gate;
+
+    explicit GatedSubmission(SubmissionGate* gate) : m_gate(gate) {}
+    GatedSubmission(GatedSubmission&& other) : m_gate(std::exchange(other.m_gate, nullptr))
+    {
+        m_gate->m_entered.release();
+        m_gate->m_resume.acquire();
+    }
+    ~GatedSubmission()
+    {
+        if (m_gate) m_gate->m_destroyed.fetch_add(1);
+    }
+    void operator()(coop::Context*) { m_gate->m_ran.store(true); }
+};
+
+void CheckShutdownAdmission(SubmissionMode mode)
+{
+    // A subprocess bounds the old SubmitSync hang without leaving detached threads or dead
+    // semaphore pointers behind. The watchdog also bounds an unexpected scheduler join hang.
+    //
+    alarm(15);
+    SubmissionGate gate;
+    coop::Cooperator target;
+    std::thread targetThread([&] { target.Launch(); });
+    std::binary_semaphore completed(0);
+    bool accepted = true;
+
+    auto submit = [&](coop::Context* ctx)
+    {
+        if (mode == SubmissionMode::Cooperate)
+        {
+            coop::CooperateHandle handle(ctx);
+            accepted = target.Cooperate(GatedSubmission(&gate), &handle);
+            EXPECT_FALSE(handle.m_signal.IsSignaled());
+        }
+        else if (mode == SubmissionMode::Sync)
+        {
+            accepted = target.SubmitSync(GatedSubmission(&gate));
+        }
+        else
+        {
+            accepted = target.Submit(GatedSubmission(&gate));
+        }
+        completed.release();
+    };
+
+    std::unique_ptr<coop::Cooperator> caller;
+    std::unique_ptr<coop::Thread> callerThread;
+    std::thread submitter;
+    if (mode == SubmissionMode::Cooperate)
+    {
+        caller = std::make_unique<coop::Cooperator>();
+        callerThread = std::make_unique<coop::Thread>(caller.get());
+        caller->Submit([&](coop::Context* ctx) { submit(ctx); });
+    }
+    else
+    {
+        submitter = std::thread([&] { submit(nullptr); });
+    }
+
+    gate.m_entered.acquire();
+    target.Shutdown();
+    targetThread.join();
+    gate.m_resume.release();
+    if (!completed.try_acquire_for(std::chrono::seconds(2)))
+    {
+        std::fputs("submission remained blocked after the target exited\n", stderr);
+        _exit(1);
+    }
+
+    if (caller)
+    {
+        caller->Shutdown();
+        callerThread.reset();
+    }
+    else
+    {
+        submitter.join();
+    }
+    EXPECT_FALSE(accepted);
+    EXPECT_FALSE(gate.m_ran.load());
+    EXPECT_EQ(gate.m_destroyed.load(), 1);
+}
+
+} // namespace
+
+TEST(ShutdownAdmissionDeathTest, SubmitRejectsAfterConcurrentShutdown)
+{
+    ASSERT_EXIT({
+        CheckShutdownAdmission(SubmissionMode::Async);
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(ShutdownAdmissionDeathTest, SubmitSyncRejectsAfterConcurrentShutdown)
+{
+    ASSERT_EXIT({
+        CheckShutdownAdmission(SubmissionMode::Sync);
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(ShutdownAdmissionDeathTest, CooperateRejectsAfterConcurrentShutdown)
+{
+    ASSERT_EXIT({
+        CheckShutdownAdmission(SubmissionMode::Cooperate);
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }, ::testing::ExitedWithCode(0), "");
+}
 
 // Spawn several contexts that yield in loops. Call Shutdown() and verify that the cooperator
 // loop terminates (Thread joins).

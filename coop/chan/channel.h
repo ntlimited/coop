@@ -399,11 +399,13 @@ struct SendChannel : virtual TypedBaseChannel<T>
 
         Context* ctx = Self();
 
+        bool acquiredSend = false;
         for (size_t i = 0; i < count; i++)
         {
-            if (Base::IsFull())
+            while (Base::IsFull())
             {
                 Base::m_send.Acquire(ctx);
+                acquiredSend = true;
                 if (Base::IsShutdown())
                 {
                     Base::m_send.Release(ctx);
@@ -413,19 +415,27 @@ struct SendChannel : virtual TypedBaseChannel<T>
 
             // Track empty→non-empty transition. Only release m_recv on that transition to
             // avoid spuriously releasing a receiver's legitimately-held m_recv on subsequent
-            // iterations. Release m_recv BEFORE acquiring m_send so that when a single
-            // SendImpl fills the channel (e.g. cap=1), a blocked receiver is woken before the
-            // sender blocks — otherwise both sides deadlock.
+            // iterations.
             //
             bool wasEmpty = Base::IsEmpty();
             [[maybe_unused]] bool ok = SendImpl(data[i]);
             assert(ok);
 
+            // A full-channel wait already acquired m_send. Mark fullness without
+            // reacquiring that held coordinator; otherwise a successful final send
+            // waits for its value to be consumed. If a batched drain freed extra
+            // space, release the acquired coordinator after the last item. Keeping it
+            // across the batch avoids waking another sender and consuming its slot
+            // before it runs.
+            // Restore this state before waking a receiver, which may run immediately.
+            //
+            if (Base::IsFull())
+                Base::m_send.TryAcquire(ctx);
+            else if (acquiredSend && i == count - 1)
+                Base::m_send.Release(ctx, false);
+
             if (wasEmpty && Base::m_recv.IsHeld())
                 Base::m_recv.Release(ctx, i == count - 1);
-
-            if (Base::IsFull())
-                Base::m_send.Acquire(ctx);
         }
 
         return true;

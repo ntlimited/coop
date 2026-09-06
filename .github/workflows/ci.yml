@@ -53,7 +53,23 @@ jobs:
         run: cmake --build build -j"$(nproc)"
 
       - name: Test
-        run: ./build/bin/coop_tests
+        run: |
+          # Preserve native execution and its exit status; inspect a core only after failure.
+          ulimit -c unlimited
+          sudo sysctl -w kernel.core_pattern="$PWD/build/core.%p"
+          status=0
+          ./build/bin/coop_tests || status=$?
+          if [ "$status" -ne 0 ]; then
+            for core in build/core.*; do
+              [ -f "$core" ] || continue
+              gdb --batch ./build/bin/coop_tests "$core" \
+                -ex 'set pagination off' \
+                -ex 'p $_siginfo' \
+                -ex 'thread apply all bt' \
+                -ex 'info registers' || true
+            done
+          fi
+          exit "$status"
 
       - name: GDB live and core inspection
         if: matrix.lane == 'debug'

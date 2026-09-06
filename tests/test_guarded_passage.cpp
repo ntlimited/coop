@@ -3,6 +3,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <semaphore>
 #include <thread>
 
 #include "coop/chan/guarded_passage.h"
@@ -112,4 +116,110 @@ TEST(GuardedPassageTest, ConcurrentSideTeardownAlwaysReachesShutdown)
         << parked << " of " << kIterations
         << " concurrent teardowns lost a side transition and parked the passage "
            "short of Shutdown";
+}
+
+namespace
+{
+
+struct DestructionState
+{
+    std::mutex mutex;
+    std::condition_variable changed;
+    size_t destroyed = 0;
+};
+
+struct TrackedValue
+{
+    explicit TrackedValue(DestructionState& state) : m_state(state) {}
+    ~TrackedValue()
+    {
+        std::lock_guard lock(m_state.mutex);
+        ++m_state.destroyed;
+        m_state.changed.notify_one();
+    }
+    DestructionState& m_state;
+};
+
+} // namespace
+
+TEST(GuardedPassageTest, StorageLivesUntilBothEndpointsAreDestroyed)
+{
+    for (bool senderFirst : {false, true})
+    {
+        SCOPED_TRACE(senderFirst ? "sender first" : "receiver first");
+        using Value = std::unique_ptr<TrackedValue>;
+        DestructionState state;
+        auto passage = std::make_unique<FixedGuardedPassage<Value, 4>>();
+        auto recv = std::make_unique<RecvSide<Value>>(*passage);
+        auto send = std::make_unique<SendSide<Value>>(*passage);
+        for (size_t i = 0; i < 4; ++i)
+            ASSERT_TRUE(send->TryPush(std::make_unique<TrackedValue>(state)));
+
+        std::binary_semaphore deleting(0);
+        std::atomic<bool> finished{false};
+        std::thread owner([&]
+        {
+            deleting.release();
+            passage.reset();
+            finished.store(true);
+        });
+        deleting.acquire();
+
+        auto expectStorageAlive = [&]
+        {
+            // Give premature element destruction a bounded chance to report itself.
+            // Endpoints stay live throughout the wait, regardless of thread scheduling.
+            //
+            std::unique_lock lock(state.mutex);
+            EXPECT_FALSE(state.changed.wait_for(lock, std::chrono::milliseconds(50), [&]
+            {
+                return state.destroyed != 0;
+            }));
+            EXPECT_FALSE(finished.load());
+        };
+
+        expectStorageAlive();
+        if (senderFirst) send.reset();
+        else recv.reset();
+        expectStorageAlive();
+        if (senderFirst) recv.reset();
+        else send.reset();
+
+        owner.join();
+        EXPECT_TRUE(finished.load());
+        EXPECT_EQ(state.destroyed, 4u);
+    }
+}
+
+TEST(GuardedPassageTest, UnusedAndReceiverOnlyPassagesCanBeDestroyed)
+{
+    FixedGuardedPassage<int, 4> unused;
+    EXPECT_EQ(unused.State(), GuardedPassageState::Created);
+
+    FixedGuardedPassage<int, 4> receiverOnly;
+    {
+        RecvSide<int> recv(receiverOnly);
+        EXPECT_EQ(receiverOnly.State(), GuardedPassageState::RecvOnly);
+    }
+    EXPECT_TRUE(receiverOnly.IsShutdown());
+}
+
+TEST(GuardedPassageTest, SenderShutdownPreservesQueuedValues)
+{
+    FixedGuardedPassage<int, 4> passage;
+    RecvSide<int> recv(passage);
+    {
+        SendSide<int> send(passage);
+        for (int i = 0; i < 4; ++i)
+            EXPECT_TRUE(send.TryPush(i));
+        EXPECT_FALSE(send.TryPush(4));
+    }
+    EXPECT_TRUE(recv.SenderDone());
+    for (int i = 0; i < 4; ++i)
+    {
+        int value = -1;
+        EXPECT_TRUE(recv.TryPop(value));
+        EXPECT_EQ(value, i);
+    }
+    EXPECT_TRUE(recv.IsEmpty());
 }

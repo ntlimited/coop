@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <cstring>
+#include <new>
 #include <string>
 
 #include "coop/context.h"
@@ -10,6 +12,38 @@
 #include "coop/debug/introspect.h"
 
 #include "test_helpers.h"
+
+namespace
+{
+
+struct UnnamedContext : coop::Context
+{
+    UnnamedContext()
+        : Context(nullptr, coop::s_defaultConfiguration, nullptr, nullptr)
+    {
+    }
+};
+
+} // namespace
+
+TEST(IntrospectTest, UnnamedContextInitializesName)
+{
+    // StackPool reuses storage without clearing it. Exercise the actual constructor on
+    // nonzero storage, without starting a scheduler or relying on allocator contents.
+    // This context never runs; skip its scheduler-dependent destructor. Its constructor
+    // allocates no external resources and the local backing storage ends its lifetime.
+    //
+    alignas(UnnamedContext) unsigned char storage[sizeof(UnnamedContext)];
+    std::memset(storage, 0xa5, sizeof(storage));
+    auto* context = new (storage) UnnamedContext;
+
+    // Compare representations first: on the broken constructor the pointer is still
+    // indeterminate, so neither evaluate it nor hand it to a string comparison.
+    //
+    const char* expected = nullptr;
+    ASSERT_EQ(std::memcmp(&context->m_name, &expected, sizeof(expected)), 0);
+    EXPECT_STREQ(context->GetName(), "[anonymous]");
+}
 
 // A distinctively-named, non-inlined function that parks the calling context on a coordinator. It
 // has external linkage so -rdynamic exposes it to dladdr; the test asserts this exact name shows up
@@ -70,6 +104,7 @@ TEST(IntrospectTest, WalksRunningContext)
         uintptr_t frames[32];
         int depth = coop::debug::CaptureStack(ctx, frames, 32);
         EXPECT_GE(depth, 1);
+        if (depth >= 2) EXPECT_NE(frames[0], frames[1]);
     });
 }
 

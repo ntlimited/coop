@@ -513,7 +513,14 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         case SchedulerJumpResult::EXITED:
         {
             COOP_PERF_INC(m_perf, perf::Counter::ContextExit);
-            m_stackPool.Free(m_scheduled, m_scheduled->m_segment.Size());
+            Context* exited = m_scheduled;
+            size_t stackSize = exited->m_segment.Size();
+            // Signal-based diagnostics may interrupt Free(), including after it unmaps the
+            // segment. Withdraw the scheduled pointer before its storage stops being readable.
+            //
+            m_scheduled = nullptr;
+            std::atomic_signal_fence(std::memory_order_release);
+            m_stackPool.Free(exited, stackSize);
             break;
         }
         case SchedulerJumpResult::YIELDED:

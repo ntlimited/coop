@@ -242,6 +242,7 @@ add_executable(coop_tests
     tests/test_stall_detector.cpp
     tests/test_reactor.cpp
     tests/test_introspect.cpp
+    tests/test_stack_walk.cpp
     tests/test_prng.cpp
     tests/test_drain.cpp
     tests/test_direct_yield.cpp
@@ -270,8 +271,20 @@ add_executable(coop_tests
 )
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
 target_link_options(coop_tests PRIVATE -rdynamic)   # dladdr symbol names for the introspection test
+# The introspection fixture asserts that its named caller remains on the blocked stack.
+# noinline alone still permits a tail call, and coop's frame-pointer flags are PRIVATE.
+# Preserve the fixture's frames without changing codegen for the runtime or other tests.
+#
+set_source_files_properties(tests/test_introspect.cpp PROPERTIES
+    COMPILE_OPTIONS "-fno-omit-frame-pointer;-fno-optimize-sibling-calls")
 include(GoogleTest)
 gtest_discover_tests(coop_tests)
+
+# Developer debugger smoke fixture; --bare also runs without io_uring.
+add_executable(coop_gdb_fixture tests/gdb_fixture.cpp)
+target_link_libraries(coop_gdb_fixture PRIVATE coop)
+target_compile_options(coop_gdb_fixture PRIVATE
+    -g -fno-omit-frame-pointer -fno-optimize-sibling-calls -fno-inline)
 
 # Benchmarks
 add_executable(coop_benchmarks

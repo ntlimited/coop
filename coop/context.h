@@ -272,7 +272,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     KillHook* m_killHooks{nullptr};
     ContextChildrenList m_children;
     Coordinator m_lastChild;
-    const char* m_name;
+    const char* m_name{nullptr};
 
     struct
     {

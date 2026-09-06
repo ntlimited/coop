@@ -64,6 +64,11 @@ size_t SignalStack::PreferredSize()
     return (wanted + page - 1) & ~(page - 1);
 }
 
+void const* SignalStack::Bottom() const
+{
+    return m_memory ? static_cast<uint8_t const*>(m_memory) + PageSize() : nullptr;
+}
+
 bool SignalStack::IsActive()
 {
     stack_t current{};

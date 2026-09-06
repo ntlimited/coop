@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <new>
 #include <unistd.h>
@@ -106,15 +107,9 @@ struct GuardedPassage
     // masks the bug rather than surfacing it. So the wait is bounded: 5 seconds
     // (no existing coop precedent covers a destructor spin; this is a generous
     // multiple of the healthy-path handshake latency, chosen purely as a hang
-    // backstop) with the same doubling backoff as the healthy wait. On expiry,
-    // in debug builds this is an invariant violation and aborts loudly, matching
-    // coop's existing assert(false) idiom for invariant violations elsewhere
-    // (cooperator.cpp, embedded_list.h, multi_coordinator.h) -- coop has no
-    // runtime logging facility to route a non-fatal report through, so under
-    // NDEBUG (where assert compiles out) this falls back to stderr and proceeds
-    // with destruction rather than hanging forever; the passage may be a
-    // half-torn UAF risk for whichever side never ran, but that risk is strictly
-    // better than wedging the thread that dropped the last reference.
+    // backstop) with the same doubling backoff as the healthy wait. Expiry aborts
+    // in every build: elapsed time cannot prove the peer has stopped accessing
+    // the passage, so returning would let destruction reclaim live storage.
     //
     ~GuardedPassage()
     {
@@ -128,19 +123,11 @@ struct GuardedPassage
             if (std::chrono::steady_clock::now() >= deadline)
             {
                 GuardedPassageState stuck = m_state.load(std::memory_order_acquire);
-                (void)stuck;
-                assert(false &&
-                    "GuardedPassage destructor timed out waiting for Shutdown -- "
-                    "the peer side (RecvSide/SendSide) never ran its destructor; "
-                    "state parked at RecvShutdown or SendShutdown");
-#ifdef NDEBUG
                 fprintf(stderr,
                     "coop::chan::GuardedPassage: destructor timed out waiting for "
-                    "Shutdown, state stuck at %d (peer side's destructor never ran); "
-                    "proceeding with destruction -- half-torn passage may leak or UAF\n",
+                    "Shutdown, state stuck at %d; aborting before reclaiming live storage\n",
                     static_cast<int>(stuck));
-#endif
-                break;
+                std::abort();
             }
             usleep(backoffUs);
             if (backoffUs < 10000)

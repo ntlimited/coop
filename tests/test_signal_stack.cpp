@@ -118,6 +118,21 @@ TEST(SignalStackTest, InstallsOnAnOrdinaryThread)
     {
         coop::SignalStack signalStack;
         activeInside = coop::SignalStack::IsActive();
+
+        stack_t current{};
+        ASSERT_EQ(sigaltstack(nullptr, &current), 0);
+        if (signalStack.IsInstalled())
+        {
+            // The public bounds describe the usable region, excluding the guard page.
+            //
+            EXPECT_EQ(signalStack.Bottom(), current.ss_sp);
+            EXPECT_EQ(signalStack.Size(), current.ss_size);
+        }
+        else
+        {
+            EXPECT_EQ(signalStack.Bottom(), nullptr);
+            EXPECT_EQ(signalStack.Size(), 0u);
+        }
     });
     t.join();
 

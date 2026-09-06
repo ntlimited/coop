@@ -6,11 +6,6 @@
 #include <thread>
 
 #include "coop/chan/guarded_passage.h"
-#include "coop/detail/asan_fiber.h"
-
-#if COOP_HAVE_ASAN
-extern "C" void __lsan_ignore_object(void const* p);
-#endif
 
 // GuardedPassage's destructor waits for both RecvSide and SendSide to have run
 // their destructors (the handshake that drives GuardedPassageState to
@@ -43,44 +38,26 @@ TEST(GuardedPassageTest, HealthyPairedTeardownIsImmediate)
     EXPECT_LT(elapsed, std::chrono::seconds(1));
 }
 
-#ifndef NDEBUG
-// Red calibration for the destructor's bounded deadline: simulate a context
-// that constructed its SendSide (so the passage committed to the SendRecv
-// handshake) and then died without ever running that destructor -- the
-// cluster cancel-path defect this change fixes at the consumer call site. With
-// only coop's bound in place (no call-site fix), destroying the passage must
-// not hang forever; in a debug build it fails loud instead.
+// A peer that never finishes teardown must fail within the bound in every build.
+// Returning from the destructor would reclaim memory the peer can still access.
 //
 TEST(GuardedPassageTest, DestructorAbortsWhenPeerSideNeverTearsDown)
 {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
 
-    auto* passage = new FixedGuardedPassage<int, 4>();
-
-    // The delete below happens in the death test's child, which is expected to abort partway
-    // through it. This process never deletes its own copy, and that is the design of the test rather
-    // than an oversight — so tell LeakSanitizer, which otherwise reports it at exit and turns an
-    // ASan run of the whole suite red on a deliberate abandonment.
-    //
-#if COOP_HAVE_ASAN
-    __lsan_ignore_object(passage);
-#endif
-
-    auto* recv = new RecvSide<int>(*passage);              // Created -> RecvOnly
-    alignas(SendSide<int>) unsigned char sendStorage[sizeof(SendSide<int>)];
-    new (sendStorage) SendSide<int>(*passage);              // RecvOnly -> SendRecv
-
-    delete recv;  // SendRecv -> RecvShutdown: the surviving peer tears down
-                   // normally. The SendSide placement-constructed above is
-                   // deliberately never destroyed -- its destructor never runs,
-                   // exactly as it would not for a context killed before
-                   // returning through RunReaderFragmentDispatch.
-
+    using Passage = FixedGuardedPassage<int, 4>;
     EXPECT_DEATH(
-        { delete passage; },
-        "the peer side \\(RecvSide/SendSide\\) never ran its destructor");
+        {
+            auto* passage = new Passage();
+            auto* recv = new RecvSide<int>(*passage);
+            alignas(SendSide<int>) unsigned char sendStorage[sizeof(SendSide<int>)];
+            new (sendStorage) SendSide<int>(*passage);
+            delete recv;
+            // Leave the sender alive while attempting to reclaim its passage.
+            delete passage;
+        },
+        "destructor timed out waiting for Shutdown");
 }
-#endif
 
 // A passage normally bridges two cooperators, so its two sides are routinely
 // destroyed on two different threads at the same time. Both destructors used to

@@ -105,6 +105,13 @@ list(FILTER COOP_SOURCES EXCLUDE REGEX ".*/coop/chan/.*")
 
 add_library(coop STATIC ${COOP_SOURCES} $<TARGET_OBJECTS:coop_chan>)
 target_include_directories(coop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(COOP_ASAN)
+    # Consumers must use the same sanitizer-dependent public layout and link its runtime,
+    # including when coop is embedded with add_subdirectory.
+    #
+    target_compile_options(coop PUBLIC -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(coop PUBLIC -fsanitize=address)
+endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
     target_compile_options(coop PRIVATE -Wcpp -fno-omit-frame-pointer -msse4.2)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")

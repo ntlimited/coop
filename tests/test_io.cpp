@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -129,6 +130,55 @@ TEST(IoTest, RecvTimesOut)
             std::chrono::milliseconds(50));
 
         EXPECT_EQ(result, -ETIMEDOUT);
+    });
+}
+
+TEST(IoTest, RecvTimeoutAtSubmissionQueueBoundary)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        auto* uring = coop::GetUring();
+        coop::io::Descriptor reader(sp.fds[0], uring);
+        sp.fds[0] = -1;
+        uring->Poll();
+
+        // Leave one SQ slot for the recv, so adding its linked timeout needs another slot.
+        // Each filler owns a real Handle: its completion must obey the normal CQE lifecycle.
+        // No yield or Poll may intervene between filling the SQ and queuing the timed recv.
+        //
+        std::vector<std::unique_ptr<coop::Coordinator>> coordinators;
+        std::vector<std::unique_ptr<coop::io::Handle>> handles;
+        while (io_uring_sq_space_left(uring->Ring()) > 1)
+        {
+            coordinators.push_back(std::make_unique<coop::Coordinator>());
+            handles.push_back(std::make_unique<coop::io::Handle>(
+                ctx, uring, coordinators.back().get()));
+            auto* sqe = uring->GetSqe();
+            ASSERT_NE(sqe, nullptr);
+            io_uring_prep_nop(sqe);
+            handles.back()->Submit(sqe);
+        }
+        ASSERT_EQ(io_uring_sq_space_left(uring->Ring()), 1u);
+
+        // A rescue write bounds the test if the timeout is accidentally submitted separately
+        // from the recv. It runs on an OS thread so the cooperative scheduler cannot arm a timer
+        // or flush the SQ before the recv occupies its final slot.
+        //
+        std::thread rescue([fd = sp.fds[1]]
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            (void)::write(fd, "x", 1);
+        });
+        char byte = 0;
+        int result = coop::io::Recv(reader, &byte, 1, 0, std::chrono::milliseconds(5));
+        rescue.join();
+        EXPECT_EQ(result, -ETIMEDOUT);
+
+        for (auto& handle : handles)
+        {
+            EXPECT_EQ(handle->Wait(), 0);
+        }
     });
 }
 

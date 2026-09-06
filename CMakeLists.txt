@@ -257,6 +257,12 @@ set_source_files_properties(tests/test_introspect.cpp PROPERTIES
 include(GoogleTest)
 gtest_discover_tests(coop_tests)
 
+# Developer debugger smoke fixture; --bare also runs without io_uring.
+add_executable(coop_gdb_fixture tests/gdb_fixture.cpp)
+target_link_libraries(coop_gdb_fixture PRIVATE coop)
+target_compile_options(coop_gdb_fixture PRIVATE
+    -g -fno-omit-frame-pointer -fno-optimize-sibling-calls -fno-inline)
+
 # Benchmarks
 add_executable(coop_benchmarks
     benchmarks/bench_embedded_list.cpp

@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <sys/socket.h>
@@ -169,6 +170,85 @@ TEST(ArmedHandleTest, PoolExhaustionSurfacesEnobufs)
 
         EXPECT_GT(ah.Enobufs(), 0u);
         EXPECT_FALSE(ah.Armed());
+    });
+}
+
+// A shared pool must retain its full capacity when a receiver exits with queued data,
+// including when Next() has handed one buffer to its caller but has not recycled it yet.
+//
+TEST(ArmedHandleTest, SharedPoolSurvivesUnreadHandleDestruction)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::io::BufferRing br(7, /*entries=*/4, /*bufSize=*/256);
+        ASSERT_EQ(br.Register(*coop::GetUring()), 0);
+        const std::string blob(1600, 'x');
+
+        for (bool consumeChunk : {false, true})
+        {
+            SCOPED_TRACE(consumeChunk ? "one chunk consumed" : "wholly unread");
+            {
+                SocketPair sp;
+                coop::io::Descriptor reader(sp.fds[0], coop::GetUring());
+                sp.fds[0] = -1; // Descriptor owns the read fd.
+                coop::Coordinator coord;
+                coop::io::ArmedHandle ah(ctx, reader, &br, &coord);
+                ah.Arm();
+                ASSERT_EQ(::write(sp.fds[1], blob.data(), blob.size()), (ssize_t)blob.size());
+
+                // Leave the CQE queue unread until all four buffers are checked out and
+                // the kernel has terminated the multishot with ENOBUFS.
+                //
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                while (ah.Armed() && std::chrono::steady_clock::now() < deadline)
+                {
+                    ctx->Yield(true);
+                }
+                ASSERT_FALSE(ah.Armed());
+                ASSERT_GT(ah.Enobufs(), 0u);
+                ASSERT_EQ(ah.Delivered(), br.Entries());
+
+                if (consumeChunk)
+                {
+                    coop::io::ArmedHandle::Chunk c;
+                    ASSERT_GT(ah.Next(&c), 0);
+                }
+            }
+
+            // Reuse the same registered ring without recreating it. Queue a full pool
+            // before consuming anything: recovering only one buffer cannot pass.
+            //
+            SocketPair sp;
+            coop::io::Descriptor reader(sp.fds[0], coop::GetUring());
+            sp.fds[0] = -1;
+            coop::Coordinator coord;
+            coop::io::ArmedHandle ah(ctx, reader, &br, &coord);
+            ah.Arm();
+            ASSERT_EQ(::write(sp.fds[1], blob.data(), blob.size()), (ssize_t)blob.size());
+
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (ah.Armed() && std::chrono::steady_clock::now() < deadline)
+            {
+                ctx->Yield(true);
+            }
+            ASSERT_FALSE(ah.Armed());
+            ASSERT_GT(ah.Enobufs(), 0u);
+            ASSERT_EQ(ah.Delivered(), br.Entries());
+
+            bool seen[4]{};
+            coop::io::ArmedHandle::Chunk c;
+            for (uint32_t i = 0; i < br.Entries(); ++i)
+            {
+                int n = ah.Next(&c);
+                ASSERT_GT(n, 0);
+                ASSERT_GE(c.bid, 0);
+                ASSERT_LT(uint32_t(c.bid), br.Entries());
+                EXPECT_FALSE(seen[c.bid]);
+                seen[c.bid] = true;
+                EXPECT_EQ(std::string(c.data, n), blob.substr(0, n));
+            }
+            EXPECT_EQ(ah.Next(&c), -ENOBUFS);
+        }
     });
 }
 

@@ -111,7 +111,12 @@ struct GuardedPassage
     // in every build: elapsed time cannot prove the peer has stopped accessing
     // the passage, so returning would let destruction reclaim live storage.
     //
-    ~GuardedPassage()
+    ~GuardedPassage() { WaitForShutdown(); }
+
+protected:
+    // The storage owner must wait before destroying its elements.
+    //
+    void WaitForShutdown()
     {
         if (m_state.load(std::memory_order_acquire) == GuardedPassageState::Created)
             return;
@@ -135,7 +140,6 @@ struct GuardedPassage
         }
     }
 
-protected:
     // Only constructed by FixedGuardedPassage.
     //
     explicit GuardedPassage(size_t capacity) : m_capacity(capacity) {}
@@ -161,6 +165,7 @@ struct FixedGuardedPassage : GuardedPassage<T>
     static_assert(N > 0, "Capacity must be positive");
 
     FixedGuardedPassage() : GuardedPassage<T>(N) {}
+    ~FixedGuardedPassage() { this->WaitForShutdown(); }
 
 private:
     T m_storage[N];

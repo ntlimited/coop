@@ -68,31 +68,54 @@ bool Upgrade(http::ConnectionBase& conn)
     char wsKey[64] = {};
     size_t wsKeyLen = 0;
 
+    // Header names live in the connection's receive buffer, NUL-terminated in place.
+    // Reading the value refills that buffer, which moves the bytes and takes the
+    // terminator with them — so the name is copied out first. Measuring it afterwards
+    // scans for a NUL that is no longer there, past the end of a 2KB buffer.
+    //
+    char nameBuf[64];
+
     while (const char* name = conn.NextHeaderName())
     {
+        size_t nameLen = strlen(name);
+        if (nameLen >= sizeof(nameBuf))
+        {
+            conn.SkipHeaderValue();     // no handshake header is anywhere near this long
+            continue;
+        }
+        memcpy(nameBuf, name, nameLen + 1);
+
         auto* val = conn.ReadHeaderValue();
         if (!val) continue;
 
-        size_t nameLen = strlen(name);
         auto* vData = static_cast<const char*>(val->data);
         size_t vLen = val->size;
 
-        if (CaseInsensitiveEq(name, nameLen, "upgrade", 7))
+        // A value delivered in pieces has already been split by a refill; the pieces the
+        // handshake cares about are all short enough to arrive whole.
+        //
+        if (!val->complete)
+        {
+            conn.SkipHeaderValue();
+            continue;
+        }
+
+        if (CaseInsensitiveEq(nameBuf, nameLen, "upgrade", 7))
         {
             if (CaseInsensitiveEq(vData, vLen, "websocket", 9))
                 hasUpgrade = true;
         }
-        else if (CaseInsensitiveEq(name, nameLen, "connection", 10))
+        else if (CaseInsensitiveEq(nameBuf, nameLen, "connection", 10))
         {
             if (ContainsToken(vData, vLen, "upgrade", 7))
                 hasConnection = true;
         }
-        else if (CaseInsensitiveEq(name, nameLen, "sec-websocket-key", 17))
+        else if (CaseInsensitiveEq(nameBuf, nameLen, "sec-websocket-key", 17))
         {
             wsKeyLen = std::min(vLen, sizeof(wsKey) - 1);
             memcpy(wsKey, vData, wsKeyLen);
         }
-        else if (CaseInsensitiveEq(name, nameLen, "sec-websocket-version", 21))
+        else if (CaseInsensitiveEq(nameBuf, nameLen, "sec-websocket-version", 21))
         {
             if (vLen == 2 && vData[0] == '1' && vData[1] == '3')
                 hasVersion13 = true;

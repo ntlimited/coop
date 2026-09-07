@@ -28,6 +28,18 @@ struct ConnectionBase
     static constexpr size_t DEFAULT_BUFFER_SIZE = 2048;
     static constexpr size_t DEFAULT_SEND_BUFFER_SIZE = 512;
 
+    // Framing limits. Every field the parser reads is chosen by the peer, and a listener
+    // is typically open to the network without authentication, so the sizes a request may
+    // claim are capped rather than trusted. The header caps are cumulative across the
+    // whole block — the recv buffer bounds one line, not the block, because the parser
+    // compacts and refills as it goes. MAX_CHUNK_SIZE bounds a single chunk-size line's
+    // value; a body's total length is not capped (bodies stream in buffer-sized pieces
+    // and the recv timeout bounds a slow sender).
+    //
+    static constexpr size_t MAX_HEADER_COUNT = 100;
+    static constexpr size_t MAX_HEADER_BYTES = 8192;
+    static constexpr size_t MAX_CHUNK_SIZE   = size_t(1) << 30;
+
     virtual ~ConnectionBase() = default;
 
     // Phase 1: Request line. Lazy, memoized. Null = parse failure — or, on a repeat
@@ -108,6 +120,14 @@ struct ConnectionBase
     virtual void ForceClose() = 0;
 
     virtual bool SendError() const = 0;
+
+    // Non-zero once a framing field failed to be the grammar it claimed: the status the
+    // connection answered the peer with (400, 413, 431). A failed request is terminal —
+    // no further header, body, or response bytes move, keep-alive is off, and whatever
+    // remains in the receive buffer is discarded rather than read as the next request.
+    //
+    virtual int ParseError() const = 0;
+
     virtual void Reset() = 0;
     virtual bool KeepAlive() const = 0;
     virtual io::Descriptor& GetDescriptor() = 0;
@@ -165,6 +185,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool EndHeaders() override;
     void ForceClose() override { m_clientClose = true; }
     bool SendError() const override { return m_sendError; }
+    int ParseError() const override { return m_parseError; }
     void Reset() override;
     bool KeepAlive() const override { return m_keepAlive && !m_clientClose; }
     io::Descriptor& GetDescriptor() override { return m_desc; }
@@ -247,6 +268,29 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     void SkipToHeaders();
     bool SendRaw(const void* data, size_t size);
 
+    // Framing enforcement. FailRequest answers the peer once and makes the connection
+    // terminal; every other helper returns false through it. All of them return false on
+    // failure so a caller can `if (!X(...)) return nullptr;`.
+    //
+    bool FailRequest(int status);
+    bool ChargeHeaderBytes(size_t bytes);
+    bool FinishHeaders();
+    void CaptureSpecialValue(const char* data, size_t size);
+    bool ApplySpecialValue();
+    bool ConsumeChunkTrailers();
+
+    // True once a framing failure has written its response: the request is over, so a
+    // handler's later writes would append to a response it did not begin.
+    //
+    bool ResponseClosed() const { return m_parseError != 0; }
+
+    // Content-Length, Transfer-Encoding and Connection values are copied out of the
+    // window as they stream, so a value split across refills is decoded whole instead of
+    // from whichever tail happened to land in the buffer last. None of the three has a
+    // legitimate form anywhere near this long.
+    //
+    static constexpr size_t SPECIAL_VALUE_MAX = 64;
+
     io::Descriptor& m_desc;
     Context*        m_ctx;
     Cooperator*     m_co;
@@ -277,6 +321,15 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool            m_keepAlive;
     bool            m_clientClose;
     bool            m_sendError;
+
+    int             m_parseError;
+    bool            m_responseBegun;
+    size_t          m_headerCount;
+    size_t          m_headerBytes;
+    bool            m_haveContentLength;
+    bool            m_haveTransferEncoding;
+    size_t          m_specialValueLen;
+    char            m_specialValue[SPECIAL_VALUE_MAX];
 };
 
 // Connection<Transport> is the final, concrete HTTP connection. The transport template parameter

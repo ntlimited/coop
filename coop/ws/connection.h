@@ -27,6 +27,23 @@ struct ConnectionBase
     static constexpr size_t DEFAULT_RECV_BUFFER_SIZE = 4096;
     static constexpr size_t DEFAULT_SEND_BUFFER_SIZE = 512;
 
+    // A control frame carries at most 125 bytes and is never fragmented (RFC 6455 5.5),
+    // which is what lets a Ping be echoed back from a fixed-size buffer.
+    //
+    static constexpr size_t MAX_CONTROL_PAYLOAD = 125;
+
+    // Ceiling on one frame's payload and on a fragmented message's total. A peer names
+    // its own payload length in the frame header, up to 2^63-1, and a handler that
+    // reassembles a message holds all of it; without a ceiling the peer picks how much
+    // memory and how much time the connection costs.
+    //
+    static constexpr size_t DEFAULT_MAX_MESSAGE_SIZE = 16 * 1024 * 1024;
+
+    // Close codes this parser sends when a frame is not the grammar it claims.
+    //
+    static constexpr uint16_t CLOSE_PROTOCOL_ERROR = 1002;
+    static constexpr uint16_t CLOSE_MESSAGE_TOO_BIG = 1009;
+
     virtual ~ConnectionBase() = default;
 
     // Pull API. Returns the next frame (or next payload chunk of an in-progress frame).
@@ -51,6 +68,17 @@ struct ConnectionBase
     virtual bool Close(uint16_t code = 1000) = 0;
 
     virtual bool SendError() const = 0;
+
+    // Non-zero once a frame violated the protocol: the close code the connection sent
+    // before refusing to parse anything further (1002 protocol error, 1009 too big).
+    //
+    virtual uint16_t ProtocolError() const = 0;
+
+    // Lower the frame/message ceiling below DEFAULT_MAX_MESSAGE_SIZE. Set it before the
+    // first NextFrame().
+    //
+    virtual void SetMaxMessageSize(size_t bytes) = 0;
+
     virtual io::Descriptor& GetDescriptor() = 0;
 };
 
@@ -72,6 +100,8 @@ struct ConnectionImpl : ConnectionBase
     bool SendPong(const void* data, size_t size) override;
     bool Close(uint16_t code) override;
     bool SendError() const override { return m_sendError; }
+    uint16_t ProtocolError() const override { return m_protocolError; }
+    void SetMaxMessageSize(size_t bytes) override { m_maxMessageSize = bytes; }
     io::Descriptor& GetDescriptor() override { return m_desc; }
 
     // Called by Upgrade() to seed the recv buffer with leftover HTTP data.
@@ -117,6 +147,11 @@ struct ConnectionImpl : ConnectionBase
     Frame* DeliverPayloadChunk();
     bool SendFrame(Opcode opcode, bool fin, const void* payload, size_t size);
 
+    // Close the connection with `code` and stop parsing. Returns false so the frame
+    // validation reads as `if (!Fail(...)) return nullptr;`.
+    //
+    bool Fail(uint16_t code);
+
     io::Descriptor& m_desc;
     Context*        m_ctx;
     time::Interval  m_timeout;
@@ -144,6 +179,11 @@ struct ConnectionImpl : ConnectionBase
     bool            m_gotClose;
     bool            m_sentClose;
     bool            m_sendError;
+
+    size_t          m_maxMessageSize;
+    size_t          m_messageLen;       // bytes of the message being reassembled
+    bool            m_messageOpen;      // a fragmented data message is in progress
+    uint16_t        m_protocolError;
 };
 
 // Connection<Transport> is the final concrete WebSocket connection. The transport parameter

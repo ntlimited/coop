@@ -610,3 +610,392 @@ TEST(WsTest, MediumPayload)
         EXPECT_EQ(received, payload);
     });
 }
+
+// =====================================================================================
+// Frame header validation
+//
+// Every field in a WebSocket frame header — FIN, RSV, opcode, MASK, and the length in
+// three widths — is written by the peer. Each case here pairs a header that must fail
+// the connection with a well-formed one that must still be delivered.
+// =====================================================================================
+
+namespace
+{
+
+// Build a frame with direct control over the header. `b0` carries FIN, RSV and opcode.
+// `lengthForm` picks the width the length is written in (0 = shortest that fits, 2 =
+// 16-bit, 8 = 64-bit), and `declaredLen` is the length the header names — which need not
+// be the number of payload bytes that follow.
+//
+std::string BuildRawWsFrame(uint8_t b0, bool masked, uint64_t declaredLen, int lengthForm,
+                            const void* payload, size_t payloadSize,
+                            const uint8_t maskKey[4])
+{
+    std::string frame;
+    frame.push_back(static_cast<char>(b0));
+
+    uint8_t maskBit = masked ? 0x80 : 0x00;
+
+    if (lengthForm == 0 && declaredLen <= 125)
+    {
+        frame.push_back(static_cast<char>(maskBit | declaredLen));
+    }
+    else if (lengthForm == 2 || (lengthForm == 0 && declaredLen <= 65535))
+    {
+        frame.push_back(static_cast<char>(maskBit | 126));
+        frame.push_back(static_cast<char>((declaredLen >> 8) & 0xFF));
+        frame.push_back(static_cast<char>(declaredLen & 0xFF));
+    }
+    else
+    {
+        frame.push_back(static_cast<char>(maskBit | 127));
+        for (int i = 7; i >= 0; i--)
+            frame.push_back(static_cast<char>((declaredLen >> (8 * i)) & 0xFF));
+    }
+
+    if (masked) frame.append(reinterpret_cast<const char*>(maskKey), 4);
+
+    auto* src = static_cast<const uint8_t*>(payload);
+    for (size_t i = 0; i < payloadSize; i++)
+    {
+        frame.push_back(static_cast<char>(masked ? (src[i] ^ maskKey[i & 3]) : src[i]));
+    }
+    return frame;
+}
+
+const uint8_t kMask[4] = {0x37, 0xfa, 0x21, 0x3d};
+
+// Upgrade a connection, feed it `clientBytes`, and hand the ws connection to `fn`.
+//
+template<typename Fn>
+void WithUpgradedWs(coop::Context* ctx, const std::string& clientBytes, Fn&& fn)
+{
+    SocketPair sp;
+    auto* uring = coop::GetUring();
+    coop::io::Descriptor client(sp.fds[0], uring);
+    coop::io::Descriptor server(sp.fds[1], uring);
+
+    SendUpgradeRequest(client);
+
+    coop::http::PlaintextTransport httpTransport(server);
+    auto httpConn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+        httpTransport, ctx, ctx->GetCooperator());
+    httpConn->GetRequestLine();
+    ASSERT_TRUE(coop::ws::Upgrade(*httpConn));
+    RecvAll(client);
+
+    if (!clientBytes.empty())
+    {
+        SendBytes(client, clientBytes.data(), clientBytes.size());
+    }
+
+    coop::http::PlaintextTransport wsTransport(server);
+    auto ws = ctx->Allocate<WsConn>(WS_EXTRA,
+        wsTransport, ctx,
+        WsConn::DEFAULT_RECV_BUFFER_SIZE,
+        WsConn::DEFAULT_SEND_BUFFER_SIZE,
+        std::chrono::milliseconds(200),
+        httpConn->LeftoverData(), httpConn->LeftoverSize());
+
+    fn(*ws, client);
+}
+
+// A rejected frame must be refused *and* explained: the peer gets a close frame carrying
+// the code before the stream ends.
+//
+void ExpectClosedWith(coop::ws::ConnectionBase& ws, coop::io::Descriptor& client,
+                      uint16_t code)
+{
+    EXPECT_EQ(ws.NextFrame(), nullptr);
+    EXPECT_EQ(ws.ProtocolError(), code);
+
+    ParsedFrame sent = ParseServerFrame(RecvAll(client));
+    ASSERT_TRUE(sent.valid);
+    EXPECT_EQ(sent.opcode, coop::ws::Opcode::Close);
+    ASSERT_EQ(sent.payload.size(), 2u);
+    uint16_t sentCode = (static_cast<uint8_t>(sent.payload[0]) << 8)
+                      | static_cast<uint8_t>(sent.payload[1]);
+    EXPECT_EQ(sentCode, code);
+}
+
+} // end anonymous namespace
+
+// A control frame is at most 125 bytes and is never fragmented (RFC 6455 5.5). This is
+// the rule that makes echoing a Ping's payload back from a fixed buffer safe — without
+// it a 4096-byte Ping reaches a handler that then tries to Pong it.
+//
+TEST(WsFramingTest, OversizedPingRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string payload(126, 'p');
+        std::string frame = BuildRawWsFrame(0x89, true, payload.size(), 0,
+                                            payload.data(), payload.size(), kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+TEST(WsFramingTest, MaximumSizePingAccepted)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string payload(125, 'p');
+        std::string frame = BuildRawWsFrame(0x89, true, payload.size(), 0,
+                                            payload.data(), payload.size(), kMask);
+
+        WithUpgradedWs(ctx, frame, [&payload](coop::ws::ConnectionBase& ws,
+                                              coop::io::Descriptor&)
+        {
+            auto* f = ws.NextFrame();
+            ASSERT_NE(f, nullptr);
+            EXPECT_TRUE(f->IsPing());
+            EXPECT_TRUE(f->complete);
+            EXPECT_EQ(std::string(static_cast<const char*>(f->data), f->size), payload);
+
+            // A handler echoing the Ping is exactly what this bound is for.
+            //
+            EXPECT_TRUE(ws.SendPong(f->data, f->size));
+        });
+    });
+}
+
+// SendPong refuses an oversized payload instead of asserting: the size comes from a
+// Ping the peer sent, so aborting on it hands the process to the peer.
+//
+TEST(WsFramingTest, SendPongRefusesOversizedPayload)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithUpgradedWs(ctx, "", [](coop::ws::ConnectionBase& ws, coop::io::Descriptor&)
+        {
+            std::string payload(126, 'p');
+            EXPECT_FALSE(ws.SendPong(payload.data(), payload.size()));
+            EXPECT_TRUE(ws.SendPong(payload.data(), 125));
+        });
+    });
+}
+
+TEST(WsFramingTest, ControlFrameFragmentRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        // Ping with FIN clear.
+        //
+        std::string frame = BuildRawWsFrame(0x09, true, 0, 0, nullptr, 0, kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+// A client-to-server frame must be masked (RFC 6455 5.1). Accepting an unmasked one lets
+// a peer choose the literal bytes an intermediary on the path sees.
+//
+TEST(WsFramingTest, UnmaskedClientFrameRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string payload = "hello";
+        std::string frame = BuildRawWsFrame(0x81, false, payload.size(), 0,
+                                            payload.data(), payload.size(), kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+// RSV bits belong to an extension the handshake negotiated. None is offered here, so a
+// set bit means the peer is framing to a grammar this parser does not read.
+//
+TEST(WsFramingTest, ReservedBitRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string payload = "hello";
+        std::string frame = BuildRawWsFrame(0xC1, true, payload.size(), 0,
+                                            payload.data(), payload.size(), kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+// Opcodes 3-7 and 11-15 are reserved. Delivering one under whatever opcode was last seen
+// lets the peer decide what type its bytes are.
+//
+TEST(WsFramingTest, ReservedOpcodeRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string payload = "hello";
+        std::string frame = BuildRawWsFrame(0x83, true, payload.size(), 0,
+                                            payload.data(), payload.size(), kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+// The most significant bit of a 64-bit length must be 0 (RFC 6455 5.2).
+//
+TEST(WsFramingTest, SixtyFourBitLengthWithHighBitRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string frame = BuildRawWsFrame(0x82, true, 0x8000000000000000ull, 8,
+                                            nullptr, 0, kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+// A length the connection will not hold is refused from the header, before a byte of the
+// payload is read.
+//
+TEST(WsFramingTest, PayloadAboveCeilingRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        uint64_t declared = coop::ws::ConnectionBase::DEFAULT_MAX_MESSAGE_SIZE + 1;
+        std::string frame = BuildRawWsFrame(0x82, true, declared, 8, nullptr, 0, kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_MESSAGE_TOO_BIG);
+        });
+    });
+}
+
+// The ceiling applies to a message assembled from fragments, not only to one frame.
+//
+TEST(WsFramingTest, FragmentedMessageAboveCeilingRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string first = "abcd";
+        std::string frames = BuildRawWsFrame(0x01, true, first.size(), 0,
+                                             first.data(), first.size(), kMask);
+        frames += BuildRawWsFrame(0x80, true,
+                                  coop::ws::ConnectionBase::DEFAULT_MAX_MESSAGE_SIZE, 8,
+                                  nullptr, 0, kMask);
+
+        WithUpgradedWs(ctx, frames, [](coop::ws::ConnectionBase& ws,
+                                       coop::io::Descriptor& client)
+        {
+            auto* f = ws.NextFrame();
+            ASSERT_NE(f, nullptr);
+            EXPECT_TRUE(f->IsText());
+
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_MESSAGE_TOO_BIG);
+        });
+    });
+}
+
+// A Continuation names a message an earlier non-final data frame opened. With none open
+// its bytes have no message to join, and reporting them under the last opcode seen makes
+// the peer the author of what type they are.
+//
+TEST(WsFramingTest, StrayContinuationRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string payload = "orphan";
+        std::string frame = BuildRawWsFrame(0x80, true, payload.size(), 0,
+                                            payload.data(), payload.size(), kMask);
+
+        WithUpgradedWs(ctx, frame, [](coop::ws::ConnectionBase& ws,
+                                      coop::io::Descriptor& client)
+        {
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+// A second data frame while a message is still open would interleave two messages in one
+// stream (RFC 6455 5.4).
+//
+TEST(WsFramingTest, DataFrameDuringOpenMessageRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string first = "Hello";
+        std::string second = "World";
+        std::string frames = BuildRawWsFrame(0x01, true, first.size(), 0,
+                                             first.data(), first.size(), kMask);
+        frames += BuildRawWsFrame(0x81, true, second.size(), 0,
+                                  second.data(), second.size(), kMask);
+
+        WithUpgradedWs(ctx, frames, [](coop::ws::ConnectionBase& ws,
+                                       coop::io::Descriptor& client)
+        {
+            auto* f = ws.NextFrame();
+            ASSERT_NE(f, nullptr);
+            EXPECT_TRUE(f->IsText());
+            EXPECT_FALSE(f->fin);
+
+            ExpectClosedWith(ws, client, coop::ws::ConnectionBase::CLOSE_PROTOCOL_ERROR);
+        });
+    });
+}
+
+// The rules above must not cost a conforming client its fragmented messages.
+//
+TEST(WsFramingTest, FragmentedTextMessageDelivered)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string first = "Hello, ";
+        std::string mid = "frag";
+        std::string last = "mented!";
+
+        std::string frames = BuildRawWsFrame(0x01, true, first.size(), 0,
+                                             first.data(), first.size(), kMask);
+        frames += BuildRawWsFrame(0x00, true, mid.size(), 0,
+                                  mid.data(), mid.size(), kMask);
+        frames += BuildRawWsFrame(0x80, true, last.size(), 0,
+                                  last.data(), last.size(), kMask);
+
+        WithUpgradedWs(ctx, frames, [](coop::ws::ConnectionBase& ws,
+                                       coop::io::Descriptor&)
+        {
+            std::string message;
+            bool fin = false;
+            while (!fin)
+            {
+                auto* f = ws.NextFrame();
+                ASSERT_NE(f, nullptr);
+                EXPECT_TRUE(f->IsText());     // fragments report the message's opcode
+                message.append(static_cast<const char*>(f->data), f->size);
+                fin = f->fin && f->complete;
+            }
+            EXPECT_EQ(message, "Hello, fragmented!");
+            EXPECT_EQ(ws.ProtocolError(), 0);
+
+            // The message closed cleanly, so the next one may start.
+            //
+            EXPECT_TRUE(ws.SendText("ok", 2));
+        });
+    });
+}

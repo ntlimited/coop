@@ -2142,3 +2142,443 @@ TEST(HttpTest, MidHeaderEofDoesNotSpinParser)
         EXPECT_EQ(conn->ReadBody(), nullptr);   // no body; reached DONE cleanly
     });
 }
+
+// =====================================================================================
+// Framing enforcement
+//
+// Every field these tests feed is one a peer chooses. Each case pairs the malformed
+// framing that must fail the connection with the well-formed framing that must still
+// parse, so a rule that rejects everything is as visible as one that rejects nothing.
+// =====================================================================================
+
+namespace
+{
+
+// Feed `request` to a connection whose recv buffer is `recvBufSize`, so a refill lands at
+// a chosen byte of the request. Returns the parsed connection through `fn`.
+//
+template<typename Fn>
+void WithRequest(coop::Context* ctx, const std::string& request, size_t recvBufSize,
+                 Fn&& fn)
+{
+    SocketPair sp;
+    auto* uring = coop::GetUring();
+    coop::io::Descriptor client(sp.fds[0], uring);
+    coop::io::Descriptor server(sp.fds[1], uring);
+
+    coop::io::SendAll(client, request.data(), request.size());
+
+    coop::http::PlaintextTransport transport(server);
+    auto conn = ctx->Allocate<HttpConn>(
+        HttpConn::ExtraBytes(recvBufSize, HttpConn::DEFAULT_SEND_BUFFER_SIZE),
+        transport, ctx, ctx->GetCooperator(),
+        recvBufSize, HttpConn::DEFAULT_SEND_BUFFER_SIZE,
+        std::chrono::milliseconds(200));
+
+    fn(*conn, client);
+}
+
+// Read a whole body, however many chunks it arrives in.
+//
+std::string DrainBody(coop::http::ConnectionBase& conn)
+{
+    std::string body;
+    while (auto* chunk = conn.ReadBody())
+    {
+        body.append(static_cast<const char*>(chunk->data), chunk->size);
+    }
+    return body;
+}
+
+std::string ChunkedRequest(const std::string& chunks)
+{
+    return "POST /upload HTTP/1.1\r\n"
+           "Transfer-Encoding: chunked\r\n"
+           "\r\n" + chunks;
+}
+
+} // end anonymous namespace
+
+// `c & 0xF` decodes 'A' as 1 and 'a' as 1 — every letter names a size the sender never
+// wrote. The size line is hex or it is nothing.
+//
+TEST(HttpFramingTest, ChunkSizeDecodesHexDigits)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ChunkedRequest(
+            "A\r\n0123456789\r\n"
+            "1a\r\nabcdefghijklmnopqrstuvwxyz\r\n"
+            "0\r\n\r\n"), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            EXPECT_EQ(DrainBody(conn), "0123456789abcdefghijklmnopqrstuvwxyz");
+            EXPECT_EQ(conn.ParseError(), 0);
+        });
+    });
+}
+
+TEST(HttpFramingTest, ChunkSizeRejectsNonHex)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ChunkedRequest("ZZ\r\nignored\r\n0\r\n\r\n"), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor& client)
+        {
+            EXPECT_EQ(DrainBody(conn), "");
+            EXPECT_EQ(conn.ParseError(), 400);
+            EXPECT_FALSE(conn.KeepAlive());
+
+            // The peer is told, once, on the wire.
+            //
+            EXPECT_NE(RecvAll(client).find("400 Bad Request"), std::string::npos);
+        });
+    });
+}
+
+// A size line longer than 16 hex digits cannot be held in a size_t: without the digit
+// bound it wraps, and the wrapped value that reads as 0 is the terminal chunk — a
+// truncated body handed over as a complete one.
+//
+TEST(HttpFramingTest, ChunkSizeRejectsSeventeenHexDigits)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ChunkedRequest("10000000000000000\r\nx\r\n0\r\n\r\n"), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            EXPECT_EQ(DrainBody(conn), "");
+            EXPECT_EQ(conn.ParseError(), 400);
+        });
+    });
+}
+
+TEST(HttpFramingTest, ChunkSizeRejectsAboveCeiling)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ChunkedRequest("ffffffffffffffff\r\n"), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            EXPECT_EQ(DrainBody(conn), "");
+            EXPECT_EQ(conn.ParseError(), 413);
+        });
+    });
+}
+
+// Chunk extensions are the one thing that may follow the digits, and they end at the CRLF.
+//
+TEST(HttpFramingTest, ChunkSizeAcceptsExtensions)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ChunkedRequest("5;name=value\r\nHello\r\n0\r\n\r\n"), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            EXPECT_EQ(DrainBody(conn), "Hello");
+            EXPECT_EQ(conn.ParseError(), 0);
+        });
+    });
+}
+
+// The two bytes after a chunk's data are its CRLF. Stepping over them unread lets the
+// peer put the head of a second request there.
+//
+TEST(HttpFramingTest, ChunkTerminatorMustBeCrlf)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ChunkedRequest("5\r\nHelloXX0\r\n\r\n"), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            DrainBody(conn);
+            EXPECT_EQ(conn.ParseError(), 400);
+        });
+    });
+}
+
+// Trailers and the blank line closing them belong to this request. Left buffered, they
+// are read as the next one — and the peer wrote them.
+//
+TEST(HttpFramingTest, ChunkedTrailersConsumedBeforeKeepAlive)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ChunkedRequest(
+            "5\r\nHello\r\n"
+            "0\r\n"
+            "X-Checksum: deadbeef\r\n"
+            "\r\n"
+            "GET /next HTTP/1.1\r\nHost: t\r\n\r\n"), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            EXPECT_EQ(DrainBody(conn), "Hello");
+            EXPECT_EQ(conn.ParseError(), 0);
+
+            conn.SkipBody();
+            ASSERT_TRUE(conn.KeepAlive());
+            conn.Reset();
+
+            auto* next = conn.GetRequestLine();
+            ASSERT_NE(next, nullptr);
+            EXPECT_EQ(next->method, "GET");
+            EXPECT_EQ(next->path, "/next");
+        });
+    });
+}
+
+// The recv buffer ends on the CR of the Host line, so the LF arrives in the next refill.
+// Treating the lone CR as the terminator leaves the parser on it, and the following scan
+// reads that CR and its LF as the blank line ending the block — hiding Content-Length and
+// leaving the rest of the headers to be parsed as a second request.
+//
+TEST(HttpFramingTest, HeaderTerminatorSplitAcrossRefillSeesAllHeaders)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "GET /x HTTP/1.1\r\n"
+            "Host: t\r\n"
+            "X-A: 1\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "hello", 25,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            auto* req = conn.GetRequestLine();
+            ASSERT_NE(req, nullptr);
+
+            std::string names;
+            while (const char* name = conn.NextHeaderName())
+            {
+                names += name;
+                names += ";";
+                conn.SkipHeaderValue();
+            }
+            EXPECT_EQ(names, "Host;X-A;Content-Length;");
+            EXPECT_EQ(conn.ContentLength(), 5);
+            EXPECT_EQ(DrainBody(conn), "hello");
+        });
+    });
+}
+
+// The refill lands mid-digits. Restarting the decode from whatever survived the refill
+// reads "1234" as 34 — a body length neither endpoint declared.
+//
+TEST(HttpFramingTest, ContentLengthSplitAcrossRefillDecodesWhole)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\n"
+            "Content-Length: 1234\r\n"
+            "\r\n", 36,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            EXPECT_EQ(conn.ContentLength(), 1234);
+            EXPECT_EQ(conn.ParseError(), 0);
+        });
+    });
+}
+
+// Content-Length is 1*DIGIT. Skipping the non-digits reads "1abc0" as 10.
+//
+TEST(HttpFramingTest, ContentLengthRejectsNonDigits)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\nContent-Length: 1abc0\r\n\r\n", 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 400);
+        });
+    });
+}
+
+// Leading zeros are digits: 1*DIGIT admits them and they name the same length.
+//
+TEST(HttpFramingTest, ContentLengthAcceptsLeadingZeros)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\nContent-Length: 007\r\n\r\nseven!!", 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            EXPECT_EQ(conn.ContentLength(), 7);
+            EXPECT_EQ(conn.ParseError(), 0);
+        });
+    });
+}
+
+TEST(HttpFramingTest, ContentLengthRejectsTwentyDigits)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n", 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 400);
+        });
+    });
+}
+
+// Two different lengths leave the message with no single boundary; the same length twice
+// is one answer said twice.
+//
+TEST(HttpFramingTest, DuplicateContentLengthRejectedWhenValuesDiffer)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
+            2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 400);
+        });
+    });
+}
+
+TEST(HttpFramingTest, DuplicateContentLengthAcceptedWhenValuesAgree)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            EXPECT_EQ(conn.ContentLength(), 5);
+            EXPECT_EQ(conn.ParseError(), 0);
+            EXPECT_EQ(DrainBody(conn), "hello");
+        });
+    });
+}
+
+// Content-Length and Transfer-Encoding are two answers to where the body ends. Whichever
+// one a reader picks, another reader picking the other finds a request nobody sent.
+//
+TEST(HttpFramingTest, ContentLengthWithTransferEncodingRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\n"
+            "Content-Length: 6\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: t\r\n\r\n", 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 400);
+            EXPECT_FALSE(conn.KeepAlive());
+
+            // Reset must not turn the smuggled bytes into the next request: the parser
+            // stays where it was, still failed, rather than starting a request the peer
+            // hid behind a body boundary nobody agreed on.
+            //
+            conn.Reset();
+            EXPECT_EQ(conn.ParseError(), 400);
+            auto* after = conn.GetRequestLine();
+            ASSERT_NE(after, nullptr);
+            EXPECT_EQ(after->path, "/u");
+        });
+    });
+}
+
+// `chunked` is the only transfer coding this parser can frame. A prefix match accepts
+// "chunkedfoo", which is not it.
+//
+TEST(HttpFramingTest, UnknownTransferEncodingRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            "POST /u HTTP/1.1\r\nTransfer-Encoding: chunkedfoo\r\n\r\n", 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 400);
+        });
+    });
+}
+
+namespace
+{
+
+std::string ManyHeaders(int count)
+{
+    std::string request = "GET /x HTTP/1.1\r\n";
+    for (int i = 0; i < count; i++)
+    {
+        request += "X-" + std::to_string(i) + ": v\r\n";
+    }
+    return request + "\r\n";
+}
+
+} // end anonymous namespace
+
+TEST(HttpFramingTest, HeaderCountAtLimitAccepted)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx, ManyHeaders(coop::http::ConnectionBase::MAX_HEADER_COUNT), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 0);
+        });
+    });
+}
+
+// The recv buffer bounds one header line, not the block: the parser compacts and refills
+// as it scans, so without a count and a byte budget a peer streams headers indefinitely.
+//
+TEST(HttpFramingTest, HeaderCountOverLimitRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        WithRequest(ctx,
+            ManyHeaders(coop::http::ConnectionBase::MAX_HEADER_COUNT + 1), 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 431);
+        });
+    });
+}
+
+TEST(HttpFramingTest, CumulativeHeaderBytesOverLimitRejected)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        std::string request = "GET /x HTTP/1.1\r\nX-Big: "
+                            + std::string(coop::http::ConnectionBase::MAX_HEADER_BYTES + 1,
+                                          'a')
+                            + "\r\n\r\n";
+        WithRequest(ctx, request, 2048,
+            [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
+        {
+            ASSERT_NE(conn.GetRequestLine(), nullptr);
+            conn.SkipHeaders();
+            EXPECT_EQ(conn.ParseError(), 431);
+        });
+    });
+}

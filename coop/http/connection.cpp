@@ -49,12 +49,27 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_keepAlive(true)
 , m_clientClose(false)
 , m_sendError(false)
+, m_parseError(0)
+, m_responseBegun(false)
+, m_headerCount(0)
+, m_headerBytes(0)
+, m_haveContentLength(false)
+, m_haveTransferEncoding(false)
+, m_specialValueLen(0)
+, m_specialValue{}
 {
 }
 
 template<typename Derived>
 void ConnectionImpl<Derived>::Reset()
 {
+    // A failed request is not a request boundary: the bytes still buffered belong to a
+    // message this parser could not frame, so re-reading them as the next request is the
+    // step that turns a framing bug into a smuggled request. Reset is a no-op instead;
+    // the connection is already close-framed and its loop exits.
+    //
+    if (m_parseError != 0) return;
+
     Compact();
 
     m_parsePos          = 0;
@@ -76,6 +91,12 @@ void ConnectionImpl<Derived>::Reset()
     m_chunkedContentType       = nullptr;
     m_clientClose              = false;
     m_sendError                = false;
+    m_responseBegun            = false;
+    m_headerCount              = 0;
+    m_headerBytes              = 0;
+    m_haveContentLength        = false;
+    m_haveTransferEncoding     = false;
+    m_specialValueLen          = 0;
 }
 
 // -------------------------------------------------------------------------------------
@@ -86,6 +107,225 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::RecvAborted() const
 {
     return m_ctx->IsKilled();
+}
+
+// -------------------------------------------------------------------------------------
+// Framing enforcement
+// -------------------------------------------------------------------------------------
+
+namespace
+{
+
+// Reason phrase and body for the statuses a framing failure can answer with. 431 is not
+// in the pre-compiled status table, so its phrase is supplied here rather than falling
+// back to the status-class default.
+//
+struct FailureText
+{
+    const char* reason;
+    const char* body;
+};
+
+FailureText TextForFailure(int status)
+{
+    switch (status)
+    {
+        case 413: return { "Payload Too Large", "Payload Too Large\n" };
+        case 431: return { "Request Header Fields Too Large",
+                           "Request Header Fields Too Large\n" };
+        default:  return { "Bad Request", "Bad Request\n" };
+    }
+}
+
+// Hex digit value, or -1 for anything that is not one. `c & 0xF` maps every byte to a
+// digit, which is why the chunk-size line needs a real predicate.
+//
+int HexValue(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+} // end anonymous namespace
+
+// End the request: answer the peer once with `status` and make every later parse and
+// response call a no-op. A request whose framing cannot be trusted has no safe partial
+// interpretation — not the body prefix that did arrive, and not the bytes behind it.
+//
+template<typename Derived>
+bool ConnectionImpl<Derived>::FailRequest(int status)
+{
+    if (m_parseError != 0) return false;
+
+    m_phase                   = DONE;
+    m_valueConsumed           = true;
+    m_chunkedDone             = false;
+    m_bodyRemaining           = 0;
+    m_contentLength           = 0;
+    m_keepAlive               = false;
+    m_clientClose             = true;
+    m_pendingContentLength    = false;
+    m_pendingTransferEncoding = false;
+    m_pendingConnection       = false;
+
+    // A handler that already began a response owns the bytes on the wire; a status line
+    // cannot be spliced into the middle of one. Its response is left truncated and the
+    // connection closes, which is the only signal left to give.
+    //
+    if (!m_responseBegun && !m_sendError)
+    {
+        FailureText text = TextForFailure(status);
+        size_t bodyLen = strlen(text.body);
+
+        if (BeginResponse(status, text.reason)
+            && AppendHeader("Content-Type", std::string_view("text/plain"))
+            && AppendHeader("Content-Length", bodyLen)
+            && EndHeaders())
+        {
+            SendRawBytes(text.body, bodyLen);
+        }
+    }
+
+    m_parseError = status;
+    return false;
+}
+
+// Header and trailer lines are charged against one cumulative budget. The recv buffer
+// bounds a single line, but the parser compacts and refills as it scans, so without an
+// explicit budget a peer can stream header bytes for as long as it likes.
+//
+template<typename Derived>
+bool ConnectionImpl<Derived>::ChargeHeaderBytes(size_t bytes)
+{
+    m_headerBytes += bytes;
+    if (m_headerBytes > MAX_HEADER_BYTES)
+    {
+        return FailRequest(431);
+    }
+    return true;
+}
+
+// Accumulate a Content-Length / Transfer-Encoding / Connection value as it streams. A
+// value longer than any legitimate form of the three overflows deliberately: the flag
+// records it so the completed value is judged malformed rather than silently truncated.
+//
+template<typename Derived>
+void ConnectionImpl<Derived>::CaptureSpecialValue(const char* data, size_t size)
+{
+    if (m_specialValueLen > SPECIAL_VALUE_MAX) return;   // already marked overflowed
+
+    size_t space = SPECIAL_VALUE_MAX - m_specialValueLen;
+    size_t take = size < space ? size : space;
+    if (take > 0)
+    {
+        memcpy(m_specialValue + m_specialValueLen, data, take);
+        m_specialValueLen += take;
+    }
+    if (take < size)
+    {
+        m_specialValueLen = SPECIAL_VALUE_MAX + 1;   // overflow marker
+    }
+}
+
+// Decode the completed special value into framing state.
+//
+template<typename Derived>
+bool ConnectionImpl<Derived>::ApplySpecialValue()
+{
+    bool overflow = m_specialValueLen > SPECIAL_VALUE_MAX;
+    size_t len = overflow ? SPECIAL_VALUE_MAX : m_specialValueLen;
+    const char* p = m_specialValue;
+
+    // Optional whitespace around a field value is not part of it (RFC 7230 3.2.4).
+    //
+    while (len > 0 && (*p == ' ' || *p == '\t')) { p++; len--; }
+    while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+
+    m_specialValueLen = 0;
+
+    if (m_pendingContentLength)
+    {
+        m_pendingContentLength = false;
+
+        // Content-Length is 1*DIGIT and nothing else. Skipping non-digits reads
+        // "1abc0" as 10, which is a body length the peer never declared — the length a
+        // downstream reader computes and the length this one computes then differ.
+        //
+        if (overflow || len == 0 || len > 19)
+        {
+            return FailRequest(400);
+        }
+
+        int64_t value = 0;
+        for (size_t i = 0; i < len; i++)
+        {
+            if (p[i] < '0' || p[i] > '9')
+            {
+                return FailRequest(400);
+            }
+            value = value * 10 + (p[i] - '0');
+        }
+
+        // Repeating the header is allowed only when it repeats the same length; two
+        // different lengths leave the message with no single boundary.
+        //
+        if (m_haveContentLength && value != m_contentLength)
+        {
+            return FailRequest(400);
+        }
+
+        m_haveContentLength = true;
+        m_contentLength = value;
+        return true;
+    }
+
+    if (m_pendingTransferEncoding)
+    {
+        m_pendingTransferEncoding = false;
+
+        // The only transfer coding this parser can frame is `chunked`. Anything else —
+        // including a prefix match such as "chunkedfoo" — leaves the body's end unknown.
+        //
+        if (overflow || len != 7 || strncasecmp(p, "chunked", 7) != 0)
+        {
+            return FailRequest(400);
+        }
+
+        m_haveTransferEncoding = true;
+        m_chunkedBody = true;
+        return true;
+    }
+
+    if (m_pendingConnection)
+    {
+        m_pendingConnection = false;
+        if (!overflow && len == 5 && strncasecmp(p, "close", 5) == 0)
+        {
+            m_clientClose = true;
+        }
+        return true;
+    }
+
+    return true;
+}
+
+// Called once the blank line closing the header block has been consumed.
+//
+template<typename Derived>
+bool ConnectionImpl<Derived>::FinishHeaders()
+{
+    // Content-Length and Transfer-Encoding are two different answers to "where does this
+    // body end". Accepting both lets two readers of the same bytes disagree about the
+    // message boundary, and the trailing bytes then become a request nobody sent
+    // (RFC 7230 3.3.3). There is no reading that is safe to guess at.
+    //
+    if (m_haveContentLength && m_haveTransferEncoding)
+    {
+        return FailRequest(400);
+    }
+    return true;
 }
 
 // -------------------------------------------------------------------------------------
@@ -123,8 +363,13 @@ RequestLine* ConnectionImpl<Derived>::GetRequestLine()
             ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
             : nullptr;
 
-        if (cr && cr + 1 < Win() + m_bufLen && cr[1] == '\n')
+        if (cr && cr + 1 < Win() + m_bufLen)
         {
+            // A bare CR does not end a line. Waiting for more data would spin until the
+            // peer disconnected, so the request line is simply malformed.
+            //
+            if (cr[1] != '\n') return nullptr;
+
             if (!ParseRequestLine()) return nullptr;
             m_requestLineEpoch = m_bufEpoch;
             m_phase = ARGS;
@@ -415,19 +660,40 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
     {
         SkipHeaderValue();
     }
+    if (m_parseError != 0) return nullptr;
 
     while (true)
     {
         while (m_bufLen - m_parsePos < 2)
         {
             Compact();
-            if (RecvMore() <= 0) return nullptr;
+            if (RecvMore() <= 0)
+            {
+                // The header block never ended. Nothing buffered belongs to a framed
+                // request, so the connection does not go on to read it as one.
+                //
+                m_phase = DONE;
+                m_clientClose = true;
+                return nullptr;
+            }
         }
 
-        if (Win()[m_parsePos] == '\r' && Win()[m_parsePos + 1] == '\n')
+        if (Win()[m_parsePos] == '\r')
         {
+            if (Win()[m_parsePos + 1] != '\n')
+            {
+                FailRequest(400);
+                return nullptr;
+            }
             m_parsePos += 2;
+            if (!FinishHeaders()) return nullptr;
             m_phase = BODY;
+            return nullptr;
+        }
+
+        if (++m_headerCount > MAX_HEADER_COUNT)
+        {
+            FailRequest(431);
             return nullptr;
         }
 
@@ -449,7 +715,7 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
                            colon - (Win() + m_parsePos)));
                 if (cr)
                 {
-                    m_phase = DONE;
+                    FailRequest(400);
                     return nullptr;
                 }
 
@@ -458,6 +724,11 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
                 Win()[i] = '\0';
                 const char* name = Win() + nameStart;
                 m_parsePos = i + 1;
+
+                // Charge the name plus the ": " and CRLF the line must carry; the value
+                // is charged as it streams.
+                //
+                if (!ChargeHeaderBytes((nameEnd - nameStart) + 4)) return nullptr;
 
                 while (m_parsePos < m_bufLen && Win()[m_parsePos] == ' ')
                 {
@@ -481,6 +752,7 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
                     m_pendingConnection = true;
                 }
 
+                m_specialValueLen = 0;
                 m_valueConsumed = false;
                 return name;
             }
@@ -492,13 +764,21 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
                 : nullptr;
             if (cr)
             {
-                m_phase = DONE;
+                FailRequest(400);
                 return nullptr;
             }
 
             Compact();
             nameStart = m_parsePos;
-            if (RecvMore() <= 0) return nullptr;
+            if (RecvMore() <= 0)
+            {
+                // Either the peer stopped mid-name or the name filled the whole recv
+                // buffer without a colon. Neither is a header this parser will produce.
+                //
+                m_phase = DONE;
+                m_clientClose = true;
+                return nullptr;
+            }
         }
     }
 }
@@ -506,101 +786,10 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
 template<typename Derived>
 Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
 {
-    if (m_valueConsumed) return nullptr;
+    if (m_valueConsumed || m_parseError != 0) return nullptr;
 
-    size_t valueStart = m_parsePos;
-
-    size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
-    char* cr = avail > 0
-        ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
-        : nullptr;
-
-    if (cr)
-    {
-        size_t i = cr - Win();
-        m_chunk.data = Win() + valueStart;
-        m_chunk.size = i - valueStart;
-        m_chunk.complete = true;
-
-        if (m_pendingContentLength)
-        {
-            m_contentLength = 0;
-            const char* p = static_cast<const char*>(m_chunk.data);
-            for (size_t j = 0; j < m_chunk.size; j++)
-            {
-                if (p[j] >= '0' && p[j] <= '9')
-                {
-                    m_contentLength = m_contentLength * 10 + (p[j] - '0');
-                }
-            }
-            m_pendingContentLength = false;
-        }
-        if (m_pendingTransferEncoding)
-        {
-            if (m_chunk.size >= 7 &&
-                strncasecmp(static_cast<const char*>(m_chunk.data), "chunked", 7) == 0)
-            {
-                m_chunkedBody = true;
-            }
-            m_pendingTransferEncoding = false;
-        }
-        if (m_pendingConnection)
-        {
-            if (m_chunk.size >= 5 &&
-                strncasecmp(static_cast<const char*>(m_chunk.data), "close", 5) == 0)
-            {
-                m_clientClose = true;
-            }
-            m_pendingConnection = false;
-        }
-
-        m_parsePos = i;
-        if (m_parsePos + 1 < m_bufLen && Win()[m_parsePos + 1] == '\n')
-        {
-            m_parsePos += 2;
-        }
-        m_valueConsumed = true;
-        return &m_chunk;
-    }
-
-    size_t available = m_bufLen - valueStart;
-    if (available > 0)
-    {
-        m_chunk.data = Win() +valueStart;
-        m_chunk.size = available;
-        m_chunk.complete = false;
-
-        m_parsePos = m_bufLen;
-        RecvMore();
-        return &m_chunk;
-    }
-
-    if (RecvMore() <= 0)
-    {
-        m_pendingContentLength = false;
-        m_pendingTransferEncoding = false;
-        m_pendingConnection = false;
-        m_valueConsumed = true;
-        return nullptr;
-    }
-
-    return ReadHeaderValue();
-}
-
-template<typename Derived>
-void ConnectionImpl<Derived>::SkipHeaderValue()
-{
-    if (m_valueConsumed) return;
-
-    if (m_pendingContentLength || m_pendingTransferEncoding || m_pendingConnection)
-    {
-        while (true)
-        {
-            Chunk* c = ReadHeaderValue();
-            if (!c || c->complete) break;
-        }
-        return;
-    }
+    bool special = m_pendingContentLength || m_pendingTransferEncoding
+                || m_pendingConnection;
 
     while (true)
     {
@@ -611,21 +800,95 @@ void ConnectionImpl<Derived>::SkipHeaderValue()
 
         if (cr)
         {
-            m_parsePos = cr - Win();
-            if (m_parsePos + 1 < m_bufLen && Win()[m_parsePos + 1] == '\n')
+            size_t i = static_cast<size_t>(cr - Win());
+
+            // A line terminator is CRLF, and a delimiter that has not fully arrived is
+            // not a delimiter. Accepting a lone trailing CR leaves the parser sitting on
+            // it, so the next header scan reads that CR and the LF behind it as the blank
+            // line ending the block — every header after this one, Content-Length and
+            // Transfer-Encoding included, then becomes the head of a second request.
+            //
+            if (i + 1 >= m_bufLen)
             {
-                m_parsePos += 2;
+                Compact();
+                if (RecvMore() <= 0)
+                {
+                    FailRequest(400);
+                    return nullptr;
+                }
+                continue;
             }
+
+            if (Win()[i + 1] != '\n')
+            {
+                FailRequest(400);
+                return nullptr;
+            }
+
+            m_chunk.data = Win() + m_parsePos;
+            m_chunk.size = i - m_parsePos;
+            m_chunk.complete = true;
+
+            if (!ChargeHeaderBytes(m_chunk.size)) return nullptr;
+            if (special)
+            {
+                CaptureSpecialValue(static_cast<const char*>(m_chunk.data), m_chunk.size);
+            }
+
+            m_parsePos = i + 2;
             m_valueConsumed = true;
-            return;
+
+            if (special && !ApplySpecialValue()) return nullptr;
+            return &m_chunk;
+        }
+
+        if (avail > 0)
+        {
+            // Hand back what is buffered and refill on the next call. Refilling here
+            // would compact the window out from under the chunk being returned — the
+            // caller would read bytes the next recv had already overwritten.
+            //
+            m_chunk.data = Win() + m_parsePos;
+            m_chunk.size = avail;
+            m_chunk.complete = false;
+
+            if (!ChargeHeaderBytes(avail)) return nullptr;
+            if (special)
+            {
+                CaptureSpecialValue(static_cast<const char*>(m_chunk.data), avail);
+            }
+
+            m_parsePos = m_bufLen;
+            return &m_chunk;
         }
 
         Compact();
         if (RecvMore() <= 0)
         {
+            m_pendingContentLength = false;
+            m_pendingTransferEncoding = false;
+            m_pendingConnection = false;
+            m_specialValueLen = 0;
             m_valueConsumed = true;
-            return;
+            m_phase = DONE;
+            m_clientClose = true;
+            return nullptr;
         }
+    }
+}
+
+template<typename Derived>
+void ConnectionImpl<Derived>::SkipHeaderValue()
+{
+    if (m_valueConsumed) return;
+
+    // Skipping is reading and discarding: the same CRLF discipline, the same budget, and
+    // the same capture of the values that decide the body's framing.
+    //
+    while (true)
+    {
+        Chunk* c = ReadHeaderValue();
+        if (!c || c->complete) break;
     }
 }
 
@@ -858,7 +1121,7 @@ void ConnectionImpl<Derived>::SkipBody()
 template<typename Derived>
 Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
 {
-    if (m_chunkedDone) return nullptr;
+    if (m_chunkedDone || m_parseError != 0) return nullptr;
 
     if (m_bodyRemaining > 0)
     {
@@ -866,33 +1129,49 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
         if (available == 0)
         {
             Compact();
-            if (RecvMore() <= 0) return nullptr;
+            if (RecvMore() <= 0)
+            {
+                // The chunk's declared bytes never arrived. The body is short of what it
+                // claimed, so it is not complete and the connection cannot be reused.
+                //
+                m_phase = DONE;
+                m_clientClose = true;
+                return nullptr;
+            }
             available = m_bufLen - m_parsePos;
         }
 
         size_t toDeliver = std::min(available, m_bodyRemaining);
-        m_chunk.data = Win() +m_parsePos;
+        m_chunk.data = Win() + m_parsePos;
         m_chunk.size = toDeliver;
         m_bodyRemaining -= toDeliver;
         m_parsePos += toDeliver;
+        m_chunk.complete = (m_bodyRemaining == 0);
 
         if (m_bodyRemaining == 0)
         {
+            // Each chunk's data is followed by its own CRLF. Skipping two bytes without
+            // reading them lets a peer put anything there, and the two bytes it chooses
+            // are then parsed as the start of the next chunk-size line.
+            //
             while (m_bufLen - m_parsePos < 2)
             {
                 Compact();
                 if (RecvMore() <= 0)
                 {
-                    m_chunk.complete = true;
-                    m_chunkedDone = true;
                     m_phase = DONE;
+                    m_clientClose = true;
                     return &m_chunk;
                 }
+            }
+            if (Win()[m_parsePos] != '\r' || Win()[m_parsePos + 1] != '\n')
+            {
+                FailRequest(400);
+                return nullptr;
             }
             m_parsePos += 2;
         }
 
-        m_chunk.complete = (m_bodyRemaining == 0);
         return &m_chunk;
     }
 
@@ -903,24 +1182,63 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
             ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
             : nullptr;
 
-        if (cr && cr + 1 < Win() + m_bufLen && cr[1] == '\n')
+        if (cr && cr + 1 < Win() + m_bufLen)
         {
-            size_t i = cr - Win();
+            if (cr[1] != '\n')
+            {
+                FailRequest(400);
+                return nullptr;
+            }
+
+            // chunk-size is 1*HEXDIG, optionally followed by ';' and extensions. The
+            // digits are decoded as hex and nothing else: `c & 0xF` accepts every byte
+            // and turns 'a'-'f' into 1-6, so a size line can name a length the sender
+            // never wrote, and an unbounded one wraps size_t — to zero, which reads as
+            // the terminal chunk and hands the handler a truncated body as a complete
+            // one, with the rest of the request left to be parsed as the next.
+            //
+            size_t i = static_cast<size_t>(cr - Win());
             size_t chunkSize = 0;
+            size_t digits = 0;
+
             for (size_t j = m_parsePos; j < i; j++)
             {
                 char c = Win()[j];
-                if (c == ';') break;
+                if (c == ';') break;   // chunk extensions, ignored
 
-                chunkSize <<= 4;
-                chunkSize += c & 0xF;
-                if (c > '9') c += 9;
+                int v = HexValue(c);
+                if (v < 0 || ++digits > 16)
+                {
+                    FailRequest(400);
+                    return nullptr;
+                }
+                chunkSize = (chunkSize << 4) | static_cast<size_t>(v);
+            }
+
+            if (digits == 0)
+            {
+                FailRequest(400);
+                return nullptr;
+            }
+            if (chunkSize > MAX_CHUNK_SIZE)
+            {
+                FailRequest(413);
+                return nullptr;
             }
 
             m_parsePos = i + 2;
 
             if (chunkSize == 0)
             {
+                // The terminal chunk is followed by the trailer section and its blank
+                // line. Left buffered, those bytes become the head of the next
+                // keep-alive request — and the peer chooses what that request says.
+                //
+                if (!ConsumeChunkTrailers())
+                {
+                    m_phase = DONE;
+                    return nullptr;
+                }
                 m_chunkedDone = true;
                 m_phase = DONE;
                 return nullptr;
@@ -931,7 +1249,84 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
         }
 
         Compact();
-        if (RecvMore() <= 0) return nullptr;
+        if (RecvMore() <= 0)
+        {
+            m_phase = DONE;
+            m_clientClose = true;
+            return nullptr;
+        }
+    }
+}
+
+// Consume trailer field lines through the blank line that ends the chunked body. Trailer
+// lines are charged against the same budget as headers: they are headers, sent late.
+//
+template<typename Derived>
+bool ConnectionImpl<Derived>::ConsumeChunkTrailers()
+{
+    while (true)
+    {
+        while (m_bufLen - m_parsePos < 2)
+        {
+            Compact();
+            if (RecvMore() <= 0)
+            {
+                // The trailer section never ended: the message is unterminated, so the
+                // connection is not reused even though the payload arrived.
+                //
+                m_clientClose = true;
+                return false;
+            }
+        }
+
+        if (Win()[m_parsePos] == '\r')
+        {
+            if (Win()[m_parsePos + 1] != '\n')
+            {
+                return FailRequest(400);
+            }
+            m_parsePos += 2;
+            return true;
+        }
+
+        // A trailer field line: scan to its CRLF and discard it.
+        //
+        while (true)
+        {
+            size_t avail = m_bufLen > m_parsePos ? m_bufLen - m_parsePos : 0;
+            char* cr = avail > 0
+                ? static_cast<char*>(memchr(Win() + m_parsePos, '\r', avail))
+                : nullptr;
+
+            if (cr)
+            {
+                size_t i = static_cast<size_t>(cr - Win());
+                if (i + 1 >= m_bufLen)
+                {
+                    Compact();
+                    if (RecvMore() <= 0)
+                    {
+                        m_clientClose = true;
+                        return false;
+                    }
+                    continue;
+                }
+                if (Win()[i + 1] != '\n')
+                {
+                    return FailRequest(400);
+                }
+                if (!ChargeHeaderBytes((i - m_parsePos) + 2)) return false;
+                m_parsePos = i + 2;
+                break;
+            }
+
+            Compact();
+            if (RecvMore() <= 0)
+            {
+                m_clientClose = true;
+                return false;
+            }
+        }
     }
 }
 
@@ -942,7 +1337,7 @@ Chunk* ConnectionImpl<Derived>::ReadChunkedBody()
 template<typename Derived>
 bool ConnectionImpl<Derived>::Append(const void* data, size_t size)
 {
-    if (m_sendError) return false;
+    if (m_sendError || ResponseClosed()) return false;
     if (size == 0) return true;
 
     // Data larger than the entire send buffer: flush what we have, then send directly
@@ -1048,6 +1443,11 @@ bool ConnectionImpl<Derived>::AppendStatusLine(int status, std::string_view reas
 {
     assert(status >= 100 && status <= 999);
 
+    // Every response path emits its status line here, so this is where a response starts
+    // existing as far as a later framing failure is concerned.
+    //
+    m_responseBegun = true;
+
     if (reason.empty())
     {
         auto sl = response::StatusLine(status);
@@ -1070,6 +1470,8 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::SendRaw(const void* data, size_t size)
 {
     assert(!m_sendError);
+
+    if (ResponseClosed()) return false;
 
     int result = TransportSendAll(data, size);
     if (result <= 0 || static_cast<size_t>(result) != size)
@@ -1220,6 +1622,8 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::Sendfile(int fileFd, off_t offset, size_t count)
 {
     assert(!m_sendError);
+
+    if (ResponseClosed()) return false;
 
     // Flush any buffered headers before sendfile
     //

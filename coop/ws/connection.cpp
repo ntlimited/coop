@@ -4,7 +4,6 @@
 #include "coop/http/tls_transport.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cstring>
 
 namespace coop
@@ -35,7 +34,32 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx,
 , m_gotClose(false)
 , m_sentClose(false)
 , m_sendError(false)
+, m_maxMessageSize(DEFAULT_MAX_MESSAGE_SIZE)
+, m_messageLen(0)
+, m_messageOpen(false)
+, m_protocolError(0)
 {
+}
+
+// ---------------------------------------------------------------------------
+// Protocol failure
+// ---------------------------------------------------------------------------
+
+// Tell the peer why with a close frame, then stop. A frame header that is not what it
+// claims to be leaves no way to find where the next frame starts, so there is nothing to
+// resynchronize to — the stream ends here.
+//
+template<typename Derived>
+bool ConnectionImpl<Derived>::Fail(uint16_t code)
+{
+    if (m_protocolError == 0)
+    {
+        m_protocolError = code;
+        Close(code);
+    }
+    m_parseState = DONE;
+    m_payloadRemaining = 0;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,8 +175,55 @@ Frame* ConnectionImpl<Derived>::NextFrame()
     Opcode op   = static_cast<Opcode>(b0 & 0x0F);
     bool masked = (b1 & 0x80) != 0;
     size_t len7 = b1 & 0x7F;
+    bool control = (b0 & 0x08) != 0;
 
     m_parsePos += 2;
+
+    // Everything decidable from the first two bytes is decided before any more of the
+    // peer's numbers are read.
+    //
+    // RSV1-3 are reserved for an extension the handshake negotiated; none is offered
+    // here, so a set bit means the peer is framing to a different grammar than this
+    // parser reads (RFC 6455 5.2).
+    //
+    if ((b0 & 0x70) != 0)
+    {
+        Fail(CLOSE_PROTOCOL_ERROR);
+        return nullptr;
+    }
+
+    // Opcodes 3-7 and 11-15 are reserved and undefined: a frame using one has no agreed
+    // meaning, and guessing at it is how an unknown frame becomes a text message.
+    //
+    if (op != Opcode::Continuation && op != Opcode::Text && op != Opcode::Binary
+        && op != Opcode::Close && op != Opcode::Ping && op != Opcode::Pong)
+    {
+        Fail(CLOSE_PROTOCOL_ERROR);
+        return nullptr;
+    }
+
+    // A client-to-server frame must be masked (RFC 6455 5.1). The requirement exists to
+    // stop an attacker from steering the bytes a proxy on the path sees; an unmasked
+    // frame is not one a conforming client sent.
+    //
+    if (!masked)
+    {
+        Fail(CLOSE_PROTOCOL_ERROR);
+        return nullptr;
+    }
+
+    if (control)
+    {
+        // A control frame is at most 125 bytes and never fragmented (RFC 6455 5.5), which
+        // is what makes echoing a Ping from a fixed buffer safe. Enforcing it here is why
+        // a handler can hand frame->data straight back to SendPong.
+        //
+        if (len7 > MAX_CONTROL_PAYLOAD || !fin)
+        {
+            Fail(CLOSE_PROTOCOL_ERROR);
+            return nullptr;
+        }
+    }
 
     // Determine how many additional header bytes we need.
     //
@@ -182,6 +253,16 @@ Frame* ConnectionImpl<Derived>::NextFrame()
     }
     else // 127
     {
+        // The most significant bit of a 64-bit length must be 0 (RFC 6455 5.2). A length
+        // with it set is not a size any implementation can honor, and it is the value
+        // that overflows arithmetic done on it.
+        //
+        if ((static_cast<uint8_t>(RecvBuf()[m_parsePos]) & 0x80) != 0)
+        {
+            Fail(CLOSE_PROTOCOL_ERROR);
+            return nullptr;
+        }
+
         m_payloadLen = 0;
         for (int i = 0; i < 8; i++)
         {
@@ -193,14 +274,56 @@ Frame* ConnectionImpl<Derived>::NextFrame()
 
     // Mask key (client → server frames must be masked per RFC 6455 Section 5.1).
     //
-    if (masked)
+    memcpy(m_maskKey, RecvBuf() + m_parsePos, 4);
+    m_parsePos += 4;
+
+    if (m_payloadLen > m_maxMessageSize)
     {
-        memcpy(m_maskKey, RecvBuf() + m_parsePos, 4);
-        m_parsePos += 4;
+        Fail(CLOSE_MESSAGE_TOO_BIG);
+        return nullptr;
     }
-    else
+
+    // Fragmentation state. A Continuation frame names a message that a preceding
+    // non-final data frame opened; without one there is no message for its bytes to join,
+    // and delivering them under the last message's opcode makes the peer the author of
+    // what type they are. A second data frame while a message is open would interleave
+    // two messages in one stream (RFC 6455 5.4).
+    //
+    if (!control)
     {
-        memset(m_maskKey, 0, 4);
+        if (op == Opcode::Continuation)
+        {
+            if (!m_messageOpen)
+            {
+                Fail(CLOSE_PROTOCOL_ERROR);
+                return nullptr;
+            }
+            m_messageLen += m_payloadLen;
+        }
+        else
+        {
+            if (m_messageOpen)
+            {
+                Fail(CLOSE_PROTOCOL_ERROR);
+                return nullptr;
+            }
+            m_messageLen = m_payloadLen;
+        }
+
+        if (m_messageLen > m_maxMessageSize)
+        {
+            Fail(CLOSE_MESSAGE_TOO_BIG);
+            return nullptr;
+        }
+    }
+
+    // A Close frame carries either no payload or a 2-byte code plus a reason; a single
+    // byte is half a code (RFC 6455 5.5.1).
+    //
+    if (op == Opcode::Close && m_payloadLen == 1)
+    {
+        Fail(CLOSE_PROTOCOL_ERROR);
+        return nullptr;
     }
 
     m_payloadRemaining = m_payloadLen;
@@ -211,11 +334,13 @@ Frame* ConnectionImpl<Derived>::NextFrame()
     if (op == Opcode::Continuation)
     {
         m_frame.opcode = m_continuationOpcode;
+        if (fin) m_messageOpen = false;
     }
     else if (op == Opcode::Text || op == Opcode::Binary)
     {
         m_frame.opcode = op;
-        if (!fin) m_continuationOpcode = op;
+        m_continuationOpcode = op;
+        m_messageOpen = !fin;
     }
     else
     {
@@ -363,14 +488,19 @@ bool ConnectionImpl<Derived>::SendBinary(const void* data, size_t size)
 template<typename Derived>
 bool ConnectionImpl<Derived>::SendPing(const void* data, size_t size)
 {
-    assert(size <= 125);  // RFC 6455: control frame payload <= 125 bytes
+    // Refuse rather than assert. The usual Pong payload is a Ping's payload echoed back,
+    // so an oversized control frame is something a peer can ask for — aborting the
+    // process on it hands the peer the process, and emitting it anyway puts a frame on
+    // the wire that no conforming client can read.
+    //
+    if (size > MAX_CONTROL_PAYLOAD) return false;
     return SendFrame(Opcode::Ping, true, data, size);
 }
 
 template<typename Derived>
 bool ConnectionImpl<Derived>::SendPong(const void* data, size_t size)
 {
-    assert(size <= 125);
+    if (size > MAX_CONTROL_PAYLOAD) return false;
     return SendFrame(Opcode::Pong, true, data, size);
 }
 

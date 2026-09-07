@@ -59,4 +59,11 @@
 - `buffer_ring_multishot_02.md`: cross-context delivery design (#16) — detached-continuation
   delivery of a connection's multishot completions to a different (co-resident) consumer
   context, with the buffer pool as the sole back-pressure; the deferred piece from _01
+- `wire_framing_01.md`: the framing contract for the HTTP request parser and the
+  WebSocket frame parser — every framing field (chunk size, Content-Length, every
+  CRLF, every frame header field) is validated as the exact grammar it claims to be
+  and the connection is failed otherwise, with the negative covenants that a
+  delimiter which has not arrived is not a delimiter, that no pointer into the
+  receive buffer outlives a refill, that a message with two framings has none, and
+  that a failed request never becomes the next request
 - `TODO.md`: prioritized follow-up work

@@ -1,6 +1,7 @@
 #include "context.h"
 
 #include <cassert>
+#include <climits>
 
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
@@ -127,6 +128,52 @@ bool Context::LoadPrivateKey(const char* pem, size_t len)
 
     spdlog::info("ssl loaded private key len={}", len);
     return true;
+}
+
+void Context::EnablePeerVerification()
+{
+    SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
+}
+
+bool Context::LoadDefaultVerifyPaths()
+{
+    return SSL_CTX_set_default_verify_paths(m_ctx) == 1;
+}
+
+bool Context::AddTrustedCertificate(const char* pem, size_t len)
+{
+    if (!pem || len == 0 || len > INT_MAX)
+    {
+        return false;
+    }
+    BIO* bio = BIO_new_mem_buf(pem, static_cast<int>(len));
+    if (!bio)
+    {
+        return false;
+    }
+    X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    bool valid = cert != nullptr;
+    // Reject a bundle or trailing garbage before mutating the store. A caller adding multiple
+    // anchors can check each result separately; a failed call never partially imports a bundle.
+    //
+    char remaining[256];
+    int count;
+    while (valid && (count = BIO_read(bio, remaining, sizeof(remaining))) > 0)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            char c = remaining[i];
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '\f' && c != '\v')
+            {
+                valid = false;
+                break;
+            }
+        }
+    }
+    BIO_free(bio);
+    bool added = valid && X509_STORE_add_cert(SSL_CTX_get_cert_store(m_ctx), cert) == 1;
+    X509_free(cert);
+    return added;
 }
 
 void Context::EnableKTLS()

@@ -80,16 +80,26 @@ struct HttpClientWorker : Launchable
                 return;
             }
 
-            conn->SkipBody();
+            if (!conn->SkipBody())
+            {
+                fprintf(stderr, "  [client] incomplete response after %d requests: %d\n",
+                    count, conn->Error());
+                g_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             count++;
             g_requests.fetch_add(1, std::memory_order_relaxed);
 
-            if (!conn->KeepAlive())
+            if (!conn->Reusable())
             {
                 fprintf(stderr, "  [client] not keep-alive after %d requests\n", count);
                 return;
             }
-            conn->Reset();
+            if (!conn->Reset())
+            {
+                g_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
         }
     }
 

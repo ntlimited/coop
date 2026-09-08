@@ -76,10 +76,10 @@ struct NativeWorker : Launchable
         {
             if (!conn->Get(m_path))            { g_errors.fetch_add(1); return; }
             if (!conn->GetResponseLine())      { g_errors.fetch_add(1); return; }
-            conn->SkipBody();
+            if (!conn->SkipBody())             { g_errors.fetch_add(1); return; }
             g_requests.fetch_add(1, std::memory_order_relaxed);
-            if (!conn->KeepAlive())            return;
-            conn->Reset();
+            if (!conn->Reusable())             return;
+            if (!conn->Reset())                { g_errors.fetch_add(1); return; }
         }
     }
 

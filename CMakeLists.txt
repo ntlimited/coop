@@ -290,6 +290,13 @@ gtest_discover_tests(coop_http_parser_tests)
 add_executable(bench_http_parser benchmarks/bench_http_parser.cpp)
 target_link_libraries(bench_http_parser PRIVATE coop benchmark::benchmark)
 
+add_executable(coop_tls_config_tests tests/test_tls_client_config.cpp)
+target_link_libraries(coop_tls_config_tests PRIVATE coop GTest::gtest_main)
+gtest_discover_tests(coop_tls_config_tests)
+
+add_executable(http_fetch examples/http_fetch.cpp)
+target_link_libraries(http_fetch PRIVATE coop)
+
 # Developer debugger smoke fixture; --bare also runs without io_uring.
 add_executable(coop_gdb_fixture tests/gdb_fixture.cpp)
 target_link_libraries(coop_gdb_fixture PRIVATE coop)

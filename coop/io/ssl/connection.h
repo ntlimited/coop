@@ -54,6 +54,25 @@ struct Connection
 
     ~Connection();
 
+    // Configure before handshake. These setters copy into OpenSSL's session configuration;
+    // they retain no caller buffers, perform no I/O, and add no data-path work. They do not
+    // enable peer verification: use Context::EnablePeerVerification() before construction or
+    // SSL_set_verify(m_ssl, ...) for a per-connection policy. m_ssl remains the escape hatch.
+    // Empty/null inputs fail rather than silently disabling identity checks.
+    //
+    // SNI selects the server's virtual host; it does not authenticate that host. Pass a DNS
+    // name, without a port. Omit SNI when connecting to a literal IP address.
+    //
+    [[nodiscard]] bool SetServerName(const char* dnsName);
+
+    // Choose one identity kind for a connection. DNS matching uses OpenSSL's hostname rules
+    // (customizable through SSL_set_hostflags); IP matching checks IP subjectAltName entries.
+    // These setters do not clear other identities installed through these helpers or m_ssl.
+    // IP input is an unbracketed IPv4/IPv6 literal without a port or zone identifier.
+    //
+    [[nodiscard]] bool SetVerifyHost(const char* dnsName);
+    [[nodiscard]] bool SetVerifyIp(const char* address);
+
     // Perform the TLS handshake. Dispatches to the appropriate handshake implementation based
     // on the BIO mode. Returns 0 on success, negative on error.
     //

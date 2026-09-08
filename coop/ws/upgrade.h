@@ -35,13 +35,13 @@ namespace ws
 
 // Validate WebSocket upgrade headers and send the 101 Switching Protocols response.
 // Returns true on success (protocol is now WebSocket). Returns false on validation failure
-// (sends 400 to the client).
+// (sends 400 by default; respondOnError=false leaves the reply to the caller).
 //
 // After a successful return, the handler should construct a ws::Connection<Transport>
 // using conn.LeftoverData()/LeftoverSize() to capture any bytes already in the HTTP
 // recv buffer.
 //
-bool Upgrade(http::ConnectionBase& conn);
+bool Upgrade(http::ConnectionBase& conn, bool respondOnError = true);
 
 } // namespace coop::ws
 } // namespace coop

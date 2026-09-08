@@ -4,6 +4,7 @@
 #include <string_view>
 
 #include "coop/time/interval.h"
+#include "coop/http/connection.h"
 
 namespace coop
 {
@@ -50,6 +51,10 @@ struct ServerConfiguration
     //
     bool pbufRecv = false;
 
+    // Request parser limits and malformed-request response policy.
+    //
+    ServerParserOptions parserOptions{};
+
     // Graceful-drain control. When set, connections detach from the acceptor and
     // register with this handle so ServerHandle::Drain can stop accepting and drain
     // in-flight connections without cascade-killing them. nullptr = no drain machinery,
@@ -76,7 +81,9 @@ struct ServerConfiguration
 bool RunServer(Context* ctx, ServerConfiguration const& config);
 
 // Run an HTTPS server. Same as RunServer but performs a TLS handshake on each accepted connection
-// before entering the HTTP handler loop. Uses socket BIO mode with kTLS when available.
+// before entering the HTTP handler loop. sslCtx is borrowed: with control enabled it,
+// the handle, and handler state must outlive detached connections (wait for Drain),
+// even after RunTlsServer returns. TLS handshakes count as live connections during drain.
 //
 bool RunTlsServer(Context* ctx, ServerConfiguration const& config, io::ssl::Context& sslCtx);
 

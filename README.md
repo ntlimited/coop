@@ -83,6 +83,9 @@ When included as a subdirectory, only the `coop` library target is built by defa
 
 ## Native HTTP client
 
+For the matching server contracts, see [HTTP server parsing and policy](docs/http_server.md)
+and [WebSocket framing and borrowed payloads](docs/websocket.md).
+
 The native client is a streaming HTTP/1.x connection toolkit with borrowed views and
 explicit completion/reuse. See [the client contract](docs/http_client.md) for construction,
 lifetimes, framing, and caller-owned policy.

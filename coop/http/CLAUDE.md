@@ -42,12 +42,16 @@ implicitly skips the previous if not consumed (`AdvanceToPhase`). The phase enum
 calling `NextHeaderName()` before consuming args auto-advances through `SkipArgs()` ->
 `SkipToHeaders()`.
 
-**Special header detection**: Content-Length, Transfer-Encoding, and Connection headers are
-detected during header parsing. `NextHeaderName()` sets pending flags
-(`m_pendingContentLength`, etc.); `ReadHeaderValue()` captures the values. `SkipHeaderValue()`
-delegates to `ReadHeaderValue()` for special headers to ensure they're captured even when the
-handler doesn't read them. `SkipHeaders()` scans all header lines and calls
-`DetectSpecialHeader()` directly.
+**Special header detection**: Content-Length, Transfer-Encoding and Connection values
+are recognized by streaming numeric/token state over the borrowed spans exposed to callers.
+There is no fixed copied special-value buffer. Overflow and conflicting framing are terminal.
+`ServerParserOptions` carries caller-selected header count/byte and chunk-size budgets, plus
+Automatic or Caller error-response ownership. Options persist across checked `Reset()`.
+
+`NextBody()` returns the shared `BodyResult` flyweight. EOF/error is distinct from completed
+request framing, `SkipBody()` explicitly drains, and `Reset()` refuses failed, incomplete or
+closing requests. The template implementation is in `detail/server_impl.hpp`; native explicit
+instantiations remain in `connection.cpp`. See `docs/http_server.md` for precise contracts.
 
 ## Response Formatting
 
@@ -105,9 +109,9 @@ coalescing that `WritevAll` previously handled.
 
 ## Keep-Alive
 
-`Reset()` reinitializes parser state between requests on the same connection. It calls
-`Compact()` first to preserve any leftover pipelined data in the buffer, then zeroes all
-parser state. `SkipBody()` must be called before `Reset()` to drain unconsumed body bytes.
+`Reset()` reinitializes parser state only after a completed reusable request. It compacts
+to preserve pipelined bytes and retains parser policy. `SkipBody()` explicitly drains and
+returns success; neither reset nor destruction silently drains a request.
 
 ## Client (`client.h`, `client.cpp`, `detail/client_impl.hpp`)
 

@@ -14,6 +14,7 @@ namespace http
 struct RequestLine
 {
     std::string_view method;
+    std::string_view version;   // HTTP/1.0 or HTTP/1.1, borrowed like method
     std::string_view path;      // before '?'
     std::string_view query;     // after '?', empty if none
     std::string_view target;    // full request-target (path + '?' + query), verbatim for
@@ -36,6 +37,21 @@ struct Chunk
     const void* data;
     size_t size;
     bool complete;              // true if this is the last chunk of the current element
+};
+
+// A checked body pull borrows a Chunk from its connection. Truthiness means data;
+// Complete() means a successful terminal pull. Error() is a negative errno on failure.
+// Like Chunk itself, both the descriptor and its bytes expire on the next parser call.
+//
+struct BodyResult
+{
+    Chunk* chunk;
+    int error;
+    explicit operator bool() const { return chunk != nullptr; }
+    Chunk* operator->() const { return chunk; }
+    Chunk& operator*() const { return *chunk; }
+    bool Complete() const { return !chunk && error == 0; }
+    int Error() const { return error; }
 };
 
 } // end namespace coop::http

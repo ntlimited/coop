@@ -1,4 +1,5 @@
 #include "server_handle.h"
+#include "connection.h"
 
 #include <sys/socket.h>
 
@@ -21,6 +22,8 @@ void ServerHandle::ShutdownAllConns(int how)
     for (ConnNode* node = m_conns.IsEmpty() ? nullptr : m_conns.Peek();
          node; node = m_conns.Next(node))
     {
+        if (node->connection) node->connection->ForceClose();
+        if (how == SHUT_RD && !node->idle) continue;
         if (node->desc && node->desc->m_fd >= 0)
         {
             ::shutdown(node->desc->m_fd, how);
@@ -48,7 +51,8 @@ bool ServerHandle::Drain(Context* ctx, time::Interval timeout)
 
     // Soft phase: wake idle keep-alive connections (blocked reading their next request)
     // by shutting the read side — they see EOF and exit; connections mid-response finish
-    // with Connection: close (the drain flag forces it). Then wait for the count to
+    // with Connection: close. Active request bodies and TLS handshakes retain their
+    // read sides until the hard deadline. Then wait for the count to
     // reach zero, bounded by the deadline.
     //
     ShutdownAllConns(SHUT_RD);
@@ -56,9 +60,11 @@ bool ServerHandle::Drain(Context* ctx, time::Interval timeout)
     m_drainWait.TryAcquire(ctx);
     auto result = CoordinateWith(ctx, &m_drainWait, timeout);
 
-    if (result.TimedOut())
+    if (result.coordinator != &m_drainWait)
     {
-        // Hard phase: fully shut every remaining connection, waking any blocked IO with
+        // Deadline expiry or failure to arm its timer both require a hard phase.
+        // Never report a clean drain while detached connections still borrow caller state.
+        // Fully shut every remaining connection, waking any blocked IO with
         // an error, then wait for them to unwind. The coordinator is still held from the
         // soft-phase TryAcquire; the last deregister releases it.
         //

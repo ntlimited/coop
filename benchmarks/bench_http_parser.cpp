@@ -12,6 +12,9 @@
 
 #include "coop/http/client.h"
 #include "coop/http/detail/client_impl.hpp"
+#include "coop/http/detail/server_impl.hpp"
+#include "coop/http/transport.h"
+#include "coop/io/uring.h"
 
 namespace
 {
@@ -68,6 +71,55 @@ void ParseResponse(benchmark::State& state)
 }
 
 BENCHMARK(ParseResponse)->Args({0, 4096})->Args({1, 4096})->Args({0, 7})->Args({1, 7});
+
+struct BufferedServerTransport : BufferedTransport
+{
+    coop::io::Descriptor* descriptor;
+    coop::io::Descriptor& Descriptor() { return *descriptor; }
+};
+
+void ParseRequest(benchmark::State& state)
+{
+    constexpr std::string_view fixed =
+        "POST /upload HTTP/1.1\r\nContent-Type: application/octet-stream\r\n"
+        "Content-Length: 13\r\nConnection: keep-alive\r\n"
+        "X-Origin: test-origin.example.net\r\n\r\nHello, World!";
+    constexpr std::string_view chunked =
+        "POST /upload HTTP/1.1\r\nContent-Type: application/octet-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+        "d\r\nHello, World!\r\n0\r\n\r\n";
+    std::string_view request = state.range(0) ? chunked : fixed;
+    // The server exposes its descriptor to handlers; parsing itself needs no kernel
+    // operations. This borrowed invalid descriptor belongs to an uninitialized ring.
+    coop::io::Uring ring;
+    coop::io::Descriptor descriptor(coop::io::borrowed, -1, &ring);
+    using Server = coop::http::Connection<BufferedServerTransport>;
+    alignas(Server) char storage[sizeof(Server) + Server::ExtraBytes()];
+    auto* server = new (storage) Server(
+        BufferedServerTransport{{request, static_cast<size_t>(state.range(1))}, &descriptor},
+        nullptr, nullptr);
+    for (auto _ : state)
+    {
+        while (auto body = server->NextBody())
+        {
+            benchmark::DoNotOptimize(body->data);
+            benchmark::DoNotOptimize(body->size);
+        }
+        if (!server->Reset())
+        {
+            state.SkipWithError("request did not complete on a reusable connection");
+            break;
+        }
+        server->m_transport.position = 0;
+    }
+    state.SetBytesProcessed(state.iterations() * request.size());
+    state.counters["connection_bytes"] = sizeof(Server);
+    state.counters["native_connection_bytes"] =
+        sizeof(coop::http::Connection<coop::http::PlaintextTransport>);
+    server->~Server();
+}
+
+BENCHMARK(ParseRequest)->Args({0, 4096})->Args({1, 4096})->Args({0, 7})->Args({1, 7});
 } // namespace
 
 BENCHMARK_MAIN();

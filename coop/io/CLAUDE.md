@@ -288,3 +288,18 @@ Armed CQE callbacks must NOT call `io_uring_cqe_seen` — `Uring::Poll` owns the
 `ArmedHandle::Dispatch`. See `docs/buffer_ring_multishot_01.md` for the design, the measured
 throughput/memory A/B (`benchmarks/bench_buffer_ring_throughput.cpp`), covenants, and the push/pull
 impedance with coop's pull consumers.
+
+## DNS resolver (`resolve.h`, `resolve.cpp`, `detail/dns.hpp`)
+
+`ResolverConfig` is a borrowed immutable view of caller-provided nameservers and hosts text, with
+explicit per-attempt timeout and attempt count. The explicit `Resolve4(config, ...)` path performs
+no configuration I/O or allocations. `ParseResolverConfig` parses into caller-owned address storage;
+hosts lookup scans text without building an owning map. Packet names are borrowed views with bounded
+compression traversal; reply acceptance requires matching question and associated A/CNAME ownership.
+Truncation surfaces as `-EMSGSIZE` rather than implicit TCP fallback or false no-data.
+
+Legacy overloads use a one-pointer `CooperatorVar` slot, allocating default configuration only on
+first hostname lookup. A coordinator serializes setup across cooperative file reads; only a complete
+successful snapshot is published. No mutable process-global configuration, DNS answer cache, or new
+thread-local exists. See `docs/dns_resolver.md` for lifetime, retry and error contracts.
+`coop_dns_parser_tests` needs no io_uring; native first-use concurrency is `DnsRuntimeTest.*`.

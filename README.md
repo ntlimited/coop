@@ -80,3 +80,9 @@ Use targeted `--gtest_filter` runs for fast loops, then run the full suite befor
 
 When `coop` is used as a standalone project (`cmake -S . -B ...`), tests, benchmarks, and examples are built.
 When included as a subdirectory, only the `coop` library target is built by default.
+
+## DNS resolution
+
+The [resolver guide](docs/dns_resolver.md) covers explicit configuration, borrowed
+nameserver/hosts storage, lookup policy, and the system-configuration convenience API.
+`coop_dns_parser_tests` exercises packet and configuration parsing without io_uring.

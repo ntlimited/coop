@@ -80,3 +80,17 @@ Use targeted `--gtest_filter` runs for fast loops, then run the full suite befor
 
 When `coop` is used as a standalone project (`cmake -S . -B ...`), tests, benchmarks, and examples are built.
 When included as a subdirectory, only the `coop` library target is built by default.
+
+## Native HTTP client
+
+The native client is a streaming HTTP/1.x connection toolkit with borrowed views and
+explicit completion/reuse. See [the client contract](docs/http_client.md) for construction,
+lifetimes, framing, and caller-owned policy.
+
+The parser regression suite runs without initializing io_uring:
+
+```bash
+./build/debug/bin/coop_http_parser_tests
+```
+
+`bench_http_parser` isolates parser CPU cost from the network in Release builds.

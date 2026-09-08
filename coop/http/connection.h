@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -19,6 +20,18 @@ struct Cooperator;
 namespace http
 {
 
+// Resource policy is separate from wire grammar. SIZE_MAX disables a ceiling; zero
+// permits zero items/bytes. Options are copied once and persist across Reset().
+//
+enum class ParserErrorResponse { Automatic, Caller };
+struct ServerParserOptions
+{
+    size_t maxHeaderCount = 100;
+    size_t maxHeaderBytes = 8192;
+    size_t maxChunkSize = size_t(1) << 30;
+    ParserErrorResponse errorResponse = ParserErrorResponse::Automatic;
+};
+
 // ConnectionBase is the handler-facing interface. Handlers take ConnectionBase& for transport-
 // agnostic request processing. Virtual dispatch at the handler boundary; the parser internals
 // (ConnectionImpl) use CRTP for zero-overhead buffer access.
@@ -28,17 +41,10 @@ struct ConnectionBase
     static constexpr size_t DEFAULT_BUFFER_SIZE = 2048;
     static constexpr size_t DEFAULT_SEND_BUFFER_SIZE = 512;
 
-    // Framing limits. Every field the parser reads is chosen by the peer, and a listener
-    // is typically open to the network without authentication, so the sizes a request may
-    // claim are capped rather than trusted. The header caps are cumulative across the
-    // whole block — the recv buffer bounds one line, not the block, because the parser
-    // compacts and refills as it goes. MAX_CHUNK_SIZE bounds a single chunk-size line's
-    // value; a body's total length is not capped (bodies stream in buffer-sized pieces
-    // and the recv timeout bounds a slow sender).
-    //
+    // Compatibility names for the default policy; callers may choose other limits.
     static constexpr size_t MAX_HEADER_COUNT = 100;
     static constexpr size_t MAX_HEADER_BYTES = 8192;
-    static constexpr size_t MAX_CHUNK_SIZE   = size_t(1) << 30;
+    static constexpr size_t MAX_CHUNK_SIZE = size_t(1) << 30;
 
     virtual ~ConnectionBase() = default;
 
@@ -46,9 +52,9 @@ struct ConnectionBase
     // call, that the views have been invalidated by buffer movement (see below).
     //
     // View lifetime: RequestLine's string_views point into the recv buffer, and the
-    // bytes they reference are DISCARDED the first time later parsing compacts the
-    // buffer (large or split header blocks, body reads). Copy what must outlive header
-    // iteration — a proxy copies method/target before forwarding headers. Repeat
+    // argument-name parsing tokenizes target/query in place; later parsing can discard the
+    // bytes through compaction (split headers, body reads). Copy what must outlive argument or header
+    // iteration — a proxy copies method/target before consuming arguments or headers. Repeat
     // GetRequestLine() calls after invalidation return null (and assert in debug)
     // rather than serving views into reused memory.
     //
@@ -70,10 +76,19 @@ struct ConnectionBase
     virtual void SkipHeaderValue() = 0;
     virtual void SkipHeaders() = 0;
 
-    // Phase 4: Body. Handles Transfer-Encoding: chunked internally. Null = end/error.
+    // Phase 4: Body. NextBody returns borrowed data, successful completion, or errno.
+    // ReadBody retains its legacy null=end/error interface; check Complete()/Error().
+    // SkipBody explicitly drains. Reset refuses incomplete/failed/closing requests
+    // without reading. Complete describes request consumption, not response delivery.
     //
     virtual Chunk* ReadBody() = 0;
-    virtual void SkipBody() = 0;
+    virtual BodyResult NextBody() = 0;
+    virtual bool SkipBody() = 0;
+    virtual bool Complete() const = 0;
+    virtual int Error() const = 0;
+    virtual bool Reusable() const = 0;
+    virtual bool SetParserOptions(ServerParserOptions options) = 0;
+    virtual const ServerParserOptions& GetParserOptions() const = 0;
     virtual int64_t ContentLength() = 0;
 
     // Receive the remaining body directly into a file at `offset` — the receive-to-disk
@@ -87,8 +102,8 @@ struct ConnectionBase
     //
     virtual int64_t ReadBodyToFile(int fileFd, off_t offset) = 0;
 
-    // Response methods. Return false on send failure. Callers must not call send methods after
-    // a failure (asserts in debug). Use SendError() to check.
+    // Response methods return false on failure. Failures are sticky; later sends do
+    // no IO. Caller-mode parser errors allow the handler to send its own response.
     //
     virtual bool Send(int status, const char* contentType, const void* body, size_t size) = 0;
     virtual bool Send(int status, const char* contentType, const std::string& body) = 0;
@@ -121,14 +136,14 @@ struct ConnectionBase
 
     virtual bool SendError() const = 0;
 
-    // Non-zero once a framing field failed to be the grammar it claimed: the status the
-    // connection answered the peer with (400, 413, 431). A failed request is terminal —
-    // no further header, body, or response bytes move, keep-alive is off, and whatever
-    // remains in the receive buffer is discarded rather than read as the next request.
+    // HTTP status describing malformed framing or a policy limit (400, 413, 431).
+    // Automatic mode answers once if no response began; Caller mode leaves response
+    // generation to the handler. In both modes parsing is terminal and reuse is off.
+    // Error() separately preserves negative errno, including transport/sink failures.
     //
     virtual int ParseError() const = 0;
 
-    virtual void Reset() = 0;
+    virtual bool Reset() = 0;
     virtual bool KeepAlive() const = 0;
     virtual io::Descriptor& GetDescriptor() = 0;
     virtual Cooperator* GetCooperator() = 0;
@@ -146,7 +161,7 @@ struct ConnectionBase
 // ConnectionImpl<Derived> is the CRTP parser implementation. All parser state lives here; buffer
 // and transport access go through the Derived type. This gives the parser zero-overhead buffer
 // access (compile-time offset from `this`) while keeping the implementation in connection.cpp
-// via explicit template instantiation.
+// via explicit native instantiation; include detail/server_impl.hpp for custom transports.
 //
 template<typename Derived>
 struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
@@ -154,9 +169,9 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     friend struct detail::ParserBuffer<Derived>;
 
     ConnectionImpl(io::Descriptor& desc, Context* ctx, Cooperator* co,
-                   time::Interval timeout);
+                   time::Interval timeout, ServerParserOptions options);
 
-    // ConnectionBase overrides — implemented in connection.cpp
+    // ConnectionBase overrides — implemented in detail/server_impl.hpp
     //
     RequestLine* GetRequestLine() override;
     const char* NextArgName() override;
@@ -168,7 +183,18 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     void SkipHeaderValue() override;
     void SkipHeaders() override;
     Chunk* ReadBody() override;
-    void SkipBody() override;
+    BodyResult NextBody() override;
+    bool SkipBody() override;
+    bool Complete() const override { return m_phase == DONE && m_error == 0; }
+    int Error() const override { return m_error; }
+    bool Reusable() const override { return Complete() && KeepAlive() && !m_sendError; }
+    const ServerParserOptions& GetParserOptions() const override { return m_options; }
+    bool SetParserOptions(ServerParserOptions options) override
+    {
+        if (m_requestLineParsed || m_phase != REQUEST_LINE) return false;
+        m_options = options;
+        return true;
+    }
     int64_t ContentLength() override;
     int64_t ReadBodyToFile(int fileFd, off_t offset) override;
     bool Send(int status, const char* contentType, const void* body, size_t size) override;
@@ -186,8 +212,8 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     void ForceClose() override { m_clientClose = true; }
     bool SendError() const override { return m_sendError; }
     int ParseError() const override { return m_parseError; }
-    void Reset() override;
-    bool KeepAlive() const override { return m_keepAlive && !m_clientClose; }
+    bool Reset() override;
+    bool KeepAlive() const override { return m_keepAlive && !m_clientClose && !m_error; }
     io::Descriptor& GetDescriptor() override { return m_desc; }
     Cooperator* GetCooperator() override { return m_co; }
 
@@ -254,11 +280,17 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     using detail::ParserBuffer<Derived>::m_bufLen;
     using detail::ParserBuffer<Derived>::m_parsePos;
     using detail::ParserBuffer<Derived>::m_bufEpoch;
-    using detail::ParserBuffer<Derived>::RecvMore;
+
     using detail::ParserBuffer<Derived>::Compact;
     using detail::ParserBuffer<Derived>::Win;
 
     bool RecvAborted() const;
+    int RecvMore();
+    bool Receive();
+    bool Ensure(size_t size);
+    bool ConsumeCrlf();
+    bool Fail(int error);
+    bool FailIo(int error);
 
     // Internal parsing helpers
     //
@@ -275,21 +307,17 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool FailRequest(int status);
     bool ChargeHeaderBytes(size_t bytes);
     bool FinishHeaders();
-    void CaptureSpecialValue(const char* data, size_t size);
-    bool ApplySpecialValue();
-    bool ConsumeChunkTrailers();
+    bool FeedHeaderValue(const char* data, size_t size, bool final);
+    bool FinishHeaderToken();
 
-    // True once a framing failure has written its response: the request is over, so a
-    // handler's later writes would append to a response it did not begin.
+    // Automatic parser failures and IO failures prohibit further response writes.
+    // Caller-mode parser failures leave response generation under handler control.
     //
-    bool ResponseClosed() const { return m_parseError != 0; }
-
-    // Content-Length, Transfer-Encoding and Connection values are copied out of the
-    // window as they stream, so a value split across refills is decoded whole instead of
-    // from whichever tail happened to land in the buffer last. None of the three has a
-    // legitimate form anywhere near this long.
-    //
-    static constexpr size_t SPECIAL_VALUE_MAX = 64;
+    bool ResponseClosed() const
+    {
+        return m_error && (m_options.errorResponse == ParserErrorResponse::Automatic ||
+                           m_parseError == 0);
+    }
 
     io::Descriptor& m_desc;
     Context*        m_ctx;
@@ -328,8 +356,15 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     size_t          m_headerBytes;
     bool            m_haveContentLength;
     bool            m_haveTransferEncoding;
-    size_t          m_specialValueLen;
-    char            m_specialValue[SPECIAL_VALUE_MAX];
+    ServerParserOptions m_options;
+    int             m_error;
+    uint64_t        m_fieldNumber;
+    uint8_t         m_fieldState;
+    uint8_t         m_tokenLength;
+    uint8_t         m_tokenMatches;
+    bool            m_lastTokenChunked;
+    bool            m_valueStarted;
+    bool            m_needChunkCrlf;
 };
 
 // Connection<Transport> is the final, concrete HTTP connection. The transport template parameter
@@ -357,12 +392,16 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
     Connection(Transport transport, Context* ctx, Cooperator* co,
                size_t recvBufSize = ConnectionBase::DEFAULT_BUFFER_SIZE,
                size_t sendBufSize = ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
-               time::Interval timeout = std::chrono::seconds(30))
-    : ConnectionImpl<Connection<Transport>>(transport.Descriptor(), ctx, co, timeout)
+               time::Interval timeout = std::chrono::seconds(30),
+               ServerParserOptions options = {})
+    : ConnectionImpl<Connection<Transport>>(transport.Descriptor(), ctx, co, timeout, options)
     , m_transport(transport)
     , m_recvBufSize(recvBufSize)
     , m_sendBufSize(sendBufSize)
-    {}
+    { assert(recvBufSize >= 2 && sendBufSize > 0); }
+
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
 
     // CRTP transport dispatch — called by ConnectionImpl, fully inlined
     //
@@ -389,3 +428,4 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
 
 } // end namespace coop::http
 } // end namespace coop
+

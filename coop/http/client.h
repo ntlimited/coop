@@ -17,21 +17,6 @@ namespace coop
 namespace http
 {
 
-// A checked body pull borrows a Chunk from its connection. Truthiness means data;
-// Complete() means a successful terminal pull. Error() is a negative errno on failure.
-// Like Chunk itself, both the descriptor and its bytes expire on the next parser call.
-//
-struct BodyResult
-{
-    Chunk* chunk;
-    int error;
-    explicit operator bool() const { return chunk != nullptr; }
-    Chunk* operator->() const { return chunk; }
-    Chunk& operator*() const { return *chunk; }
-    bool Complete() const { return !chunk && error == 0; }
-    int Error() const { return error; }
-};
-
 // ClientConnectionImpl<Derived> is the CRTP response parser and request sender. Mirrors the
 // server-side ConnectionImpl pattern: buffer management, header/body parsing via sequential
 // phases, CRTP for zero-overhead transport dispatch.

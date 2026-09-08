@@ -121,16 +121,71 @@ bool ServeFile(ConnectionBase& conn, std::string_view reqPath,
 namespace
 {
 
+// The registration outlives the descriptor member: Drain observes zero live connections
+// only after parser, TLS and descriptor teardown have completed (destructors may yield).
+//
+struct DrainRegistration
+{
+    ServerHandle* control;
+    ServerHandle::ConnNode node;
+    bool registered = false;
+
+    explicit DrainRegistration(ServerHandle* value) : control(value) {}
+    void Begin(Context* ctx, io::Descriptor* desc)
+    {
+        if (!control) return;
+        ctx->Detach();
+        control->Register(&node, desc);
+        registered = true;
+    }
+    ~DrainRegistration() { if (registered) control->Deregister(&node); }
+};
+
+// Remove the parser pointer before its allocation unwinds. TLS/descriptor teardown can
+// suspend, and a concurrent drain must never call ForceClose on an expired parser.
+//
+struct DrainParser
+{
+    ServerHandle::ConnNode* node;
+    DrainParser(DrainRegistration& registration, ConnectionBase* connection)
+        : node(registration.control ? &registration.node : nullptr)
+    {
+        if (node) node->connection = connection;
+    }
+    ~DrainParser() { if (node) { node->connection = nullptr; node->idle = false; } }
+};
+
+struct ListenerRegistration
+{
+    ServerHandle* control;
+    io::Descriptor* listener;
+    ListenerRegistration(ServerHandle* value, io::Descriptor* desc)
+        : control(value), listener(desc)
+    {
+        if (control) control->SetListener(listener);
+    }
+    ~ListenerRegistration() { if (control) control->ClearListener(listener); }
+};
+
 // Serve one request. Returns false when no request could be parsed — clean keep-alive
 // EOF or malformed bytes — which must END the connection loop: a clean EOF that keeps
 // looping spins hot on instant zero-byte reads (the recv fastpath returns EOF without
 // ever parking), monopolizing the cooperator.
 //
-bool HandleRequest(ConnectionBase& conn, RequestHandler handler, void* userData)
+bool HandleRequest(ConnectionBase& conn, RequestHandler handler, void* userData,
+                   ServerHandle::ConnNode* node)
 {
+    if (node) node->idle = true;
     auto* req = conn.GetRequestLine();
+    if (node) node->idle = false;
     if (!req)
     {
+        if (conn.ParseError() != 0 &&
+            conn.GetParserOptions().errorResponse == ParserErrorResponse::Caller)
+        {
+            handler(conn, userData);
+            return false;
+        }
         // A clean keep-alive EOF (peer closed between requests) leaves nothing in the
         // buffer — answering it with a 400 writes into a dead socket. Only malformed
         // bytes earn a response.
@@ -159,8 +214,11 @@ struct HttpConnection : Launchable
                    RequestHandler handler, void* userData,
                    time::Interval timeout,
                    bool pbufRecv = false,
-                   ServerHandle* control = nullptr)
+                   ServerHandle* control = nullptr,
+                   ServerParserOptions parserOptions = {})
     : Launchable(ctx)
+    , m_registration(control)
+    , m_parserOptions(parserOptions)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd)
     , m_co(co)
@@ -176,24 +234,15 @@ struct HttpConnection : Launchable
 
     virtual void Launch() final
     {
-        // Drain mode: detach from the acceptor so stopping it does not cascade-kill this
-        // connection, and register with the control so Drain can find and drain it. The
-        // node is stack-resident for the connection's lifetime; deregister on exit.
-        //
-        ServerHandle::ConnNode connNode;
-        if (m_control)
-        {
-            GetContext()->Detach();
-            m_control->Register(&connNode, &m_fd);
-        }
-        DrainDeregister deregister{m_control, &connNode};
+        m_registration.Begin(GetContext(), &m_fd);
 
         using Conn = Connection<PlaintextTransport>;
         PlaintextTransport transport(m_fd);
         auto conn = GetContext()->Allocate<Conn>(
             Conn::ExtraBytes(), transport, GetContext(), m_co,
             ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
-            m_timeout);
+            m_timeout, m_parserOptions);
+        DrainParser parserRegistration(m_registration, conn.get());
 
         // Pbuf mode: one armed multishot recv serves the connection's lifetime; the
         // parser windows over kernel-selected chunks. Falls back to classic recv when
@@ -215,7 +264,8 @@ struct HttpConnection : Launchable
             {
                 conn->ForceClose();
             }
-            if (!HandleRequest(*conn, m_handler, m_userData)) return;
+            if (!HandleRequest(*conn, m_handler, m_userData,
+                               m_control ? &m_registration.node : nullptr)) return;
 
             if (conn->SendError()) return;
 
@@ -224,22 +274,15 @@ struct HttpConnection : Launchable
             // Reset() wipe a close that SkipBody just discovered — a phantom extra
             // iteration against a closed peer.
             //
-            conn->SkipBody();
+            if (!conn->SkipBody()) return;
             if (!conn->KeepAlive()) return;
             if (m_control && m_control->IsDraining()) return;   // exit promptly on drain
-            conn->Reset();
+            if (!conn->Reset()) return;
         }
     }
 
-    // RAII deregistration from the drain control on any exit path (return, throw).
-    //
-    struct DrainDeregister
-    {
-        ServerHandle* control;
-        ServerHandle::ConnNode* node;
-        ~DrainDeregister() { if (control) control->Deregister(node); }
-    };
-
+    DrainRegistration   m_registration;
+    ServerParserOptions m_parserOptions;
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
@@ -259,8 +302,12 @@ struct HttpTlsConnection : Launchable
     HttpTlsConnection(Context* ctx, int fd, Cooperator* co,
                       RequestHandler handler, void* userData,
                       io::ssl::Context& sslCtx,
-                      time::Interval timeout)
+                      time::Interval timeout,
+                      ServerHandle* control = nullptr,
+                   ServerParserOptions parserOptions = {})
     : Launchable(ctx)
+    , m_registration(control)
+    , m_parserOptions(parserOptions)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd)
     , m_co(co)
@@ -268,6 +315,7 @@ struct HttpTlsConnection : Launchable
     , m_userData(userData)
     , m_sslCtx(sslCtx)
     , m_timeout(timeout)
+    , m_control(control)
     {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 
@@ -284,20 +332,26 @@ struct HttpTlsConnection : Launchable
 
     virtual void Launch() final
     {
+        // Register before handshake: a peer that never sends ClientHello is still live.
+        m_registration.Begin(GetContext(), &m_fd);
         char sslBuf[io::ssl::Connection::BUFFER_SIZE];
         io::ssl::Connection sslConn(m_sslCtx, m_fd, sslBuf, sizeof(sslBuf));
         if (sslConn.HandshakeKill() != 0) return;
+        if (m_control && m_control->IsDraining()) return;
 
         using Conn = Connection<TlsTransport>;
         TlsTransport transport(sslConn, m_fd);
         auto conn = GetContext()->Allocate<Conn>(
             Conn::ExtraBytes(), transport, GetContext(), m_co,
             ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
-            m_timeout);
+            m_timeout, m_parserOptions);
+        DrainParser parserRegistration(m_registration, conn.get());
 
         while (!GetContext()->IsKilled())
         {
-            if (!HandleRequest(*conn, m_handler, m_userData)) return;
+            if (m_control && m_control->IsDraining()) conn->ForceClose();
+            if (!HandleRequest(*conn, m_handler, m_userData,
+                               m_control ? &m_registration.node : nullptr)) return;
 
             if (conn->SendError()) return;
 
@@ -306,12 +360,15 @@ struct HttpTlsConnection : Launchable
             // Reset() wipe a close that SkipBody just discovered — a phantom extra
             // iteration against a closed peer.
             //
-            conn->SkipBody();
+            if (!conn->SkipBody()) return;
             if (!conn->KeepAlive()) return;
-            conn->Reset();
+            if (m_control && m_control->IsDraining()) return;
+            if (!conn->Reset()) return;
         }
     }
 
+    DrainRegistration   m_registration;
+    ServerParserOptions m_parserOptions;
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
@@ -319,6 +376,7 @@ struct HttpTlsConnection : Launchable
     void*               m_userData;
     io::ssl::Context&   m_sslCtx;
     time::Interval      m_timeout;
+    ServerHandle*       m_control;
 };
 
 // Create, bind, and listen the server socket with checked returns. An assert-only
@@ -397,6 +455,7 @@ static void AcceptLoop(Context* ctx, io::Descriptor& desc,
             {
                 break;
             }
+            if (draining()) { ::close(fd); break; }
             launch(fd);
             ctx->Yield();
         }
@@ -410,6 +469,7 @@ static void AcceptLoop(Context* ctx, io::Descriptor& desc,
         {
             break;
         }
+        if (draining()) { ::close(fd); break; }
         launch(fd);
         ctx->Yield();
     }
@@ -435,16 +495,17 @@ bool RunServer(Context* ctx, ServerConfiguration const& config)
 
     auto* co = ctx->GetCooperator();
     io::Descriptor desc(serverFd);
-    if (config.control)
-    {
-        config.control->SetListener(&desc);
-    }
+    ListenerRegistration listenerRegistration(config.control, &desc);
 
     AcceptLoop(ctx, desc, config, [&](int fd)
     {
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 32768};
-        co->Launch<HttpConnection>(spawn, fd, co, config.handler, config.userData,
-                                   config.timeout, config.pbufRecv, config.control);
+        if (!co->Launch<HttpConnection>(spawn, fd, co, config.handler, config.userData,
+                                       config.timeout, config.pbufRecv, config.control,
+                                       config.parserOptions))
+        {
+            ::close(fd);
+        }
     });
     return true;
 }
@@ -467,14 +528,19 @@ bool RunTlsServer(Context* ctx, ServerConfiguration const& config, io::ssl::Cont
 
     auto* co = ctx->GetCooperator();
     io::Descriptor desc(serverFd);
+    ListenerRegistration listenerRegistration(config.control, &desc);
 
     AcceptLoop(ctx, desc, config, [&](int fd)
     {
         // TLS handshake + HTTP requires more stack for OpenSSL
         //
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 65536};
-        co->Launch<HttpTlsConnection>(spawn, fd, co, config.handler, config.userData,
-                                      sslCtx, config.timeout);
+        if (!co->Launch<HttpTlsConnection>(spawn, fd, co, config.handler, config.userData,
+                                          sslCtx, config.timeout, config.control,
+                                          config.parserOptions))
+        {
+            ::close(fd);
+        }
     });
     return true;
 }

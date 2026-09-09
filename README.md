@@ -94,3 +94,9 @@ The parser regression suite runs without initializing io_uring:
 ```
 
 `bench_http_parser` isolates parser CPU cost from the network in Release builds.
+
+## DNS resolution
+
+The [resolver guide](docs/dns_resolver.md) covers explicit configuration, borrowed
+nameserver/hosts storage, lookup policy, and the system-configuration convenience API.
+`coop_dns_parser_tests` exercises packet and configuration parsing without io_uring.

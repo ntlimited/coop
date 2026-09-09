@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cerrno>
 #include <cstring>
 
 #include "coop/io/recv_source.h"
@@ -63,7 +64,7 @@ struct ParserBuffer
     {
         auto* self = static_cast<Derived*>(this);
 
-        if (self->RecvAborted()) return -1;
+        if (self->RecvAborted()) return -ECANCELED;
 
         if (!m_source)
         {
@@ -72,15 +73,18 @@ struct ParserBuffer
             if (m_bufLen >= self->RecvBufSize())
             {
                 Compact();
-                if (m_bufLen >= self->RecvBufSize()) return 0;
+                if (m_bufLen >= self->RecvBufSize()) return -EMSGSIZE;
             }
 
             int n = self->TransportRecv(self->RecvBuf() + m_bufLen,
                                         self->RecvBufSize() - m_bufLen, 0,
                                         self->m_timeout);
 
-            if (self->RecvAborted()) return -1;
-            if (n <= 0) return -1;
+            if (self->RecvAborted()) return -ECANCELED;
+            // EOF is a valid delimiter only for close-framed responses. Preserve it
+            // separately from transport errors so the parser can make that decision.
+            //
+            if (n <= 0) return n;
 
             m_bufLen += n;
             return n;
@@ -96,13 +100,13 @@ struct ParserBuffer
         }
         if (m_bufLen >= self->RecvBufSize())
         {
-            return 0;   // staging full: token larger than the reassembly buffer
+            return -EMSGSIZE;   // token larger than the caller's reassembly buffer
         }
 
         char* data = nullptr;
         int n = m_source->Peek(&data);
-        if (self->RecvAborted()) return -1;
-        if (n <= 0) return -1;
+        if (self->RecvAborted()) return -ECANCELED;
+        if (n <= 0) return n;
 
         if (m_bufLen == 0)
         {

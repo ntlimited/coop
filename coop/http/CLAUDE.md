@@ -109,20 +109,30 @@ coalescing that `WritevAll` previously handled.
 `Compact()` first to preserve any leftover pipelined data in the buffer, then zeroes all
 parser state. `SkipBody()` must be called before `Reset()` to drain unconsumed body bytes.
 
-## Client (`client.{h,cpp}`)
+## Client (`client.h`, `client.cpp`, `detail/client_impl.hpp`)
 
-`ClientConnection<Transport>` mirrors the server connection: CRTP parser, trailing dual
-buffers, phases `RESPONSE_LINE -> HEADERS -> BODY -> DONE`. Composed requests: `Get`,
-`Post`, `Head`, `SendRequest`. Component requests for arbitrary headers and streamed
-bodies: `BeginRequest(method, path)` (request line + Host, and remembers HEAD) /
-`AppendHeader(name, value)` / `EndHeaders()` (blank line + flush) / `SendBody(data, size)`
-(append + flush; oversized bodies bypass the buffer). Caller owns body framing via a
-Content-Length or Transfer-Encoding header.
+`ClientConnection<Transport>` retains the contiguous allocation and CRTP parser. Native
+plaintext/TLS instantiations live in `client.cpp`; the implementation header lets static
+custom transports instantiate the identical parser without a runtime callback seam.
 
-Response bodies: `ReadBody` handles Content-Length and chunked. HEAD responses and 204/304
-statuses are framing-only — `ReadBody` ends immediately while `ContentLength()` still
-reports the advertised entity length (a proxy forwards it), keeping the connection
-positioned for keep-alive reuse.
+`NextBody()` returns a borrowed `BodyResult`: data, successful completion, or negative
+errno. `ReadBody()` remains pointer-only; its caller checks `Complete()`/`Error()` after
+ending the loop. `SkipBody()` explicitly drains and returns completion. `Reusable()`
+requires a complete final response and persistence; `Reset()` refuses incomplete, failed,
+close-delimited or upgraded responses without draining. Informational responses remain
+observable and advance only through `AdvanceResponse()`.
+
+Content-Length, chunked and close-delimited bodies share the same streaming interface.
+Framing and delimiter validation do not depend on receive boundaries. Header values and
+body spans remain valid until the next parsing operation; a read never refills after
+forming its returned view. `Chunk::complete` marks an element/wire-chunk boundary;
+`BodyResult::Complete()` marks the response boundary, after chunk trailers.
+
+The connection borrows its transport resources and Host string; it owns no header map,
+body string, admission policy, retry loop, or timer. Request components are literal caller
+input, and component-body framing is caller-owned. See `docs/http_client.md` for the full
+ownership, error and sequencing contract. `coop_http_parser_tests` exercises this code
+without initializing a kernel ring.
 
 ## Pbuf-mode parsing (ParseWindow + RecvSource)
 

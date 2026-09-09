@@ -29,15 +29,27 @@ jobs:
           # Plain -O2, no LTO: the codegen-fragility guard — the red-zone crash class hid here.
           - lane: o2-nolto
             cmake_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" -DCOOP_LTO=OFF
-    runs-on: ubuntu-24.04
+          # Native aarch64 checks exercise its assembly and weaker memory ordering.
+          - lane: debug-arm64
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug
+            runner: ubuntu-24.04-arm
+          - lane: release-arm64
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y liburing-dev libssl-dev gdb
+          # All dependencies come from Ubuntu; unrelated preinstalled package feeds must
+          # not make builds depend on their availability or metadata consistency.
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources
+                       -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" update
+          sudo apt-get "${apt_sources[@]}" install -y liburing-dev libssl-dev gdb
 
       - name: Probe io_uring availability
         run: |
@@ -55,6 +67,7 @@ jobs:
       - name: Test
         run: |
           ./build/bin/coop_http_parser_tests
+          ./build/bin/coop_dns_parser_tests
           # Preserve native execution and its exit status; inspect a core only after failure.
           ulimit -c unlimited
           sudo sysctl -w kernel.core_pattern="$PWD/build/core.%p"

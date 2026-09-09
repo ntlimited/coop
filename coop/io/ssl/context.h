@@ -52,6 +52,27 @@ struct Context
     //
     bool LoadPrivateKey(const char* pem, size_t len);
 
+    // Client authentication policy is opt-in: construction retains OpenSSL's SSL_VERIFY_NONE
+    // default. Configure shared policy before creating connections. This enables chain
+    // verification with OpenSSL's default callback; set a DNS/IP identity on each connection
+    // as well. m_ctx remains available for custom callbacks and other verification policies.
+    //
+    void EnablePeerVerification();
+
+    // Explicitly load OpenSSL's default trust paths. May perform blocking filesystem I/O;
+    // call during application setup, outside a cooperator. Directory-backed stores can also
+    // perform deferred filesystem lookups during verification; use memory anchors to avoid
+    // this. Returns OpenSSL's setup result, which does not guarantee usable anchors were found.
+    //
+    [[nodiscard]] bool LoadDefaultVerifyPaths();
+
+    // Add one PEM-encoded trust anchor from memory, with optional trailing whitespace.
+    // No file I/O. Does not enable verification. OpenSSL retains its own certificate reference;
+    // the input buffer can be released on return. False leaves the trust store unchanged.
+    // For bundles/custom stores, use SSL_CTX_get_cert_store(m_ctx) directly.
+    //
+    [[nodiscard]] bool AddTrustedCertificate(const char* pem, size_t len);
+
     // Enable kernel TLS offload. When active, OpenSSL installs cipher state into the kernel
     // after handshake so that subsequent send/recv bypasses userspace crypto entirely. Requires
     // a TCP socket (not AF_UNIX) and a socket BIO connection. Must be called before any

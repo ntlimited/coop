@@ -95,6 +95,18 @@ The parser regression suite runs without initializing io_uring:
 
 `bench_http_parser` isolates parser CPU cost from the network in Release builds.
 
+For explicit TLS trust, identity verification, and SNI setup, see
+[the TLS client guide](docs/tls_client.md). The native streaming example is:
+
+```bash
+./build/debug/bin/http_fetch example.com 443 / --tls
+./build/debug/bin/http_fetch 127.0.0.1 8080 /
+./build/debug/bin/coop_tls_config_tests
+```
+
+The example uses the existing IPv4/DNS Connect helper and leaves redirects, retries,
+and total transaction deadlines to application policy.
+
 ## DNS resolution
 
 The [resolver guide](docs/dns_resolver.md) covers explicit configuration, borrowed

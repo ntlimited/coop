@@ -98,6 +98,22 @@ Connection::~Connection()
     SSL_free(m_ssl);
 }
 
+bool Connection::SetServerName(const char* dnsName)
+{
+    return dnsName && *dnsName && SSL_set_tlsext_host_name(m_ssl, dnsName) == 1;
+}
+
+bool Connection::SetVerifyHost(const char* dnsName)
+{
+    return dnsName && *dnsName && SSL_set1_host(m_ssl, dnsName) == 1;
+}
+
+bool Connection::SetVerifyIp(const char* address)
+{
+    return address && *address
+        && X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(m_ssl), address) == 1;
+}
+
 // Drain any pending data from OpenSSL's write BIO and send it over the wire via io::Send. This
 // must be called after every SSL operation that might produce output (handshake, SSL_write, etc).
 //

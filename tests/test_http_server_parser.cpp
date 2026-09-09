@@ -356,4 +356,72 @@ TEST(HttpServerParser, HeaderByteLimitCountsWireFieldsExactly)
     EXPECT_EQ(fails.conn->ParseError(), 431);
 }
 
+TEST(HttpServerParser, EmptyTransferEncodingFailsWithoutConsumingPipeline)
+{
+    for (const std::string value : {"", " \t ", ", ,\t,"})
+    {
+        for (int contentLength = 0; contentLength != 3; ++contentLength)
+        {
+            const std::string length = "Content-Length: 0\r\n";
+            const std::string wire = "POST / HTTP/1.1\r\n" +
+                (contentLength == 1 ? length : "") + "Transfer-Encoding:" + value + "\r\n" +
+                (contentLength == 2 ? length : "") + "\r\n" + next;
+            SCOPED_TRACE(wire);
+            for (auto response : {coop::http::ParserErrorResponse::Automatic,
+                                  coop::http::ParserErrorResponse::Caller})
+            {
+                coop::http::ServerParserOptions options;
+                options.errorResponse = response;
+                // Exercise whole input, byte fragments, and every two-packet boundary.
+                for (size_t split = 0; split <= wire.size(); ++split)
+                {
+                    SCOPED_TRACE(split);
+                    auto packets = split == 0 ? Bytes(wire) :
+                        split == wire.size() ? std::vector<std::string>{wire} :
+                        std::vector<std::string>{wire.substr(0, split), wire.substr(split)};
+                    Parser parser(std::move(packets), 64, options);
+                    EXPECT_FALSE(parser.conn->SkipBody());
+                    EXPECT_EQ(parser.conn->Error(), -EPROTO);
+                    EXPECT_EQ(parser.conn->ParseError(), 400);
+                    EXPECT_FALSE(parser.conn->Complete());
+                    EXPECT_FALSE(parser.conn->Reusable());
+                    EXPECT_FALSE(parser.conn->KeepAlive());
+                    const size_t reads = parser.script.reads;
+                    const std::string sent = parser.script.sent;
+                    EXPECT_FALSE(parser.conn->Reset());
+                    EXPECT_FALSE(parser.conn->SkipBody());
+                    EXPECT_EQ(parser.conn->NextBody().Error(), -EPROTO);
+                    EXPECT_EQ(parser.script.reads, reads);
+                    EXPECT_EQ(parser.script.sent, sent);
+                    if (response == coop::http::ParserErrorResponse::Automatic)
+                        EXPECT_NE(sent.find("400"), std::string::npos);
+                    else
+                        EXPECT_TRUE(sent.empty());
+                }
+            }
+        }
+    }
+}
+TEST(HttpServerParser, EmptyListMembersPreserveValidTransferCodingsAndReset)
+{
+    for (const std::string fields : {
+        "Transfer-Encoding: , gzip; p=\"opaque\", , chunked, \r\n",
+        "Transfer-Encoding: , \r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: , \r\n"})
+    {
+        SCOPED_TRACE(fields);
+        const std::string wire = "POST / HTTP/1.1\r\n" + fields + "\r\n1\r\nx\r\n0\r\n\r\n" +
+            "POST /next HTTP/1.1\r\nContent-Length: 1\r\n\r\ny";
+        for (auto packets : {std::vector<std::string>{wire}, Bytes(wire)})
+        {
+            Parser parser(std::move(packets), 64);
+            EXPECT_EQ(parser.Body(), "x");
+            ASSERT_TRUE(parser.conn->Reusable());
+            ASSERT_TRUE(parser.conn->Reset());
+            EXPECT_EQ(parser.Body(), "y");
+            EXPECT_TRUE(parser.conn->Reusable());
+        }
+    }
+}
+
 }

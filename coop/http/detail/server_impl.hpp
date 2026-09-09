@@ -306,7 +306,6 @@ bool ConnectionImpl<Derived>::FinishHeaderToken()
     {
         if (m_chunkedBody) return Fail(-EPROTO); // chunked must occur once, last
         m_chunkedBody = chunked;
-        m_haveTransferEncoding = true;
         m_lastTokenChunked = chunked;
     }
     else
@@ -346,7 +345,6 @@ bool ConnectionImpl<Derived>::FeedHeaderValue(const char* data, size_t size, boo
         else if (length == 7 && !strncasecmp(data, "chunked", 7))
         {
             if (m_chunkedBody) return Fail(-EPROTO);
-            m_haveTransferEncoding = true;
             m_chunkedBody = true;
             return true;
         }
@@ -873,6 +871,10 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
             m_pendingContentLength = length == 14 && !strncasecmp(start, "content-length", 14);
             m_pendingTransferEncoding = length == 17 && !strncasecmp(start, "transfer-encoding", 17);
             m_pendingConnection = length == 10 && !strncasecmp(start, "connection", 10);
+            // An empty coding list is still Transfer-Encoding framing metadata.
+            // Record field presence independently of successful token recognition.
+            //
+            if (m_pendingTransferEncoding) m_haveTransferEncoding = true;
             // A recognized name is already known to consist of token characters.
             // Other names retain full grammar validation without a second name scan
             // on the framing-only common path.

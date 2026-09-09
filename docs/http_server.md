@@ -81,8 +81,9 @@ must tolerate a null `GetRequestLine()` and inspect `ParseError()`.
 ## Framing and file paths
 
 Content-Length is parsed with checked arithmetic. Repeated or comma-joined lengths must agree.
-Conflicting Content-Length and Transfer-Encoding are rejected. Transfer codings remain opaque;
-a request transfer-coding list must end in exactly one `chunked`. The parser removes chunk
+Content-Length together with any Transfer-Encoding field is rejected, including an empty field.
+Transfer codings remain opaque; the combined request transfer-coding list must be nonempty and
+end in exactly one `chunked`. Empty list members are ignored. The parser removes chunk
 framing without decompressing preceding codings. Connection tokens are case-insensitive and
 may span arbitrarily many receives. HTTP/1.0 defaults to close; HTTP/1.1 defaults to persistence.
 

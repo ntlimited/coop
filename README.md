@@ -109,3 +109,9 @@ For explicit TLS trust, identity verification, and SNI setup, see
 
 The example uses the existing IPv4/DNS Connect helper and leaves redirects, retries,
 and total transaction deadlines to application policy.
+
+## DNS resolution
+
+The [resolver guide](docs/dns_resolver.md) covers explicit configuration, borrowed
+nameserver/hosts storage, lookup policy, and the system-configuration convenience API.
+`coop_dns_parser_tests` exercises packet and configuration parsing without io_uring.

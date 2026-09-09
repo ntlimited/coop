@@ -169,7 +169,7 @@ inline size_t Base64Encode(const uint8_t* src, size_t srcLen, char* dst)
 
 inline void ComputeAcceptKey(const char* clientKey, size_t keyLen, char* out)
 {
-    static constexpr char kGUID[] = "258EAFA5-E914-47DA-95CA-5AB5DC65C37B";
+    static constexpr char kGUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
     SHA1 sha;
     sha.Init();

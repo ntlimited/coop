@@ -2488,14 +2488,14 @@ TEST(HttpFramingTest, ContentLengthWithTransferEncodingRejected)
             EXPECT_FALSE(conn.KeepAlive());
 
             // Reset must not turn the smuggled bytes into the next request: the parser
-            // stays where it was, still failed, rather than starting a request the peer
-            // hid behind a body boundary nobody agreed on.
+            // remains terminal rather than starting a request the peer hid behind a
+            // body boundary nobody agreed on. Terminal accessors return failure, not a
+            // cached borrowed request line whose storage may already have changed.
             //
-            conn.Reset();
+            EXPECT_FALSE(conn.Reset());
             EXPECT_EQ(conn.ParseError(), 400);
-            auto* after = conn.GetRequestLine();
-            ASSERT_NE(after, nullptr);
-            EXPECT_EQ(after->path, "/u");
+            EXPECT_EQ(conn.Error(), -EPROTO);
+            EXPECT_EQ(conn.GetRequestLine(), nullptr);
         });
     });
 }

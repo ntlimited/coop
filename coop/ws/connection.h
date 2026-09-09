@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cassert>
+#include <climits>
 
 #include "types.h"
 #include "coop/io/descriptor.h"
@@ -27,19 +29,18 @@ struct ConnectionBase
     static constexpr size_t DEFAULT_RECV_BUFFER_SIZE = 4096;
     static constexpr size_t DEFAULT_SEND_BUFFER_SIZE = 512;
 
-    // A control frame carries at most 125 bytes and is never fragmented (RFC 6455 5.5),
-    // which is what lets a Ping be echoed back from a fixed-size buffer.
+    // A control frame carries at most 125 bytes and is never fragmented on the wire
+    // (RFC 6455 5.5). Its payload can still arrive in several borrowed receive spans.
     //
     static constexpr size_t MAX_CONTROL_PAYLOAD = 125;
 
-    // Ceiling on one frame's payload and on a fragmented message's total. A peer names
-    // its own payload length in the frame header, up to 2^63-1, and a handler that
-    // reassembles a message holds all of it; without a ceiling the peer picks how much
-    // memory and how much time the connection costs.
+    // Default admission ceiling on data frames and a fragmented message's total.
+    // Callers choose their own limit with SetMaxMessageSize; no payload allocation or
+    // message reassembly is performed by the connection.
     //
     static constexpr size_t DEFAULT_MAX_MESSAGE_SIZE = 16 * 1024 * 1024;
 
-    // Close codes this parser sends when a frame is not the grammar it claims.
+    // Close codes recorded when a frame is not the grammar it claims.
     //
     static constexpr uint16_t CLOSE_PROTOCOL_ERROR = 1002;
     static constexpr uint16_t CLOSE_MESSAGE_TOO_BIG = 1009;
@@ -59,25 +60,39 @@ struct ConnectionBase
     //
     virtual void SkipPayload() = 0;
 
+    // PeerClosed is true after the complete Close payload was delivered or skipped.
+    // Error distinguishes transport failure/truncation from a peer Close handshake.
+    virtual bool PeerClosed() const = 0;
+    virtual int Error() const = 0;
+
     // Send methods. Return false on send failure.
     //
     virtual bool SendText(const void* data, size_t size) = 0;
     virtual bool SendBinary(const void* data, size_t size) = 0;
+
+    // Explicit data-frame fragmentation. Start with Text/Binary and fin=false, then use
+    // Continuation; fin=true ends the message. Control sends may interleave. No buffering
+    // or message accumulation: each call sends one frame synchronously.
+    virtual bool SendFragment(Opcode opcode, bool fin, const void* data, size_t size) = 0;
     virtual bool SendPing(const void* data = nullptr, size_t size = 0) = 0;
     virtual bool SendPong(const void* data, size_t size) = 0;
     virtual bool Close(uint16_t code = 1000) = 0;
 
     virtual bool SendError() const = 0;
 
-    // Non-zero once a frame violated the protocol: the close code the connection sent
-    // before refusing to parse anything further (1002 protocol error, 1009 too big).
+    // Non-zero once a frame violated the protocol: the close code recorded before
+    // refusing further parsing (1002 protocol error, 1009 too big).
     //
     virtual uint16_t ProtocolError() const = 0;
 
-    // Lower the frame/message ceiling below DEFAULT_MAX_MESSAGE_SIZE. Set it before the
-    // first NextFrame().
+    // Set the data-message ceiling (raise, lower, or SIZE_MAX for the protocol limit).
+    // Control frames retain their independent 125-byte protocol limit. Set before parsing.
     //
     virtual void SetMaxMessageSize(size_t bytes) = 0;
+
+    // Default true preserves automatic protocol-error Close replies. False records the
+    // error without sending; the handler can inspect ProtocolError() and choose a reply.
+    virtual void SetAutoCloseOnError(bool enabled) = 0;
 
     virtual io::Descriptor& GetDescriptor() = 0;
 };
@@ -85,28 +100,35 @@ struct ConnectionBase
 // ConnectionImpl<Derived> is the CRTP frame parser. All parsing state lives here; buffer and
 // transport access go through the Derived type (compile-time offset, zero indirection).
 //
-// Implementation in connection.cpp via explicit template instantiation for known transports.
+// Custom transports include detail/connection_impl.hpp; native transports are instantiated in .cpp.
 //
 template<typename Derived>
 struct ConnectionImpl : ConnectionBase
 {
-    ConnectionImpl(io::Descriptor& desc, Context* ctx, time::Interval timeout);
+    explicit ConnectionImpl(time::Interval timeout);
 
     Frame* NextFrame() override;
     void SkipPayload() override;
+    bool PeerClosed() const override { return m_gotClose && m_payloadRemaining == 0; }
+    int Error() const override { return m_recvError; }
     bool SendText(const void* data, size_t size) override;
     bool SendBinary(const void* data, size_t size) override;
+    bool SendFragment(Opcode opcode, bool fin, const void* data, size_t size) override;
     bool SendPing(const void* data, size_t size) override;
     bool SendPong(const void* data, size_t size) override;
     bool Close(uint16_t code) override;
     bool SendError() const override { return m_sendError; }
     uint16_t ProtocolError() const override { return m_protocolError; }
     void SetMaxMessageSize(size_t bytes) override { m_maxMessageSize = bytes; }
-    io::Descriptor& GetDescriptor() override { return m_desc; }
+    void SetAutoCloseOnError(bool enabled) override { m_autoCloseOnError = enabled; }
+    io::Descriptor& GetDescriptor() override
+    {
+        return static_cast<Derived*>(this)->m_transport.Descriptor();
+    }
 
     // Called by Upgrade() to seed the recv buffer with leftover HTTP data.
     //
-    void SetInitialRecvData(size_t n) { m_bufLen = n; }
+    void SetInitialRecvData(size_t n) { assert(n <= RecvBufSize()); m_bufLen = n; }
 
   private:
     // CRTP buffer access
@@ -152,8 +174,6 @@ struct ConnectionImpl : ConnectionBase
     //
     bool Fail(uint16_t code);
 
-    io::Descriptor& m_desc;
-    Context*        m_ctx;
     time::Interval  m_timeout;
 
     size_t          m_bufLen;
@@ -184,6 +204,9 @@ struct ConnectionImpl : ConnectionBase
     size_t          m_messageLen;       // bytes of the message being reassembled
     bool            m_messageOpen;      // a fragmented data message is in progress
     uint16_t        m_protocolError;
+    int             m_recvError;
+    bool            m_sendMessageOpen;
+    bool            m_autoCloseOnError;
 };
 
 // Connection<Transport> is the final concrete WebSocket connection. The transport parameter
@@ -207,17 +230,24 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
                size_t sendBufSize = ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
                time::Interval timeout = std::chrono::seconds(30),
                const char* initialData = nullptr, size_t initialDataSize = 0)
-    : ConnectionImpl<Connection<Transport>>(transport.Descriptor(), ctx, timeout)
+    : ConnectionImpl<Connection<Transport>>(timeout)
     , m_transport(transport)
     , m_recvBufSize(recvBufSize)
     , m_sendBufSize(sendBufSize)
     {
-        if (initialData && initialDataSize > 0 && initialDataSize <= recvBufSize)
+        // At most 12 bytes after the leading two frame-header bytes must fit together.
+        assert(recvBufSize >= 12 && sendBufSize > 0 && sendBufSize <= INT_MAX);
+        assert(initialDataSize <= recvBufSize && (initialData || initialDataSize == 0));
+        (void)ctx;
+        if (initialDataSize > 0)
         {
             memcpy(m_buf, initialData, initialDataSize);
             this->SetInitialRecvData(initialDataSize);
         }
     }
+
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
 
     int DoRecv(void* buf, size_t size, int flags, time::Interval timeout)
     {
@@ -237,3 +267,4 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
 
 } // namespace coop::ws
 } // namespace coop
+

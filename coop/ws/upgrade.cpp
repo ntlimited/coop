@@ -1,150 +1,181 @@
 #include "upgrade.h"
 #include "sha1.h"
 
-#include "coop/http/connection.h"
-
-#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
-namespace coop
+namespace coop::ws
 {
-namespace ws
-{
-
 namespace
 {
-
 bool CaseInsensitiveEq(const char* a, size_t aLen, const char* b, size_t bLen)
 {
     if (aLen != bLen) return false;
-    for (size_t i = 0; i < aLen; i++)
+    for (size_t i = 0; i < aLen; ++i)
     {
-        char ca = a[i];
-        char cb = b[i];
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return false;
+        char c = a[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != b[i]) return false;
     }
     return true;
 }
 
-// Check if `needle` appears in a comma-separated `haystack` (case-insensitive).
-//
-bool ContainsToken(const char* haystack, size_t hayLen,
-                   const char* needle, size_t needleLen)
+// Recognize one token in a streamed comma-separated field. The field may be arbitrarily
+// long: only the match position and whitespace phase survive a receive-buffer refill.
+struct TokenMatch
 {
-    size_t pos = 0;
-    while (pos < hayLen)
+    const char* token;
+    size_t length;
+    size_t pos{0};
+    bool trailing{false};
+    bool mismatch{false};
+    bool found{false};
+
+    void Finish()
     {
-        while (pos < hayLen && (haystack[pos] == ' ' || haystack[pos] == '\t'))
-            pos++;
-
-        size_t start = pos;
-        while (pos < hayLen && haystack[pos] != ',')
-            pos++;
-
-        size_t end = pos;
-        while (end > start && (haystack[end - 1] == ' ' || haystack[end - 1] == '\t'))
-            end--;
-
-        if (CaseInsensitiveEq(haystack + start, end - start, needle, needleLen))
-            return true;
-
-        if (pos < hayLen) pos++;  // skip comma
+        found |= !mismatch && pos == length;
+        pos = 0;
+        trailing = mismatch = false;
     }
-    return false;
+
+    void Feed(const char* data, size_t size)
+    {
+        for (size_t i = 0; i < size; ++i)
+        {
+            char c = data[i];
+            if (c == ',') { Finish(); continue; }
+            if (c == ' ' || c == '\t')
+            {
+                if (pos) trailing = true;
+                continue;
+            }
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (trailing || pos >= length || c != token[pos]) mismatch = true;
+            if (pos < length) ++pos;
+        }
+    }
+};
+
+// Key/version are protocol-sized single values, with optional surrounding OWS. This
+// accumulator rejects overflow instead of truncating it into a seemingly valid value.
+struct SmallValue
+{
+    char* data;
+    size_t capacity;
+    size_t size{0};
+    bool trailing{false};
+    bool invalid{false};
+
+    void Feed(const char* input, size_t count)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            char c = input[i];
+            if (c == ' ' || c == '\t')
+            {
+                if (size) trailing = true;
+                continue;
+            }
+            if (trailing || size == capacity) { invalid = true; continue; }
+            data[size++] = c;
+        }
+    }
+};
+
+int Base64Digit(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
 }
 
-} // anonymous namespace
-
-bool Upgrade(http::ConnectionBase& conn)
+bool ValidKey(const SmallValue& key)
 {
-    // Scan HTTP headers for WebSocket upgrade indicators.
-    //
+    if (key.invalid || key.size != 24 || key.data[22] != '=' || key.data[23] != '=')
+        return false;
+    for (size_t i = 0; i < 22; ++i)
+        if (Base64Digit(key.data[i]) < 0) return false;
+    return (Base64Digit(key.data[21]) & 15) == 0;
+}
+} // namespace
+
+bool Upgrade(http::ConnectionBase& conn, bool respondOnError)
+{
+    // Make request-line decisions before any header read can invalidate its borrowed views.
+    auto* line = conn.GetRequestLine();
+    bool valid = line && line->method == "GET" && line->version == "HTTP/1.1";
     bool hasUpgrade = false;
     bool hasConnection = false;
-    bool hasVersion13 = false;
-    char wsKey[64] = {};
-    size_t wsKeyLen = 0;
-
-    // Header names live in the connection's receive buffer, NUL-terminated in place.
-    // Reading the value refills that buffer, which moves the bytes and takes the
-    // terminator with them — so the name is copied out first. Measuring it afterwards
-    // scans for a NUL that is no longer there, past the end of a 2KB buffer.
-    //
-    char nameBuf[64];
+    bool hasHost = false;
+    bool sawKey = false;
+    bool sawVersion = false;
+    char keyData[24];
+    SmallValue key{keyData, sizeof(keyData)};
+    char versionData[2];
+    SmallValue version{versionData, sizeof(versionData)};
 
     while (const char* name = conn.NextHeaderName())
     {
-        size_t nameLen = strlen(name);
-        if (nameLen >= sizeof(nameBuf))
-        {
-            conn.SkipHeaderValue();     // no handshake header is anywhere near this long
-            continue;
-        }
-        memcpy(nameBuf, name, nameLen + 1);
+        // Classify now: the next read may overwrite both name and value storage.
+        size_t size = strlen(name);
+        enum Field { Other, UpgradeField, ConnectionField, KeyField, VersionField, HostField };
+        Field field = Other;
+        if (CaseInsensitiveEq(name, size, "upgrade", 7)) field = UpgradeField;
+        else if (CaseInsensitiveEq(name, size, "connection", 10)) field = ConnectionField;
+        else if (CaseInsensitiveEq(name, size, "sec-websocket-key", 17)) field = KeyField;
+        else if (CaseInsensitiveEq(name, size, "sec-websocket-version", 21)) field = VersionField;
+        else if (CaseInsensitiveEq(name, size, "host", 4)) field = HostField;
 
-        auto* val = conn.ReadHeaderValue();
-        if (!val) continue;
-
-        auto* vData = static_cast<const char*>(val->data);
-        size_t vLen = val->size;
-
-        // A value delivered in pieces has already been split by a refill; the pieces the
-        // handshake cares about are all short enough to arrive whole.
-        //
-        if (!val->complete)
+        if (field == Other) { conn.SkipHeaderValue(); continue; }
+        if (field == KeyField) { valid &= !sawKey; sawKey = true; }
+        if (field == VersionField) { valid &= !sawVersion; sawVersion = true; }
+        TokenMatch match{field == UpgradeField ? "websocket" : "upgrade",
+                         field == UpgradeField ? size_t(9) : size_t(7)};
+        while (auto* chunk = conn.ReadHeaderValue())
         {
-            conn.SkipHeaderValue();
-            continue;
+            auto* data = static_cast<const char*>(chunk->data);
+            if (field == UpgradeField || field == ConnectionField) match.Feed(data, chunk->size);
+            else if (field == KeyField) key.Feed(data, chunk->size);
+            else if (field == VersionField) version.Feed(data, chunk->size);
+            else
+                for (size_t i = 0; i < chunk->size; ++i)
+                    hasHost |= data[i] != ' ' && data[i] != '\t';
+            if (chunk->complete) break;
         }
-
-        if (CaseInsensitiveEq(nameBuf, nameLen, "upgrade", 7))
-        {
-            if (CaseInsensitiveEq(vData, vLen, "websocket", 9))
-                hasUpgrade = true;
-        }
-        else if (CaseInsensitiveEq(nameBuf, nameLen, "connection", 10))
-        {
-            if (ContainsToken(vData, vLen, "upgrade", 7))
-                hasConnection = true;
-        }
-        else if (CaseInsensitiveEq(nameBuf, nameLen, "sec-websocket-key", 17))
-        {
-            wsKeyLen = std::min(vLen, sizeof(wsKey) - 1);
-            memcpy(wsKey, vData, wsKeyLen);
-        }
-        else if (CaseInsensitiveEq(nameBuf, nameLen, "sec-websocket-version", 21))
-        {
-            if (vLen == 2 && vData[0] == '1' && vData[1] == '3')
-                hasVersion13 = true;
-        }
+        match.Finish();
+        if (field == UpgradeField) hasUpgrade |= match.found;
+        if (field == ConnectionField) hasConnection |= match.found;
     }
 
-    if (!hasUpgrade || !hasConnection || wsKeyLen == 0 || !hasVersion13)
+    // Never append a 101 (or a second error response) after HTTP framing failed. A body
+    // cannot be handed to the frame parser as if it were already WebSocket traffic.
+    if (conn.Error() != 0 || conn.ParseError() != 0 || conn.SendError()) return false;
+    if (!valid || !hasHost || !hasUpgrade || !hasConnection || !sawKey || !ValidKey(key)
+        || !sawVersion || version.invalid || version.size != 2
+        || version.data[0] != '1' || version.data[1] != '3' || !conn.Complete())
     {
-        conn.Send(400, "text/plain", "Bad WebSocket handshake\n", 24);
+        conn.ForceClose();
+        if (respondOnError)
+        {
+            constexpr char error[] = "Bad WebSocket handshake\n";
+            conn.Send(400, "text/plain", error, sizeof(error) - 1);
+        }
         return false;
     }
 
-    // Compute Sec-WebSocket-Accept.
-    //
     char acceptKey[32];
-    detail::ComputeAcceptKey(wsKey, wsKeyLen, acceptKey);
-
-    // Send 101 Switching Protocols.
-    //
+    detail::ComputeAcceptKey(key.data, key.size, acceptKey);
     char response[256];
-    int respLen = snprintf(response, sizeof(response),
+    int size = snprintf(response, sizeof(response),
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: %s\r\n"
-        "\r\n", acceptKey);
-
-    return conn.SendRawBytes(response, static_cast<size_t>(respLen));
+        "Sec-WebSocket-Accept: %s\r\n\r\n", acceptKey);
+    // The HTTP keep-alive loop must never resume parsing after a protocol handoff.
+    conn.ForceClose();
+    return conn.SendRawBytes(response, static_cast<size_t>(size));
 }
-
 } // namespace coop::ws
-} // namespace coop

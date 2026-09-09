@@ -188,7 +188,7 @@ TEST(WsTest, SHA1AcceptKey)
     //
     char accept[32];
     coop::ws::detail::ComputeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==", 24, accept);
-    EXPECT_STREQ(accept, "fgMhHRkFb6vkp88ijC+kVh06XXU=");
+    EXPECT_STREQ(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 }
 
 // -------------------------------------------------------------------------------------
@@ -221,7 +221,7 @@ TEST(WsTest, UpgradeSuccess)
         //
         std::string resp = RecvAll(client);
         EXPECT_NE(resp.find("101 Switching Protocols"), std::string::npos);
-        EXPECT_NE(resp.find("fgMhHRkFb6vkp88ijC+kVh06XXU="), std::string::npos);
+        EXPECT_NE(resp.find("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), std::string::npos);
     });
 }
 
@@ -999,3 +999,4 @@ TEST(WsFramingTest, FragmentedTextMessageDelivered)
         });
     });
 }
+

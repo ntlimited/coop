@@ -295,6 +295,14 @@ add_executable(coop_tls_config_tests tests/test_tls_client_config.cpp)
 target_link_libraries(coop_tls_config_tests PRIVATE coop GTest::gtest_main)
 gtest_discover_tests(coop_tls_config_tests)
 
+add_executable(coop_http_server_parser_tests tests/test_http_server_parser.cpp)
+target_link_libraries(coop_http_server_parser_tests PRIVATE coop GTest::gtest_main)
+gtest_discover_tests(coop_http_server_parser_tests)
+
+add_executable(coop_ws_parser_tests tests/test_ws_parser.cpp)
+target_link_libraries(coop_ws_parser_tests PRIVATE coop GTest::gtest_main)
+gtest_discover_tests(coop_ws_parser_tests)
+
 add_executable(http_fetch examples/http_fetch.cpp)
 target_link_libraries(http_fetch PRIVATE coop)
 

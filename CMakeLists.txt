@@ -281,6 +281,16 @@ set_source_files_properties(tests/test_introspect.cpp PROPERTIES
 include(GoogleTest)
 gtest_discover_tests(coop_tests)
 
+# The HTTP parser runs against a static scripted transport: receive boundaries and
+# failures are deterministic, and these regressions do not require a kernel ring.
+#
+add_executable(coop_http_parser_tests tests/test_http_client_parser.cpp)
+target_link_libraries(coop_http_parser_tests PRIVATE coop GTest::gtest_main)
+gtest_discover_tests(coop_http_parser_tests)
+
+add_executable(bench_http_parser benchmarks/bench_http_parser.cpp)
+target_link_libraries(bench_http_parser PRIVATE coop benchmark::benchmark)
+
 # Packet/config parsing uses the production implementation without a kernel ring.
 add_executable(coop_dns_parser_tests tests/test_dns_parser.cpp)
 target_link_libraries(coop_dns_parser_tests PRIVATE coop GTest::gtest_main)

@@ -795,4 +795,76 @@ TEST(HttpClientParser, CombinedIdenticalContentLengthsAreAccepted)
     ExpectReusableResponse(parser, "hello");
 }
 
+TEST(HttpClientParser, EmptyTransferEncodingCannotSelectBodyFraming)
+{
+    for (const std::string value : {"", " \t ", ",", " , ,\t,"})
+    {
+        for (const std::string length : {"", "Content-Length: 0\r\n"})
+        {
+            const std::string wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding:" + value +
+                "\r\n" + length + "\r\nextra";
+            auto reject = [&](std::vector<std::string> packets)
+            {
+                Parser parser(std::move(packets), 32);
+                EXPECT_EQ(parser.Body(), "");
+                EXPECT_EQ(parser.client->Error(), -EPROTO);
+                EXPECT_FALSE(parser.client->Complete());
+                EXPECT_FALSE(parser.client->Reusable());
+                EXPECT_FALSE(parser.client->Reset());
+            };
+            SCOPED_TRACE(wire);
+            reject({wire});
+            reject(Bytes(wire));
+            for (size_t split = 1; split < wire.size(); ++split)
+            {
+                SCOPED_TRACE(split);
+                reject({wire.substr(0, split), wire.substr(split)});
+            }
+        }
+    }
+}
+
+TEST(HttpClientParser, TransferEncodingEmptyMembersAcrossFieldsPreserveCoding)
+{
+    for (const std::string fields : {
+        "Transfer-Encoding: ,gzip,,chunked,,\r\n",
+        "Transfer-Encoding: , ,\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: \t, ,\r\n"})
+    {
+        const std::string wire = "HTTP/1.1 200 OK\r\n" + fields + "\r\n2\r\nok\r\n0\r\n\r\n";
+        auto accept = [&](std::vector<std::string> packets)
+        {
+            Parser parser(std::move(packets), 32);
+            ExpectReusableResponse(parser, "ok");
+        };
+        SCOPED_TRACE(fields);
+        accept({wire});
+        accept(Bytes(wire));
+        for (size_t split = 1; split < wire.size(); ++split)
+        {
+            SCOPED_TRACE(split);
+            accept({wire.substr(0, split), wire.substr(split)});
+        }
+    }
+}
+
+TEST(HttpClientParser, SuccessfulConnectIgnoresEmptyTransferEncoding)
+{
+    for (const std::string value : {"", " \t ", ",", " , ,\t,"})
+    {
+        const std::string wire = "HTTP/1.1 200 Connection Established\r\n"
+            "Content-Length: not-a-length\r\nTransfer-Encoding:" + value + "\r\n\r\n";
+        for (bool fragmented : {false, true})
+        {
+            Parser parser(fragmented ? Bytes(wire) : std::vector<std::string>{wire});
+            ASSERT_TRUE(parser.client->SendRequest("CONNECT", "example.test:443"));
+            EXPECT_EQ(parser.Body(), "");
+            EXPECT_TRUE(parser.client->Complete());
+            EXPECT_EQ(parser.client->Error(), 0);
+            EXPECT_EQ(parser.client->ContentLength(), -1);
+            EXPECT_FALSE(parser.client->Reusable());
+        }
+    }
+}
+
 } // namespace

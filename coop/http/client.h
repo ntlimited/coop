@@ -240,7 +240,8 @@ struct ClientConnectionImpl : detail::ParserBuffer<Derived>
     int             m_error;
     bool            m_needChunkCrlf;
     bool            m_closeDelimited;
-    bool            m_transferEncoding;
+    bool            m_transferEncoding; // at least one parsed transfer coding
+    bool            m_hasTransferEncoding; // field presence, including empty lists
     bool            m_upgraded;
     bool            m_isConnect;
     bool            m_valueStarted;

@@ -67,6 +67,7 @@ jobs:
       - name: Test
         run: |
           ./build/bin/coop_http_parser_tests
+          ./build/bin/coop_tls_config_tests
           ./build/bin/coop_dns_parser_tests
           # Preserve native execution and its exit status; inspect a core only after failure.
           ulimit -c unlimited

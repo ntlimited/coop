@@ -50,3 +50,15 @@ Both kTLS and socket BIO paths use direct syscalls with `io::Poll` fallback, avo
 for the common case where the syscall succeeds immediately. This is critical for throughput —
 routing every send through `io::Send` (uring SQE/CQE) adds ~20us per-op overhead that
 dominates the crypto savings kTLS provides.
+
+## Client authentication policy
+
+Client contexts preserve OpenSSL's `SSL_VERIFY_NONE` default. Opt-in helpers keep trust,
+verification, and routing identity separate: `Context::AddTrustedCertificate` loads one PEM
+trust anchor without I/O, `LoadDefaultVerifyPaths` explicitly opts into filesystem-backed trust,
+and `EnablePeerVerification` enables OpenSSL chain verification. Configure the context before
+creating connections. Per-connection `SetVerifyHost`/`SetVerifyIp` select DNS/IP authentication;
+`SetServerName` sets DNS SNI independently. None adds object state or data-path branches, and
+`m_ctx`/`m_ssl` remain available for custom policy. See `docs/tls_client.md` for checked setup and
+lifetimes. `coop_tls_config_tests` exercises real memory-BIO TLS handshakes without initializing
+io_uring; scheduler, socket BIO, and kTLS integration still require runtime tests.

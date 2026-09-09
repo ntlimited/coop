@@ -43,8 +43,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y liburing-dev libssl-dev gdb
+          # All dependencies come from Ubuntu; unrelated preinstalled package feeds must
+          # not make builds depend on their availability or metadata consistency.
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources
+                       -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" update
+          sudo apt-get "${apt_sources[@]}" install -y liburing-dev libssl-dev gdb
 
       - name: Probe io_uring availability
         run: |

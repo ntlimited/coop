@@ -72,6 +72,7 @@ void ClientConnectionImpl<Derived>::ClearResponse()
     m_needChunkCrlf = false;
     m_closeDelimited = false;
     m_transferEncoding = false;
+    m_hasTransferEncoding = false;
     m_upgraded = false;
     m_valueStarted = false;
     m_fieldNumber = 0;
@@ -244,9 +245,11 @@ bool ClientConnectionImpl<Derived>::FinishHeaders()
         return true;
     }
     // Ambiguous framing must never enter a persistent connection pool. Reject it
-    // rather than silently deciding which upstream interpretation to trust.
+    // rather than silently deciding which upstream interpretation to trust. A present
+    // Transfer-Encoding field must contribute a coding across its combined values.
     //
-    if (m_transferEncoding && m_contentLength >= 0) return Fail(-EPROTO);
+    if (m_hasTransferEncoding && (!m_transferEncoding || m_contentLength >= 0))
+        return Fail(-EPROTO);
     m_phase = BODY;
     m_closeDelimited = !m_chunkedBody && (m_transferEncoding || m_contentLength < 0);
     if (m_closeDelimited) m_serverClose = true;
@@ -283,6 +286,7 @@ const char* ClientConnectionImpl<Derived>::NextHeaderName()
             m_pendingContentLength = length == 14 && !strncasecmp(start, "content-length", 14);
             m_pendingTransferEncoding = length == 17 && !strncasecmp(start, "transfer-encoding", 17);
             m_pendingConnection = length == 10 && !strncasecmp(start, "connection", 10);
+            if (m_pendingTransferEncoding) m_hasTransferEncoding = true;
             // A recognized name is already known to consist of token characters.
             // Other names retain full grammar validation without a second name scan
             // on the framing-only common path.

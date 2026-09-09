@@ -87,8 +87,10 @@ Successful CONNECT ignores Content-Length/Transfer-Encoding and reports length `
 
 Fixed-length, chunked, and close-delimited responses are supported. Content-Length must
 contain valid nonnegative decimal values that fit `int64_t`; repeated values must agree.
-Conflicting Content-Length/Transfer-Encoding on body-bearing responses is rejected. Chunk sizes are checked for
-overflow, delimiters and extensions validated, and trailers consumed before completion.
+Conflicting Content-Length/Transfer-Encoding on body-bearing responses is rejected, as is
+a Transfer-Encoding list containing no coding. Empty list members are ignored when the
+combined field values contain a coding. Chunk sizes are checked for overflow, delimiters
+and extensions validated, and trailers consumed before completion.
 Trailers are validated/discarded without materializing them or changing body framing;
 this interface does not expose trailer fields.
 

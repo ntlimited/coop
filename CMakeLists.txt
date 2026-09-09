@@ -259,6 +259,7 @@ add_executable(coop_tests
     tests/test_shutdown.cpp
     tests/test_uring_lifecycle.cpp
     tests/test_io.cpp
+    tests/test_dns_runtime.cpp
     tests/test_armed_handle.cpp
     tests/test_stress.cpp
     tests/test_http.cpp
@@ -304,6 +305,11 @@ gtest_discover_tests(coop_ws_parser_tests)
 
 add_executable(http_fetch examples/http_fetch.cpp)
 target_link_libraries(http_fetch PRIVATE coop)
+
+# Packet/config parsing uses the production implementation without a kernel ring.
+add_executable(coop_dns_parser_tests tests/test_dns_parser.cpp)
+target_link_libraries(coop_dns_parser_tests PRIVATE coop GTest::gtest_main)
+gtest_discover_tests(coop_dns_parser_tests)
 
 # Developer debugger smoke fixture; --bare also runs without io_uring.
 add_executable(coop_gdb_fixture tests/gdb_fixture.cpp)

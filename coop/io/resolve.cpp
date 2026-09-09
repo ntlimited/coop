@@ -1,552 +1,248 @@
 #include "resolve.h"
 
-#include <arpa/inet.h>
 #include <cerrno>
-#include <cstdlib>
-#include <cstring>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
+#include <chrono>
+#include <fcntl.h>
+#include <memory>
 #include <string>
-#include <unordered_map>
+#include <sys/random.h>
+#include <sys/socket.h>
 #include <vector>
 
-#include <spdlog/spdlog.h>
-
+#include "coop/cooperator_var.hpp"
+#include "coop/coordinator.h"
 #include "coop/self.h"
 
-#include "close.h"
 #include "connect.h"
 #include "descriptor.h"
-#include "read_file.h"
+#include "detail/dns.hpp"
+#include "open.h"
+#include "read.h"
 #include "recv.h"
 #include "send.h"
 
-namespace coop
+namespace coop::io
 {
 
-namespace io
+int ParseResolverConfig(std::string_view text, std::span<sockaddr_in> storage,
+                        ResolverConfig& config)
 {
-
-// -------------------------------------------------------------------------------------
-// Config state — lazily parsed on first Resolve4 call
-// -------------------------------------------------------------------------------------
-
-struct ResolvConfig
-{
-    std::vector<struct sockaddr_in> nameservers;
-    int timeoutSec  = 5;
-    int attempts    = 2;
-    bool loaded     = false;
-};
-
-struct HostsConfig
-{
-    std::unordered_map<std::string, struct in_addr> entries;
-    bool loaded = false;
-};
-
-static ResolvConfig s_resolv;
-static HostsConfig  s_hosts;
-
-// -------------------------------------------------------------------------------------
-// Config parsers
-// -------------------------------------------------------------------------------------
-
-static void ParseResolvConf()
-{
-    if (s_resolv.loaded) return;
-    s_resolv.loaded = true;
-
-    char buf[4096];
-    int len = ReadFile("/etc/resolv.conf", buf, sizeof(buf) - 1);
-    if (len < 0)
+    size_t used = 0;
+    ResolverConfig parsed = config;
+    int r = detail::DnsConfig(text, parsed, [&](sockaddr_in address)
     {
-        spdlog::warn("resolve: failed to read /etc/resolv.conf err={}", len);
-        return;
-    }
-    buf[len] = '\0';
-
-    char* line = buf;
-    while (line && *line)
-    {
-        char* nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        // Skip leading whitespace
-        //
-        while (*line == ' ' || *line == '\t') line++;
-
-        if (strncmp(line, "nameserver", 10) == 0 && (line[10] == ' ' || line[10] == '\t'))
-        {
-            char* ip = line + 11;
-            while (*ip == ' ' || *ip == '\t') ip++;
-
-            // Trim trailing whitespace
-            //
-            char* end = ip + strlen(ip) - 1;
-            while (end > ip && (*end == ' ' || *end == '\t' || *end == '\r')) *end-- = '\0';
-
-            struct sockaddr_in addr = {};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(53);
-            if (inet_pton(AF_INET, ip, &addr.sin_addr) == 1)
-            {
-                s_resolv.nameservers.push_back(addr);
-                SPDLOG_DEBUG("resolve: nameserver {}", ip);
-            }
-        }
-        else if (strncmp(line, "options", 7) == 0 && (line[7] == ' ' || line[7] == '\t'))
-        {
-            char* opts = line + 8;
-
-            char* timeout = strstr(opts, "timeout:");
-            if (timeout)
-            {
-                int val = atoi(timeout + 8);
-                if (val > 0) s_resolv.timeoutSec = val;
-            }
-
-            char* attempts = strstr(opts, "attempts:");
-            if (attempts)
-            {
-                int val = atoi(attempts + 9);
-                if (val > 0) s_resolv.attempts = val;
-            }
-        }
-
-        line = nl ? nl + 1 : nullptr;
-    }
-
-    if (s_resolv.nameservers.empty())
-    {
-        spdlog::warn("resolve: no nameservers found, adding 127.0.0.53 as fallback");
-        struct sockaddr_in fallback = {};
-        fallback.sin_family = AF_INET;
-        fallback.sin_port = htons(53);
-        inet_pton(AF_INET, "127.0.0.53", &fallback.sin_addr);
-        s_resolv.nameservers.push_back(fallback);
-    }
-}
-
-static void ParseHosts()
-{
-    if (s_hosts.loaded) return;
-    s_hosts.loaded = true;
-
-    char buf[8192];
-    int len = ReadFile("/etc/hosts", buf, sizeof(buf) - 1);
-    if (len < 0)
-    {
-        spdlog::warn("resolve: failed to read /etc/hosts err={}", len);
-        return;
-    }
-    buf[len] = '\0';
-
-    char* line = buf;
-    while (line && *line)
-    {
-        char* nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
-        // Skip leading whitespace
-        //
-        while (*line == ' ' || *line == '\t') line++;
-
-        // Skip comments and blank lines
-        //
-        if (*line == '#' || *line == '\0')
-        {
-            line = nl ? nl + 1 : nullptr;
-            continue;
-        }
-
-        // Parse: <ip> <hostname> [aliases...]
-        //
-        char* ip = line;
-        char* sep = ip;
-        while (*sep && *sep != ' ' && *sep != '\t') sep++;
-        if (!*sep)
-        {
-            line = nl ? nl + 1 : nullptr;
-            continue;
-        }
-        *sep = '\0';
-
-        struct in_addr addr;
-        if (inet_pton(AF_INET, ip, &addr) != 1)
-        {
-            // Could be IPv6 — skip
-            //
-            line = nl ? nl + 1 : nullptr;
-            continue;
-        }
-
-        // Walk remaining tokens as hostnames
-        //
-        char* tok = sep + 1;
-        while (*tok)
-        {
-            while (*tok == ' ' || *tok == '\t') tok++;
-            if (!*tok || *tok == '#') break;
-
-            char* end = tok;
-            while (*end && *end != ' ' && *end != '\t' && *end != '#' && *end != '\r') end++;
-
-            std::string name(tok, end - tok);
-            s_hosts.entries[name] = addr;
-            SPDLOG_DEBUG("resolve: hosts entry {} -> {}", name, ip);
-
-            tok = end;
-        }
-
-        line = nl ? nl + 1 : nullptr;
-    }
-}
-
-// -------------------------------------------------------------------------------------
-// DNS packet construction
-// -------------------------------------------------------------------------------------
-
-// Encode a hostname into DNS wire format (length-prefixed labels). Returns bytes written,
-// or 0 on error (hostname too long, empty label, etc).
-//
-static int EncodeDnsName(const char* hostname, uint8_t* buf, int bufSize)
-{
-    int pos = 0;
-    const char* p = hostname;
-
-    while (*p)
-    {
-        const char* dot = strchr(p, '.');
-        int labelLen = dot ? static_cast<int>(dot - p) : static_cast<int>(strlen(p));
-
-        if (labelLen == 0)
-        {
-            // Trailing dot — just skip it
-            //
-            if (dot)
-            {
-                p = dot + 1;
-                continue;
-            }
-            break;
-        }
-
-        if (labelLen > 63 || pos + 1 + labelLen >= bufSize)
-        {
-            return 0;
-        }
-
-        buf[pos++] = static_cast<uint8_t>(labelLen);
-        memcpy(buf + pos, p, labelLen);
-        pos += labelLen;
-
-        p = dot ? dot + 1 : p + labelLen;
-    }
-
-    if (pos + 1 > bufSize) return 0;
-    buf[pos++] = 0; // root label
-    return pos;
-}
-
-// Build a DNS A-record query. Returns total packet length, or 0 on error.
-//
-static int BuildDnsQuery(const char* hostname, uint8_t* buf, int bufSize, uint16_t txnId)
-{
-    if (bufSize < 12) return 0;
-
-    // Header (12 bytes)
-    //
-    buf[0] = txnId >> 8;
-    buf[1] = txnId & 0xFF;
-    buf[2] = 0x01; // flags: RD (recursion desired)
-    buf[3] = 0x00;
-    buf[4] = 0x00; buf[5] = 0x01; // QDCOUNT = 1
-    buf[6] = 0x00; buf[7] = 0x00; // ANCOUNT = 0
-    buf[8] = 0x00; buf[9] = 0x00; // NSCOUNT = 0
-    buf[10] = 0x00; buf[11] = 0x00; // ARCOUNT = 0
-
-    int nameLen = EncodeDnsName(hostname, buf + 12, bufSize - 12 - 4);
-    if (nameLen == 0) return 0;
-
-    int pos = 12 + nameLen;
-    if (pos + 4 > bufSize) return 0;
-
-    // QTYPE = A (1)
-    //
-    buf[pos++] = 0x00;
-    buf[pos++] = 0x01;
-
-    // QCLASS = IN (1)
-    //
-    buf[pos++] = 0x00;
-    buf[pos++] = 0x01;
-
-    return pos;
-}
-
-// -------------------------------------------------------------------------------------
-// DNS response parsing
-// -------------------------------------------------------------------------------------
-
-// Skip a DNS name in wire format, handling compression pointers. Returns the number of bytes
-// consumed from the current position, or 0 on error.
-//
-static int SkipDnsName(const uint8_t* pkt, int pktLen, int offset)
-{
-    int pos = offset;
-    int jumped = 0;
-    int bytesConsumed = 0;
-
-    while (pos < pktLen)
-    {
-        uint8_t len = pkt[pos];
-
-        if (len == 0)
-        {
-            // End of name
-            //
-            if (!jumped) bytesConsumed = pos - offset + 1;
-            return bytesConsumed ? bytesConsumed : 1;
-        }
-
-        if ((len & 0xC0) == 0xC0)
-        {
-            // Compression pointer
-            //
-            if (pos + 1 >= pktLen) return 0;
-            if (!jumped) bytesConsumed = pos - offset + 2;
-            int ptr = ((len & 0x3F) << 8) | pkt[pos + 1];
-            if (ptr >= pktLen) return 0;
-            pos = ptr;
-            jumped = 1;
-            continue;
-        }
-
-        if (len > 63) return 0;
-        pos += 1 + len;
-    }
-
+        if (used == storage.size()) return -ENOSPC;
+        storage[used++] = address;
+        return 0;
+    });
+    if (r < 0) return r;
+    parsed.nameservers = storage.first(used);
+    config = parsed;
     return 0;
 }
 
-// Parse a DNS response and extract the first A record. Returns 0 on success, negative errno
-// on failure.
+namespace
+{
+
+// Only the legacy convenience path owns configuration. The eager per-cooperator cost is one
+// pointer; its state and contiguous backing storage are allocated only on the first hostname
+// lookup. Publication happens after all cooperative setup I/O succeeds, under the coordinator.
+// DNS queries never mutate configuration, so lookups release the setup gate before doing IO.
 //
-static int ParseDnsResponse(const uint8_t* pkt, int pktLen, uint16_t expectedId,
-                            struct in_addr* result)
+struct DefaultResolver
 {
-    if (pktLen < 12)
+    Coordinator loading;
+    bool ready = false;
+    std::string hosts;
+    std::vector<sockaddr_in> nameservers;
+    ResolverConfig config;
+};
+
+CooperatorVar<std::unique_ptr<DefaultResolver>> s_defaultResolver;
+
+struct SetupGuard
+{
+    Coordinator& coord;
+    Context* context = Self();
+    explicit SetupGuard(Coordinator& c) : coord(c) { coord.Acquire(context); }
+    ~SetupGuard() { coord.Release(context, false); }
+};
+
+int LoadText(const char* path, std::string& text)
+{
+    int fd = Open(path, O_RDONLY);
+    if (fd < 0) return fd;
+    Descriptor file(fd);
+    char chunk[1024];
+    uint64_t offset = 0;
+    for (;;)
     {
-        SPDLOG_DEBUG("resolve: response too short len={}", pktLen);
-        return -EPROTO;
+        int n = Read(file, chunk, sizeof(chunk), offset);
+        if (n < 0) return n;
+        if (n == 0) return 0;
+        text.append(chunk, static_cast<size_t>(n));
+        offset += static_cast<unsigned>(n);
     }
-
-    uint16_t id = (pkt[0] << 8) | pkt[1];
-    if (id != expectedId)
-    {
-        SPDLOG_DEBUG("resolve: id mismatch expected={} got={}", expectedId, id);
-        return -EPROTO;
-    }
-
-    uint8_t flags1 = pkt[2];
-    uint8_t flags2 = pkt[3];
-
-    // Check QR bit (must be 1 = response)
-    //
-    if (!(flags1 & 0x80))
-    {
-        SPDLOG_DEBUG("resolve: QR bit not set");
-        return -EPROTO;
-    }
-
-    // Check RCODE
-    //
-    int rcode = flags2 & 0x0F;
-    if (rcode == 3) // NXDOMAIN
-    {
-        SPDLOG_DEBUG("resolve: NXDOMAIN");
-        return -ENOENT;
-    }
-    if (rcode != 0)
-    {
-        SPDLOG_DEBUG("resolve: DNS error rcode={}", rcode);
-        return -EPROTO;
-    }
-
-    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
-    uint16_t ancount = (pkt[6] << 8) | pkt[7];
-
-    // Skip question section
-    //
-    int pos = 12;
-    for (int i = 0; i < qdcount; i++)
-    {
-        int nameLen = SkipDnsName(pkt, pktLen, pos);
-        if (nameLen == 0) return -EPROTO;
-        pos += nameLen;
-        pos += 4; // QTYPE + QCLASS
-        if (pos > pktLen) return -EPROTO;
-    }
-
-    // Walk answer RRs looking for the first A record
-    //
-    for (int i = 0; i < ancount; i++)
-    {
-        int nameLen = SkipDnsName(pkt, pktLen, pos);
-        if (nameLen == 0) return -EPROTO;
-        pos += nameLen;
-
-        if (pos + 10 > pktLen) return -EPROTO;
-
-        uint16_t rrtype  = (pkt[pos] << 8) | pkt[pos + 1];
-        uint16_t rrclass = (pkt[pos + 2] << 8) | pkt[pos + 3];
-        // TTL at pos+4..pos+7 (unused)
-        uint16_t rdlen   = (pkt[pos + 8] << 8) | pkt[pos + 9];
-        pos += 10;
-
-        if (pos + rdlen > pktLen) return -EPROTO;
-
-        if (rrtype == 1 && rrclass == 1 && rdlen == 4)
-        {
-            // A record — copy the 4-byte IPv4 address
-            //
-            memcpy(result, pkt + pos, 4);
-            return 0;
-        }
-
-        pos += rdlen;
-    }
-
-    SPDLOG_DEBUG("resolve: no A record in {} answers", ancount);
-    return -ENOENT;
 }
 
-// -------------------------------------------------------------------------------------
-// Transport
-// -------------------------------------------------------------------------------------
-
-static int DoResolve4(const char* hostname, struct in_addr* result, time::Interval timeout)
+int DefaultConfig(ResolverConfig& config)
 {
-    // Fast path: numeric address
-    //
-    if (inet_pton(AF_INET, hostname, result) == 1)
+    auto& owner = *s_defaultResolver;
+    if (!owner) owner = std::make_unique<DefaultResolver>();
+    auto& state = *owner;
+    if (!state.ready)
     {
-        return 0;
-    }
-
-    // Check /etc/hosts
-    //
-    ParseHosts();
-    auto it = s_hosts.entries.find(hostname);
-    if (it != s_hosts.entries.end())
-    {
-        *result = it->second;
-        SPDLOG_DEBUG("resolve: {} found in /etc/hosts", hostname);
-        return 0;
-    }
-
-    // DNS query
-    //
-    ParseResolvConf();
-
-    // Build query packet
-    //
-    uint16_t txnId = static_cast<uint16_t>(rand() & 0xFFFF);
-    uint8_t query[512];
-    int queryLen = BuildDnsQuery(hostname, query, sizeof(query), txnId);
-    if (queryLen == 0)
-    {
-        spdlog::warn("resolve: failed to build query for {}", hostname);
-        return -EINVAL;
-    }
-
-    // Try each nameserver
-    //
-    for (auto& ns : s_resolv.nameservers)
-    {
-        for (int attempt = 0; attempt < s_resolv.attempts; attempt++)
+        SetupGuard guard(state.loading);
+        if (!state.ready)
         {
-            int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-            if (fd < 0)
-            {
-                spdlog::warn("resolve: socket() failed errno={}", errno);
-                return -errno;
-            }
-
-            auto* ring = GetUring();
-            Descriptor desc(fd, ring);
-
-            // UDP connect just sets the destination address
+            // Build privately: a failed read/parse leaves no half-loaded configuration behind.
+            // Missing hosts is allowed; unreadable or malformed resolver configuration is not
+            // silently replaced with an empty successful snapshot.
             //
-            int ret = Connect(desc, (struct sockaddr*)&ns, sizeof(ns));
-            if (ret < 0)
+            std::string hosts, resolv;
+            std::vector<sockaddr_in> nameservers;
+            ResolverConfig parsed;
+            int r = LoadText("/etc/hosts", hosts);
+            if (r < 0 && r != -ENOENT) return r;
+            r = LoadText("/etc/resolv.conf", resolv);
+            if (r < 0) return r;
+            r = detail::DnsConfig(resolv, parsed, [&](sockaddr_in address)
             {
-                SPDLOG_DEBUG("resolve: connect to nameserver failed ret={}", ret);
-                desc.Close();
-                continue;
-            }
-
-            ret = Send(desc, query, queryLen);
-            if (ret < 0)
-            {
-                SPDLOG_DEBUG("resolve: send failed ret={}", ret);
-                desc.Close();
-                continue;
-            }
-
-            uint8_t response[512];
-            ret = Recv(desc, response, sizeof(response), 0, timeout);
-            desc.Close();
-
-            if (ret == -ETIMEDOUT)
-            {
-                SPDLOG_DEBUG("resolve: timeout from nameserver, attempt {}", attempt + 1);
-                continue;
-            }
-
-            if (ret < 0)
-            {
-                SPDLOG_DEBUG("resolve: recv failed ret={}", ret);
-                continue;
-            }
-
-            int parseRet = ParseDnsResponse(response, ret, txnId, result);
-            if (parseRet == 0)
-            {
-                char ipStr[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, result, ipStr, sizeof(ipStr));
-                SPDLOG_DEBUG("resolve: {} -> {}", hostname, ipStr);
+                nameservers.push_back(address);
                 return 0;
-            }
-
-            // NXDOMAIN is authoritative — don't retry other nameservers
-            //
-            if (parseRet == -ENOENT)
+            });
+            if (r < 0) return r;
+            if (nameservers.empty())
             {
-                return parseRet;
+                // Preserve the convenience resolver's local-stub fallback. Explicit configs
+                // have no fallback: an empty nameserver span is -ENETUNREACH when DNS is needed.
+                //
+                sockaddr_in fallback{};
+                fallback.sin_family = AF_INET;
+                fallback.sin_port = htons(53);
+                fallback.sin_addr.s_addr = htonl(0x7f000035); // 127.0.0.53
+                nameservers.push_back(fallback);
             }
-
-            SPDLOG_DEBUG("resolve: parse error ret={}, retrying", parseRet);
+            state.hosts = std::move(hosts);
+            state.nameservers = std::move(nameservers);
+            parsed.hosts = state.hosts;
+            parsed.nameservers = state.nameservers;
+            state.config = parsed;
+            state.ready = true;
         }
     }
-
-    spdlog::warn("resolve: all nameservers exhausted for {}", hostname);
-    return -ETIMEDOUT;
+    config = state.config;
+    return 0;
 }
 
-int Resolve4(const char* hostname, struct in_addr* result)
+int Numeric(const char* hostname, in_addr* result)
 {
-    auto timeout = std::chrono::seconds(s_resolv.loaded ? s_resolv.timeoutSec : 5);
-    return DoResolve4(hostname, result, std::chrono::duration_cast<time::Interval>(timeout));
+    if (!hostname || !result || !*hostname) return -EINVAL;
+    in_addr address;
+    if (inet_pton(AF_INET, hostname, &address) != 1) return 1;
+    *result = address;
+    return 0;
 }
 
-int Resolve4(const char* hostname, struct in_addr* result, time::Interval timeout)
+int TransactionId(uint16_t& id)
 {
-    return DoResolve4(hostname, result, timeout);
+    // DNS IDs must not use the predictable process-global rand() sequence. GRND_NONBLOCK makes
+    // random-source readiness an explicit error rather than a hidden block on the cooperator.
+    // The UDP socket's ephemeral source port supplies the other half of reply association.
+    //
+    ssize_t n;
+    do { n = getrandom(&id, sizeof(id), GRND_NONBLOCK); } while (n < 0 && errno == EINTR);
+    if (n < 0) return -errno;
+    return n == sizeof(id) ? 0 : -EIO;
 }
 
-} // end namespace coop::io
-} // end namespace coop
+int Exchange(const sockaddr_in& server, std::span<const uint8_t> query,
+             time::Interval timeout, in_addr& result)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+    Descriptor desc(fd);
+    // Keep one attempt budget across all of its ring operations. Comparing elapsed time avoids
+    // overflow in now + a caller-supplied large interval.
+    //
+    auto start = std::chrono::steady_clock::now();
+    auto remaining = [&]
+    {
+        auto elapsed = std::chrono::duration_cast<time::Interval>(
+            std::chrono::steady_clock::now() - start);
+        return elapsed < timeout ? timeout - elapsed : time::Interval::zero();
+    };
+    auto budget = remaining();
+    if (budget <= time::Interval::zero()) return -ETIMEDOUT;
+    int r = Connect(desc, reinterpret_cast<const sockaddr*>(&server), sizeof(server), budget);
+    if (r < 0) return r;
+    budget = remaining();
+    if (budget <= time::Interval::zero()) return -ETIMEDOUT;
+    r = Send(desc, query.data(), query.size(), 0, budget);
+    if (r < 0) return r;
+    if (static_cast<size_t>(r) != query.size()) return -EIO;
+    budget = remaining();
+    if (budget <= time::Interval::zero()) return -ETIMEDOUT;
+    // Classical DNS UDP has a protocol-defined 512-byte limit without EDNS. MSG_TRUNC exposes
+    // a larger datagram rather than treating a truncated local copy as a complete packet.
+    //
+    uint8_t response[512];
+    r = Recv(desc, response, sizeof(response), MSG_TRUNC, budget);
+    if (r < 0) return r;
+    if (static_cast<size_t>(r) > sizeof(response)) return -EMSGSIZE;
+    return detail::DnsResponse({response, static_cast<size_t>(r)}, query, result);
+}
+
+} // namespace
+
+int Resolve4(const ResolverConfig& config, const char* hostname, in_addr* result)
+{
+    int r = Numeric(hostname, result);
+    if (r <= 0) return r;
+    in_addr address;
+    if (detail::DnsHosts(config.hosts, hostname, address) == 0)
+    {
+        *result = address;
+        return 0;
+    }
+    if (config.attempts == 0 || config.timeout <= time::Interval::zero()) return -EINVAL;
+    if (config.nameservers.empty()) return -ENETUNREACH;
+    for (const auto& ns : config.nameservers)
+        if (ns.sin_family != AF_INET || ns.sin_port == 0) return -EINVAL;
+
+    uint8_t query[12 + 255 + 4];
+    // Validate the supplied name before drawing randomness or doing network IO.
+    //
+    int n = detail::DnsQuery(hostname, query, 0);
+    if (n < 0) return n;
+    uint16_t id;
+    r = TransactionId(id);
+    if (r < 0) return r;
+    query[0] = id >> 8;
+    query[1] = id & 255;
+    r = detail::DnsAttempts(config, {query, static_cast<size_t>(n)}, address, Exchange);
+    if (r == 0) *result = address;
+    return r;
+}
+
+int Resolve4(const char* hostname, in_addr* result)
+{
+    int r = Numeric(hostname, result);
+    if (r <= 0) return r;
+    ResolverConfig config;
+    r = DefaultConfig(config);
+    return r < 0 ? r : Resolve4(config, hostname, result);
+}
+
+int Resolve4(const char* hostname, in_addr* result, time::Interval timeout)
+{
+    int r = Numeric(hostname, result);
+    if (r <= 0) return r;
+    ResolverConfig config;
+    r = DefaultConfig(config);
+    if (r < 0) return r;
+    config.timeout = timeout;
+    return Resolve4(config, hostname, result);
+}
+
+} // namespace coop::io

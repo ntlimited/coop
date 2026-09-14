@@ -115,6 +115,15 @@ into its waiter. Drivable without rebuilding via `COOP_SCHED_SEED` / `COOP_SCHED
 the seed needed to replay. Off by default; the default path is one never-taken branch. See
 `docs/adversarial_scheduling_01.md`.
 
+**Scheduling checkpoints**: `Context::SchedulingCheckpoint()` is an explicit caller-marked boundary
+where adversarial scheduling may give an already-runnable peer one observation turn. It returns
+false without suspending unless the policy is seeded Adversarial and a peer is runnable. When active,
+it records the current context as the anti-affinity exclusion and delegates to forced `Yield(true)`,
+so it returns true only after a peer ran. It uses the existing `YieldFrom` / `NextRunnable` path; it
+does not create a selector, runnable representation, callback, allocation, I/O path, or fairness
+guarantee. Like `Yield`, a checkpoint may run only with no pinned traversal epoch, outstanding debug
+borrow, or active thunk.
+
 ## Context Lifecycle (`context.cpp`)
 
 **Construction**: parent registers child in `m_children` list; first child `TryAcquire`s the

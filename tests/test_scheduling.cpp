@@ -19,8 +19,10 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <semaphore>
 #include <set>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -68,18 +70,122 @@ bool EnvironmentForcesScheduling()
 void RunScheduled(SchedulingMode mode,
                   YieldPolicy policy,
                   uint64_t seed,
-                  std::function<void(coop::Context*)> fn)
+                  std::function<void(coop::Context*)> fn,
+                  bool directYield = false)
 {
     coop::CooperatorConfiguration cfg = coop::s_defaultCooperatorConfiguration;
     cfg.schedulingMode = mode;
     cfg.yieldPolicy = policy;
     cfg.schedulingSeed = seed;
+    cfg.directYield = directYield;
 
     coop::Cooperator co(cfg);
     coop::Thread t(&co);
 
     co.SubmitSync([&](coop::Context* ctx) { fn(ctx); });
     co.Shutdown();
+}
+
+struct SchedulingCheckpointObservation
+{
+    bool peerWasRunnable = false;
+    bool returned = false;
+    bool peerRanBeforeReturn = false;
+    bool completed = false;
+};
+
+// Submit from another thread and wait until its eventfd write has returned. The SubmissionDrainer is
+// then the only runnable context when the queue is empty, or WaitAndPoll makes its fresh wake visible
+// before the check. The submitted task only notifies ran; after it runs, one parent yield lets a
+// re-armed drainer block again. No timing or retry determines the isolated state.
+//
+bool IsolateSubmissionDrainer(coop::Context* parent)
+{
+    auto* co = parent->GetCooperator();
+    coop::Signal ran(parent);
+    std::binary_semaphore published(0);
+    bool submitted = false;
+
+    std::thread producer([&]
+    {
+        submitted = co->Submit([&](coop::Context* submittedCtx)
+        {
+            ran.Notify(submittedCtx, false /* schedule */);
+        });
+        published.release();
+    });
+    published.acquire();
+    producer.join();
+
+    if (!submitted)
+    {
+        return false;
+    }
+
+    if (co->YieldedCount() == 0)
+    {
+        co->GetUring()->WaitAndPoll();
+    }
+    if (co->YieldedCount() == 0)
+    {
+        return false;
+    }
+
+    ran.Wait(parent);
+    parent->Yield(true /* force */);
+    return co->YieldedCount() == 0;
+}
+
+// Enter a fresh child directly from its parent. The parent is consequently the only runnable peer
+// at the measured checkpoint after IsolateSubmissionDrainer. A parent-owned signal joins the child
+// after the parent marks its turn, so the observation has no timing, retry, or scheduler-turn
+// assumption.
+//
+template<typename Checkpoint>
+bool ObserveSchedulingCheckpoint(SchedulingMode mode,
+                                 YieldPolicy policy,
+                                 bool directYield,
+                                 Checkpoint checkpoint,
+                                 SchedulingCheckpointObservation& observation)
+{
+    bool peerMarker = false;
+
+    RunScheduled(mode, policy, 20260911, [&](coop::Context* parent)
+    {
+        ASSERT_TRUE(IsolateSubmissionDrainer(parent));
+        coop::Signal completion(parent);
+        ASSERT_TRUE(coop::Spawn([&](coop::Context* checkpointContext)
+        {
+            observation.peerWasRunnable =
+                checkpointContext->GetCooperator()->YieldedCount() != 0;
+            observation.returned = checkpoint(checkpointContext);
+            observation.peerRanBeforeReturn = peerMarker;
+            observation.completed = true;
+            completion.Notify(checkpointContext, false /* schedule */);
+        }));
+
+        peerMarker = true;
+        completion.Wait(parent);
+        EXPECT_TRUE(observation.completed);
+    }, directYield);
+
+    return observation.peerWasRunnable && observation.returned &&
+           observation.peerRanBeforeReturn && observation.completed;
+}
+
+bool SchedulingCheckpointWithoutPeer(bool directYield)
+{
+    bool returned = true;
+    RunScheduled(SchedulingMode::Seeded,
+                 YieldPolicy::Adversarial,
+                 20260911,
+                 [&](coop::Context* ctx)
+                 {
+                     ASSERT_TRUE(IsolateSubmissionDrainer(ctx));
+                     returned = ctx->SchedulingCheckpoint();
+                 },
+                 directYield);
+    return returned;
 }
 
 // Spawn `workers` contexts that do nothing but take turns, each appending its own digit to a shared
@@ -334,6 +440,88 @@ std::string AfterReleasePoints(std::string const& trace)
 }
 
 } // namespace
+
+TEST(SchedulingTest, DefaultAndSeededFifoCheckpointAreNoOps)
+{
+    SKIP_IF_ENVIRONMENT_FORCES_SCHEDULING();
+
+    struct NoOpControl
+    {
+        SchedulingMode mode;
+        YieldPolicy policy;
+        char const* label;
+    };
+
+    for (bool directYield : {false, true})
+    {
+        SCOPED_TRACE(directYield ? "direct yield" : "loop yield");
+        for (NoOpControl const& control : {
+                 NoOpControl{SchedulingMode::Default, YieldPolicy::Fifo, "default fifo"},
+                 NoOpControl{SchedulingMode::Default,
+                             YieldPolicy::Adversarial,
+                             "default adversarial"},
+                 NoOpControl{SchedulingMode::Seeded, YieldPolicy::Fifo, "seeded fifo"},
+             })
+        {
+            SCOPED_TRACE(control.label);
+            SchedulingCheckpointObservation observation;
+            EXPECT_FALSE(ObserveSchedulingCheckpoint(
+                control.mode,
+                control.policy,
+                directYield,
+                [](coop::Context* ctx) { return ctx->SchedulingCheckpoint(); },
+                observation));
+            EXPECT_TRUE(observation.peerWasRunnable);
+            EXPECT_FALSE(observation.returned);
+            EXPECT_FALSE(observation.peerRanBeforeReturn);
+            EXPECT_TRUE(observation.completed);
+        }
+
+        EXPECT_FALSE(SchedulingCheckpointWithoutPeer(directYield));
+    }
+}
+
+TEST(SchedulingTest, SchedulingCheckpointRunsPeerBeforeReturning)
+{
+    SKIP_IF_ENVIRONMENT_FORCES_SCHEDULING();
+
+    for (bool directYield : {false, true})
+    {
+        SCOPED_TRACE(directYield ? "direct yield" : "loop yield");
+        SchedulingCheckpointObservation observation;
+        EXPECT_TRUE(ObserveSchedulingCheckpoint(
+            SchedulingMode::Seeded,
+            YieldPolicy::Adversarial,
+            directYield,
+            [](coop::Context* ctx) { return ctx->SchedulingCheckpoint(); },
+            observation));
+        EXPECT_TRUE(observation.peerWasRunnable);
+        EXPECT_TRUE(observation.returned);
+        EXPECT_TRUE(observation.peerRanBeforeReturn);
+        EXPECT_TRUE(observation.completed);
+    }
+}
+
+TEST(SchedulingTest, SchedulingCheckpointDetectorRejectsNoOpCandidate)
+{
+    SKIP_IF_ENVIRONMENT_FORCES_SCHEDULING();
+
+    for (bool directYield : {false, true})
+    {
+        SCOPED_TRACE(directYield ? "direct yield" : "loop yield");
+        SchedulingCheckpointObservation observation;
+        EXPECT_FALSE(ObserveSchedulingCheckpoint(
+            SchedulingMode::Seeded,
+            YieldPolicy::Adversarial,
+            directYield,
+            [](coop::Context*) { return false; },
+            observation));
+        EXPECT_TRUE(observation.peerWasRunnable);
+        EXPECT_FALSE(observation.returned);
+        EXPECT_FALSE(observation.peerRanBeforeReturn);
+        EXPECT_TRUE(observation.completed);
+    }
+}
 
 // The default policy is strict round-robin: the runnable list is a FIFO, a suspending context goes
 // to the tail, and the head is resumed. So with N contexts taking turns the trace has period N.

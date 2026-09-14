@@ -300,7 +300,13 @@ target_link_options(coop_tests PRIVATE -rdynamic)   # dladdr symbol names for th
 set_source_files_properties(tests/test_introspect.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-omit-frame-pointer;-fno-optimize-sibling-calls")
 include(GoogleTest)
-gtest_discover_tests(coop_tests)
+if(CMAKE_CROSSCOMPILING)
+    # The test executable targets x86. Discover it on the target host when
+    # ctest runs, never on the aarch64 build host while the binary is linked.
+    gtest_discover_tests(coop_tests DISCOVERY_MODE PRE_TEST)
+else()
+    gtest_discover_tests(coop_tests)
+endif()
 
 # Developer debugger smoke fixture; --bare also runs without io_uring.
 add_executable(coop_gdb_fixture tests/gdb_fixture.cpp)

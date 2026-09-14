@@ -171,6 +171,74 @@ private:
     T m_storage[N];
 };
 
+namespace detail
+{
+
+template<typename Passage>
+void CompleteRecvTeardown(Passage& passage)
+{
+    while (true)
+    {
+        auto s = passage.State();
+        if (s == GuardedPassageState::RecvOnly)
+        {
+            if (passage.TransitionTo(GuardedPassageState::RecvOnly,
+                                     GuardedPassageState::Shutdown))
+                return;
+        }
+        else if (s == GuardedPassageState::SendRecv)
+        {
+            if (passage.TransitionTo(GuardedPassageState::SendRecv,
+                                     GuardedPassageState::RecvShutdown))
+                return;
+        }
+        else if (s == GuardedPassageState::SendShutdown)
+        {
+            if (passage.TransitionTo(GuardedPassageState::SendShutdown,
+                                     GuardedPassageState::Shutdown))
+                return;
+        }
+        else
+        {
+            // RecvShutdown/Shutdown/Created: this side is already accounted
+            // for (or was never paired), and no transition is owed.
+            //
+            return;
+        }
+    }
+}
+
+template<typename Passage>
+void CompleteSendTeardown(Passage& passage)
+{
+    while (true)
+    {
+        auto s = passage.State();
+        if (s == GuardedPassageState::SendRecv)
+        {
+            if (passage.TransitionTo(GuardedPassageState::SendRecv,
+                                     GuardedPassageState::SendShutdown))
+                return;
+        }
+        else if (s == GuardedPassageState::RecvShutdown)
+        {
+            if (passage.TransitionTo(GuardedPassageState::RecvShutdown,
+                                     GuardedPassageState::Shutdown))
+                return;
+        }
+        else
+        {
+            // SendShutdown/Shutdown: already accounted for. RecvOnly/Created:
+            // this side's constructor never committed the handshake, so it
+            // owes nothing.
+            //
+            return;
+        }
+    }
+}
+
+} // namespace detail
+
 // ---------------------------------------------------------------------------
 // RecvSide<T>: RAII consumer guard. Operates on GuardedPassage<T>*.
 //
@@ -193,35 +261,7 @@ struct RecvSide
     ~RecvSide()
     {
         if (!m_core) return;
-        while (true)
-        {
-            auto s = m_core->State();
-            if (s == GuardedPassageState::RecvOnly)
-            {
-                if (m_core->TransitionTo(GuardedPassageState::RecvOnly,
-                                         GuardedPassageState::Shutdown))
-                    return;
-            }
-            else if (s == GuardedPassageState::SendRecv)
-            {
-                if (m_core->TransitionTo(GuardedPassageState::SendRecv,
-                                         GuardedPassageState::RecvShutdown))
-                    return;
-            }
-            else if (s == GuardedPassageState::SendShutdown)
-            {
-                if (m_core->TransitionTo(GuardedPassageState::SendShutdown,
-                                         GuardedPassageState::Shutdown))
-                    return;
-            }
-            else
-            {
-                // RecvShutdown/Shutdown/Created: this side is already accounted
-                // for (or was never paired), and no transition is owed.
-                //
-                return;
-            }
-        }
+        detail::CompleteRecvTeardown(*m_core);
     }
 
     RecvSide(RecvSide const&) = delete;
@@ -274,30 +314,7 @@ struct SendSide
     ~SendSide()
     {
         if (!m_core) return;
-        while (true)
-        {
-            auto s = m_core->State();
-            if (s == GuardedPassageState::SendRecv)
-            {
-                if (m_core->TransitionTo(GuardedPassageState::SendRecv,
-                                         GuardedPassageState::SendShutdown))
-                    return;
-            }
-            else if (s == GuardedPassageState::RecvShutdown)
-            {
-                if (m_core->TransitionTo(GuardedPassageState::RecvShutdown,
-                                         GuardedPassageState::Shutdown))
-                    return;
-            }
-            else
-            {
-                // SendShutdown/Shutdown: already accounted for. RecvOnly/Created:
-                // this side's constructor never committed the handshake, so it
-                // owes nothing.
-                //
-                return;
-            }
-        }
+        detail::CompleteSendTeardown(*m_core);
     }
 
     SendSide(SendSide const&) = delete;

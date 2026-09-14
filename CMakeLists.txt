@@ -13,6 +13,28 @@ else()
     set(COOP_STANDALONE FALSE)
 endif()
 
+if(COOP_STANDALONE)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_custom_target(coop_cross_toolchain_contract
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cross_toolchain_contract.py
+                --cmake ${CMAKE_COMMAND}
+                --generator ${CMAKE_GENERATOR}
+                --toolchain
+                ${CMAKE_CURRENT_SOURCE_DIR}/cmake/toolchains/aarch64-clang-x86_64-al2023.cmake
+            COMMENT "Calibrating the aarch64-to-x86 cross-toolchain contract"
+            VERBATIM)
+    else()
+        add_custom_target(coop_cross_toolchain_contract
+            COMMAND ${CMAKE_COMMAND} -E echo
+                "coop_cross_toolchain_contract requires a Python 3 interpreter."
+            COMMAND ${CMAKE_COMMAND} -E false
+            COMMENT "Cross-toolchain contract calibration is unavailable"
+            VERBATIM)
+    endif()
+endif()
+
 # Code coverage instrumentation (use with build/coverage)
 option(COOP_COVERAGE "Build with gcov coverage instrumentation" OFF)
 if(COOP_COVERAGE)

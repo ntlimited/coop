@@ -98,6 +98,18 @@ bool Context::Yield(const bool force /* = false */)
     return true;
 }
 
+bool Context::SchedulingCheckpoint()
+{
+    if (!m_cooperator->m_schedAdversarial || m_cooperator->m_yielded.IsEmpty())
+    {
+        return false;
+    }
+
+    m_cooperator->m_schedLastRan = this;
+    Yield(true /* force */);
+    return true;
+}
+
 void Context::Detach()
 {
     assert(m_parent);

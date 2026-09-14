@@ -88,9 +88,17 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
 
     ~Context();
 
-    // Return control to the cooperator so that it can schedule other contexts
+    // Return control to the cooperator so that it can schedule other contexts. The caller must
+    // have no pinned traversal epoch, outstanding debug borrow, or active thunk.
     //
     bool Yield(bool force = false);
+
+    // Mark an explicit yield-safe boundary where adversarial scheduling may let another already
+    // runnable context observe state. Returns false without yielding unless adversarial scheduling
+    // is active and a peer is runnable; otherwise yields once and returns true after that peer ran.
+    // This has the same safety preconditions as Yield.
+    //
+    bool SchedulingCheckpoint();
 
     Cooperator* GetCooperator()
     {

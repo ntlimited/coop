@@ -7,7 +7,9 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "coop/chan/guarded_passage.h"
 
@@ -23,6 +25,158 @@ using coop::chan::FixedGuardedPassage;
 using coop::chan::GuardedPassageState;
 using coop::chan::RecvSide;
 using coop::chan::SendSide;
+
+namespace
+{
+
+struct RetryEvidence
+{
+    GuardedPassageState finalState;
+    size_t reads;
+    size_t attempts;
+    std::vector<std::string> calls;
+};
+
+struct RecvTeardownRacePassage
+{
+    GuardedPassageState State()
+    {
+        ++m_reads;
+        m_calls.push_back(m_state == GuardedPassageState::SendRecv
+            ? "State SendRecv" : "State SendShutdown");
+        return m_state;
+    }
+
+    bool TransitionTo(GuardedPassageState expected, GuardedPassageState next)
+    {
+        ++m_attempts;
+        m_calls.push_back(expected == GuardedPassageState::SendRecv
+            ? "Transition SendRecv->RecvShutdown"
+            : "Transition SendShutdown->Shutdown");
+        if (m_attempts == 1 && expected == GuardedPassageState::SendRecv &&
+            next == GuardedPassageState::RecvShutdown)
+        {
+            m_state = GuardedPassageState::SendShutdown;
+            return false;
+        }
+        if (m_state != expected)
+            return false;
+        m_state = next;
+        return true;
+    }
+
+    RetryEvidence Evidence() const { return {m_state, m_reads, m_attempts, m_calls}; }
+
+private:
+    GuardedPassageState m_state = GuardedPassageState::SendRecv;
+    size_t m_reads = 0;
+    size_t m_attempts = 0;
+    std::vector<std::string> m_calls;
+};
+
+struct SendTeardownRacePassage
+{
+    GuardedPassageState State()
+    {
+        ++m_reads;
+        m_calls.push_back(m_state == GuardedPassageState::SendRecv
+            ? "State SendRecv" : "State RecvShutdown");
+        return m_state;
+    }
+
+    bool TransitionTo(GuardedPassageState expected, GuardedPassageState next)
+    {
+        ++m_attempts;
+        m_calls.push_back(expected == GuardedPassageState::SendRecv
+            ? "Transition SendRecv->SendShutdown"
+            : "Transition RecvShutdown->Shutdown");
+        if (m_attempts == 1 && expected == GuardedPassageState::SendRecv &&
+            next == GuardedPassageState::SendShutdown)
+        {
+            m_state = GuardedPassageState::RecvShutdown;
+            return false;
+        }
+        if (m_state != expected)
+            return false;
+        m_state = next;
+        return true;
+    }
+
+    RetryEvidence Evidence() const { return {m_state, m_reads, m_attempts, m_calls}; }
+
+private:
+    GuardedPassageState m_state = GuardedPassageState::SendRecv;
+    size_t m_reads = 0;
+    size_t m_attempts = 0;
+    std::vector<std::string> m_calls;
+};
+
+template<typename Teardown>
+bool DetectRecvRetry(Teardown teardown, RetryEvidence& evidence)
+{
+    RecvTeardownRacePassage passage;
+    teardown(passage);
+    evidence = passage.Evidence();
+    return evidence.finalState == GuardedPassageState::Shutdown &&
+           evidence.reads == 2 &&
+           evidence.attempts == 2 &&
+           evidence.calls == std::vector<std::string>{
+               "State SendRecv",
+               "Transition SendRecv->RecvShutdown",
+               "State SendShutdown",
+               "Transition SendShutdown->Shutdown",
+           };
+}
+
+template<typename Teardown>
+bool DetectSendRetry(Teardown teardown, RetryEvidence& evidence)
+{
+    SendTeardownRacePassage passage;
+    teardown(passage);
+    evidence = passage.Evidence();
+    return evidence.finalState == GuardedPassageState::Shutdown &&
+           evidence.reads == 2 &&
+           evidence.attempts == 2 &&
+           evidence.calls == std::vector<std::string>{
+               "State SendRecv",
+               "Transition SendRecv->SendShutdown",
+               "State RecvShutdown",
+               "Transition RecvShutdown->Shutdown",
+           };
+}
+
+template<typename Passage>
+void HistoricalOneShotRecvTeardown(Passage& passage)
+{
+    auto s = passage.State();
+    if (s == GuardedPassageState::RecvOnly)
+    {
+        passage.TransitionTo(GuardedPassageState::RecvOnly, GuardedPassageState::Shutdown);
+        return;
+    }
+    if (s == GuardedPassageState::SendRecv)
+    {
+        passage.TransitionTo(GuardedPassageState::SendRecv, GuardedPassageState::RecvShutdown);
+        return;
+    }
+    if (s == GuardedPassageState::SendShutdown)
+        passage.TransitionTo(GuardedPassageState::SendShutdown, GuardedPassageState::Shutdown);
+}
+
+template<typename Passage>
+void HistoricalOneShotSendTeardown(Passage& passage)
+{
+    auto s = passage.State();
+    if (s == GuardedPassageState::SendRecv)
+    {
+        passage.TransitionTo(GuardedPassageState::SendRecv, GuardedPassageState::SendShutdown);
+        return;
+    }
+    if (s == GuardedPassageState::RecvShutdown)
+        passage.TransitionTo(GuardedPassageState::RecvShutdown, GuardedPassageState::Shutdown);
+}
+
+} // namespace
 
 TEST(GuardedPassageTest, HealthyPairedTeardownIsImmediate)
 {
@@ -63,59 +217,83 @@ TEST(GuardedPassageTest, DestructorAbortsWhenPeerSideNeverTearsDown)
         "destructor timed out waiting for Shutdown");
 }
 
-// A passage normally bridges two cooperators, so its two sides are routinely
-// destroyed on two different threads at the same time. Both destructors used to
-// read the state once and issue a single CAS: when both observed SendRecv, one
-// CAS won and the loser's failed silently, parking the passage at SendShutdown
-// or RecvShutdown with no side left alive to finish the handshake. The next
-// ~GuardedPassage then waited out its full bound and failed loud -- a pairing
-// bug reported against call sites that had paired correctly.
-//
-// Red calibration (single read-then-CAS): ~1700 of 20000 iterations park
-// off-Shutdown on this host. Green (retrying destructors): zero. A parked
-// passage is deliberately leaked rather than deleted -- deleting it would spend
-// the destructor's full bound and then abort, hiding the count this test
-// reports.
-//
-TEST(GuardedPassageTest, ConcurrentSideTeardownAlwaysReachesShutdown)
+TEST(GuardedPassageTest, RecvRetryDetectorAcceptsHelperAndRejectsOneShotTeardown)
 {
-    constexpr int kIterations = 20000;
-    int parked = 0;
-
-    for (int i = 0; i < kIterations; i++)
+    RetryEvidence good;
+    EXPECT_TRUE(DetectRecvRetry([](auto& passage)
     {
-        auto* passage = new FixedGuardedPassage<int, 4>();
-        auto* recv = new RecvSide<int>(*passage);   // Created  -> RecvOnly
-        auto* send = new SendSide<int>(*passage);   // RecvOnly -> SendRecv
+        coop::chan::detail::CompleteRecvTeardown(passage);
+    }, good));
+    EXPECT_EQ(good.reads, 2u);
+    EXPECT_EQ(good.attempts, 2u);
+    EXPECT_EQ(good.finalState, GuardedPassageState::Shutdown);
 
-        std::atomic<int> ready{0};
-        std::thread recvThread([&]
-        {
-            ready.fetch_add(1, std::memory_order_acq_rel);
-            while (ready.load(std::memory_order_acquire) < 2) {}
-            delete recv;
-        });
-        std::thread sendThread([&]
-        {
-            ready.fetch_add(1, std::memory_order_acq_rel);
-            while (ready.load(std::memory_order_acquire) < 2) {}
-            delete send;
-        });
-        recvThread.join();
-        sendThread.join();
+    RetryEvidence historical;
+    EXPECT_FALSE(DetectRecvRetry(HistoricalOneShotRecvTeardown<RecvTeardownRacePassage>,
+                                 historical));
+    EXPECT_EQ(historical.reads, 1u);
+    EXPECT_EQ(historical.attempts, 1u);
+    EXPECT_EQ(historical.finalState, GuardedPassageState::SendShutdown);
+}
 
-        if (passage->State() != GuardedPassageState::Shutdown)
+TEST(GuardedPassageTest, SendRetryDetectorAcceptsHelperAndRejectsOneShotTeardown)
+{
+    RetryEvidence good;
+    EXPECT_TRUE(DetectSendRetry([](auto& passage)
+    {
+        coop::chan::detail::CompleteSendTeardown(passage);
+    }, good));
+    EXPECT_EQ(good.reads, 2u);
+    EXPECT_EQ(good.attempts, 2u);
+    EXPECT_EQ(good.finalState, GuardedPassageState::Shutdown);
+
+    RetryEvidence historical;
+    EXPECT_FALSE(DetectSendRetry(HistoricalOneShotSendTeardown<SendTeardownRacePassage>,
+                                 historical));
+    EXPECT_EQ(historical.reads, 1u);
+    EXPECT_EQ(historical.attempts, 1u);
+    EXPECT_EQ(historical.finalState, GuardedPassageState::RecvShutdown);
+}
+
+// This integration coverage establishes each partial state directly, then
+// lets the real endpoint destructors complete the complementary transition.
+// The deterministic fake tests above cover the concurrent stale-read race.
+//
+TEST(GuardedPassageTest, RealDestructorsCompleteEstablishedPartialStates)
+{
+    {
+        FixedGuardedPassage<int, 4> passage;
         {
-            parked++;
-            continue;  // leaked on purpose; see comment above
+            RecvSide<int> recv(passage);
+            SendSide<int> send(passage);
+            auto senderObserved = passage.State();
+            auto receiverObserved = passage.State();
+            ASSERT_EQ(senderObserved, GuardedPassageState::SendRecv);
+            ASSERT_EQ(receiverObserved, GuardedPassageState::SendRecv);
+
+            ASSERT_TRUE(passage.TransitionTo(senderObserved, GuardedPassageState::SendShutdown));
+            EXPECT_FALSE(passage.TransitionTo(receiverObserved, GuardedPassageState::RecvShutdown));
+            EXPECT_EQ(passage.State(), GuardedPassageState::SendShutdown);
         }
-        delete passage;
+        EXPECT_EQ(passage.State(), GuardedPassageState::Shutdown);
     }
 
-    EXPECT_EQ(parked, 0)
-        << parked << " of " << kIterations
-        << " concurrent teardowns lost a side transition and parked the passage "
-           "short of Shutdown";
+    {
+        FixedGuardedPassage<int, 4> passage;
+        {
+            RecvSide<int> recv(passage);
+            SendSide<int> send(passage);
+            auto receiverObserved = passage.State();
+            auto senderObserved = passage.State();
+            ASSERT_EQ(receiverObserved, GuardedPassageState::SendRecv);
+            ASSERT_EQ(senderObserved, GuardedPassageState::SendRecv);
+
+            ASSERT_TRUE(passage.TransitionTo(receiverObserved, GuardedPassageState::RecvShutdown));
+            EXPECT_FALSE(passage.TransitionTo(senderObserved, GuardedPassageState::SendShutdown));
+            EXPECT_EQ(passage.State(), GuardedPassageState::RecvShutdown);
+        }
+        EXPECT_EQ(passage.State(), GuardedPassageState::Shutdown);
+    }
 }
 
 namespace

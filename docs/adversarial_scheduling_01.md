@@ -58,6 +58,25 @@ it is on every contended lock, every signal, every cooperative handoff. The adve
 removes it, and removes it into a path the runtime already takes, since a CQE-driven release wakes
 through the queue anyway.
 
+## Explicit scheduling checkpoints
+
+Some semantic boundaries are safe places for another context to inspect live state, but ordinary
+execution must not gain an implicit suspension just because a scheduling mode exists.
+`Context::SchedulingCheckpoint()` makes that boundary explicit. It returns `false` and does not
+suspend unless the current cooperator is using the seeded adversarial policy and another context is
+already runnable. Default scheduling and seeded FIFO therefore keep the same execution path.
+
+When active, the checkpoint records its caller as the anti-affinity exclusion and performs one
+forced ordinary `Context::Yield(true)`. That uses the existing runnable queue and selector, and the
+checkpoint returns `true` only after another runnable context has received a turn. Recording the
+current context matters for a freshly direct-entered spawn context, where the policy's last selected
+context can still describe an earlier turn.
+
+Checkpoints are opt-in calls at boundaries whose callers have already established the ordinary
+`Yield` safety preconditions: no pinned traversal epoch, outstanding debug borrow, or active thunk.
+They add no fairness or progress guarantee beyond the one peer turn they report, and they do not add
+an automatic yield, callback, allocation, I/O path, selector, or scheduling mode.
+
 ## Replay
 
 A schedule that finds a failure is worthless if it cannot be run again, and the run that finds it is

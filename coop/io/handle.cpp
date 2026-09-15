@@ -162,9 +162,14 @@ void Handle::Cancel()
     m_pendingCqes++;
 }
 
+// DECLARED-PRIOR(io-defer-min-pending-ops,
+// owner=Dendrite-004-S6b-declared-prior-gate,
+// expires=first-independent-multi-architecture-io-batching-calibration):
 // Minimum in-flight io_uring operations before a fast-path-armed op defers its submit. Below this
 // the flow is effectively serial and benefits from a prompt eager submit; above it there is enough
 // concurrency that folding the submit into the batch-boundary Poll() amortizes the io_uring_enter().
+// The threshold is fixed without knowledge of this system's measured workload behaviour. It changes
+// batching timing only -- when a submit reaches the kernel -- never whether an fsync runs.
 //
 static constexpr int kDeferMinPendingOps = 8;
 

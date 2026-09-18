@@ -10,8 +10,8 @@
 namespace coop
 {
 
-class Cooperator;
-class Context;
+struct Cooperator;
+struct Context;
 
 // StallDetector -- a cooperative-scheduling watchdog.
 //

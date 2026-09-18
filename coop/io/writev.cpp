@@ -40,12 +40,6 @@ int Writev(Descriptor& desc, const struct iovec* iov, int iovcnt)
 
 int WritevAll(Descriptor& desc, struct iovec* iov, int iovcnt)
 {
-    size_t total = 0;
-    for (int i = 0; i < iovcnt; i++)
-    {
-        total += iov[i].iov_len;
-    }
-
     size_t sent = 0;
     while (iovcnt > 0)
     {

@@ -28,7 +28,9 @@
 //
 //   ssl::Send(connection, buf, size)  — encrypt and send plaintext
 //   ssl::Recv(connection, buf, size)  — receive and decrypt ciphertext
+//   ssl::Recv(..., timeout)           — same, bounded wait (-ETIMEDOUT)
 //   ssl::SendKill / ssl::RecvKill     — explicit kill-aware siblings
+//   ssl::RecvKill(..., timeout)       — kill-aware bounded wait
 //
 // Usage (memory BIO):
 //

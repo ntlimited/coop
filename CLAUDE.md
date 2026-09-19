@@ -186,8 +186,9 @@ Fail-fast: the first child returning `false` cancels its siblings via `Handle::K
 (which they observe through kill-aware waits) and makes `Wait()` return false.
 `SetLimit(n)` bounds in-flight children through a Semaphore — `Go` blocks the owner at the
 limit. Child fns return `bool` (true = ok) or `void` (always ok) and must be kill-aware
-for cancellation to reach them. Complementary to kill trees: a kill tree propagates
-termination down; a Group drains up and can refuse/cancel work.
+for cancellation to reach them (`CoordinateWithKill`, `io::*Kill`, `chan::RecvKill` /
+`SendKill`). Complementary to kill trees: a kill tree propagates termination down; a
+Group drains up and can refuse/cancel work.
 
 ### Deadlines & kill cause (`coop/context.h`)
 `Context` carries an optional deadline (`SetDeadlineIn`/`SetDeadline`, absolute

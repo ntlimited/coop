@@ -119,7 +119,7 @@ bool Connection::SetVerifyIp(const char* address)
 //
 // Returns 0 on success, negative on I/O error.
 //
-int Connection::FlushWrite(bool killAware)
+int Connection::FlushWrite(bool killAware, time::Interval timeout)
 {
     while (BIO_ctrl_pending(m_wbio) > 0)
     {
@@ -133,13 +133,23 @@ int Connection::FlushWrite(bool killAware)
         int at = 0;
         while (at < n)
         {
-            int sent = killAware
-                ? io::SendKill(m_desc, &m_buffer[at], n - at)
-                : io::Send(m_desc, &m_buffer[at], n - at);
+            int sent;
+            if (timeout.count() > 0)
+            {
+                sent = killAware
+                    ? io::SendKill(m_desc, &m_buffer[at], n - at, 0, timeout)
+                    : io::Send(m_desc, &m_buffer[at], n - at, 0, timeout);
+            }
+            else
+            {
+                sent = killAware
+                    ? io::SendKill(m_desc, &m_buffer[at], n - at)
+                    : io::Send(m_desc, &m_buffer[at], n - at);
+            }
             if (sent <= 0)
             {
                 spdlog::warn("ssl flush_write fd={} send failed={}", m_desc.m_fd, sent);
-                return -1;
+                return sent < 0 ? sent : -1;
             }
             at += sent;
         }
@@ -152,11 +162,21 @@ int Connection::FlushWrite(bool killAware)
 //
 // Returns bytes fed on success, 0 on clean disconnect, negative on error.
 //
-int Connection::FeedRead(bool killAware)
+int Connection::FeedRead(bool killAware, time::Interval timeout)
 {
-    int n = killAware
-        ? io::RecvKill(m_desc, m_buffer, m_bufferSize)
-        : io::Recv(m_desc, m_buffer, m_bufferSize);
+    int n;
+    if (timeout.count() > 0)
+    {
+        n = killAware
+            ? io::RecvKill(m_desc, m_buffer, m_bufferSize, 0, timeout)
+            : io::Recv(m_desc, m_buffer, m_bufferSize, 0, timeout);
+    }
+    else
+    {
+        n = killAware
+            ? io::RecvKill(m_desc, m_buffer, m_bufferSize)
+            : io::Recv(m_desc, m_buffer, m_bufferSize);
+    }
     if (n <= 0)
     {
         SPDLOG_TRACE("ssl feed_read fd={} recv={}", m_desc.m_fd, n);

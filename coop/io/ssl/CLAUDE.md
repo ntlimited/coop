@@ -46,6 +46,11 @@ In `ssl::Send` and `ssl::Recv`:
 2. `m_buffer == nullptr` (socket BIO, no kTLS) -> `SSL_write`/`SSL_read` + `io::Poll`
 3. `m_buffer != nullptr` (memory BIO) -> existing `FlushWrite`/`FeedRead` path
 
+`ssl::Recv(..., timeout)` / `RecvKill(..., timeout)` bound each nested socket wait.
+A zero timeout waits until data, kill, or error. HTTP `TlsTransport` forwards
+`ServerConfiguration::timeout` through this path so idle TLS keep-alive matches
+plaintext (`-ETIMEDOUT` ends the connection loop).
+
 Both kTLS and socket BIO paths use direct syscalls with `io::Poll` fallback, avoiding uring
 for the common case where the syscall succeeds immediately. This is critical for throughput —
 routing every send through `io::Send` (uring SQE/CQE) adds ~20us per-op overhead that

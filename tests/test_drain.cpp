@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -24,6 +25,7 @@
 #include "coop/http/connection.h"
 #include "coop/http/server.h"
 #include "coop/http/server_handle.h"
+#include "coop/time/now.h"
 
 #include "test_helpers.h"
 
@@ -244,7 +246,8 @@ struct DrainServer
     bool returned = false;
 
     DrainServer(coop::Context* ctx, coop::io::ssl::Context* tls,
-                coop::http::RequestHandler handler = &OkHandler, void* state = nullptr)
+                coop::http::RequestHandler handler = &OkHandler, void* state = nullptr,
+                coop::time::Interval timeout = std::chrono::seconds(30))
         : context(ctx)
     {
         // Reserve an ephemeral loopback port, then let RunServer bind it. Each test
@@ -263,6 +266,7 @@ struct DrainServer
         config.control = &control;
         config.handler = handler;
         config.userData = state;
+        config.timeout = timeout;
         ctx->GetCooperator()->Spawn({.stackSize = 65536}, [this, tls](coop::Context* server)
         {
             EXPECT_TRUE(tls ? coop::http::RunTlsServer(server, config, *tls)
@@ -347,6 +351,50 @@ TEST_P(DrainProtocolTest, IdleKeepAliveDrainsAndClearsListener)
         EXPECT_EQ(server.control.LiveConnections(), 0u);
         server.AwaitStopped();
         EXPECT_TRUE(server.control.Drain(ctx, std::chrono::milliseconds(1)));
+    });
+}
+
+TEST_P(DrainProtocolTest, IdleKeepAliveTimesOut)
+{
+    RunDrainTest([&](coop::Context* ctx)
+    {
+        DrainServer server(ctx, GetParam() ? &m_tls : nullptr, &OkHandler, nullptr,
+                           std::chrono::milliseconds(50));
+        DrainClient client(server.config.port, GetParam());
+
+        int64_t deadline = coop::time::MonotonicMicros() + 2'000'000;
+        while (server.control.LiveConnections() == 0)
+        {
+            ASSERT_LT(coop::time::MonotonicMicros(), deadline)
+                << "accepted connection never registered";
+            ctx->Yield(true);
+        }
+        EXPECT_EQ(server.control.LiveConnections(), 1u);
+        while (server.control.LiveConnections() > 0)
+        {
+            ASSERT_LT(coop::time::MonotonicMicros(), deadline)
+                << "idle keep-alive did not time out";
+            ctx->Yield(true);
+        }
+        EXPECT_EQ(server.control.LiveConnections(), 0u);
+    });
+}
+
+TEST_P(DrainProtocolTest, TlsClientRecvTimesOut)
+{
+    if (!GetParam())
+    {
+        GTEST_SKIP() << "socket-BIO Recv timeout is TLS-only";
+    }
+    RunDrainTest([&](coop::Context* ctx)
+    {
+        DrainServer server(ctx, &m_tls);
+        DrainClient client(server.config.port, true);
+        char bytes[64];
+        int n = coop::io::ssl::Recv(*client.tls, bytes, sizeof(bytes),
+                                    std::chrono::milliseconds(50));
+        EXPECT_EQ(n, -ETIMEDOUT);
+        ctx->Yield(true);
     });
 }
 

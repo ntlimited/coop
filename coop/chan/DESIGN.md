@@ -4,7 +4,7 @@
 
 | Type | Role |
 |------|------|
-| `Channel<T>` / `FixedChannel<T,N>` | Intra-cooperator buffered channel. Two coordinators encode state: `m_recv` held ↔ empty, `m_send` held ↔ full. |
+| `Channel<T>` / `FixedChannel<T,N>` | Intra-cooperator buffered channel. Two coordinators encode state: `m_recv` held ↔ empty, `m_send` held ↔ full. `Recv`/`Send` are kill-oblivious (cleanup); `RecvKill`/`SendKill` are the Group-cancellation siblings. |
 | `Pipe<T,U>` | Transform stage: reads from a `RecvChannel<T>`, writes to an internal `FixedChannel<U,N>`. Shuts down when source closes. |
 | `Filter<T>` | Like Pipe but same type; drops items that fail the predicate. |
 | `Merge<T>` | Fan-in two `RecvChannel<T>`s into one output channel via `Select`. |

@@ -10,6 +10,7 @@
 #include "coop/signal.h"
 #include "coop/group.h"
 #include "coop/self.h"
+#include "coop/chan/channel.h"
 
 #include "test_helpers.h"
 
@@ -90,6 +91,29 @@ TEST(GroupTest, FailFastCancelsSiblings)
         EXPECT_TRUE(g.Failed());
         EXPECT_TRUE(siblingSawKill);
         EXPECT_EQ(completedNormally.load(), 0);
+    });
+}
+
+TEST(GroupTest, FailFastCancelsChannelRecvKill)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buffer[1];
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
+        bool siblingSawKill = false;
+
+        coop::Group g(ctx);
+        g.Go([&](coop::Context* c) -> bool
+        {
+            int value = 0;
+            bool got = ch.RecvKill(value);
+            siblingSawKill = c->IsKilled() && !got;
+            return true;
+        });
+        g.Go([](coop::Context*) -> bool { return false; });
+
+        EXPECT_FALSE(g.Wait());
+        EXPECT_TRUE(siblingSawKill);
     });
 }
 

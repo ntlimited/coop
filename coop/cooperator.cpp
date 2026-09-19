@@ -1,6 +1,5 @@
 #include <cstdarg>
 #include <cerrno>
-#include <functional>
 #include <liburing.h>
 #include <mutex>
 #include <new>
@@ -374,6 +373,12 @@ void Cooperator::DrainSubmissions()
     {
         auto* entry = head;
         head = head->m_next;
+        if (entry->m_inline)
+        {
+            entry->m_invoke(entry, m_scheduled);
+            entry->m_destroy(entry);
+            continue;
+        }
         SpawnFromSubmission(entry);
     }
 }
@@ -400,16 +405,9 @@ void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
         if (handle && callerCoop)
         {
             handle->m_spawnOk = spawned;
-
-            // Push completion notification back to caller's cooperator so Signal::Notify
-            // runs in the caller's thread (Signal is local to that cooperator).
+            // Reverse notify is embedded in the handle — no heap on this path.
             //
-            auto* notifEntry = new TypedSubmission<std::function<void(Context*)>>(
-                [handle](Context* ctx)
-                {
-                    handle->m_signal.Notify(ctx, false);
-                }, s_defaultConfiguration);
-            callerCoop->PushSubmission(notifEntry, true /* completionNotification */);
+            callerCoop->PushSubmission(&handle->m_reply, true /* completionNotification */);
             callerCoop->WakeCooperator();
         }
         return;
@@ -458,6 +456,13 @@ void Cooperator::DrainRemainingSubmissions()
         auto* entry = head;
         head = head->m_next;
 
+        if (entry->m_inline)
+        {
+            entry->m_invoke(entry, m_scheduled);
+            entry->m_destroy(entry);
+            continue;
+        }
+
         bool isCooperate = (reinterpret_cast<uintptr_t>(entry->m_completion) & 1) != 0;
         if (isCooperate)
         {
@@ -468,12 +473,7 @@ void Cooperator::DrainRemainingSubmissions()
             if (handle && callerCoop)
             {
                 handle->m_spawnOk = false;
-                auto* notifEntry = new TypedSubmission<std::function<void(Context*)>>(
-                    [handle](Context* ctx)
-                    {
-                        handle->m_signal.Notify(ctx, false);
-                    }, s_defaultConfiguration);
-                callerCoop->PushSubmission(notifEntry, true /* completionNotification */);
+                callerCoop->PushSubmission(&handle->m_reply, true /* completionNotification */);
                 callerCoop->WakeCooperator();
             }
 

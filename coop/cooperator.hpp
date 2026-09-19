@@ -1,5 +1,6 @@
 #pragma once
 
+#include <new>
 #include <type_traits>
 
 #include "context.h"
@@ -192,12 +193,17 @@ bool Cooperator::Cooperate(Fn&& fn, CooperateHandle* handle,
         return false;
 
     using DecayFn = std::decay_t<Fn>;
-    auto* entry = new TypedSubmission<DecayFn>(std::forward<Fn>(fn), config);
+    auto* entry = new (std::nothrow) TypedSubmission<DecayFn>(std::forward<Fn>(fn), config);
+    if (!entry)
+    {
+        return false;
+    }
 
     if (handle)
     {
         // Tag-bit encoding: bit 0 of m_completion distinguishes Cooperate from SubmitSync.
         // m_completionOk is reinterpreted as the caller's Cooperator*.
+        // Reverse notify lives on the handle; the target must not allocate to wake us.
         //
         entry->m_completion = reinterpret_cast<std::binary_semaphore*>(
             reinterpret_cast<uintptr_t>(handle) | 1);

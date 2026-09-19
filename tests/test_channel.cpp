@@ -2359,3 +2359,85 @@ TEST(ChannelTest, SubscribeDrivenThroughBaseInterface)
         base.Wait();
     });
 }
+
+TEST(ChannelTest, RecvKillReturnsWhenKilled)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buffer[1];
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
+
+        coop::Context::Handle child;
+        bool returned = false;
+        bool got = true;
+        ctx->GetCooperator()->Spawn([&](coop::Context* c)
+        {
+            int value = 0;
+            got = ch.RecvKill(value);
+            returned = true;
+            EXPECT_TRUE(c->IsKilled());
+        }, &child);
+
+        ctx->Yield(true);
+        EXPECT_FALSE(returned);
+        child.Kill();
+        ctx->Yield(true);
+        EXPECT_TRUE(returned);
+        EXPECT_FALSE(got);
+    });
+}
+
+TEST(ChannelTest, SendKillReturnsWhenKilled)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buffer[1];
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
+        EXPECT_TRUE(ch.TrySend(1));
+
+        coop::Context::Handle child;
+        bool returned = false;
+        bool sent = true;
+        ctx->GetCooperator()->Spawn([&](coop::Context* c)
+        {
+            sent = ch.SendKill(2);
+            returned = true;
+            EXPECT_TRUE(c->IsKilled());
+        }, &child);
+
+        ctx->Yield(true);
+        EXPECT_FALSE(returned);
+        child.Kill();
+        ctx->Yield(true);
+        EXPECT_TRUE(returned);
+        EXPECT_FALSE(sent);
+    });
+}
+
+TEST(ChannelTest, RecvStillIgnoresKill)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int buffer[1];
+        coop::chan::Channel<int> ch(ctx, buffer, 1);
+
+        coop::Context::Handle child;
+        bool returned = false;
+        ctx->GetCooperator()->Spawn([&](coop::Context* c)
+        {
+            int value = 0;
+            ch.Recv(value);
+            returned = true;
+            EXPECT_EQ(value, 7);
+        }, &child);
+
+        ctx->Yield(true);
+        child.Kill();
+        ctx->Yield(true);
+        EXPECT_FALSE(returned);
+
+        ch.Send(7);
+        ctx->Yield(true);
+        EXPECT_TRUE(returned);
+    });
+}

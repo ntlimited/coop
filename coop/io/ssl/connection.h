@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <openssl/ssl.h>
 
+#include "coop/time/interval.h"
+
 namespace coop
 {
 
@@ -95,8 +97,10 @@ struct Connection
     friend int SendAllKill(Connection&, const void*, size_t);
     friend int SendImpl(Connection&, const void*, size_t, bool);
     friend int Recv(Connection&, void*, size_t);
+    friend int Recv(Connection&, void*, size_t, time::Interval);
     friend int RecvKill(Connection&, void*, size_t);
-    friend int RecvImpl(Connection&, void*, size_t, bool);
+    friend int RecvKill(Connection&, void*, size_t, time::Interval);
+    friend int RecvImpl(Connection&, void*, size_t, bool, time::Interval);
 
     // Socket BIO handshake — drives SSL_do_handshake with readiness waits. The kill-aware public
     // variant routes through the same implementation with kill-aware waits enabled. After
@@ -112,13 +116,14 @@ struct Connection
     // after any SSL operation that may produce output (handshake steps, SSL_write, shutdown).
     // Memory BIO mode only.
     //
-    int FlushWrite(bool killAware = false);
+    int FlushWrite(bool killAware = false, time::Interval timeout = {});
 
     // Pull encrypted data from the descriptor into OpenSSL's read BIO. Called when an SSL operation
     // returns SSL_ERROR_WANT_READ, meaning it needs more ciphertext to proceed.
-    // Memory BIO mode only.
+    // Memory BIO mode only. A positive timeout bounds the socket wait; zero means wait until
+    // data, kill, or error.
     //
-    int FeedRead(bool killAware = false);
+    int FeedRead(bool killAware = false, time::Interval timeout = {});
 
     BIO* m_rbio;
     BIO* m_wbio;

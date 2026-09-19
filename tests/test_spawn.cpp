@@ -427,6 +427,19 @@ struct SpawnInCtorLaunchable : coop::Launchable
 
 } // end anonymous namespace
 
+TEST(SpawnTest, HandleGetKilledSignalNullAfterExit)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Context::Handle handle;
+        ctx->GetCooperator()->Spawn([](coop::Context*) {}, &handle);
+        ctx->Yield(true);
+        EXPECT_FALSE(handle);
+        EXPECT_EQ(handle.GetKilledSignal(), nullptr);
+        handle.Kill();
+    });
+}
+
 TEST(SpawnTest, LaunchWhoseConstructorSpawns)
 {
     test::RunInCooperator([](coop::Context* ctx)

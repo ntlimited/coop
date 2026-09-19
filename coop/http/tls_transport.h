@@ -29,10 +29,12 @@ struct TlsTransport
 
     io::Descriptor& Descriptor() { return m_desc; }
 
-    int Recv(void* buf, size_t size, int /* flags */, time::Interval /* timeout */)
+    int Recv(void* buf, size_t size, int /* flags */, time::Interval timeout)
     {
-        // TODO: timeout support for TLS recv
-        //
+        if (timeout.count() > 0)
+        {
+            return io::ssl::Recv(m_conn, buf, size, timeout);
+        }
         return io::ssl::Recv(m_conn, buf, size);
     }
 

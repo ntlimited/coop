@@ -8,9 +8,10 @@ namespace coop
 
 Signal* Context::Handle::GetKilledSignal()
 {
-    // TODO add some "you're in the right cooperator" asserts here and everywhere
+    // After the spawned context exits, ~Context clears m_context. Kill already treats
+    // that as a no-op; this must too — the handle outlives the context by contract.
     //
-    return m_context->GetKilledSignal();
+    return m_context ? m_context->GetKilledSignal() : nullptr;
 }
 
 // Note that the kill works on the handle, not the context

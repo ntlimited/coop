@@ -19,11 +19,27 @@ namespace io
 namespace ssl
 {
 
+// Cooperative wait for socket readiness. A positive timeout bounds the wait and returns
+// -ETIMEDOUT; zero waits until readiness, kill, or error. Negative results (timeout, kill,
+// hard error) propagate so HTTP keep-alive can exit instead of hanging.
+//
+static int WaitSocket(Descriptor& desc, unsigned mask, bool killAware, time::Interval timeout)
+{
+    if (timeout.count() > 0)
+    {
+        return killAware
+            ? io::PollKill(desc, mask, timeout)
+            : io::Poll(desc, mask, timeout);
+    }
+    return killAware ? io::PollKill(desc, mask) : io::Poll(desc, mask);
+}
+
 // kTLS RX recv — read() directly, kernel handles decryption. Falls back to readiness waits when
 // no data available (EAGAIN). First call typically returns EAGAIN (receiver called before
 // sender), but if data is already buffered, returns immediately without uring.
 //
-static int RecvKtls(Connection& conn, void* buf, size_t size, bool killAware)
+static int RecvKtls(Connection& conn, void* buf, size_t size, bool killAware,
+                    time::Interval timeout)
 {
     SPDLOG_TRACE("ssl ktls recv fd={} maxsize={}", conn.m_desc.m_fd, size);
     for (;;)
@@ -39,8 +55,8 @@ static int RecvKtls(Connection& conn, void* buf, size_t size, bool killAware)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
             SPDLOG_TRACE("ssl ktls recv fd={} EAGAIN", conn.m_desc.m_fd);
-            int r = killAware ? io::PollKill(conn.m_desc, POLLIN) : io::Poll(conn.m_desc, POLLIN);
-            if (r < 0) return -1;
+            int r = WaitSocket(conn.m_desc, POLLIN, killAware, timeout);
+            if (r < 0) return r;
             continue;
         }
 
@@ -52,7 +68,8 @@ static int RecvKtls(Connection& conn, void* buf, size_t size, bool killAware)
 // Socket BIO recv — SSL_read operates on the real fd, readiness waits for cooperative waiting.
 // Used when kTLS didn't activate but the connection uses a socket BIO.
 //
-static int RecvSocketBio(Connection& conn, void* buf, size_t size, bool killAware)
+static int RecvSocketBio(Connection& conn, void* buf, size_t size, bool killAware,
+                         time::Interval timeout)
 {
     SPDLOG_TRACE("ssl socket-bio recv fd={} maxsize={}", conn.m_desc.m_fd, size);
     for (;;)
@@ -70,8 +87,8 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size, bool killAwar
         case SSL_ERROR_WANT_READ:
         {
             SPDLOG_TRACE("ssl socket-bio recv fd={} WANT_READ", conn.m_desc.m_fd);
-            int r = killAware ? io::PollKill(conn.m_desc, POLLIN) : io::Poll(conn.m_desc, POLLIN);
-            if (r < 0) return -1;
+            int r = WaitSocket(conn.m_desc, POLLIN, killAware, timeout);
+            if (r < 0) return r;
             break;
         }
 
@@ -80,8 +97,8 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size, bool killAwar
             // Renegotiation
             //
             SPDLOG_TRACE("ssl socket-bio recv fd={} WANT_WRITE", conn.m_desc.m_fd);
-            int r = killAware ? io::PollKill(conn.m_desc, POLLOUT) : io::Poll(conn.m_desc, POLLOUT);
-            if (r < 0) return -1;
+            int r = WaitSocket(conn.m_desc, POLLOUT, killAware, timeout);
+            if (r < 0) return r;
             break;
         }
 
@@ -101,22 +118,24 @@ static int RecvSocketBio(Connection& conn, void* buf, size_t size, bool killAwar
 //   Socket BIO:  SSL_read on real fd + readiness waits
 //   Memory BIO:  FeedRead -> rbio -> SSL_read (existing path)
 //
-// Returns bytes read on success, negative on error, 0 on clean shutdown.
+// A positive timeout bounds each nested socket wait in this Recv (keep-alive idle is one
+// wait). Zero means wait until data, kill, or error. Returns bytes read on success,
+// negative on error (including -ETIMEDOUT / -ECANCELED), 0 on clean shutdown.
 //
-int RecvImpl(Connection& conn, void* buf, size_t size, bool killAware)
+int RecvImpl(Connection& conn, void* buf, size_t size, bool killAware, time::Interval timeout)
 {
     // kTLS RX: kernel handles decryption, read() directly
     //
     if (conn.m_ktlsRx)
     {
-        return RecvKtls(conn, buf, size, killAware);
+        return RecvKtls(conn, buf, size, killAware, timeout);
     }
 
     // Socket BIO without kTLS: SSL_read on real fd + readiness waits
     //
     if (conn.m_buffer == nullptr)
     {
-        return RecvSocketBio(conn, buf, size, killAware);
+        return RecvSocketBio(conn, buf, size, killAware, timeout);
     }
 
     // Memory BIO: existing path
@@ -136,13 +155,13 @@ int RecvImpl(Connection& conn, void* buf, size_t size, bool killAware)
         {
         case SSL_ERROR_WANT_READ:
             SPDLOG_TRACE("ssl recv fd={} WANT_READ", conn.m_desc.m_fd);
-            if (conn.FlushWrite(killAware) < 0)
+            if (int w = conn.FlushWrite(killAware, timeout); w < 0)
             {
-                return -1;
+                return w;
             }
-            if (conn.FeedRead(killAware) <= 0)
+            if (int n = conn.FeedRead(killAware, timeout); n <= 0)
             {
-                return -1;
+                return n < 0 ? n : -1;
             }
             break;
 
@@ -150,9 +169,9 @@ int RecvImpl(Connection& conn, void* buf, size_t size, bool killAware)
             // Can happen during TLS renegotiation.
             //
             SPDLOG_TRACE("ssl recv fd={} WANT_WRITE", conn.m_desc.m_fd);
-            if (conn.FlushWrite(killAware) < 0)
+            if (int w = conn.FlushWrite(killAware, timeout); w < 0)
             {
-                return -1;
+                return w;
             }
             break;
 
@@ -168,12 +187,22 @@ int RecvImpl(Connection& conn, void* buf, size_t size, bool killAware)
 
 int Recv(Connection& conn, void* buf, size_t size)
 {
-    return RecvImpl(conn, buf, size, false);
+    return RecvImpl(conn, buf, size, false, {});
+}
+
+int Recv(Connection& conn, void* buf, size_t size, time::Interval timeout)
+{
+    return RecvImpl(conn, buf, size, false, timeout);
 }
 
 int RecvKill(Connection& conn, void* buf, size_t size)
 {
-    return RecvImpl(conn, buf, size, true);
+    return RecvImpl(conn, buf, size, true, {});
+}
+
+int RecvKill(Connection& conn, void* buf, size_t size, time::Interval timeout)
+{
+    return RecvImpl(conn, buf, size, true, timeout);
 }
 
 } // end namespace coop::io::ssl

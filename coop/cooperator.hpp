@@ -103,13 +103,13 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn&& fn, Context::Handl
 }
 
 template<typename T, typename... Args>
-T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle, Args&&... args)
+LaunchResult<T> Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle, Args&&... args)
 {
     static_assert(std::is_base_of<Launchable, T>::value);
 
     if (m_scheduled && m_scheduled->IsKilled())
     {
-        return nullptr;
+        return {};
     }
 
     SpawnConfiguration actual = config;
@@ -119,10 +119,13 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
     auto* alloc = m_stackPool.Allocate(actual.stackSize);
     if (!alloc)
     {
-        return nullptr;
+        return {};
     }
 
-    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, handle, this);
+    Context::Handle localHandle;
+    Context::Handle* live = handle ? handle : &localHandle;
+
+    auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, live, this);
     m_contexts.Push(spawnCtx);
 
     size_t varSize = ContextVarTotalSize();
@@ -142,7 +145,11 @@ T* Cooperator::Launch(SpawnConfiguration const& config, Context::Handle* handle,
     spawnCtx->m_entry = &LaunchTrampoline<T>;
     spawnCtx->m_cleanup = &LaunchCleanup<T>;
     EnterContext(spawnCtx);
-    return launchable;
+
+    // EnterContext runs the child until it yields or exits. A completed Launchable has
+    // already been destroyed; handing back that address was the dangling-pointer footgun.
+    //
+    return { *live ? launchable : nullptr, true };
 }
 
 // Type-erased submission entry that owns a lambda of type Fn. Allocated on the heap by Submit,
@@ -279,25 +286,25 @@ bool Spawn(SpawnConfiguration const& config, Fn&& fn, Context::Handle* handle = 
 }
 
 template<typename T, typename... Args>
-T* Launch(SpawnConfiguration const& config, Context::Handle* handle, Args&&... args)
+LaunchResult<T> Launch(SpawnConfiguration const& config, Context::Handle* handle, Args&&... args)
 {
     return Cooperator::thread_cooperator->Launch<T>(config, handle, std::forward<Args>(args)...);
 }
 
 template<typename T, typename... Args>
-T* Launch(SpawnConfiguration const& config, Args&&... args)
+LaunchResult<T> Launch(SpawnConfiguration const& config, Args&&... args)
 {
     return Cooperator::thread_cooperator->Launch<T>(config, std::forward<Args>(args)...);
 }
 
 template<typename T, typename... Args>
-T* Launch(Context::Handle* handle, Args&&... args)
+LaunchResult<T> Launch(Context::Handle* handle, Args&&... args)
 {
     return Cooperator::thread_cooperator->Launch<T>(handle, std::forward<Args>(args)...);
 }
 
 template<typename T, typename... Args>
-T* Launch(Args&&... args)
+LaunchResult<T> Launch(Args&&... args)
 {
     return Cooperator::thread_cooperator->Launch<T>(std::forward<Args>(args)...);
 }

@@ -124,7 +124,9 @@ Size-class allocator for context stack segments, owned by `Cooperator`. 6 power-
 ### Spawn vs Launch (`coop/cooperator.h`)
 Two ways to create contexts:
 - `bool Spawn(Fn const& fn)` — lambda copied to context stack, for simple one-off tasks
-- `T* Launch<T>(Args&&...)` — Launchable subclass, forwarded ctor args, for stateful handlers
+- `LaunchResult<T> Launch<T>(Args&&...)` — Launchable subclass; `spawned` is whether a
+  context was created, `object` is live only if it yielded. `if (!Launch<T>(...))` means
+  spawn failed, not "already finished".
 
 Both accept optional `SpawnConfiguration` and `Context::Handle*`.
 Both are available as free functions (prefer these) or as `Cooperator` methods.
@@ -162,7 +164,9 @@ struct MyHandler : Launchable {
     virtual void Launch() final { /* runs on own context */ }
     io::Descriptor m_fd;
 };
-Launch<MyHandler>(fd, ...);
+auto r = Launch<MyHandler>(fd, ...);
+if (!r) { /* spawn failed */ }
+// r.object is live only if Launch() yielded
 ```
 
 ### Coordinator (`coop/coordinator.h`)

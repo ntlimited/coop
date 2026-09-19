@@ -344,6 +344,18 @@ struct Context::Handle
     {
     }
 
+    // Detach so ~Context does not write through a dead Handle. Launch uses a
+    // stack Handle to observe whether the child exited before Launch returns.
+    //
+    ~Handle()
+    {
+        if (m_context)
+        {
+            m_context->m_handle = nullptr;
+            m_context = nullptr;
+        }
+    }
+
     void Kill(KillCause cause = KillCause::Kill);
 
     Signal* GetKilledSignal();

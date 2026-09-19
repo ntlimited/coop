@@ -8,24 +8,7 @@ namespace chan
 
 bool BaseChannel::Shutdown()
 {
-    if (m_shutdown)
-    {
-        return false;
-    }
-
-    m_shutdown = true;
-    Context* ctx = Self();
-
-    if (m_recv.IsHeld())
-    {
-        m_recv.Release(ctx);
-    }
-    if (m_send.IsHeld())
-    {
-        m_send.Release(ctx);
-    }
-
-    return true;
+    return ShutdownEnds(m_shutdown, m_recv, m_send);
 }
 
 } // namespace chan

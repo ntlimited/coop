@@ -38,7 +38,7 @@ namespace detail
 {
 
 template<size_t N, typename T, typename Pred>
-void SpawnFilter(FilterHandle<T, N>& handle, RecvChannel<T>& src, Pred pred);
+void SpawnFilter(FilterHandle<T, N>& handle, RecvChannel<T> src, Pred pred);
 
 } // namespace detail
 
@@ -62,7 +62,7 @@ struct FilterHandle
 
   private:
     template<typename Pred>
-    FilterHandle(Context* ctx, RecvChannel<T>& src, Pred pred)
+    FilterHandle(Context* ctx, RecvChannel<T> src, Pred pred)
     : m_ch(ctx)
     , m_stop(ctx)
     {
@@ -70,10 +70,10 @@ struct FilterHandle
     }
 
     template<size_t N2, typename T2, typename Pred2>
-    friend void detail::SpawnFilter(FilterHandle<T2, N2>&, RecvChannel<T2>&, Pred2);
+    friend void detail::SpawnFilter(FilterHandle<T2, N2>&, RecvChannel<T2>, Pred2);
 
     template<size_t N2, typename U, typename Pred>
-    friend auto Filter(Context*, RecvChannel<U>&, Pred)
+    friend auto Filter(Context*, RecvChannel<U>, Pred)
         -> FilterHandle<U, N2>;
 
     FixedChannel<T, N> m_ch;
@@ -89,15 +89,15 @@ namespace detail
 {
 
 template<size_t N, typename T, typename Pred>
-void SpawnFilter(FilterHandle<T, N>& handle, RecvChannel<T>& src, Pred pred)
+void SpawnFilter(FilterHandle<T, N>& handle, RecvChannel<T> src, Pred pred)
 {
-    Spawn([&handle, &src, pred = std::move(pred)](Context* filterCtx)
+    Spawn([&handle, src, pred = std::move(pred)](Context* filterCtx)
     {
         handle.m_exit.Acquire(filterCtx);
 
         while (true)
         {
-            auto r = CoordinateWithKill(filterCtx, &handle.m_stop, &src.m_recv);
+            auto r = CoordinateWithKill(filterCtx, &handle.m_stop, src.RecvCoord());
             if (r.Killed() || r == &handle.m_stop)
             {
                 break;
@@ -130,7 +130,7 @@ void SpawnFilter(FilterHandle<T, N>& handle, RecvChannel<T>& src, Pred pred)
 // ---------------------------------------------------------------------------
 
 template<size_t N = 1, typename T, typename Pred>
-auto Filter(Context* ctx, RecvChannel<T>& src, Pred pred)
+auto Filter(Context* ctx, RecvChannel<T> src, Pred pred)
     -> FilterHandle<T, N>
 {
     return FilterHandle<T, N>(ctx, src, std::move(pred));

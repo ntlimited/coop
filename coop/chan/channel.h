@@ -1,29 +1,28 @@
 #pragma once
 
+#include <cassert>
 #include <utility>
 
 #include "coop/coordinator.h"
 #include "coop/coordinate_with.h"
 #include "coop/self.h"
 
-// This is a pretty close facsimile of golang's channel implementation and is meant to be a second
-// order coordination primitive on top of the Coordinator.
+// Go-style directional channels: Channel<T> is chan T; RecvChannel / SendChannel are
+// <-chan T / chan<- T — the same buffer, restricted operations. They are pointer-sized
+// views, not virtual bases, so Channel::Recv/Send are direct member access (no vbptr).
+// Pipe, Select, and friends take the view by value (a Channel& converts). Capture the
+// view, not a reference to a temporary view.
 //
-// Select across channels: use CoordinateWith on m_recv (or m_send for send-select), then call
-// RecvAcquired (or SendAcquired) on the winning channel to complete the operation:
+// Select across channels: CoordinateWith on m_recv (or m_send), then RecvAcquired /
+// SendAcquired on the winner:
 //
 //   auto r = CoordinateWithKill(ctx, &ch1.m_recv, &ch2.m_recv);
 //   if (r.Killed())            { ... }
 //   else if (r == &ch1.m_recv) { ch1.RecvAcquired(v1); }
 //   else                       { ch2.RecvAcquired(v2); }
 //
-// The channel invariant (m_recv not held ↔ channel non-empty) means CoordinateWith's TryAcquire
-// fast path fires immediately when a channel already has data.
-//
-// TODO: the main value here would be that in theory, this supporting `Shutdown` would make the
-// coordinator not have to natively support it instead (e.g. we want the "always immediately select
-// the cancelled channel" semantics from golang). However the nuance above regarding our version
-// (multi-coordinator patterns) means that we're kind of stuck between things.
+// Invariant (outside shutdown): empty ↔ m_recv held; full ↔ m_send held.
+// m_recv starts held. m_send starts held only for capacity 0 (rendezvous).
 //
 
 namespace coop
@@ -45,21 +44,26 @@ inline bool WaitCoordinator(Coordinator* c, Context* ctx, bool killAware)
     return !CoordinateWithKill(ctx, c).Killed();
 }
 
+inline bool ShutdownEnds(bool& shutdown, Coordinator& recv, Coordinator& send)
+{
+    if (shutdown)
+    {
+        return false;
+    }
+    shutdown = true;
+    Context* ctx = Self();
+    if (recv.IsHeld())
+    {
+        recv.Release(ctx);
+    }
+    if (send.IsHeld())
+    {
+        send.Release(ctx);
+    }
+    return true;
+}
 
-// NOTE: there is almost certainly a good amount of refactoring (I would hope?) around all of the
-// subtly different logic in the send/recv implementations. Or maybe not and that's why it's
-// subtly different.
-//
-// The basic contract here is that we have two coordinators used to allow blocking on the channel's
-// two sides: e.g. waiting for someone to send when we're recv-ing, and waiting for someone to recv
-// when we're send-ing. This is complicated by the 'shutdown' semantic but not that terribly. In
-// short, we need to make sure the following invariants are true (outside of the shutdown case):
-//
-//  - If the channel is empty, the recv coordinator is held
-//  - If the channel is full, the send coordinator is held
-//
-// This means that we must start out with m_recv held initially in all cases, and that we must
-// start out with m_send held in the 0-capacity channel case.
+// Shared coordinators + shutdown for Channel<void>. Not a virtual base.
 //
 struct BaseChannel
 {
@@ -69,49 +73,31 @@ struct BaseChannel
     {
     }
 
-  protected:
-    // Required for virtual inheritance — the most-derived class initializes the virtual base
-    // directly, but intermediate classes still need a default constructor to exist syntactically.
-    //
-    BaseChannel()
-    : m_shutdown(false)
-    {
-    }
-
-  public:
-
-    virtual ~BaseChannel()
-    {
-    }
-
-    bool IsShutdown() const
-    {
-        return m_shutdown;
-    }
-
+    bool IsShutdown() const { return m_shutdown; }
     bool Shutdown();
 
     Coordinator m_recv;
     Coordinator m_send;
 
-  private:
+  protected:
     bool m_shutdown;
 };
 
 template<typename T>
-struct TypedBaseChannel : public BaseChannel
+struct Channel
 {
-  public:
-    TypedBaseChannel(TypedBaseChannel const& other) = delete;
-    TypedBaseChannel(TypedBaseChannel&&) = delete;
+    Channel(const Channel&) = delete;
+    Channel(Channel&&) = delete;
 
-    TypedBaseChannel(Context* ctx, T* buffer, size_t capacity)
-    : BaseChannel(ctx)
+    Channel(Context* ctx, T* buffer, size_t capacity)
+    : m_recv(ctx)
+    , m_send()
     , m_buffer(buffer)
     , m_head(0)
     , m_tail(0)
     , m_size(0)
     , m_capacity(capacity)
+    , m_shutdown(false)
     {
         if (!m_capacity)
         {
@@ -119,52 +105,15 @@ struct TypedBaseChannel : public BaseChannel
         }
     }
 
-  protected:
-    // See BaseChannel default constructor comment
-    //
-    TypedBaseChannel()
-    : m_buffer(nullptr)
-    , m_head(0)
-    , m_tail(0)
-    , m_size(0)
-    , m_capacity(0)
-    {
-    }
+    bool IsShutdown() const { return m_shutdown; }
+    bool Shutdown() { return ShutdownEnds(m_shutdown, m_recv, m_send); }
 
-  public:
-
-    virtual ~TypedBaseChannel()
-    {
-    }
-
-    bool IsEmpty() const
-    {
-        return m_size == 0;
-    }
-
-    bool IsFull() const
-    {
-        return m_size == m_capacity;
-    }
-
-  protected:
-    T* m_buffer;
-    size_t m_head;
-    size_t m_tail;
-    size_t m_size;
-    size_t m_capacity;
-};
-
-// If there's a way to get rid of the `Base::` stuttering everywhere I didn't find or remember one.
-//
-template<typename T>
-struct RecvChannel : virtual TypedBaseChannel<T>
-{
-    using Base = TypedBaseChannel<T>;
+    bool IsEmpty() const { return m_size == 0; }
+    bool IsFull() const { return m_size == m_capacity; }
 
     bool TryRecv(T& value /* out */)
     {
-        if (Base::IsEmpty())
+        if (IsEmpty())
         {
             return false;
         }
@@ -172,85 +121,159 @@ struct RecvChannel : virtual TypedBaseChannel<T>
         RecvImpl(value);
         Context* ctx = Self();
 
-        if (Base::IsEmpty())
+        if (IsEmpty())
         {
-            Base::m_recv.Acquire(ctx);
+            m_recv.Acquire(ctx);
         }
 
-        if (Base::m_send.IsHeld())
+        if (m_send.IsHeld())
         {
-            Base::m_send.Release(ctx);
+            m_send.Release(ctx);
         }
 
         return true;
     }
 
-    // Mirror image of the above but we handle shutdown differently
-    //
-    bool Recv(T& value /* out */)
-    {
-        return RecvWait(value, false);
-    }
+    bool Recv(T& value /* out */) { return RecvWait(value, false); }
+    bool RecvKill(T& value /* out */) { return RecvWait(value, true); }
 
-    // Kill-aware Recv. Returns false on shutdown or if the calling context is killed
-    // while waiting. Distinguishing the two is IsKilled() / WhyKilled().
-    //
-    bool RecvKill(T& value /* out */)
-    {
-        return RecvWait(value, true);
-    }
-
-    // Pull up to maxCount available items non-blockingly. Returns the number of items drained.
-    // Returns 0 immediately if the channel is empty. Releases m_send with schedule=false when
-    // unblocking a waiting sender, so the caller can process the batch before the sender refills.
+    // Pull up to maxCount available items non-blockingly. Returns the number of items
+    // drained. Releases m_send with schedule=false when unblocking a waiting sender.
     //
     size_t Drain(T* data, size_t maxCount)
     {
-        if (Base::IsEmpty()) return 0;
+        if (IsEmpty()) return 0;
 
         Context* ctx = Self();
         size_t n = 0;
 
-        while (n < maxCount && !Base::IsEmpty())
+        while (n < maxCount && !IsEmpty())
         {
-            bool wasFull = Base::IsFull();
+            bool wasFull = IsFull();
             RecvImpl(data[n++]);
 
-            if (wasFull && Base::m_send.IsHeld())
-                Base::m_send.Release(ctx, false);
+            if (wasFull && m_send.IsHeld())
+                m_send.Release(ctx, false);
         }
 
-        if (Base::IsEmpty() && !Base::IsShutdown())
-            Base::m_recv.Acquire(ctx);
+        if (IsEmpty() && !IsShutdown())
+            m_recv.Acquire(ctx);
 
         return n;
     }
 
-    // Complete a recv after m_recv has been acquired externally via CoordinateWith. The caller
-    // is responsible for having acquired m_recv (the invariant that m_recv not held ↔ non-empty
-    // guarantees RecvImpl will succeed unless the channel was shut down).
-    //
     bool RecvAcquired(T& value)
     {
         Context* ctx = Self();
 
         if (!RecvImpl(value))
         {
-            assert(Base::IsShutdown());
-            Base::m_recv.Release(ctx);
+            assert(IsShutdown());
+            m_recv.Release(ctx);
             return false;
         }
 
-        if ((Base::IsShutdown() && Base::IsEmpty()) || !Base::IsEmpty())
-            Base::m_recv.Release(ctx);
+        if ((IsShutdown() && IsEmpty()) || !IsEmpty())
+            m_recv.Release(ctx);
 
-        if (Base::m_send.IsHeld() && !Base::IsFull())
-            Base::m_send.Release(ctx);
+        if (m_send.IsHeld() && !IsFull())
+            m_send.Release(ctx);
 
         return true;
     }
 
-  protected:
+    bool TrySend(T value)
+    {
+        if (IsShutdown() || IsFull())
+        {
+            return false;
+        }
+
+        [[maybe_unused]] bool sent = SendImpl(std::move(value));
+        assert(sent);
+        Context* ctx = Self();
+
+        if (IsFull())
+        {
+            m_send.Acquire(ctx);
+        }
+
+        if (m_recv.IsHeld())
+        {
+            m_recv.Release(ctx);
+        }
+        return true;
+    }
+
+    bool Send(T value) { return SendWait(std::move(value), false); }
+    bool SendKill(T value) { return SendWait(std::move(value), true); }
+
+    // Push all items in [data, data+count), blocking when full. Intermediate m_recv
+    // releases use schedule=false so the consumer is deferred until the batch is
+    // complete or the buffer is full.
+    //
+    bool SendAll(const T* data, size_t count)
+    {
+        if (IsShutdown()) return false;
+
+        Context* ctx = Self();
+
+        bool acquiredSend = false;
+        for (size_t i = 0; i < count; i++)
+        {
+            while (IsFull())
+            {
+                m_send.Acquire(ctx);
+                acquiredSend = true;
+                if (IsShutdown())
+                {
+                    m_send.Release(ctx);
+                    return false;
+                }
+            }
+
+            bool wasEmpty = IsEmpty();
+            [[maybe_unused]] bool ok = SendImpl(data[i]);
+            assert(ok);
+
+            if (IsFull())
+                m_send.TryAcquire(ctx);
+            else if (acquiredSend && i == count - 1)
+                m_send.Release(ctx, false);
+
+            if (wasEmpty && m_recv.IsHeld())
+                m_recv.Release(ctx, i == count - 1);
+        }
+
+        return true;
+    }
+
+    bool SendAcquired(T value)
+    {
+        Context* ctx = Self();
+
+        if (IsShutdown())
+        {
+            m_send.Release(ctx);
+            return false;
+        }
+
+        [[maybe_unused]] bool ok = SendImpl(std::move(value));
+        assert(ok);
+
+        if (!IsFull())
+            m_send.Release(ctx);
+
+        if (m_recv.IsHeld() && !IsEmpty())
+            m_recv.Release(ctx);
+
+        return true;
+    }
+
+    Coordinator m_recv;
+    Coordinator m_send;
+
+  private:
     bool RecvWait(T& value, bool killAware)
     {
         if (TryRecv(value))
@@ -260,57 +283,42 @@ struct RecvChannel : virtual TypedBaseChannel<T>
 
         Context* ctx = Self();
 
-        // TryRecv returned false: channel is empty (cooperative scheduling guarantees this
-        // is still true here). If already shut down, nothing more will ever arrive. Release
-        // m_recv if we hold it (TryRecv may have acquired it when draining the last item)
-        // to propagate the shutdown to any other waiting receivers.
-        //
-        if (Base::IsShutdown())
+        if (IsShutdown())
         {
-            if (Base::m_recv.IsHeld())
+            if (m_recv.IsHeld())
             {
-                Base::m_recv.Release(ctx);
+                m_recv.Release(ctx);
             }
             return false;
         }
 
-        if (!WaitCoordinator(&this->m_recv, ctx, killAware))
+        if (!WaitCoordinator(&m_recv, ctx, killAware))
         {
             return false;
         }
 
-        // Spurious-wakeup loop: Drain and TryRecv pre-acquire m_recv while still running
-        // (not blocking), so a sender may release m_recv to an empty wait list, leaving
-        // m_recv un-held. When we then Acquire it lands immediately even though the channel
-        // is still empty. In that case m_recv is now held by us; re-wait to actually
-        // block until the sender adds an item or the channel is shut down.
-        //
         while (!RecvImpl(value))
         {
-            if (Base::IsShutdown())
+            if (IsShutdown())
             {
-                Base::m_recv.Release(ctx);
+                m_recv.Release(ctx);
                 return false;
             }
 
-            if (!WaitCoordinator(&this->m_recv, ctx, killAware))
+            if (!WaitCoordinator(&m_recv, ctx, killAware))
             {
                 return false;
             }
         }
 
-        // If we are shutdown, no more things can come through so signal anyone else who is waiting
-        // on the coordinator; alternatively, if there is more to recv, then let go of it for the
-        // next coordinatee.
-        //
-        if ((Base::IsShutdown() && Base::IsEmpty()) || !Base::IsEmpty())
+        if ((IsShutdown() && IsEmpty()) || !IsEmpty())
         {
-            Base::m_recv.Release(ctx);
+            m_recv.Release(ctx);
         }
 
-        if (Base::m_send.IsHeld() && !Base::IsFull())
+        if (m_send.IsHeld() && !IsFull())
         {
-            Base::m_send.Release(ctx);
+            m_send.Release(ctx);
         }
 
         return true;
@@ -318,200 +326,62 @@ struct RecvChannel : virtual TypedBaseChannel<T>
 
     bool RecvImpl(T& value)
     {
-        if (Base::IsEmpty())
+        if (IsEmpty())
         {
             return false;
         }
 
-        value = std::move(Base::m_buffer[Base::m_head++]);
-        if (Base::m_head == Base::m_capacity)
+        value = std::move(m_buffer[m_head++]);
+        if (m_head == m_capacity)
         {
-            Base::m_head = 0;
+            m_head = 0;
         }
-        Base::m_size--;
-        return true;
-    }
-};
-
-template<typename T>
-struct SendChannel : virtual TypedBaseChannel<T>
-{
-    using Base = TypedBaseChannel<T>;
-
-    bool TrySend(T value)
-    {
-        if (Base::IsShutdown() || Base::IsFull())
-        {
-            return false;
-        }
-
-        [[maybe_unused]] bool sent = SendImpl(std::move(value));
-        assert(sent);
-        Context* ctx = Self();
-
-        if (Base::IsFull())
-        {
-            Base::m_send.Acquire(ctx);
-        }
-
-        // Note that this is not the same as the non-try case
-        //
-        if (Base::m_recv.IsHeld())
-        {
-            Base::m_recv.Release(ctx);
-        }
+        m_size--;
         return true;
     }
 
-    // Push adds the given item to the channel, returning failure if the channel was shutdown
-    // before the push completed.
-    //
-    bool Send(T value)
-    {
-        return SendWait(std::move(value), false);
-    }
-
-    // Kill-aware Send. Returns false on shutdown or if the calling context is killed
-    // while waiting for capacity.
-    //
-    bool SendKill(T value)
-    {
-        return SendWait(std::move(value), true);
-    }
-
-    // Push all items in [data, data+count), blocking when the channel is full. Returns false if
-    // shutdown before all items were sent. Unlike calling Send() in a loop, intermediate m_recv
-    // releases use schedule=false so the consumer is deferred until the batch is complete or the
-    // buffer is full, reducing context switches when filling from an empty channel.
-    //
-    bool SendAll(const T* data, size_t count)
-    {
-        if (Base::IsShutdown()) return false;
-
-        Context* ctx = Self();
-
-        bool acquiredSend = false;
-        for (size_t i = 0; i < count; i++)
-        {
-            while (Base::IsFull())
-            {
-                Base::m_send.Acquire(ctx);
-                acquiredSend = true;
-                if (Base::IsShutdown())
-                {
-                    Base::m_send.Release(ctx);
-                    return false;
-                }
-            }
-
-            // Track empty→non-empty transition. Only release m_recv on that transition to
-            // avoid spuriously releasing a receiver's legitimately-held m_recv on subsequent
-            // iterations.
-            //
-            bool wasEmpty = Base::IsEmpty();
-            [[maybe_unused]] bool ok = SendImpl(data[i]);
-            assert(ok);
-
-            // A full-channel wait already acquired m_send. Mark fullness without
-            // reacquiring that held coordinator; otherwise a successful final send
-            // waits for its value to be consumed. If a batched drain freed extra
-            // space, release the acquired coordinator after the last item. Keeping it
-            // across the batch avoids waking another sender and consuming its slot
-            // before it runs.
-            // Restore this state before waking a receiver, which may run immediately.
-            //
-            if (Base::IsFull())
-                Base::m_send.TryAcquire(ctx);
-            else if (acquiredSend && i == count - 1)
-                Base::m_send.Release(ctx, false);
-
-            if (wasEmpty && Base::m_recv.IsHeld())
-                Base::m_recv.Release(ctx, i == count - 1);
-        }
-
-        return true;
-    }
-
-    // Complete a send after m_send has been acquired externally via CoordinateWith. The caller
-    // is responsible for having acquired m_send (the invariant that m_send not held ↔ non-full
-    // guarantees SendImpl will succeed unless the channel was shut down).
-    //
-    bool SendAcquired(T value)
-    {
-        Context* ctx = Self();
-
-        if (Base::IsShutdown())
-        {
-            Base::m_send.Release(ctx);
-            return false;
-        }
-
-        [[maybe_unused]] bool ok = SendImpl(std::move(value));
-        assert(ok);
-
-        if (!Base::IsFull())
-            Base::m_send.Release(ctx);
-
-        if (Base::m_recv.IsHeld() && !Base::IsEmpty())
-            Base::m_recv.Release(ctx);
-
-        return true;
-    }
-
-  protected:
     bool SendWait(T value, bool killAware)
     {
-        // Fast path: cannot call TrySend(value) here because for move-only T, TrySend takes
-        // its argument by value (consuming it), and we need the value preserved if the channel
-        // is full so the blocking path can send it. Inline the fast path instead.
-        //
-        if (!Base::IsShutdown() && !Base::IsFull())
+        if (!IsShutdown() && !IsFull())
         {
             [[maybe_unused]] bool sent = SendImpl(std::move(value));
             assert(sent);
             Context* ctx = Self();
 
-            if (Base::IsFull())
+            if (IsFull())
             {
-                Base::m_send.Acquire(ctx);
+                m_send.Acquire(ctx);
             }
 
-            if (Base::m_recv.IsHeld())
+            if (m_recv.IsHeld())
             {
-                Base::m_recv.Release(ctx);
+                m_recv.Release(ctx);
             }
             return true;
         }
 
-        // Blocking path: note that IsShutdown() can get flipped while we were coordinating
-        //
         Context* ctx = Self();
-        if (!WaitCoordinator(&this->m_send, ctx, killAware))
+        if (!WaitCoordinator(&m_send, ctx, killAware))
         {
             return false;
         }
-        if (Base::IsShutdown())
+        if (IsShutdown())
         {
-            Base::m_send.Release(ctx);
+            m_send.Release(ctx);
             return false;
         }
 
         [[maybe_unused]] bool sent = SendImpl(std::move(value));
         assert(sent);
 
-        // If there is space, let go of the coordinator so that the preconditions still stand. This
-        // in theory wouldn't happen today but if we change the unblock mechanics to not just
-        // chain immediately it's very possible for multiple Recvs before this wakes up holding the
-        // coordinator.
-        //
-        if (!Base::IsFull())
+        if (!IsFull())
         {
-            Base::m_send.Release(ctx);
+            m_send.Release(ctx);
         }
 
-        if (Base::m_recv.IsHeld() && !Base::IsEmpty())
+        if (m_recv.IsHeld() && !IsEmpty())
         {
-            Base::m_recv.Release(ctx);
+            m_recv.Release(ctx);
         }
 
         return true;
@@ -519,44 +389,76 @@ struct SendChannel : virtual TypedBaseChannel<T>
 
     bool SendImpl(T value)
     {
-        if (Base::IsFull())
+        if (IsFull())
         {
             return false;
         }
-        Base::m_buffer[Base::m_tail++] = std::move(value);
-        if (Base::m_tail == Base::m_capacity)
+        m_buffer[m_tail++] = std::move(value);
+        if (m_tail == m_capacity)
         {
-            Base::m_tail = 0;
+            m_tail = 0;
         }
-        Base::m_size++;
+        m_size++;
         return true;
     }
+
+    T* m_buffer;
+    size_t m_head;
+    size_t m_tail;
+    size_t m_size;
+    size_t m_capacity;
+    bool m_shutdown;
 };
 
+// <-chan T. Pointer-sized; Channel& converts. Capture by value across Spawn.
+//
 template<typename T>
-struct Channel : RecvChannel<T>, SendChannel<T>
+struct RecvChannel
 {
-    Channel(Context* ctx, T* buffer, size_t capacity)
-    : TypedBaseChannel<T>(ctx, buffer, capacity)
-    {
-    }
+    Channel<T>* ch{};
 
-  protected:
-    // For subclasses that initialize the virtual base (TypedBaseChannel) directly.
-    // Without this, the most-derived class has no default Channel<T> constructor to call
-    // after it handles the virtual base initialization itself.
-    //
-    Channel() = default;
+    RecvChannel() = default;
+    RecvChannel(Channel<T>& c) : ch(&c) {}
+
+    Coordinator* RecvCoord() const { return &ch->m_recv; }
+
+    bool IsShutdown() const { return ch->IsShutdown(); }
+    bool Shutdown() { return ch->Shutdown(); }
+    bool IsEmpty() const { return ch->IsEmpty(); }
+    bool IsFull() const { return ch->IsFull(); }
+
+    bool TryRecv(T& value) { return ch->TryRecv(value); }
+    bool Recv(T& value) { return ch->Recv(value); }
+    bool RecvKill(T& value) { return ch->RecvKill(value); }
+    size_t Drain(T* data, size_t maxCount) { return ch->Drain(data, maxCount); }
+    bool RecvAcquired(T& value) { return ch->RecvAcquired(value); }
 };
 
-// Channel<void> — counting channel (no ring buffer, no value). Semantics are identical
-// to Channel<T> except that send/recv transfer no data: senders increment a count, receivers
-// decrement it. Useful as a first-class signaling primitive that participates in Select.
+// chan<- T.
 //
-// Capacity follows the same contract as Channel<T>: capacity 0 is a rendezvous channel
-// (sender blocks until a receiver is ready), capacity N buffers up to N pending signals.
-//
-// Use On(ch, callback) where callback takes no arguments.
+template<typename T>
+struct SendChannel
+{
+    Channel<T>* ch{};
+
+    SendChannel() = default;
+    SendChannel(Channel<T>& c) : ch(&c) {}
+
+    Coordinator* SendCoord() const { return &ch->m_send; }
+
+    bool IsShutdown() const { return ch->IsShutdown(); }
+    bool Shutdown() { return ch->Shutdown(); }
+    bool IsEmpty() const { return ch->IsEmpty(); }
+    bool IsFull() const { return ch->IsFull(); }
+
+    bool TrySend(T value) { return ch->TrySend(std::move(value)); }
+    bool Send(T value) { return ch->Send(std::move(value)); }
+    bool SendKill(T value) { return ch->SendKill(std::move(value)); }
+    bool SendAll(const T* data, size_t count) { return ch->SendAll(data, count); }
+    bool SendAcquired(T value) { return ch->SendAcquired(std::move(value)); }
+};
+
+// Channel<void> — counting channel (no ring). Same capacity contract as Channel<T>.
 //
 template<>
 struct Channel<void> : BaseChannel
@@ -594,15 +496,8 @@ struct Channel<void> : BaseChannel
         return true;
     }
 
-    bool Send()
-    {
-        return SendWait(false);
-    }
-
-    bool SendKill()
-    {
-        return SendWait(true);
-    }
+    bool Send() { return SendWait(false); }
+    bool SendKill() { return SendWait(true); }
 
     bool TryRecv()
     {
@@ -620,18 +515,9 @@ struct Channel<void> : BaseChannel
         return true;
     }
 
-    bool Recv()
-    {
-        return RecvWait(false);
-    }
+    bool Recv() { return RecvWait(false); }
+    bool RecvKill() { return RecvWait(true); }
 
-    bool RecvKill()
-    {
-        return RecvWait(true);
-    }
-
-    // Complete a recv after m_recv has been acquired externally via CoordinateWith.
-    //
     bool RecvAcquired()
     {
         Context* ctx = Self();
@@ -652,8 +538,6 @@ struct Channel<void> : BaseChannel
         return true;
     }
 
-    // Complete a send after m_send has been acquired externally via CoordinateWith.
-    //
     bool SendAcquired()
     {
         Context* ctx = Self();
@@ -753,20 +637,11 @@ struct Channel<void> : BaseChannel
     size_t m_capacity;
 };
 
-// Fixed-capacity channel that owns its buffer. Eliminates the parallel buffer declaration
-// that Channel<T> requires at the call site.
-//
-//   coop::FixedChannel<int, 4> ch(ctx);
-//
-// Virtual base construction note: FixedChannel is the most-derived class, so it must
-// initialize TypedBaseChannel<T> (the virtual base) directly. Channel<T>'s own initializer
-// for the virtual base is skipped in that context.
-//
 template<typename T, size_t N>
 struct FixedChannel : Channel<T>
 {
     explicit FixedChannel(Context* ctx)
-    : TypedBaseChannel<T>(ctx, m_buf, N)
+    : Channel<T>(ctx, m_buf, N)
     {}
     T m_buf[N];
 };

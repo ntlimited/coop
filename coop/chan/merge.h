@@ -51,7 +51,7 @@ namespace detail
 {
 
 template<size_t N, typename T>
-void SpawnMerger(MergeHandle<T, N>& handle, RecvChannel<T>& src1, RecvChannel<T>& src2);
+void SpawnMerger(MergeHandle<T, N>& handle, RecvChannel<T> src1, RecvChannel<T> src2);
 
 } // namespace detail
 
@@ -81,7 +81,7 @@ struct MergeHandle
     Channel<T>& Chan() { return m_ch; }
 
   private:
-    MergeHandle(Context* ctx, RecvChannel<T>& src1, RecvChannel<T>& src2)
+    MergeHandle(Context* ctx, RecvChannel<T> src1, RecvChannel<T> src2)
     : m_ch(ctx)
     , m_stop(ctx)
     {
@@ -89,10 +89,10 @@ struct MergeHandle
     }
 
     template<size_t N2, typename T2>
-    friend void detail::SpawnMerger(MergeHandle<T2, N2>&, RecvChannel<T2>&, RecvChannel<T2>&);
+    friend void detail::SpawnMerger(MergeHandle<T2, N2>&, RecvChannel<T2>, RecvChannel<T2>);
 
     template<size_t N2, typename U>
-    friend auto Merge(Context*, RecvChannel<U>&, RecvChannel<U>&)
+    friend auto Merge(Context*, RecvChannel<U>, RecvChannel<U>)
         -> MergeHandle<U, N2>;
 
     FixedChannel<T, N> m_ch;
@@ -108,9 +108,9 @@ namespace detail
 {
 
 template<size_t N, typename T>
-void SpawnMerger(MergeHandle<T, N>& handle, RecvChannel<T>& src1, RecvChannel<T>& src2)
+void SpawnMerger(MergeHandle<T, N>& handle, RecvChannel<T> src1, RecvChannel<T> src2)
 {
-    Spawn([&handle, &src1, &src2](Context* mergerCtx)
+    Spawn([&handle, src1, src2](Context* mergerCtx)
     {
         handle.m_exit.Acquire(mergerCtx);
 
@@ -126,15 +126,15 @@ void SpawnMerger(MergeHandle<T, N>& handle, RecvChannel<T>& src1, RecvChannel<T>
             if (alive1 && alive2)
             {
                 r = CoordinateWithKill(mergerCtx, &handle.m_stop,
-                                       &src1.m_recv, &src2.m_recv);
+                                       src1.RecvCoord(), src2.RecvCoord());
             }
             else if (alive1)
             {
-                r = CoordinateWithKill(mergerCtx, &handle.m_stop, &src1.m_recv);
+                r = CoordinateWithKill(mergerCtx, &handle.m_stop, src1.RecvCoord());
             }
             else
             {
-                r = CoordinateWithKill(mergerCtx, &handle.m_stop, &src2.m_recv);
+                r = CoordinateWithKill(mergerCtx, &handle.m_stop, src2.RecvCoord());
             }
 
             if (r.Killed() || r == &handle.m_stop)
@@ -146,7 +146,7 @@ void SpawnMerger(MergeHandle<T, N>& handle, RecvChannel<T>& src1, RecvChannel<T>
             //
             T val{};
 
-            if (r == &src1.m_recv)
+            if (r == src1.RecvCoord())
             {
                 if (!src1.RecvAcquired(val)) { alive1 = false; continue; }
             }
@@ -173,7 +173,7 @@ void SpawnMerger(MergeHandle<T, N>& handle, RecvChannel<T>& src1, RecvChannel<T>
 // ---------------------------------------------------------------------------
 
 template<size_t N = 1, typename T>
-auto Merge(Context* ctx, RecvChannel<T>& src1, RecvChannel<T>& src2)
+auto Merge(Context* ctx, RecvChannel<T> src1, RecvChannel<T> src2)
     -> MergeHandle<T, N>
 {
     return MergeHandle<T, N>(ctx, src1, src2);

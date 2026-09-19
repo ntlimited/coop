@@ -280,8 +280,8 @@ struct Arm final : ArmBase
     // handler may CancelAll, which walks every arm. Subscription's ctor body calls ArmInitial() once
     // per arm after that wiring is done.
     //
-    Arm(SubscriptionCore* core, RecvChannel<T>* channel, H handler)
-    : ArmBase(core, &channel->m_recv)
+    Arm(SubscriptionCore* core, RecvChannel<T> channel, H handler)
+    : ArmBase(core, channel.RecvCoord())
     , m_channel(channel)
     , m_handler(std::move(handler))
     {
@@ -303,13 +303,13 @@ struct Arm final : ArmBase
         {
             return;
         }
-        if (m_channel->IsEmpty())
+        if (m_channel.IsEmpty())
         {
             // A channel already shut down before we subscribed will never fire us (its Shutdown
             // already pulsed m_recv to an empty wait list), so registering would strand the arm and
             // hang Wait(). Retire it straight away instead.
             //
-            if (m_channel->IsShutdown())
+            if (m_channel.IsShutdown())
             {
                 Retire();
                 return;
@@ -360,7 +360,7 @@ struct Arm final : ArmBase
         Control ctl;
         bool    done = false;
         size_t  n;
-        while (!done && (n = m_channel->Drain(batch, kBatch)) > 0)
+        while (!done && (n = m_channel.Drain(batch, kBatch)) > 0)
         {
             for (size_t i = 0; i < n; i++)
             {
@@ -381,7 +381,7 @@ struct Arm final : ArmBase
             m_core->RetireAll();           // retires this arm and every sibling
             return false;
         }
-        if (ctl.m_stop || m_channel->IsShutdown())
+        if (ctl.m_stop || m_channel.IsShutdown())
         {
             Retire();                      // terminal
             return false;
@@ -389,8 +389,8 @@ struct Arm final : ArmBase
         return true;
     }
 
-    RecvChannel<T>* m_channel;
-    H               m_handler;
+    RecvChannel<T> m_channel;
+    H              m_handler;
 };
 
 // A Drain case before it is hosted: the channel and handler, plus the concrete Arm type to build.
@@ -401,17 +401,17 @@ struct DrainSpec
 {
     using ArmType = Arm<T, H>;
 
-    RecvChannel<T>* m_channel;
-    H               m_handler;
+    RecvChannel<T> m_channel;
+    H              m_handler;
 };
 
-// Drain(ch, handler) -- declare an arm. T is deduced from the channel (derived-to-base deduction
-// handles Channel<T>/FixedChannel), H from the handler.
+// Drain(ch, handler) -- declare an arm. T is deduced from the channel (Channel& converts
+// to RecvChannel), H from the handler.
 //
 template<typename T, typename H>
-[[nodiscard]] DrainSpec<T, H> Drain(RecvChannel<T>& channel, H handler)
+[[nodiscard]] DrainSpec<T, H> Drain(RecvChannel<T> channel, H handler)
 {
-    return DrainSpec<T, H>{&channel, std::move(handler)};
+    return DrainSpec<T, H>{channel, std::move(handler)};
 }
 
 namespace detail

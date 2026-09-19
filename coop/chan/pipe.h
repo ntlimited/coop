@@ -56,7 +56,7 @@ namespace detail
 {
 
 template<size_t N, typename T, typename Out, typename Fn>
-void SpawnPipe(PipeHandle<Out, N>& handle, RecvChannel<T>& src, Fn fn);
+void SpawnPipe(PipeHandle<Out, N>& handle, RecvChannel<T> src, Fn fn);
 
 } // namespace detail
 
@@ -91,7 +91,7 @@ struct PipeHandle
     // ctx initialises m_ch and m_stop (held, so the pipe blocks until Stop() releases it).
     //
     template<typename T, typename Fn>
-    PipeHandle(Context* ctx, RecvChannel<T>& src, Fn fn)
+    PipeHandle(Context* ctx, RecvChannel<T> src, Fn fn)
     : m_ch(ctx)
     , m_stop(ctx)
     {
@@ -101,10 +101,10 @@ struct PipeHandle
     // Friend all SpawnPipe instantiations — SpawnPipe accesses m_exit, m_stop, and m_ch.
     //
     template<size_t N2, typename T2, typename Out2, typename Fn2>
-    friend void detail::SpawnPipe(PipeHandle<Out2, N2>&, RecvChannel<T2>&, Fn2);
+    friend void detail::SpawnPipe(PipeHandle<Out2, N2>&, RecvChannel<T2>, Fn2);
 
     template<size_t N2, typename T, typename Fn>
-    friend auto Pipe(Context*, RecvChannel<T>&, Fn)
+    friend auto Pipe(Context*, RecvChannel<T>, Fn)
         -> PipeHandle<std::invoke_result_t<Fn, T>, N2>;
 
     FixedChannel<Out, N> m_ch;
@@ -120,9 +120,9 @@ namespace detail
 {
 
 template<size_t N, typename T, typename Out, typename Fn>
-void SpawnPipe(PipeHandle<Out, N>& handle, RecvChannel<T>& src, Fn fn)
+void SpawnPipe(PipeHandle<Out, N>& handle, RecvChannel<T> src, Fn fn)
 {
-    Spawn([&handle, &src, fn = std::move(fn)](Context* pipeCtx)
+    Spawn([&handle, src, fn = std::move(fn)](Context* pipeCtx)
     {
         handle.m_exit.Acquire(pipeCtx);
 
@@ -130,7 +130,7 @@ void SpawnPipe(PipeHandle<Out, N>& handle, RecvChannel<T>& src, Fn fn)
         {
             // Wait for: kill signal | explicit stop | data available on source.
             //
-            auto r = CoordinateWithKill(pipeCtx, &handle.m_stop, &src.m_recv);
+            auto r = CoordinateWithKill(pipeCtx, &handle.m_stop, src.RecvCoord());
             if (r.Killed() || r == &handle.m_stop) break;
 
             // src.m_recv has been acquired — complete the recv.
@@ -165,7 +165,7 @@ void SpawnPipe(PipeHandle<Out, N>& handle, RecvChannel<T>& src, Fn fn)
 // ---------------------------------------------------------------------------
 
 template<size_t N = 1, typename T, typename Fn>
-auto Pipe(Context* ctx, RecvChannel<T>& src, Fn fn)
+auto Pipe(Context* ctx, RecvChannel<T> src, Fn fn)
     -> PipeHandle<std::invoke_result_t<Fn, T>, N>
 {
     using Out = std::invoke_result_t<Fn, T>;

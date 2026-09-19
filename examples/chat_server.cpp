@@ -48,7 +48,7 @@ struct ClientSlot
 {
     bool                        active;
     int32_t                     fd;
-    coop::chan::SendChannel<Message>* outbound;
+    coop::chan::SendChannel<Message> outbound;
     coop::Context::Handle       writerHandle;
 };
 
@@ -61,7 +61,7 @@ struct ClientRegistry
         memset(clients, 0, sizeof(clients));
     }
 
-    int32_t Register(int32_t fd, coop::chan::SendChannel<Message>* outbound)
+    int32_t Register(int32_t fd, coop::chan::SendChannel<Message> outbound)
     {
         for (int32_t i = 0; i < MAX_CLIENTS; i++)
         {
@@ -79,7 +79,7 @@ struct ClientRegistry
     void Unregister(int32_t slot)
     {
         clients[slot].active = false;
-        clients[slot].outbound = nullptr;
+        clients[slot].outbound = {};
     }
 };
 
@@ -88,7 +88,7 @@ struct ChatHandler : coop::Launchable
     ChatHandler(
         coop::Context* ctx,
         int fd,
-        coop::chan::SendChannel<Message>* broadcast,
+        coop::chan::SendChannel<Message> broadcast,
         ClientRegistry* registry)
     : coop::Launchable(ctx)
     , m_fd(fd)
@@ -108,7 +108,7 @@ struct ChatHandler : coop::Launchable
 
         // Register with the client registry so the broadcaster can find us
         //
-        int32_t slot = m_registry->Register(rawFd, &m_outbound);
+        int32_t slot = m_registry->Register(rawFd, m_outbound);
         if (slot < 0)
         {
             spdlog::warn("chat: too many clients, rejecting fd={}", rawFd);
@@ -122,14 +122,14 @@ struct ChatHandler : coop::Launchable
         // Spawn the writer context as a child. It reads from our outbound channel and writes
         // to the socket.
         //
-        coop::chan::RecvChannel<Message>* outbound = &m_outbound;
+        coop::chan::RecvChannel<Message> outbound = m_outbound;
         auto* stream = &m_stream;
         coop::Spawn([outbound, stream, rawFd](coop::Context* writerCtx)
         {
             writerCtx->SetName("ChatWriter");
             Message msg;
 
-            while (outbound->Recv(msg))
+            while (outbound.Recv(msg))
             {
                 int sent = stream->SendAll(msg.data, msg.len);
                 if (sent <= 0)
@@ -155,7 +155,7 @@ struct ChatHandler : coop::Launchable
             msg.len = snprintf(msg.data, sizeof(msg.data), "[fd=%d] %.*s", rawFd, n, recvBuf);
             msg.senderFd = rawFd;
 
-            if (!m_broadcast->Send(msg))
+            if (!m_broadcast.Send(msg))
             {
                 break;
             }
@@ -175,7 +175,7 @@ struct ChatHandler : coop::Launchable
     }
 
     coop::io::Descriptor        m_fd;
-    coop::chan::SendChannel<Message>* m_broadcast;
+    coop::chan::SendChannel<Message> m_broadcast;
     ClientRegistry*             m_registry;
     Message                     m_outboundBuffer[OUTBOUND_BUFFER_SLOTS];
     coop::chan::Channel<Message>      m_outbound;
@@ -234,20 +234,20 @@ void SpawningTask(coop::Context* ctx, void*)
                 break;
             }
 
-            coop::Launch<ChatHandler>(fd, &broadcast, &registry);
+            coop::Launch<ChatHandler>(fd, broadcast, &registry);
             coop::Yield();
         }
     });
 
     // Broadcaster: reads from the broadcast channel and fans out to all connected clients
     //
-    coop::chan::RecvChannel<Message>* bcastRecv = &broadcast;
+    coop::chan::RecvChannel<Message> bcastRecv = broadcast;
     coop::Spawn([bcastRecv, &registry](coop::Context* bcastCtx)
     {
         bcastCtx->SetName("Broadcaster");
         Message msg;
 
-        while (bcastRecv->Recv(msg))
+        while (bcastRecv.Recv(msg))
         {
             for (int32_t i = 0; i < MAX_CLIENTS; i++)
             {
@@ -263,7 +263,7 @@ void SpawningTask(coop::Context* ctx, void*)
                     continue;
                 }
 
-                registry.clients[i].outbound->TrySend(msg);
+                registry.clients[i].outbound.TrySend(msg);
             }
         }
     });

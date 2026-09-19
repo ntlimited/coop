@@ -64,11 +64,11 @@ struct NoSent
 template<typename T, typename OnValue, typename OnShutdown>
 struct RecvCase
 {
-    RecvChannel<T>& ch;
+    RecvChannel<T> ch;
     OnValue   onValue;
     OnShutdown onShutdown;
 
-    Coordinator* Coord() { return &ch.m_recv; }
+    Coordinator* Coord() { return ch.RecvCoord(); }
 
     bool Fire()
     {
@@ -115,12 +115,12 @@ struct RecvCase<void, OnValue, OnShutdown>
 template<typename T, typename OnSent, typename OnShutdown>
 struct SendCase
 {
-    SendChannel<T>& ch;
+    SendChannel<T> ch;
     T value;
     OnSent     onSent;
     OnShutdown onShutdown;
 
-    Coordinator* Coord() { return &ch.m_send; }
+    Coordinator* Coord() { return ch.SendCoord(); }
 
     bool Fire()
     {
@@ -286,14 +286,14 @@ void TryDispatchCases(Context* ctx, bool& fired, bool& ok, CaseTuple& cases,
 // ---------------------------------------------------------------------------
 
 template<typename T, typename OnValue>
-auto On(RecvChannel<T>& ch, OnValue&& onValue)
+auto On(RecvChannel<T> ch, OnValue&& onValue)
     -> RecvCase<T, std::decay_t<OnValue>, NoShutdown>
 {
     return { ch, std::forward<OnValue>(onValue), NoShutdown{} };
 }
 
 template<typename T, typename OnValue, typename OnShutdown>
-auto On(RecvChannel<T>& ch, OnValue&& onValue, OnShutdown&& onShutdown)
+auto On(RecvChannel<T> ch, OnValue&& onValue, OnShutdown&& onShutdown)
     -> RecvCase<T, std::decay_t<OnValue>, std::decay_t<OnShutdown>>
 {
     return { ch, std::forward<OnValue>(onValue), std::forward<OnShutdown>(onShutdown) };
@@ -318,21 +318,21 @@ auto On(Channel<void>& ch, OnValue&& onValue, OnShutdown&& onShutdown)
 // ---------------------------------------------------------------------------
 
 template<typename T>
-auto OnSend(SendChannel<T>& ch, T value)
+auto OnSend(SendChannel<T> ch, T value)
     -> SendCase<T, NoSent, NoShutdown>
 {
     return { ch, std::move(value), NoSent{}, NoShutdown{} };
 }
 
 template<typename T, typename OnSent>
-auto OnSend(SendChannel<T>& ch, T value, OnSent&& onSent)
+auto OnSend(SendChannel<T> ch, T value, OnSent&& onSent)
     -> SendCase<T, std::decay_t<OnSent>, NoShutdown>
 {
     return { ch, std::move(value), std::forward<OnSent>(onSent), NoShutdown{} };
 }
 
 template<typename T, typename OnSent, typename OnShutdown>
-auto OnSend(SendChannel<T>& ch, T value, OnSent&& onSent, OnShutdown&& onShutdown)
+auto OnSend(SendChannel<T> ch, T value, OnSent&& onSent, OnShutdown&& onShutdown)
     -> SendCase<T, std::decay_t<OnSent>, std::decay_t<OnShutdown>>
 {
     return { ch, std::move(value), std::forward<OnSent>(onSent),

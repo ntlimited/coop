@@ -16,6 +16,7 @@
 #include "cooperator_configuration.h"
 #include "cooperator_var.h"
 #include "spawn_configuration.h"
+#include "detail/submission_entry.h"
 #include "stack_pool.h"
 #include "perf/counters.h"
 #include "prng.h"
@@ -442,18 +443,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     void PrintContextTree(Context* ctx = nullptr, int indent = 0) ;
 
-    // Type-erased submission entry for cross-thread work dispatch. Public because TypedSubmission
-    // (in cooperator.hpp) inherits from it.
-    //
-    struct SubmissionEntry
-    {
-        SubmissionEntry* m_next{nullptr};
-        void (*m_invoke)(SubmissionEntry*, Context*);
-        void (*m_destroy)(SubmissionEntry*);
-        SpawnConfiguration m_config;
-        std::binary_semaphore* m_completion{nullptr};
-        bool* m_completionOk{nullptr};
-    };
+    using SubmissionEntry = coop::SubmissionEntry;
 
   private:
     // Shared logic for entering a newly created context. Handles saving the spawning context's

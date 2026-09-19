@@ -132,6 +132,9 @@ Both are available as free functions (prefer these) or as `Cooperator` methods.
 ### Submit (`coop/cooperator.h`)
 Cross-thread API for queuing work onto a cooperator from external threads. Uses eventfd for
 wake notification and an intrusive linked list (unbounded, no capacity limit).
+`Cooperate` is the in-context sibling: the spawn-result wake is embedded in
+`CooperateHandle` and runs inline on the caller, so the target never heap-allocates
+to notify.
 ```cpp
 // Fire-and-forget with lambda (heap-allocated, freed after execution)
 cooperator.Submit([&](Context* ctx) { ... });

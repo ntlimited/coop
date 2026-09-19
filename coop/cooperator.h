@@ -17,6 +17,7 @@
 #include "cooperator_var.h"
 #include "spawn_configuration.h"
 #include "detail/submission_entry.h"
+#include "launchable.h"
 #include "stack_pool.h"
 #include "perf/counters.h"
 #include "prng.h"
@@ -80,35 +81,32 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
         Fn&& fn,
         Context::Handle* handle = nullptr);
 
-    // Launch is an alternative, in-context API where Launchable types can be constructed and
-    // given their own context to execute in.
+    // Launch constructs a Launchable on a new context and enters it. Returns LaunchResult:
+    // spawned is false only if the context was never created (parent killed, alloc fail).
+    // object is non-null only while the Launchable is still running (it yielded).
+    // `if (!Launch<T>(...))` means spawn failed — a connection that finishes handshake
+    // and exits is spawned, not a failure, so the caller must not close the fd again.
     //
-    // This is a slightly dangerous API in two ways:
-    //  (1) The context that is passed into the constructor is not the current context
-    //  (2) The returned instance may already be destructed.
-    //
-    // The former is unfortunate and would be nice to patch up. The latter is just the nature of
-    // things; if you know enough about the type to want to touch it after, then you should also
-    // know enough to know if it is safe.
+    // The Context* passed to the Launchable constructor is the new context, not Self().
     //
     template<typename T, typename... Args>
-    T* Launch(SpawnConfiguration const&, Context::Handle*, Args&&...);
+    LaunchResult<T> Launch(SpawnConfiguration const&, Context::Handle*, Args&&...);
 
     template<typename T, typename... Args>
-    T* Launch(SpawnConfiguration const& config, Args&&... args)
+    LaunchResult<T> Launch(SpawnConfiguration const& config, Args&&... args)
     {
         Context::Handle* h = nullptr;
         return Launch<T>(config, h, std::forward<Args&&>(args)...);
     }
 
     template<typename T, typename... Args>
-    T* Launch(Context::Handle* h, Args&&... args)
+    LaunchResult<T> Launch(Context::Handle* h, Args&&... args)
     {
         return Launch<T>(s_defaultConfiguration, h, std::forward<Args&&>(args)...);
     }
 
     template<typename T, typename... Args>
-    T* Launch(Args&&... args)
+    LaunchResult<T> Launch(Args&&... args)
     {
         Context::Handle* h = nullptr;
         return Launch<T>(s_defaultConfiguration, h, std::forward<Args&&>(args)...);

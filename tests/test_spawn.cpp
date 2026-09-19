@@ -116,9 +116,71 @@ TEST(SpawnTest, LaunchBasic)
     test::RunInCooperator([](coop::Context* ctx)
     {
         bool launched = false;
-        auto* obj = ctx->GetCooperator()->Launch<TestLaunchable>(&launched);
-        EXPECT_NE(obj, nullptr);
+        auto result = ctx->GetCooperator()->Launch<TestLaunchable>(&launched);
+        EXPECT_TRUE(result.spawned);
+        EXPECT_EQ(result.object, nullptr);
         EXPECT_TRUE(launched);
+    });
+}
+
+namespace
+{
+
+struct YieldingLaunchable : coop::Launchable
+{
+    YieldingLaunchable(coop::Context* ctx, int* step)
+    : coop::Launchable(ctx)
+    , m_step(step)
+    {
+    }
+
+    virtual void Launch() final
+    {
+        *m_step = 1;
+        GetContext()->Yield(true);
+        *m_step = 2;
+    }
+
+    coop::Context* Ctx() { return GetContext(); }
+
+    int* m_step;
+};
+
+} // end anonymous namespace
+
+TEST(SpawnTest, LaunchReturnsLiveObjectIfYields)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int step = 0;
+        auto result = ctx->GetCooperator()->Launch<YieldingLaunchable>(&step);
+        EXPECT_TRUE(result.spawned);
+        ASSERT_NE(result.object, nullptr);
+        EXPECT_EQ(step, 1);
+        EXPECT_EQ(result.object->Ctx()->Parent(), ctx);
+
+        ctx->Yield(true);
+        EXPECT_EQ(step, 2);
+    });
+}
+
+TEST(SpawnTest, LaunchFailsWhenParentKilled)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::Context::Handle child;
+        ctx->GetCooperator()->Spawn([&](coop::Context* c)
+        {
+            c->Yield(true);
+            bool launched = false;
+            auto result = c->GetCooperator()->Launch<TestLaunchable>(&launched);
+            EXPECT_FALSE(result.spawned);
+            EXPECT_EQ(result.object, nullptr);
+            EXPECT_FALSE(launched);
+        }, &child);
+
+        child.Kill();
+        ctx->Yield(true);
     });
 }
 
@@ -446,9 +508,10 @@ TEST(SpawnTest, LaunchWhoseConstructorSpawns)
     {
         bool ctorSpawnRan = false;
         bool launched = false;
-        auto* obj = ctx->GetCooperator()->Launch<SpawnInCtorLaunchable>(
+        auto result = ctx->GetCooperator()->Launch<SpawnInCtorLaunchable>(
             &ctorSpawnRan, &launched);
-        EXPECT_NE(obj, nullptr);
+        EXPECT_TRUE(result.spawned);
+        EXPECT_EQ(result.object, nullptr);
         EXPECT_TRUE(launched);
         ctx->Yield(true);
         EXPECT_TRUE(ctorSpawnRan);

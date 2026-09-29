@@ -23,12 +23,37 @@ no per-message submission cost.
 
 Three pieces, all opt-in. A Uring with no buffer ring and no armed recv behaves exactly as before.
 
-### `BufferRing` (`coop/io/buffer_ring.h`, header-only)
+### `BufferRing` (`coop/io/buffer_ring.{h,cpp}`)
 
 Registers a pbuf ring, seeds every slot, decodes the kernel-selected buffer id out of a recv
 completion (`IORING_CQE_F_BUFFER` / `cqe->flags >> IORING_CQE_BUFFER_SHIFT`), and recycles consumed
 buffers back to the kernel. Recycle is batched: `Return(bid)` stages a slot, `Publish()` makes the
 staged slots visible to the kernel in one ring advance.
+
+#### Ubuntu registration compatibility
+
+Ubuntu kernels `6.8.0-139-generic` and `6.8.0-142-generic` invert the provided-buffer-ring
+reserved-field check (Ubuntu bug [2162843](https://bugs.launchpad.net/bugs/2162843)). The
+default-off `COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK` CMake option permits a retry with
+`resv[0]=1` only after normal registration returns `-EINVAL`, the release matches exactly,
+the kernel version contains `-Ubuntu`, and the ring parameters are valid. Workaround rings
+use the same reserved value for unregister;
+teardown stops the process if unregister fails, so kernel-owned buffers are never freed. Other
+kernels and errors retain the normal liburing path. Remove the macro when affected kernels are
+retired or repaired.
+
+Enable it in a separate build directory:
+
+```bash
+cmake -S . -B build/debug-ubuntu-pbuf -DCMAKE_BUILD_TYPE=Debug \
+    -DCOOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK=ON
+cmake --build build/debug-ubuntu-pbuf -j
+./build/debug-ubuntu-pbuf/bin/coop_tests
+```
+
+Both ordinary and workaround registration retain ownership until successful unregister.
+An unregister error stops the process before the backing buffer storage is destroyed.
+The compile-time option changes only setup and teardown; it adds no receive-path check.
 
 ### `ArmedHandle` (`coop/io/armed_handle.{h,cpp}`)
 

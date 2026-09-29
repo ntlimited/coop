@@ -42,6 +42,9 @@ if(COOP_COVERAGE)
     add_link_options(--coverage)
 endif()
 
+option(COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK
+    "Enable the provided-buffer-ring workaround for affected Ubuntu 6.8 kernels" OFF)
+
 # AddressSanitizer. Worth a switch of its own because a cooperative runtime is not something ASan
 # can follow unaided: it tracks one stack per thread, and coop moves between many. The annotations
 # in coop/detail/asan_fiber.h keep its shadow pointed at whichever fiber is live, and they compile
@@ -127,6 +130,9 @@ list(FILTER COOP_SOURCES EXCLUDE REGEX ".*/coop/chan/.*")
 
 add_library(coop STATIC ${COOP_SOURCES} $<TARGET_OBJECTS:coop_chan>)
 target_include_directories(coop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK)
+    target_compile_definitions(coop PRIVATE COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK=1)
+endif()
 if(COOP_ASAN)
     # Consumers must use the same sanitizer-dependent public layout and link its runtime,
     # including when coop is embedded with add_subdirectory.
@@ -286,6 +292,7 @@ add_executable(coop_tests
     tests/test_handle_completion_callbacks.cpp
     tests/test_dns_runtime.cpp
     tests/test_armed_handle.cpp
+    tests/test_buffer_ring.cpp
     tests/test_stress.cpp
     tests/test_http.cpp
     tests/test_perf.cpp
@@ -309,8 +316,19 @@ target_compile_definitions(coop_test_completion_dispatch PRIVATE
     "$<TARGET_PROPERTY:coop,COMPILE_DEFINITIONS>")
 target_sources(coop_tests PRIVATE $<TARGET_OBJECTS:coop_test_completion_dispatch>)
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
+if(COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK)
+    target_compile_definitions(coop_tests PRIVATE COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK=1)
+endif()
 target_link_options(coop_tests PRIVATE -rdynamic
-    -Wl,--wrap=_ZN4coop2io6Handle8CallbackEP12io_uring_cqe)
+    -Wl,--wrap=_ZN4coop2io6Handle8CallbackEP12io_uring_cqe
+    -Wl,--wrap=io_uring_setup_buf_ring
+    -Wl,--wrap=io_uring_free_buf_ring
+    -Wl,--wrap=io_uring_register_buf_ring
+    -Wl,--wrap=io_uring_unregister_buf_ring
+    -Wl,--wrap=io_uring_register
+    -Wl,--wrap=uname
+    -Wl,--wrap=mmap
+    -Wl,--wrap=munmap)
 # The introspection fixture asserts that its named caller remains on the blocked stack.
 # noinline alone still permits a tail call, and coop's frame-pointer flags are PRIVATE.
 # Preserve the fixture's frames without changing codegen for the runtime or other tests.

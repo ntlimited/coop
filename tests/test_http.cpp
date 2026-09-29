@@ -1816,7 +1816,15 @@ void RunWithBufferRing(uint32_t entries, uint32_t bufSize,
 
     cooperator.SubmitSync([&](coop::Context* ctx)
     {
-        fn(ctx);
+        // Keep shutdown outside the assertion's return path so an unavailable pool
+        // reports its prerequisite failure without crashing or stranding the thread.
+        //
+        [&]
+        {
+            ASSERT_NE(coop::GetUring()->GetBufferRing(), nullptr)
+                << "provided buffer-ring registration failed";
+            fn(ctx);
+        }();
         cooperator.Shutdown();
     });
 }

@@ -486,8 +486,22 @@ TEST(ChannelTest, SelectRecv)
         int sum = 0, count = 0;
         bool done1 = false, done2 = false;
 
-        auto on1 = coop::chan::On(ch1, [&](int v) { sum += v; count++; }, [&]{ done1 = true; });
-        auto on2 = coop::chan::On(ch2, [&](int v) { sum += v; count++; }, [&]{ done2 = true; });
+        auto on1 = coop::chan::On<int>(
+            ch1,
+            [&](int v)
+            {
+                sum += v;
+                count++;
+            },
+            [&] { done1 = true; });
+        auto on2 = coop::chan::On<int>(
+            ch2,
+            [&](int v)
+            {
+                sum += v;
+                count++;
+            },
+            [&] { done2 = true; });
 
         while (!done1 || !done2)
         {
@@ -525,10 +539,10 @@ TEST(ChannelTest, SelectRecvShutdown)
 
         // Loop until Select returns false (ch1 shutdown fires).
         //
-        while (coop::chan::Select(ctx,
-            coop::chan::On(ch1, [&](int v) { received = v; }),
-            coop::chan::On(ch2, [&](int v) { (void)v; })
-        )) {}
+        while (coop::chan::Select(ctx, coop::chan::On<int>(ch1, [&](int v) { received = v; }),
+                                  coop::chan::On<int>(ch2, [&](int v) { (void)v; })))
+        {
+        }
 
         EXPECT_EQ(received, 42);
 
@@ -632,9 +646,8 @@ TEST(ChannelTest, MoveOnlyTypeSelect)
         });
 
         int received = -1;
-        bool ok = coop::chan::Select(ctx,
-            coop::chan::On(ch, [&](std::unique_ptr<int> v){ received = *v; })
-        );
+        bool ok = coop::chan::Select(ctx, coop::chan::On<std::unique_ptr<int>>(
+                                              ch, [&](std::unique_ptr<int> v) { received = *v; }));
 
         EXPECT_TRUE(ok);
         EXPECT_EQ(received, 42);
@@ -684,7 +697,8 @@ TEST(ChannelTest, VoidChannelSelect)
         bool sigDone = false, dataDone = false;
 
         auto onSig  = coop::chan::On(sig,  [&]()      { signals++; },   [&]{ sigDone  = true; });
-        auto onData = coop::chan::On(data, [&](int v) { dataVal = v; }, [&]{ dataDone = true; });
+        auto onData = coop::chan::On<int>(
+            data, [&](int v) { dataVal = v; }, [&] { dataDone = true; });
 
         while (!sigDone || !dataDone)
         {
@@ -736,10 +750,8 @@ TEST(ChannelTest, SelectSend)
         EXPECT_TRUE(ch1.TrySend(0));
 
         int sent = -1;
-        coop::chan::Select(ctx,
-            coop::chan::OnSend(ch1, 10, [&]{ sent = 1; }),
-            coop::chan::OnSend(ch2, 20, [&]{ sent = 2; })
-        );
+        coop::chan::Select(ctx, coop::chan::OnSend<int>(ch1, 10, [&] { sent = 1; }),
+                           coop::chan::OnSend<int>(ch2, 20, [&] { sent = 2; }));
 
         EXPECT_EQ(sent, 2);
 
@@ -778,9 +790,13 @@ TEST(ChannelTest, SelectMixedRecvSend)
         bool gotRecv = false, gotSend = false;
 
         coop::chan::Select(ctx,
-            coop::chan::On(recvCh,     [&](int v){ received = v; gotRecv = true; }),
-            coop::chan::OnSend(sendCh, 99, [&]{ gotSend = true; })
-        );
+                           coop::chan::On<int>(recvCh,
+                                               [&](int v)
+                                               {
+                                                   received = v;
+                                                   gotRecv = true;
+                                               }),
+                           coop::chan::OnSend<int>(sendCh, 99, [&] { gotSend = true; }));
 
         EXPECT_TRUE(gotRecv);
         EXPECT_FALSE(gotSend);
@@ -812,9 +828,8 @@ TEST(ChannelTest, SelectSendShutdown)
             ch.Shutdown();
         });
 
-        bool ok = coop::chan::Select(ctx,
-            coop::chan::OnSend(ch, 42, [&]{}, [&]{ shutdownSeen = true; })
-        );
+        bool ok = coop::chan::Select(ctx, coop::chan::OnSend<int>(
+                                              ch, 42, [&] {}, [&] { shutdownSeen = true; }));
 
         EXPECT_FALSE(ok);
         EXPECT_TRUE(shutdownSeen);
@@ -835,10 +850,8 @@ TEST(ChannelTest, SelectDefault)
 
         // Channel empty — default fires.
         //
-        bool ok = coop::chan::Select(ctx,
-            coop::chan::On(ch, [&](int v){ received = v; }),
-            coop::chan::Default([&]{ defaultFired = true; })
-        );
+        bool ok = coop::chan::Select(ctx, coop::chan::On<int>(ch, [&](int v) { received = v; }),
+                                     coop::chan::Default([&] { defaultFired = true; }));
 
         EXPECT_FALSE(ok);
         EXPECT_TRUE(defaultFired);
@@ -849,10 +862,8 @@ TEST(ChannelTest, SelectDefault)
         ch.TrySend(42);
         defaultFired = false;
 
-        ok = coop::chan::Select(ctx,
-            coop::chan::On(ch, [&](int v){ received = v; }),
-            coop::chan::Default([&]{ defaultFired = true; })
-        );
+        ok = coop::chan::Select(ctx, coop::chan::On<int>(ch, [&](int v) { received = v; }),
+                                coop::chan::Default([&] { defaultFired = true; }));
 
         EXPECT_TRUE(ok);
         EXPECT_FALSE(defaultFired);
@@ -876,10 +887,9 @@ TEST(ChannelTest, SelectTimeout)
 
         // Nothing will send — timeout should fire.
         //
-        bool ok = coop::chan::Select(ctx,
-            coop::chan::On(ch, [&](int v) { received = v; }),
-            coop::chan::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
-        );
+        bool ok = coop::chan::Select(
+            ctx, coop::chan::On<int>(ch, [&](int v) { received = v; }),
+            coop::chan::Timeout(std::chrono::milliseconds(50), [&] { timedOut = true; }));
 
         EXPECT_FALSE(ok);
         EXPECT_TRUE(timedOut);
@@ -905,10 +915,9 @@ TEST(ChannelTest, SelectTimeoutNotFired)
             ch.Send(99);
         });
 
-        bool ok = coop::chan::Select(ctx,
-            coop::chan::On(ch, [&](int v) { EXPECT_EQ(v, 99); }),
-            coop::chan::Timeout(std::chrono::milliseconds(5000), [&]{ timedOut = true; })
-        );
+        bool ok = coop::chan::Select(
+            ctx, coop::chan::On<int>(ch, [&](int v) { EXPECT_EQ(v, 99); }),
+            coop::chan::Timeout(std::chrono::milliseconds(5000), [&] { timedOut = true; }));
 
         EXPECT_TRUE(ok);
         EXPECT_FALSE(timedOut);
@@ -933,11 +942,9 @@ TEST(ChannelTest, SelectTimeoutMixed)
 
         bool timedOut = false;
 
-        bool ok = coop::chan::Select(ctx,
-            coop::chan::On(recvCh, [&](int) {}),
-            coop::chan::OnSend(sendCh, 42),
-            coop::chan::Timeout(std::chrono::milliseconds(50), [&]{ timedOut = true; })
-        );
+        bool ok = coop::chan::Select(
+            ctx, coop::chan::On<int>(recvCh, [&](int) {}), coop::chan::OnSend<int>(sendCh, 42),
+            coop::chan::Timeout(std::chrono::milliseconds(50), [&] { timedOut = true; }));
 
         EXPECT_FALSE(ok);
         EXPECT_TRUE(timedOut);
@@ -1060,7 +1067,8 @@ TEST(ChannelTest, PipeBasicTransform)
         int buf[4];
         coop::chan::Channel<int> src(ctx, buf, 4);
 
-        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v * 2; });
+        auto pipe =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{src}, [](int v) { return v * 2; });
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1093,7 +1101,8 @@ TEST(ChannelTest, PipeSourceShutdownPropagates)
         int buf[4];
         coop::chan::Channel<int> src(ctx, buf, 4);
 
-        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v + 100; });
+        auto pipe =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{src}, [](int v) { return v + 100; });
 
         // Send N items then shut down
         //
@@ -1114,8 +1123,8 @@ TEST(ChannelTest, PipeSourceShutdownPropagates)
     });
 }
 
-// Pipe composes: a PipeHandle implicitly converts to Channel<Out>& so it can be passed
-// directly as the source to another Pipe stage.
+// Pipe composes: a PipeHandle implicitly converts to Channel<Out>&, which can
+// then be viewed as a RecvChannel for another Pipe stage.
 //
 TEST(ChannelTest, PipeChained)
 {
@@ -1128,13 +1137,14 @@ TEST(ChannelTest, PipeChained)
 
         // Stage 1: int → int (*2)
         //
-        auto stage1 = coop::chan::Pipe(ctx, src, [](int v) { return v * 2; });
+        auto stage1 =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{src}, [](int v) { return v * 2; });
 
         // Stage 2: int → std::string (via implicit Channel<int>& conversion of stage1)
         //
         coop::chan::Channel<int>& stage1Ch = stage1;
-        auto stage2 = coop::chan::Pipe(ctx, stage1Ch,
-            [](int v) { return std::to_string(v); });
+        auto stage2 = coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{stage1Ch},
+                                       [](int v) { return std::to_string(v); });
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1167,7 +1177,8 @@ TEST(ChannelTest, PipeStopEarly)
         int buf[64];
         coop::chan::Channel<int> src(ctx, buf, 64);
 
-        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v; });
+        auto pipe =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{src}, [](int v) { return v; });
 
         // Producer runs indefinitely until killed.
         //
@@ -1208,7 +1219,8 @@ TEST(ChannelTest, PipeSelectComposition)
         int buf[4];
         coop::chan::Channel<int> src(ctx, buf, 4);
 
-        auto pipe = coop::chan::Pipe(ctx, src, [](int v) { return v * 3; });
+        auto pipe =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{src}, [](int v) { return v * 3; });
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1219,13 +1231,14 @@ TEST(ChannelTest, PipeSelectComposition)
 
         int count = 0;
         int value = 0;
-        while (coop::chan::SelectWithKill(ctx,
-            coop::chan::On(pipe.Chan(), [&](int v)
-            {
-                EXPECT_EQ(v, count * 3);
-                count++;
-            })
-        )) {}
+        while (coop::chan::SelectWithKill(ctx, coop::chan::On<int>(pipe.Chan(),
+                                                                   [&](int v)
+                                                                   {
+                                                                       EXPECT_EQ(v, count * 3);
+                                                                       count++;
+                                                                   })))
+        {
+        }
 
         EXPECT_EQ(count, N);
     });
@@ -1247,7 +1260,8 @@ TEST(ChannelTest, MergeBasic)
         coop::chan::Channel<int> chA(ctx, bufA, 4);
         coop::chan::Channel<int> chB(ctx, bufB, 4);
 
-        auto merged = coop::chan::Merge(ctx, chA, chB);
+        auto merged = coop::chan::Merge(ctx, coop::chan::RecvChannel<int>{chA},
+                                        coop::chan::RecvChannel<int>{chB});
 
         // Producer A: even numbers
         //
@@ -1289,7 +1303,8 @@ TEST(ChannelTest, MergeOneSourceDiesEarly)
         coop::chan::Channel<int> chA(ctx, bufA, 4);
         coop::chan::Channel<int> chB(ctx, bufB, 4);
 
-        auto merged = coop::chan::Merge(ctx, chA, chB);
+        auto merged = coop::chan::Merge(ctx, coop::chan::RecvChannel<int>{chA},
+                                        coop::chan::RecvChannel<int>{chB});
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1326,12 +1341,15 @@ TEST(ChannelTest, MergePipeComposition)
 
         // Pipe each source through a transform, then merge.
         //
-        auto pipedA = coop::chan::Pipe(ctx, chA, [](int v) { return v * 2; });
-        auto pipedB = coop::chan::Pipe(ctx, chB, [](int v) { return v * 3; });
+        auto pipedA =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{chA}, [](int v) { return v * 2; });
+        auto pipedB =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{chB}, [](int v) { return v * 3; });
 
         coop::chan::Channel<int>& pA = pipedA;
         coop::chan::Channel<int>& pB = pipedB;
-        auto merged = coop::chan::Merge(ctx, pA, pB);
+        auto merged = coop::chan::Merge(ctx, coop::chan::RecvChannel<int>{pA},
+                                        coop::chan::RecvChannel<int>{pB});
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1371,7 +1389,8 @@ TEST(ChannelTest, MergeStopEarly)
         coop::chan::Channel<int> chA(ctx, bufA, 64);
         coop::chan::Channel<int> chB(ctx, bufB, 64);
 
-        auto merged = coop::chan::Merge(ctx, chA, chB);
+        auto merged = coop::chan::Merge(ctx, coop::chan::RecvChannel<int>{chA},
+                                        coop::chan::RecvChannel<int>{chB});
 
         coop::Context::Handle hA, hB;
         ctx->GetCooperator()->Spawn([&](coop::Context*) { int i = 0; while (chA.Send(i++)) {} }, &hA);
@@ -1411,9 +1430,11 @@ TEST(ChannelTest, MergeChained)
         coop::chan::Channel<int> chB(ctx, bB, 4);
         coop::chan::Channel<int> chC(ctx, bC, 4);
 
-        auto m1 = coop::chan::Merge(ctx, chA, chB);
+        auto m1 = coop::chan::Merge(ctx, coop::chan::RecvChannel<int>{chA},
+                                    coop::chan::RecvChannel<int>{chB});
         coop::chan::Channel<int>& m1ch = m1;
-        auto m2 = coop::chan::Merge(ctx, m1ch, chC);
+        auto m2 = coop::chan::Merge(ctx, coop::chan::RecvChannel<int>{m1ch},
+                                    coop::chan::RecvChannel<int>{chC});
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1455,7 +1476,8 @@ TEST(ChannelTest, FilterBasic)
         int buf[4];
         coop::chan::Channel<int> src(ctx, buf, 4);
 
-        auto evens = coop::chan::Filter(ctx, src, [](int v) { return v % 2 == 0; });
+        auto evens = coop::chan::Filter(ctx, coop::chan::RecvChannel<int>{src},
+                                        [](int v) { return v % 2 == 0; });
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1485,7 +1507,8 @@ TEST(ChannelTest, FilterRejectAll)
         int buf[4];
         coop::chan::Channel<int> src(ctx, buf, 4);
 
-        auto none = coop::chan::Filter(ctx, src, [](int) { return false; });
+        auto none =
+            coop::chan::Filter(ctx, coop::chan::RecvChannel<int>{src}, [](int) { return false; });
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1508,9 +1531,10 @@ TEST(ChannelTest, FilterPipeComposition)
         int buf[4];
         coop::chan::Channel<int> src(ctx, buf, 4);
 
-        auto doubled = coop::chan::Pipe(ctx, src, [](int v) { return v * 2; });
-        auto big     = coop::chan::Filter(ctx, doubled.Chan(),
-                                          [](int v) { return v > 10; });
+        auto doubled =
+            coop::chan::Pipe(ctx, coop::chan::RecvChannel<int>{src}, [](int v) { return v * 2; });
+        auto big = coop::chan::Filter(ctx, coop::chan::RecvChannel<int>{doubled.Chan()},
+                                      [](int v) { return v > 10; });
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -1544,7 +1568,8 @@ TEST(ChannelTest, FilterStopEarly)
 
         // Pass everything so no items are dropped.
         //
-        auto pass = coop::chan::Filter(ctx, src, [](int) { return true; });
+        auto pass =
+            coop::chan::Filter(ctx, coop::chan::RecvChannel<int>{src}, [](int) { return true; });
 
         coop::Context::Handle hProd;
         ctx->GetCooperator()->Spawn(
@@ -1972,16 +1997,24 @@ TEST(ChannelTest, SubscribeDeliversInOrder)
         int total       = 0;
 
         auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch0, [&](SubMsg&& m)
-            {
-                if (m.seq != nextSeq[0]) outOfOrder++;
-                nextSeq[0]++; received[0]++; total++;
-            }),
-            coop::chan::Drain(ch1, [&](SubMsg&& m)
-            {
-                if (m.seq != nextSeq[1]) outOfOrder++;
-                nextSeq[1]++; received[1]++; total++;
-            }));
+                                         coop::chan::Drain<SubMsg>(ch0,
+                                                                   [&](SubMsg&& m)
+                                                                   {
+                                                                       if (m.seq != nextSeq[0])
+                                                                           outOfOrder++;
+                                                                       nextSeq[0]++;
+                                                                       received[0]++;
+                                                                       total++;
+                                                                   }),
+                                         coop::chan::Drain<SubMsg>(ch1,
+                                                                   [&](SubMsg&& m)
+                                                                   {
+                                                                       if (m.seq != nextSeq[1])
+                                                                           outOfOrder++;
+                                                                       nextSeq[1]++;
+                                                                       received[1]++;
+                                                                       total++;
+                                                                   }));
 
         coop::chan::Channel<SubMsg>* chans[2] = {&ch0, &ch1};
         for (int c = 0; c < 2; c++)
@@ -2023,12 +2056,14 @@ TEST(ChannelTest, SubscribeDrainsBurstInOneFire)
         int nextSeq    = 0;
         int outOfOrder = 0;
 
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch, [&](SubMsg&& m)
-            {
-                if (m.seq != nextSeq) outOfOrder++;
-                nextSeq++; received++;
-            }));
+        auto sub = coop::chan::Subscribe(ctx, coop::chan::Drain<SubMsg>(ch,
+                                                                        [&](SubMsg&& m)
+                                                                        {
+                                                                            if (m.seq != nextSeq)
+                                                                                outOfOrder++;
+                                                                            nextSeq++;
+                                                                            received++;
+                                                                        }));
 
         // A producer dumps the whole burst without yielding: all BURST items land in the channel,
         // but only the first Send pulses m_recv (empty -> non-empty edge).
@@ -2059,8 +2094,8 @@ TEST(ChannelTest, SubscribeShutdownRetiresArm)
 
         int received = 0;
 
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch, [&](SubMsg&&) { received++; }));
+        auto sub = coop::chan::Subscribe(
+            ctx, coop::chan::Drain<SubMsg>(ch, [&](SubMsg&&) { received++; }));
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -2089,16 +2124,15 @@ TEST(ChannelTest, SubscribeControlStopRetiresOneArm)
         int stopReceived = 0;
         int liveReceived = 0;
 
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(chStop, [&](SubMsg&&, coop::chan::Control& ctl)
-            {
-                stopReceived++;
-                ctl.Stop();      // retire this arm after this item
-            }),
-            coop::chan::Drain(chLive, [&](SubMsg&&)
-            {
-                liveReceived++;
-            }));
+        auto sub = coop::chan::Subscribe(
+            ctx,
+            coop::chan::Drain<SubMsg>(chStop,
+                                      [&](SubMsg&&, coop::chan::Control& ctl)
+                                      {
+                                          stopReceived++;
+                                          ctl.Stop(); // retire this arm after this item
+                                      }),
+            coop::chan::Drain<SubMsg>(chLive, [&](SubMsg&&) { liveReceived++; }));
 
         // First item to chStop triggers Stop. Deliver it, let the arm retire.
         //
@@ -2140,16 +2174,15 @@ TEST(ChannelTest, SubscribeControlCancelAllRetiresSubscription)
         int r0 = 0;
         int r1 = 0;
 
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch0, [&](SubMsg&&, coop::chan::Control& ctl)
-            {
-                r0++;
-                ctl.CancelAll();
-            }),
-            coop::chan::Drain(ch1, [&](SubMsg&&)
-            {
-                r1++;
-            }));
+        auto sub =
+            coop::chan::Subscribe(ctx,
+                                  coop::chan::Drain<SubMsg>(ch0,
+                                                            [&](SubMsg&&, coop::chan::Control& ctl)
+                                                            {
+                                                                r0++;
+                                                                ctl.CancelAll();
+                                                            }),
+                                  coop::chan::Drain<SubMsg>(ch1, [&](SubMsg&&) { r1++; }));
 
         ctx->GetCooperator()->Spawn([&](coop::Context*)
         {
@@ -2186,9 +2219,9 @@ TEST(ChannelTest, SubscribeWaitJoinsOnAllShutdown)
 
         int total = 0;
 
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch0, [&](SubMsg&&) { total++; }),
-            coop::chan::Drain(ch1, [&](SubMsg&&) { total++; }));
+        auto sub =
+            coop::chan::Subscribe(ctx, coop::chan::Drain<SubMsg>(ch0, [&](SubMsg&&) { total++; }),
+                                  coop::chan::Drain<SubMsg>(ch1, [&](SubMsg&&) { total++; }));
 
         bool joined = false;
 
@@ -2236,12 +2269,14 @@ TEST(ChannelTest, SubscribeAdoptsBufferedItems)
         int nextSeq    = 0;
         int outOfOrder = 0;
 
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch, [&](SubMsg&& m)
-            {
-                if (m.seq != nextSeq) outOfOrder++;
-                nextSeq++; received++;
-            }));
+        auto sub = coop::chan::Subscribe(ctx, coop::chan::Drain<SubMsg>(ch,
+                                                                        [&](SubMsg&& m)
+                                                                        {
+                                                                            if (m.seq != nextSeq)
+                                                                                outOfOrder++;
+                                                                            nextSeq++;
+                                                                            received++;
+                                                                        }));
 
         // Adopted synchronously by the courtesy fire during Subscribe -- no scheduler turn needed.
         //
@@ -2275,8 +2310,8 @@ TEST(ChannelTest, SubscribeAlreadyShutdownEmptyRetiresImmediately)
         ch.Shutdown();                       // shut down BEFORE subscribing, channel empty
 
         int received = 0;
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch, [&](SubMsg&&) { received++; }));
+        auto sub = coop::chan::Subscribe(
+            ctx, coop::chan::Drain<SubMsg>(ch, [&](SubMsg&&) { received++; }));
 
         sub.Wait();                          // must return immediately -- arm retired in ArmInitial
         EXPECT_EQ(received, 0);               // never fired
@@ -2298,8 +2333,8 @@ TEST(ChannelTest, SubscribeAlreadyShutdownDrainsBufferThenRetires)
         ch.Shutdown();                       // buffered items remain; channel shut down
 
         int received = 0;
-        auto sub = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch, [&](SubMsg&&) { received++; }));
+        auto sub = coop::chan::Subscribe(
+            ctx, coop::chan::Drain<SubMsg>(ch, [&](SubMsg&&) { received++; }));
 
         EXPECT_EQ(received, 2);               // courtesy-drained synchronously before retiring
         sub.Wait();                           // joins -- arm retired after the drain
@@ -2320,10 +2355,10 @@ TEST(ChannelTest, SubscribeDrivenThroughBaseInterface)
 
         // Two independent subscriptions with different (here identical) arm shapes.
         //
-        auto subA = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch0, [&](SubMsg&&) { r++; }));
-        auto subB = coop::chan::Subscribe(ctx,
-            coop::chan::Drain(ch1, [&](SubMsg&&) { r++; }));
+        auto subA =
+            coop::chan::Subscribe(ctx, coop::chan::Drain<SubMsg>(ch0, [&](SubMsg&&) { r++; }));
+        auto subB =
+            coop::chan::Subscribe(ctx, coop::chan::Drain<SubMsg>(ch1, [&](SubMsg&&) { r++; }));
 
         coop::chan::Subscription* subs[2] = {&subA, &subB};
 

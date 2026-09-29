@@ -81,6 +81,10 @@ one `Context` to block on action by another.
 
 All actual "blocking" operations are forbidden, ideally including syscalls which should be dispatched
 via the `coop::io` system which is built on top of `io_uring`.
+The bounded exception is `io::Handle::WaitWithoutYield()` for an explicitly non-yielding resource
+boundary: a running application context on the Handle's owning cooperator may block that OS thread
+while driving the native ring to full Handle completion. It never replaces ordinary cooperative
+`Wait()`/`WaitKill()` implicitly, and cannot depend on another local context running for progress.
 
 ### Context (`coop/context.h`)
 Contexts are the unit of execution. Each has its own stack segment allocated by the Cooperator.

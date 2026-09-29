@@ -124,7 +124,7 @@ struct ChatHandler : coop::Launchable
         //
         coop::chan::RecvChannel<Message> outbound = m_outbound;
         auto* stream = &m_stream;
-        coop::Spawn([outbound, stream, rawFd](coop::Context* writerCtx)
+        coop::Spawn([outbound, stream, rawFd](coop::Context* writerCtx) mutable
         {
             writerCtx->SetName("ChatWriter");
             Message msg;
@@ -242,7 +242,7 @@ void SpawningTask(coop::Context* ctx, void*)
     // Broadcaster: reads from the broadcast channel and fans out to all connected clients
     //
     coop::chan::RecvChannel<Message> bcastRecv = broadcast;
-    coop::Spawn([bcastRecv, &registry](coop::Context* bcastCtx)
+    coop::Spawn([bcastRecv, &registry](coop::Context* bcastCtx) mutable
     {
         bcastCtx->SetName("Broadcaster");
         Message msg;

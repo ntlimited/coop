@@ -16,6 +16,8 @@
 #include "coop/detail/timer_tag.h"
 #include "coop/perf/probe.h"
 #include "coop/cooperator.h"
+#include "coop/self.h"
+#include "coop/thunk.h"
 
 namespace coop
 {
@@ -249,6 +251,24 @@ int Handle::WaitKill()
     }
 
     m_coord->Release(m_context, false);
+    return m_result;
+}
+
+int Handle::WaitWithoutYield()
+{
+    // CONTRACT(non-yielding-completion): only an application context on the issuing
+    // cooperator may drive its native ring. An already completed submitted operation is valid.
+    coop::detail::AssertNotInThunk();
+    assert(Cooperator::thread_cooperator != nullptr);
+    auto* current = Self();
+    assert(current != nullptr);
+    assert(m_context != nullptr);
+    assert(current->GetCooperator() == m_context->GetCooperator());
+    assert(m_ring == current->GetCooperator()->GetUring());
+    while (m_pendingCqes > 0)
+    {
+        m_ring->WaitAndPoll();
+    }
     return m_result;
 }
 

@@ -431,7 +431,7 @@ struct RecvChannel
     bool Recv(T& value) { return ch->Recv(value); }
     bool RecvKill(T& value) { return ch->RecvKill(value); }
     size_t Drain(T* data, size_t maxCount) { return ch->Drain(data, maxCount); }
-    bool RecvAcquired(T& value) { return ch->RecvAcquired(value); }
+    bool RecvAcquired(T& value) const { return ch->RecvAcquired(value); }
 };
 
 // chan<- T.

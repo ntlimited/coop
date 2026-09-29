@@ -368,50 +368,47 @@ TEST(SpawnTest, BoundaryCrossingKill)
 
 TEST(SpawnTest, StackPoolReuse)
 {
-    test::RunInCooperator([](coop::Context* ctx)
-    {
-        coop::Context* firstAddr = nullptr;
-        coop::Context* secondAddr = nullptr;
-
-        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+    test::RunInCooperator(
+        [](coop::Context* ctx)
         {
-            firstAddr = child;
-        });
+            coop::SpawnConfiguration smallConfig = {.priority = 0, .stackSize = 16384};
+            coop::Context* firstAddr = nullptr;
+            coop::Context* secondAddr = nullptr;
 
-        ctx->GetCooperator()->Spawn([&](coop::Context* child)
-        {
-            secondAddr = child;
-        });
+            ctx->GetCooperator()->Spawn(smallConfig,
+                                        [&](coop::Context* child) { firstAddr = child; });
 
-        EXPECT_NE(firstAddr, nullptr);
-        EXPECT_EQ(firstAddr, secondAddr);
-    });
+            ctx->GetCooperator()->Spawn(smallConfig,
+                                        [&](coop::Context* child) { secondAddr = child; });
+
+            EXPECT_NE(firstAddr, nullptr);
+            EXPECT_EQ(firstAddr, secondAddr);
+        });
 }
 
 TEST(SpawnTest, StackPoolReuseDifferentSizes)
 {
-    test::RunInCooperator([](coop::Context* ctx)
-    {
-        // Spawn with default 16KB, then 32KB — different buckets, should NOT reuse
-        //
-        coop::Context* firstAddr = nullptr;
-        coop::Context* secondAddr = nullptr;
-
-        ctx->GetCooperator()->Spawn([&](coop::Context* child)
+    test::RunInCooperator(
+        [](coop::Context* ctx)
         {
-            firstAddr = child;
-        });
+            // Explicit pooled sizes: the configured default may bypass the pool entirely.
+            // Spawn with 16KB, then 32KB — different buckets, should NOT reuse
+            //
+            coop::SpawnConfiguration smallConfig = {.priority = 0, .stackSize = 16384};
+            coop::Context* firstAddr = nullptr;
+            coop::Context* secondAddr = nullptr;
 
-        coop::SpawnConfiguration bigConfig = {.priority = 0, .stackSize = 32768};
-        ctx->GetCooperator()->Spawn(bigConfig, [&](coop::Context* child)
-        {
-            secondAddr = child;
-        });
+            ctx->GetCooperator()->Spawn(smallConfig,
+                                        [&](coop::Context* child) { firstAddr = child; });
 
-        EXPECT_NE(firstAddr, nullptr);
-        EXPECT_NE(secondAddr, nullptr);
-        EXPECT_NE(firstAddr, secondAddr);
-    });
+            coop::SpawnConfiguration bigConfig = {.priority = 0, .stackSize = 32768};
+            ctx->GetCooperator()->Spawn(bigConfig,
+                                        [&](coop::Context* child) { secondAddr = child; });
+
+            EXPECT_NE(firstAddr, nullptr);
+            EXPECT_NE(secondAddr, nullptr);
+            EXPECT_NE(firstAddr, secondAddr);
+        });
 }
 
 TEST(SpawnTest, KillParentKillsChildren)

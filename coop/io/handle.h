@@ -103,6 +103,19 @@ struct Handle : EmbeddedListHookups<Handle>
     //
     int WaitKill();
 
+    // CONTRACT(non-yielding-completion): block the owning cooperator's OS thread while driving
+    // this Handle's native ring until every CQE for the submitted operation has drained. The
+    // caller must be a running application context on that cooperator, either the issuer or a
+    // sibling. Cross-thread, non-native-ring, scheduler-thunk and recursive CQE-dispatch use are
+    // outside the contract. The Handle must have been submitted; it, its issuer, coordinator,
+    // descriptor and referenced buffers must remain alive at stable addresses through completion.
+    // Progress must not require another context or continuation on this cooperator to run.
+    // This does not yield, acquire the coordinator, cancel the operation, or guarantee a deadline.
+    // Negative operation results return normally. Queued contexts and continuations may still hold
+    // captured objects after return; their owners must keep those objects alive until they retire.
+    //
+    int WaitWithoutYield();
+
     // Return the cached result. Only valid after all CQEs have been accounted for (asserts
     // m_pendingCqes == 0).
     //

@@ -824,21 +824,32 @@ TEST(ResolveTest, NonExistent)
 
 TEST(ResolveTest, ConnectWithHostname)
 {
-    test::RunInCooperator([](coop::Context* ctx)
-    {
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-        ASSERT_GE(fd, 0);
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            ListeningSocket server;
+            struct sockaddr_in address
+            {
+            };
+            socklen_t addressSize = sizeof(address);
+            ASSERT_EQ(
+                getsockname(server.fd, reinterpret_cast<struct sockaddr*>(&address), &addressSize),
+                0);
 
-        auto* ring = coop::GetUring();
-        coop::io::Descriptor desc(fd, ring);
+            int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            ASSERT_GE(fd, 0);
 
-        // Connect to dns.google on port 443 — just verify the connect succeeds
-        //
-        int ret = coop::io::Connect(desc, "dns.google", 443);
-        EXPECT_GE(ret, 0);
+            auto* ring = coop::GetUring();
+            coop::io::Descriptor desc(fd, ring);
 
-        desc.Close();
-    });
+            // Exercise hostname resolution and connection against a listener owned by this test.
+            // Public DNS query behavior is covered separately; this needs no external TCP service.
+            //
+            int ret = coop::io::Connect(desc, "localhost", ntohs(address.sin_port));
+            EXPECT_GE(ret, 0);
+
+            desc.Close();
+        });
 }
 
 // -------------------------------------------------------------------------------------

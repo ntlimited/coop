@@ -281,6 +281,9 @@ add_executable(coop_tests
     tests/test_shutdown.cpp
     tests/test_uring_lifecycle.cpp
     tests/test_io.cpp
+    tests/completion_observer.cpp
+    tests/test_handle_completion.cpp
+    tests/test_handle_completion_callbacks.cpp
     tests/test_dns_runtime.cpp
     tests/test_armed_handle.cpp
     tests/test_stress.cpp
@@ -292,8 +295,22 @@ add_executable(coop_tests
     tests/test_coop_var.cpp
     tests/test_ws.cpp
 )
+# The completion observer wraps Handle::Callback at link time. LTO can inline that call
+# before wrapping, so tests use a native Uring object with the same runtime compile settings.
+# It resolves Uring symbols before the archive; production libcoop retains its LTO object.
+# Release tests therefore cover ordinary CQE dispatch without cross-TU optimization of Uring.
+#
+add_library(coop_test_completion_dispatch OBJECT coop/io/uring.cpp)
+set_property(TARGET coop_test_completion_dispatch PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+target_link_libraries(coop_test_completion_dispatch PRIVATE coop)
+target_compile_options(coop_test_completion_dispatch PRIVATE
+    "$<TARGET_PROPERTY:coop,COMPILE_OPTIONS>")
+target_compile_definitions(coop_test_completion_dispatch PRIVATE
+    "$<TARGET_PROPERTY:coop,COMPILE_DEFINITIONS>")
+target_sources(coop_tests PRIVATE $<TARGET_OBJECTS:coop_test_completion_dispatch>)
 target_link_libraries(coop_tests PRIVATE coop GTest::gtest_main)
-target_link_options(coop_tests PRIVATE -rdynamic)   # dladdr symbol names for the introspection test
+target_link_options(coop_tests PRIVATE -rdynamic
+    -Wl,--wrap=_ZN4coop2io6Handle8CallbackEP12io_uring_cqe)
 # The introspection fixture asserts that its named caller remains on the blocked stack.
 # noinline alone still permits a tail call, and coop's frame-pointer flags are PRIVATE.
 # Preserve the fixture's frames without changing codegen for the runtime or other tests.

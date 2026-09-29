@@ -100,8 +100,10 @@ struct Uring
     int ReapOnly();
 
     // Block until at least one CQE is available. Submits pending SQEs first. Used by the
-    // cooperator when all contexts are blocked on IO — replaces a tight spin with an efficient
-    // kernel wait. Returns number of CQEs dispatched.
+    // cooperator when all contexts are blocked on IO, and by Handle::WaitWithoutYield from a
+    // running application context on this native ring. It must not be called recursively from
+    // CQE dispatch. It replaces a tight spin with an efficient kernel wait. Returns the number
+    // of CQEs dispatched; callbacks may queue other application work without running it here.
     //
     int WaitAndPoll();
 

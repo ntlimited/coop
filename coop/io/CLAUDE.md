@@ -28,6 +28,19 @@ returns `-ECANCELED` when kill wins. The operation macros generate both plain bl
 (`Recv`, `Accept`, ...) and kill-aware blocking wrappers (`RecvKill`, `AcceptKill`, ...).
 `Result()` provides non-blocking access to the cached result (asserts all CQEs are drained).
 
+**Non-yielding completion** (`WaitWithoutYield()`): CONTRACT(non-yielding-completion) for a
+resource boundary that cannot yield. A running application context on the issuer's cooperator,
+whether the issuer itself or a sibling, repeatedly calls the same native ring's `WaitAndPoll()`
+until this Handle's pending CQEs reach zero, then returns the ordinary cached result (including
+negative results). It does not acquire/release the coordinator, cancel/retry the operation, or
+schedule application work. The Handle must already have been submitted; the Handle, issuer,
+coordinator, descriptor, buffers and ring must live at stable addresses through completion.
+Progress must not require another local context or continuation to run. Return can leave contexts
+and continuations queued, so their captured objects must remain alive until those users retire.
+Other ring CQEs can be dispatched and have their ordinary side effects during the drive; this is
+not a no-side-effect or scheduler-quiescence guarantee. Cross-thread, non-native-ring,
+scheduler-thunk and recursive CQE-dispatch calls are outside its contract.
+
 **Encapsulation**: Handle fields are private. Internal access from IO operation macros and
 implementation files goes through `detail::HandleExtension` (friend struct), which exposes
 `GetSqe`, `Fd`, and `Timeout` static methods.

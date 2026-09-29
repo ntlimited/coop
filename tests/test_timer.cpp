@@ -183,10 +183,10 @@ INSTANTIATE_TEST_SUITE_P(
         return info.param == coop::TimerMode::UserspaceQueue ? "UserspaceQueue" : "KernelPerTimer";
     });
 
-// Many concurrent sleeps each wake no earlier than their requested interval, and complete in
-// deadline order. This is the fan-out the timer queue exists to serve.
+// Many concurrent sleeps each wake no earlier than their requested interval. This is the
+// fan-out the timer queue exists to serve.
 //
-TEST_P(TimerIntegrationTest, ConcurrentSleepsFireInOrderNotEarly)
+TEST_P(TimerIntegrationTest, ConcurrentSleepsDoNotFireEarly)
 {
     RunWithTimerMode(GetParam(), [](coop::Context* ctx)
     {
@@ -201,8 +201,8 @@ TEST_P(TimerIntegrationTest, ConcurrentSleepsFireInOrderNotEarly)
         for (int i = 0; i < N; i++)
         {
             // Spread deadlines across a window wide enough that the cooperator genuinely idles
-            // between expiries (so the single-timer arm/service path is exercised), with several
-            // sharing a deadline to exercise equal keys.
+            // between expiries (so the single-timer arm/service path is exercised), with repeated
+            // intervals. Each child starts at a different time, so intervals do not order deadlines.
             //
             int64_t requestedUs = 2000 + (i % 32) * 1000;
 
@@ -235,14 +235,6 @@ TEST_P(TimerIntegrationTest, ConcurrentSleepsFireInOrderNotEarly)
                 << "sleep " << r.id << " fired early";
         }
 
-        // Completion order follows deadline order: each completion's requested interval is >= the
-        // previous one's (the queue services nearest-deadline-first).
-        //
-        for (size_t k = 1; k < done.size(); k++)
-        {
-            EXPECT_GE(done[k].requestedUs, done[k - 1].requestedUs)
-                << "out-of-order completion at index " << k;
-        }
     });
 }
 

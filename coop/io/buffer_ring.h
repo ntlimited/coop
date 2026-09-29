@@ -69,30 +69,9 @@ struct BufferRing
     // Register the ring with the kernel and seed every slot. Returns 0 on success or a negative
     // errno. Call once, after the owning Uring has been Init()'d.
     //
-    int Register(Uring& uring)
-    {
-        int err = 0;
-        m_ring = io_uring_setup_buf_ring(&uring.m_ring, m_entries, m_group, 0, &err);
-        if (!m_ring)
-        {
-            return err;
-        }
-        m_uring = &uring;
-        for (uint32_t b = 0; b < m_entries; b++)
-        {
-            io_uring_buf_ring_add(m_ring, Slot(b), m_bufSize, b, m_mask, b);
-        }
-        io_uring_buf_ring_advance(m_ring, m_entries);
-        return 0;
-    }
+    int Register(Uring& uring);
 
-    ~BufferRing()
-    {
-        if (m_ring && m_uring)
-        {
-            (void)io_uring_free_buf_ring(&m_uring->m_ring, m_ring, m_entries, m_group);
-        }
-    }
+    ~BufferRing();
 
     uint16_t Group() const { return m_group; }
     uint32_t Entries() const { return m_entries; }
@@ -147,6 +126,7 @@ private:
     uint32_t m_bufSize;
     int m_mask;
     uint32_t m_pending{0};
+    bool m_ubuntuWorkaroundRegistered{false};
     std::vector<char> m_storage;
 };
 

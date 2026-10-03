@@ -1,5 +1,7 @@
 #pragma once
 
+#include <utility>
+
 namespace coop
 {
 
@@ -14,14 +16,15 @@ struct FixedList
         m_tail = 0;
     }
 
-    bool Push(T t)
+    template<typename U = T>
+    bool Push(U&& t)
     {
         auto newTail = (m_tail + 1) & (C - 1);
         if (newTail == m_head)
         {
             return false;
         }
-        m_slots[m_tail] = t;
+        m_slots[m_tail] = std::forward<U>(t);
         m_tail = newTail;
         return true;
     }

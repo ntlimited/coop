@@ -182,14 +182,17 @@ struct Channel
         return true;
     }
 
-    bool TrySend(T value)
+    // Refusal leaves ownership with the caller for retry.
+    //
+    template<typename U = T>
+    bool TrySend(U&& value)
     {
         if (IsShutdown() || IsFull())
         {
             return false;
         }
 
-        [[maybe_unused]] bool sent = SendImpl(std::move(value));
+        [[maybe_unused]] bool sent = SendImpl(std::forward<U>(value));
         assert(sent);
         Context* ctx = Self();
 
@@ -451,7 +454,8 @@ struct SendChannel
     bool IsEmpty() const { return ch->IsEmpty(); }
     bool IsFull() const { return ch->IsFull(); }
 
-    bool TrySend(T value) { return ch->TrySend(std::move(value)); }
+    template<typename U = T>
+    bool TrySend(U&& value) { return ch->TrySend(std::forward<U>(value)); }
     bool Send(T value) { return ch->Send(std::move(value)); }
     bool SendKill(T value) { return ch->SendKill(std::move(value)); }
     bool SendAll(const T* data, size_t count) { return ch->SendAll(data, count); }

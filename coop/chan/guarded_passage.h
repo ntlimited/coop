@@ -48,13 +48,16 @@ struct GuardedPassage
     // Use FixedGuardedPassage<T, N> to construct.
     //
 
-    bool TryPush(T value)
+    // A full queue leaves the caller's value intact for retry.
+    //
+    template<typename U = T>
+    bool TryPush(U&& value)
     {
         size_t tail = m_tail.load(std::memory_order_relaxed);
         size_t head = m_head.load(std::memory_order_acquire);
         if ((tail - head) == m_capacity)
             return false;
-        m_ring[tail % m_capacity] = std::move(value);
+        m_ring[tail % m_capacity] = std::forward<U>(value);
         m_tail.store(tail + 1, std::memory_order_release);
         return true;
     }
@@ -327,7 +330,8 @@ struct SendSide
         return *this;
     }
 
-    bool TryPush(T value) { return m_core->TryPush(std::move(value)); }
+    template<typename U = T>
+    bool TryPush(U&& value) { return m_core->TryPush(std::forward<U>(value)); }
 
     bool ReceiverDone() const
     {

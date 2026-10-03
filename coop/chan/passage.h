@@ -54,7 +54,8 @@ struct MpscRing
 
     // Wait-free for producers. Returns false if the ring is full.
     //
-    bool Push(T value)
+    template<typename U = T>
+    bool Push(U&& value)
     {
         size_t pos = m_tail.load(std::memory_order_relaxed);
 
@@ -83,7 +84,7 @@ struct MpscRing
         }
 
         Slot& slot = m_slots[pos & (N - 1)];
-        slot.m_value = std::move(value);
+        slot.m_value = std::forward<U>(value);
         slot.m_seq.store(pos + 1, std::memory_order_release);
         return true;
     }
@@ -145,7 +146,8 @@ struct SpscRing
     static_assert(std::is_move_assignable_v<T>,
         "Passage value type T must be move-assignable.");
 
-    bool Push(T value)
+    template<typename U = T>
+    bool Push(U&& value)
     {
 #ifndef NDEBUG
         AssertSingleProducer();
@@ -157,7 +159,7 @@ struct SpscRing
         if ((tail - head) == N)
             return false;  // full
 
-        m_slots[tail & (N - 1)] = std::move(value);
+        m_slots[tail & (N - 1)] = std::forward<U>(value);
         m_tail.store(tail + 1, std::memory_order_release);
         return true;
     }
@@ -247,9 +249,11 @@ struct BasicPassage
     ~BasicPassage() { Shutdown(); }
 
     // Thread-safe. Callable from any thread or cooperator.
-    // Returns false if the passage is shut down or the ring is full.
+    // Shutdown or full-ring refusal before enqueue leaves value intact. Once
+    // enqueued, a wake submission failure can return false after taking ownership.
     //
-    bool Send(T value);
+    template<typename U = T>
+    bool Send(U&& value);
 
     // Receiver-only, non-blocking pop. Returns false if no item is currently available.
     //
@@ -343,7 +347,8 @@ bool BasicPassage<T, N, Ring>::SubmitWake(bool releaseOnEmpty)
 // ---------------------------------------------------------------------------
 
 template<typename T, size_t N, template<typename, size_t> class Ring>
-bool BasicPassage<T, N, Ring>::Send(T value)
+template<typename U>
+bool BasicPassage<T, N, Ring>::Send(U&& value)
 {
     auto state = m_state;
 
@@ -358,7 +363,7 @@ bool BasicPassage<T, N, Ring>::Send(T value)
         return false;
     }
 
-    if (!state->m_ring.Push(std::move(value)))
+    if (!state->m_ring.Push(std::forward<U>(value)))
         return false;  // ring full
 
     // Submit failure can happen if target enters shutdown between push and submit.

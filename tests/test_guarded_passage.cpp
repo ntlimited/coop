@@ -12,6 +12,10 @@
 #include <vector>
 
 #include "coop/chan/guarded_passage.h"
+#include "coop/chan/passage.h"
+#include "coop/chan/channel.h"
+#include "coop/detail/fixed_list.h"
+#include "test_helpers.h"
 
 // GuardedPassage's destructor waits for both RecvSide and SendSide to have run
 // their destructors (the handshake that drives GuardedPassageState to
@@ -400,4 +404,226 @@ TEST(GuardedPassageTest, SenderShutdownPreservesQueuedValues)
         EXPECT_EQ(value, i);
     }
     EXPECT_TRUE(recv.IsEmpty());
+}
+
+// A rejected nonblocking send must leave ownership with the caller for retry.
+// Exercise both the ring and its public producer wrappers.
+//
+TEST(GuardedPassageTest, FullQueuePreservesOwnershipForRetry)
+{
+    for (bool throughSendSide : {false, true})
+    {
+        SCOPED_TRACE(throughSendSide);
+        FixedGuardedPassage<std::unique_ptr<int>, 2> passage;
+        RecvSide<std::unique_ptr<int>> recv(passage);
+        SendSide<std::unique_ptr<int>> send(passage);
+        auto push = [&](std::unique_ptr<int>& value) {
+            return throughSendSide ? send.TryPush(std::move(value))
+                                   : passage.TryPush(std::move(value));
+        };
+        auto first = std::make_unique<int>(1);
+        auto second = std::make_unique<int>(2);
+        auto retry = std::make_unique<int>(3);
+        int* identity = retry.get();
+        ASSERT_TRUE(push(first));
+        ASSERT_TRUE(push(second));
+        EXPECT_EQ(first, nullptr);
+        EXPECT_EQ(second, nullptr);
+        EXPECT_FALSE(push(retry));
+        EXPECT_EQ(retry.get(), identity);
+        if (!retry)
+            continue;
+        std::unique_ptr<int> popped;
+        ASSERT_TRUE(recv.TryPop(popped));
+        EXPECT_EQ(*popped, 1);
+        ASSERT_TRUE(push(retry));
+        EXPECT_EQ(retry, nullptr);
+        ASSERT_TRUE(recv.TryPop(popped));
+        EXPECT_EQ(*popped, 2);
+        ASSERT_TRUE(recv.TryPop(popped));
+        EXPECT_EQ(popped.get(), identity);
+        EXPECT_EQ(*popped, 3);
+        EXPECT_FALSE(recv.TryPop(popped));
+    }
+}
+
+namespace
+{
+template<typename Ring>
+void CheckFullRingRetry()
+{
+    Ring ring;
+    ASSERT_TRUE(ring.Push(std::make_unique<int>(1)));
+    ASSERT_TRUE(ring.Push(std::make_unique<int>(2)));
+    auto retry = std::make_unique<int>(3);
+    int* identity = retry.get();
+    EXPECT_FALSE(ring.Push(std::move(retry)));
+    ASSERT_EQ(retry.get(), identity);
+    std::unique_ptr<int> popped;
+    ASSERT_TRUE(ring.Pop(popped));
+    EXPECT_EQ(*popped, 1);
+    ASSERT_TRUE(ring.Push(std::move(retry)));
+    EXPECT_EQ(retry, nullptr);
+    ASSERT_TRUE(ring.Pop(popped));
+    EXPECT_EQ(*popped, 2);
+    ASSERT_TRUE(ring.Pop(popped));
+    EXPECT_EQ(popped.get(), identity);
+    EXPECT_EQ(*popped, 3);
+    EXPECT_FALSE(ring.Pop(popped));
+}
+
+template<typename Passage>
+void CheckFullPassageRetry(coop::Context* ctx)
+{
+    Passage passage(ctx, ctx->GetCooperator());
+    ASSERT_TRUE(passage.Send(std::make_unique<int>(1)));
+    ASSERT_TRUE(passage.Send(std::make_unique<int>(2)));
+    auto retry = std::make_unique<int>(3);
+    int* identity = retry.get();
+    EXPECT_FALSE(passage.Send(std::move(retry)));
+    ASSERT_EQ(retry.get(), identity);
+    std::unique_ptr<int> popped;
+    ASSERT_TRUE(passage.TryRecv(popped));
+    EXPECT_EQ(*popped, 1);
+    ASSERT_TRUE(passage.Send(std::move(retry)));
+    EXPECT_EQ(retry, nullptr);
+    ASSERT_TRUE(passage.TryRecv(popped));
+    EXPECT_EQ(*popped, 2);
+    ASSERT_TRUE(passage.TryRecv(popped));
+    EXPECT_EQ(popped.get(), identity);
+    EXPECT_EQ(*popped, 3);
+    EXPECT_FALSE(passage.TryRecv(popped));
+}
+} // namespace
+
+TEST(PassageTest, FullMpscRingPreservesOwnershipForRetry)
+{
+    CheckFullRingRetry<coop::chan::MpscRing<std::unique_ptr<int>, 2>>();
+}
+
+TEST(SpscPassageTest, FullSpscRingPreservesOwnershipForRetry)
+{
+    CheckFullRingRetry<coop::chan::SpscRing<std::unique_ptr<int>, 2>>();
+}
+
+TEST(PassageTest, FullQueuePreservesOwnershipForRetry)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        { CheckFullPassageRetry<coop::chan::Passage<std::unique_ptr<int>, 2>>(ctx); });
+}
+
+TEST(SpscPassageTest, FullQueuePreservesOwnershipForRetry)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        { CheckFullPassageRetry<coop::chan::SpscPassage<std::unique_ptr<int>, 2>>(ctx); });
+}
+
+TEST(FixedListTest, FullQueuePreservesOwnershipForRetry)
+{
+    // FixedList::Pop copies: shared ownership exercises its existing contract.
+    coop::FixedList<std::shared_ptr<int>, 2> list;
+    ASSERT_TRUE(list.Push(std::make_shared<int>(1)));
+    auto retry = std::make_shared<int>(2);
+    int* identity = retry.get();
+    EXPECT_FALSE(list.Push(std::move(retry)));
+    ASSERT_EQ(retry.get(), identity);
+    std::shared_ptr<int> popped;
+    ASSERT_TRUE(list.Pop(popped));
+    EXPECT_EQ(*popped, 1);
+    ASSERT_TRUE(list.Push(std::move(retry)));
+    EXPECT_EQ(retry, nullptr);
+    ASSERT_TRUE(list.Pop(popped));
+    EXPECT_EQ(popped.get(), identity);
+    EXPECT_EQ(*popped, 2);
+    EXPECT_FALSE(list.Pop(popped));
+}
+
+TEST(ChannelTest, FullQueuePreservesOwnershipForRetry)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            for (bool throughSendSide : {false, true})
+            {
+                SCOPED_TRACE(throughSendSide);
+                coop::chan::FixedChannel<std::unique_ptr<int>, 2> channel(ctx);
+                coop::chan::SendChannel<std::unique_ptr<int>> send(channel);
+                auto push = [&](std::unique_ptr<int>& value) {
+                    return throughSendSide ? send.TrySend(std::move(value))
+                                           : channel.TrySend(std::move(value));
+                };
+                auto first = std::make_unique<int>(1);
+                auto second = std::make_unique<int>(2);
+                auto retry = std::make_unique<int>(3);
+                int* identity = retry.get();
+                ASSERT_TRUE(push(first));
+                ASSERT_TRUE(push(second));
+                EXPECT_FALSE(push(retry));
+                EXPECT_EQ(retry.get(), identity);
+                if (!retry)
+                    continue;
+                std::unique_ptr<int> popped;
+                ASSERT_TRUE(channel.TryRecv(popped));
+                EXPECT_EQ(*popped, 1);
+                ASSERT_TRUE(push(retry));
+                EXPECT_EQ(retry, nullptr);
+                ASSERT_TRUE(channel.TryRecv(popped));
+                EXPECT_EQ(*popped, 2);
+                ASSERT_TRUE(channel.TryRecv(popped));
+                EXPECT_EQ(popped.get(), identity);
+                EXPECT_EQ(*popped, 3);
+                EXPECT_FALSE(channel.TryRecv(popped));
+            }
+        });
+}
+
+TEST(PassageTest, BracedValuesRemainAccepted)
+{
+    using Value = std::pair<int, int>;
+    coop::chan::MpscRing<Value, 2> mpsc;
+    coop::chan::SpscRing<Value, 2> spsc;
+    coop::FixedList<Value, 2> list;
+    ASSERT_TRUE(mpsc.Push({1, 2}));
+    ASSERT_TRUE(spsc.Push({1, 2}));
+    ASSERT_TRUE(list.Push({1, 2}));
+    Value value;
+    ASSERT_TRUE(mpsc.Pop(value));
+    EXPECT_EQ(value, (Value{1, 2}));
+    ASSERT_TRUE(spsc.Pop(value));
+    EXPECT_EQ(value, (Value{1, 2}));
+    ASSERT_TRUE(list.Pop(value));
+    EXPECT_EQ(value, (Value{1, 2}));
+    {
+        FixedGuardedPassage<Value, 2> passage;
+        RecvSide<Value> recv(passage);
+        SendSide<Value> send(passage);
+        ASSERT_TRUE(passage.TryPush({1, 2}));
+        ASSERT_TRUE(send.TryPush({3, 4}));
+        ASSERT_TRUE(recv.TryPop(value));
+        EXPECT_EQ(value, (Value{1, 2}));
+        ASSERT_TRUE(recv.TryPop(value));
+        EXPECT_EQ(value, (Value{3, 4}));
+    }
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::chan::Passage<Value, 2> mpscPassage(ctx, ctx->GetCooperator());
+        coop::chan::SpscPassage<Value, 2> spscPassage(ctx, ctx->GetCooperator());
+        coop::chan::FixedChannel<Value, 2> channel(ctx);
+        coop::chan::SendChannel<Value> send(channel);
+        ASSERT_TRUE(mpscPassage.Send({1, 2}));
+        ASSERT_TRUE(spscPassage.Send({1, 2}));
+        ASSERT_TRUE(channel.TrySend({1, 2}));
+        ASSERT_TRUE(send.TrySend({3, 4}));
+        Value value;
+        ASSERT_TRUE(mpscPassage.TryRecv(value));
+        EXPECT_EQ(value, (Value{1, 2}));
+        ASSERT_TRUE(spscPassage.TryRecv(value));
+        EXPECT_EQ(value, (Value{1, 2}));
+        ASSERT_TRUE(channel.TryRecv(value));
+        EXPECT_EQ(value, (Value{1, 2}));
+        ASSERT_TRUE(channel.TryRecv(value));
+        EXPECT_EQ(value, (Value{3, 4}));
+    });
 }

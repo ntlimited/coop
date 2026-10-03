@@ -40,12 +40,15 @@ extern "C" void __real__ZN4coop2io6Handle8CallbackEP12io_uring_cqe(io_uring_cqe*
 
 extern "C" void __wrap__ZN4coop2io6Handle8CallbackEP12io_uring_cqe(io_uring_cqe* cqe)
 {
+    const coop::test::CompletionRecord record{cqe->user_data, cqe->res, cqe->flags};
     if (observer)
     {
         if (observer->size == observer->records.size())
             observer->overflow = true;
         else
-            observer->records[observer->size++] = {cqe->user_data, cqe->res, cqe->flags};
+            observer->records[observer->size++] = record;
     }
     __real__ZN4coop2io6Handle8CallbackEP12io_uring_cqe(cqe);
+    if (observer && observer->afterDispatch)
+        observer->afterDispatch(record, observer->afterDispatchData);
 }

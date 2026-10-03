@@ -54,6 +54,56 @@ struct SocketPair
     }
 };
 
+// Keep target completion behind observed native dispatch, rather than relying on
+// elapsed time to order unrelated CQEs. A timeout still lets the target complete so
+// the missing dispatch is reported by the test's assertions.
+//
+struct CompletionGate
+{
+    static constexpr unsigned kData = 1;
+    static constexpr unsigned kTerminal = 2;
+    static constexpr unsigned kTimeout = 4;
+    static constexpr unsigned kReturned = 8;
+    static constexpr unsigned kConsumed = 16;
+
+    uintptr_t armedData{0};
+    uintptr_t timeoutData{0};
+    std::mutex mutex;
+    std::condition_variable changed;
+    unsigned observed{0};
+
+    void Publish(unsigned bits)
+    {
+        std::lock_guard lock(mutex);
+        observed |= bits;
+        changed.notify_one();
+    }
+
+    bool Wait(unsigned bits)
+    {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(2),
+                                [&] { return (observed & bits) == bits; });
+    }
+
+    static void AfterDispatch(const coop::test::CompletionRecord& cqe, void* data)
+    {
+        auto& gate = *static_cast<CompletionGate*>(data);
+        unsigned bits = 0;
+        if (cqe.data == gate.armedData)
+        {
+            if (cqe.result > 0 && (cqe.flags & IORING_CQE_F_BUFFER))
+                bits |= kData;
+            if (cqe.result == 0 && !(cqe.flags & IORING_CQE_F_MORE))
+                bits |= kTerminal;
+        }
+        if (cqe.data == gate.timeoutData && cqe.result == -ETIME)
+            bits |= kTimeout;
+        if (bits)
+            gate.Publish(bits);
+    }
+};
+
 // A kernel timer gates the target writer. The earlier, unrelated timeout and socket
 // completion can therefore be harvested during the target drive without relying on a
 // same-cooperator producer context or a scheduler yield.
@@ -203,6 +253,9 @@ TEST(HandleCompletionCallbacksTest, ArmedReceiveAndTimeoutStayDeferredThroughDri
             coop::io::Handle target(driver, targetDescriptor, &targetCoordinator);
             char targetByte{};
             EXPECT_TRUE(coop::io::Recv(target, &targetByte, 1));
+            CompletionGate gate;
+            gate.armedData = reinterpret_cast<uintptr_t>(armed) | uintptr_t(0x2);
+            gate.timeoutData = reinterpret_cast<uintptr_t>(&timeout);
             bool producerOk = false;
             std::thread producer(
                 [&]
@@ -210,14 +263,17 @@ TEST(HandleCompletionCallbacksTest, ArmedReceiveAndTimeoutStayDeferredThroughDri
                     bool ok = ::write(otherSockets.fd[1], "data", 4) == 4;
                     ::close(otherSockets.fd[1]);
                     otherSockets.fd[1] = -1;
-                    bool timerOk = WaitForTimer(std::chrono::milliseconds(20));
+                    bool dispatched = gate.Wait(CompletionGate::kData | CompletionGate::kTerminal |
+                                                CompletionGate::kTimeout);
                     bool targetOk = ::write(targetSockets.fd[1], "!", 1) == 1;
                     ::shutdown(targetSockets.fd[1], SHUT_WR);
-                    producerOk = ok && timerOk && targetOk;
+                    producerOk = ok && dispatched && targetOk;
                 });
 
             {
                 coop::test::CompletionObserver completions;
+                completions.afterDispatch = CompletionGate::AfterDispatch;
+                completions.afterDispatchData = &gate;
                 int result = target.WaitWithoutYield();
                 EXPECT_EQ(result, 1);
                 EXPECT_EQ(targetByte, '!');
@@ -242,7 +298,10 @@ TEST(HandleCompletionCallbacksTest, ArmedReceiveAndTimeoutStayDeferredThroughDri
                         << "armed receive EOF CQE was not observed during drive";
                 }
                 EXPECT_FALSE(completions.overflow);
-                EXPECT_EQ(timeout.Result(), -ETIME) << "timer CQE was not harvested";
+                if (completions.Count(gate.timeoutData) > 0)
+                    EXPECT_EQ(timeout.Result(), -ETIME);
+                else
+                    ADD_FAILURE() << "timer CQE was not harvested";
                 EXPECT_EQ(receiverRuns, 0) << "NO_YIELD: armed receiver ran inside drive";
                 EXPECT_EQ(continuationRuns, 0) << "NO_YIELD: continuation ran inside drive";
             }
@@ -257,6 +316,116 @@ TEST(HandleCompletionCallbacksTest, ArmedReceiveAndTimeoutStayDeferredThroughDri
             EXPECT_GE(deliveredAfter, 1u);
             EXPECT_EQ(continuationRuns, 1);
             EXPECT_EQ(continuation.Await(), 0);
+            driver->GetCooperator()->Shutdown();
+        }));
+}
+
+TEST(HandleCompletionCallbacksTest, ArmedReceiveEofAfterDriveWakesConsumer)
+{
+    coop::Cooperator cooperator;
+    coop::Thread thread(&cooperator);
+    ASSERT_TRUE(cooperator.SubmitSync(
+        [&](coop::Context* driver)
+        {
+            auto* ring = driver->GetCooperator()->GetUring();
+            coop::io::BufferRing buffers(7, 16, 256);
+            if (buffers.Register(*ring) != 0)
+            {
+                ADD_FAILURE() << "provided-buffer registration failed";
+                driver->GetCooperator()->Shutdown();
+                return;
+            }
+
+            SocketPair otherSockets;
+            SocketPair targetSockets;
+            CompletionGate gate;
+            bool receiverReady = false;
+            bool receiverDone = false;
+            int receiverRuns = 0;
+            int terminal = -1;
+            std::string captured;
+            coop::io::ArmedHandle* armed = nullptr;
+            bool spawned = driver->GetCooperator()->Spawn(
+                [&](coop::Context* receiver)
+                {
+                    {
+                        coop::io::Descriptor descriptor(coop::io::borrowed, otherSockets.fd[0],
+                                                        ring);
+                        coop::Coordinator coordinator;
+                        coop::io::ArmedHandle handle(receiver, descriptor, &buffers, &coordinator);
+                        armed = &handle;
+                        handle.Arm();
+                        receiverReady = true;
+                        coop::io::ArmedHandle::Chunk chunk{};
+                        do
+                        {
+                            terminal = handle.Next(&chunk);
+                            if (terminal > 0)
+                            {
+                                captured.append(chunk.data, terminal);
+                                ++receiverRuns;
+                                gate.Publish(CompletionGate::kConsumed);
+                            }
+                        } while (terminal > 0);
+                    }
+                    armed = nullptr;
+                    receiverDone = true;
+                });
+            if (!spawned)
+            {
+                ADD_FAILURE() << "receiver context did not spawn";
+                driver->GetCooperator()->Shutdown();
+                return;
+            }
+            while (!receiverReady)
+                driver->Yield(true);
+            gate.armedData = reinterpret_cast<uintptr_t>(armed) | uintptr_t(0x2);
+
+            coop::io::Descriptor targetDescriptor(coop::io::borrowed, targetSockets.fd[0], ring);
+            coop::Coordinator targetCoordinator;
+            coop::io::Handle target(driver, targetDescriptor, &targetCoordinator);
+            char targetByte{};
+            EXPECT_TRUE(coop::io::Recv(target, &targetByte, 1));
+            bool producerOk = false;
+            std::thread producer(
+                [&]
+                {
+                    bool dataOk = ::write(otherSockets.fd[1], "data", 4) == 4;
+                    bool dispatched = gate.Wait(CompletionGate::kData);
+                    bool targetOk = ::write(targetSockets.fd[1], "!", 1) == 1;
+                    ::shutdown(targetSockets.fd[1], SHUT_WR);
+                    // The first chunk is consumed on the ordinary scheduler after the
+                    // drive returns; only then deliver EOF to its next parked Next().
+                    //
+                    bool consumed =
+                        gate.Wait(CompletionGate::kReturned | CompletionGate::kConsumed);
+                    ::close(otherSockets.fd[1]);
+                    otherSockets.fd[1] = -1;
+                    producerOk = dataOk && dispatched && targetOk && consumed;
+                });
+            {
+                coop::test::CompletionObserver completions;
+                completions.afterDispatch = CompletionGate::AfterDispatch;
+                completions.afterDispatchData = &gate;
+                EXPECT_EQ(target.WaitWithoutYield(), 1);
+                EXPECT_EQ(targetByte, '!');
+                EXPECT_EQ(receiverRuns, 0) << "NO_YIELD: armed receiver ran inside drive";
+                EXPECT_NE(armed, nullptr);
+                if (armed)
+                {
+                    EXPECT_GE(armed->Delivered(), 1u);
+                    EXPECT_TRUE(armed->Armed()) << "peer must stay open through the drive";
+                }
+                EXPECT_FALSE(completions.overflow);
+            }
+            gate.Publish(CompletionGate::kReturned);
+            while (!receiverDone)
+                driver->Yield(true);
+            producer.join();
+            EXPECT_TRUE(producerOk);
+            EXPECT_EQ(receiverRuns, 1);
+            EXPECT_EQ(captured, "data");
+            EXPECT_EQ(terminal, 0);
             driver->GetCooperator()->Shutdown();
         }));
 }

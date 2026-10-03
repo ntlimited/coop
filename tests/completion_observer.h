@@ -27,6 +27,11 @@ struct CompletionObserver
     std::array<CompletionRecord, 256> records{};
     size_t size{0};
     bool overflow{false};
+
+    // Publish test synchronization only after the ordinary callback has dispatched.
+    //
+    void (*afterDispatch)(const CompletionRecord&, void*){nullptr};
+    void* afterDispatchData{nullptr};
 };
 
 } // namespace coop::test

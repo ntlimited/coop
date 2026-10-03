@@ -261,13 +261,19 @@ TEST(HandleCompletionCallbacksTest, ArmedReceiveAndTimeoutStayDeferredThroughDri
                 [&]
                 {
                     bool ok = ::write(otherSockets.fd[1], "data", 4) == 4;
+                    // Linux 6.17 can lose the AF_UNIX multishot EOF when data and close
+                    // wakeups coalesce (liburing issue #1549). Dispatch the data before
+                    // closing so this tests callback deferral independently of that bug.
+                    // https://github.com/torvalds/linux/commit/a68ed2df7213
+                    //
+                    bool dataDispatched = gate.Wait(CompletionGate::kData);
                     ::close(otherSockets.fd[1]);
                     otherSockets.fd[1] = -1;
                     bool dispatched = gate.Wait(CompletionGate::kData | CompletionGate::kTerminal |
                                                 CompletionGate::kTimeout);
                     bool targetOk = ::write(targetSockets.fd[1], "!", 1) == 1;
                     ::shutdown(targetSockets.fd[1], SHUT_WR);
-                    producerOk = ok && dispatched && targetOk;
+                    producerOk = ok && dataDispatched && dispatched && targetOk;
                 });
 
             {

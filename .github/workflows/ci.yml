@@ -59,7 +59,8 @@ jobs:
           uname -r
 
       - name: Configure
-        run: cmake -S . -B build ${{ matrix.cmake_args }}
+        # Keep each lane's optimization settings and include symbols for failed-test cores.
+        run: cmake -S . -B build ${{ matrix.cmake_args }} -DCMAKE_CXX_FLAGS=-g
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -75,7 +76,8 @@ jobs:
           ulimit -c unlimited
           sudo sysctl -w kernel.core_pattern="$PWD/build/core.%p"
           status=0
-          ./build/bin/coop_tests || status=$?
+          # Abort hangs early enough to inspect their core before the job-wide timeout.
+          timeout --verbose --signal=ABRT --kill-after=15s 5m ./build/bin/coop_tests || status=$?
           if [ "$status" -ne 0 ]; then
             for core in build/core.*; do
               [ -f "$core" ] || continue
@@ -83,7 +85,10 @@ jobs:
                 -ex 'set pagination off' \
                 -ex 'p $_siginfo' \
                 -ex 'thread apply all bt' \
-                -ex 'info registers' || true
+                -ex 'info registers' \
+                -ex 'source tools/coop_gdb.py' \
+                -ex 'coop contexts' \
+                -ex 'coop bt all' || true
             done
           fi
           exit "$status"

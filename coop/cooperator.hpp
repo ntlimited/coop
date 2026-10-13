@@ -12,6 +12,20 @@
 namespace coop
 {
 
+namespace detail
+{
+    // The ContextVar region ends on a 16-byte boundary; the next object may require more.
+    // Use the same absolute-address calculation for construction, invocation and destruction.
+    //
+    template<typename T>
+    void* StackObjectBase(Context* ctx)
+    {
+        uintptr_t base =
+            reinterpret_cast<uintptr_t>(ctx->m_segment.Bottom()) + ContextVarTotalSize();
+        return reinterpret_cast<void*>((base + alignof(T) - 1) & ~(uintptr_t(alignof(T)) - 1));
+    }
+} // namespace detail
+
 // Typed entry points that know how to invoke the lambda (Spawn) or Launchable (Launch) stored
 // at the segment's bottom, past the ContextVar region. Called from CoopContextEntry via
 // ctx->m_entry.
@@ -19,24 +33,21 @@ namespace coop
 template<typename Fn>
 void SpawnTrampoline(Context* ctx)
 {
-    auto* fn = reinterpret_cast<Fn*>(
-        static_cast<char*>(ctx->m_segment.Bottom()) + ContextVarTotalSize());
+    auto* fn = static_cast<Fn*>(detail::StackObjectBase<Fn>(ctx));
     (*fn)(ctx);
 }
 
 template<typename T>
 void LaunchTrampoline(Context* ctx)
 {
-    auto* obj = reinterpret_cast<T*>(
-        static_cast<char*>(ctx->m_segment.Bottom()) + ContextVarTotalSize());
+    auto* obj = static_cast<T*>(detail::StackObjectBase<T>(ctx));
     obj->Launch();
 }
 
 template<typename T>
 void LaunchCleanup(Context* ctx)
 {
-    auto* obj = reinterpret_cast<T*>(
-        static_cast<char*>(ctx->m_segment.Bottom()) + ContextVarTotalSize());
+    auto* obj = static_cast<T*>(detail::StackObjectBase<T>(ctx));
     obj->~T();
 }
 
@@ -85,10 +96,20 @@ bool Cooperator::Spawn(SpawnConfiguration const& config, Fn&& fn, Context::Handl
     auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, handle, this);
     m_contexts.Push(spawnCtx);
 
-    size_t varSize = ContextVarTotalSize();
-    void* launchBase = static_cast<char*>(spawnCtx->m_segment.Bottom()) + varSize;
+    void* launchBase = detail::StackObjectBase<Decayed>(spawnCtx);
 
-    assert(varSize + sizeof(Decayed) <= actual.stackSize);
+    // Padding for extended alignment can consume the remaining stack. Refuse before
+    // constructing ContextVars or moving the caller's object, including release builds.
+    // The Context has no children/waiters yet, so destruction rolls back registration.
+    //
+    uintptr_t objectStart = reinterpret_cast<uintptr_t>(launchBase);
+    uintptr_t stackEnd = reinterpret_cast<uintptr_t>(spawnCtx->m_segment.Top());
+    if (objectStart > stackEnd || sizeof(Decayed) > stackEnd - objectStart)
+    {
+        spawnCtx->~Context();
+        m_stackPool.Free(alloc, actual.stackSize);
+        return false;
+    }
     detail::ContextVarRegistry::Instance().ConstructAll(spawnCtx->m_segment.Bottom());
     new (launchBase) Decayed(std::forward<Fn>(fn));
 
@@ -128,10 +149,20 @@ LaunchResult<T> Cooperator::Launch(SpawnConfiguration const& config, Context::Ha
     auto* spawnCtx = new (alloc) Context(m_scheduled /* parent */, actual, live, this);
     m_contexts.Push(spawnCtx);
 
-    size_t varSize = ContextVarTotalSize();
-    void* launchBase = static_cast<char*>(spawnCtx->m_segment.Bottom()) + varSize;
+    void* launchBase = detail::StackObjectBase<T>(spawnCtx);
 
-    assert(varSize + sizeof(T) <= actual.stackSize);
+    // Padding for extended alignment can consume the remaining stack. Refuse before
+    // constructing ContextVars or moving the caller's object, including release builds.
+    // The Context has no children/waiters yet, so destruction rolls back registration.
+    //
+    uintptr_t objectStart = reinterpret_cast<uintptr_t>(launchBase);
+    uintptr_t stackEnd = reinterpret_cast<uintptr_t>(spawnCtx->m_segment.Top());
+    if (objectStart > stackEnd || sizeof(T) > stackEnd - objectStart)
+    {
+        spawnCtx->~Context();
+        m_stackPool.Free(alloc, actual.stackSize);
+        return {};
+    }
     detail::ContextVarRegistry::Instance().ConstructAll(spawnCtx->m_segment.Bottom());
     auto* launchable = new (launchBase) T(
         spawnCtx,

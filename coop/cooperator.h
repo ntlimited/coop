@@ -621,7 +621,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // coupling the scheduler to those subsystems. Offsets are assigned at static init via
     // CooperatorVarRegistry; access is thread-local cooperator + constant offset.
     //
-    alignas(64) char m_localStorage[LOCAL_STORAGE_SIZE];
+    alignas(kCooperatorVarAlignment) char m_localStorage[LOCAL_STORAGE_SIZE];
 
     static std::atomic<bool> s_registryShutdown;
     static std::mutex        s_registryMutex;

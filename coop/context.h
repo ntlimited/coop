@@ -29,8 +29,12 @@ enum class KillCause : uint8_t
 struct Segment
 {
     size_t m_size;
-    uint8_t    m_bottom[0] __attribute__((aligned(128)));
-    
+    // Preserve the segment-base contract for ContextVar slots up to 128-byte alignment.
+    // The context-switch ABI only needs 16; the stronger storage contract is intentional.
+    // StackPool must honor the resulting alignof(Context), including recycled allocations.
+    //
+    alignas(128) uint8_t m_bottom[0];
+
     size_t Size() const
     {
         return m_size;

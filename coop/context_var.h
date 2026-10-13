@@ -138,6 +138,9 @@ inline size_t ContextVarTotalSize()
 template<typename T>
 struct ContextVar
 {
+    static_assert(alignof(T) <= alignof(Segment),
+                  "ContextVar alignment exceeds the segment-base contract");
+
     ContextVar()
     {
         m_offset = detail::ContextVarRegistry::Instance().Register(

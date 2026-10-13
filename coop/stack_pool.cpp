@@ -157,6 +157,11 @@ void* StackPool::RawAllocate(size_t stackSize)
 
     static const size_t kPageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
 
+    // Guard-page offsets must preserve the declared Context alignment.
+    //
+    if (kPageSize % alignof(Context) != 0)
+        return nullptr;
+
     size_t usable = sizeof(Context) + stackSize;
     size_t usableAligned = (usable + kPageSize - 1) & ~(kPageSize - 1);
     size_t total = kPageSize + usableAligned + kPageSize;
@@ -188,7 +193,12 @@ void StackPool::RawFree(void* ptr, size_t stackSize)
 void* StackPool::RawAllocate(size_t stackSize)
 {
     assert((stackSize & 127) == 0);
-    return malloc(sizeof(Context) + stackSize);
+    void* storage = nullptr;
+    if (posix_memalign(&storage, alignof(Context), sizeof(Context) + stackSize) != 0)
+    {
+        return nullptr;
+    }
+    return storage;
 }
 
 void StackPool::RawFree(void* ptr, size_t)

@@ -198,6 +198,19 @@ struct DetachedContinuationImpl final : Continuation
         Cooperator::thread_cooperator->FreeContinuation(p, n);
     }
 
+    // Extended alignment cannot use the size-only pool: a reused block carries no
+    // alignment class. C++ selects these overloads for over-aligned Fn storage.
+    //
+    static void* operator new(std::size_t n, std::align_val_t alignment)
+    {
+        return ::operator new(n, alignment);
+    }
+
+    static void operator delete(void* p, std::align_val_t alignment)
+    {
+        ::operator delete(p, alignment);
+    }
+
     DetachedContinuationImpl(Coordinator* coord, Fn fn)
     : m_coordinated(static_cast<Continuation*>(this))
     , m_coord(coord)

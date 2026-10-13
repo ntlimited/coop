@@ -237,3 +237,91 @@ TEST(ContinuationDeathTest, SuspendInsideThunkAsserts)
         "must not suspend");
 }
 #endif
+
+namespace
+{
+struct alignas(4096) AlignedDetachedFn
+{
+    bool* ran;
+    void operator()(Coordinator*)
+    {
+        volatile uintptr_t address = reinterpret_cast<uintptr_t>(this);
+        EXPECT_EQ(address % 4096, 0u);
+        *ran = true;
+    }
+};
+} // namespace
+
+TEST(ContinuationTest, OverAlignedDetached)
+{
+    // Page-aligned by-value temporaries consume several pages in unoptimized builds.
+    // Give the test driver room without changing the continuation's allocation contract.
+    //
+    test::RunInCooperator(
+        [](Context* ctx)
+        {
+            for (int round = 0; round < 64; ++round)
+            {
+                Coordinator coord;
+                coord.Acquire(ctx);
+                bool ran = false;
+                coord.ContinueDetached(AlignedDetachedFn{&ran});
+                coord.Release(ctx);
+                ctx->GetCooperator()->DrainContinuations();
+                EXPECT_TRUE(ran);
+            }
+        }, {.stackSize = 65536});
+}
+
+namespace
+{
+template<size_t Alignment>
+struct alignas(Alignment) SmallAlignedDetachedFn
+{
+    std::shared_ptr<int> token;
+    void operator()(Coordinator*)
+    {
+        volatile uintptr_t address = reinterpret_cast<uintptr_t>(this);
+        EXPECT_EQ(address % Alignment, 0u);
+        ++*token;
+    }
+};
+
+template<size_t Alignment>
+void CheckSmallAlignedDetached(Context* ctx)
+{
+    using Impl = DetachedContinuationImpl<SmallAlignedDetachedFn<Alignment>>;
+    static_assert(sizeof(Impl) <= 512);
+    auto* co = ctx->GetCooperator();
+    // Seed this size class. Aligned deletion must leave the pool's head unchanged;
+    // a mistaken sized delete would insert the aligned allocation ahead of it.
+    //
+    void* pooled = co->AllocateContinuation(sizeof(Impl));
+    ASSERT_NE(pooled, nullptr);
+    co->FreeContinuation(pooled, sizeof(Impl));
+    auto token = std::make_shared<int>(0);
+    for (int round = 0; round < 64; ++round)
+    {
+        Coordinator coord;
+        coord.Acquire(ctx);
+        coord.ContinueDetached(SmallAlignedDetachedFn<Alignment>{token});
+        EXPECT_EQ(token.use_count(), 2);
+        coord.Release(ctx);
+        co->DrainContinuations();
+        EXPECT_EQ(token.use_count(), 1);
+        EXPECT_EQ(*token, round + 1);
+        void* reused = co->AllocateContinuation(sizeof(Impl));
+        EXPECT_EQ(reused, pooled);
+        co->FreeContinuation(reused, sizeof(Impl));
+    }
+}
+} // namespace
+
+TEST(ContinuationTest, SmallOverAlignedDetached)
+{
+    test::RunInCooperator([](Context* ctx)
+    {
+        CheckSmallAlignedDetached<32>(ctx);
+        CheckSmallAlignedDetached<64>(ctx);
+    });
+}

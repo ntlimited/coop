@@ -14,7 +14,9 @@ namespace test
 // GTest assertions work inside the function because Thread::~Thread joins, establishing a
 // happens-before relationship with the calling test.
 //
-inline void RunInCooperator(std::function<void(coop::Context*)> fn)
+inline void RunInCooperator(
+    std::function<void(coop::Context*)> fn,
+    coop::SpawnConfiguration const& config = coop::s_defaultConfiguration)
 {
     coop::Cooperator cooperator;
     coop::Thread t(&cooperator);
@@ -24,7 +26,7 @@ inline void RunInCooperator(std::function<void(coop::Context*)> fn)
         auto* fn = static_cast<std::function<void(coop::Context*)>*>(arg);
         (*fn)(ctx);
         ctx->GetCooperator()->Shutdown();
-    }, &fn);
+    }, &fn, config);
 }
 
 } // end namespace test

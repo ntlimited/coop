@@ -9,6 +9,7 @@ namespace coop
 {
 
 struct Cooperator;
+inline constexpr size_t kCooperatorVarAlignment = 64;
 
 // CooperatorVar<T> provides per-cooperator typed storage with the same declaration ergonomics
 // as ContextVar<T>, but with lifetime tied to the cooperator rather than a context.
@@ -127,6 +128,9 @@ private:
 template<typename T>
 struct CooperatorVar
 {
+    static_assert(alignof(T) <= kCooperatorVarAlignment,
+                  "CooperatorVar alignment exceeds inline storage alignment");
+
     CooperatorVar()
     {
         m_offset = detail::CooperatorVarRegistry::Instance().Register(

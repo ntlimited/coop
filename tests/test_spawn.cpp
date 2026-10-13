@@ -514,3 +514,137 @@ TEST(SpawnTest, LaunchWhoseConstructorSpawns)
         EXPECT_TRUE(ctorSpawnRan);
     });
 }
+
+// Check storage before construction as well as live contexts: an optimizing compiler may
+// assume a typed Context* is aligned even when the allocator broke that contract.
+//
+TEST(SpawnTest, ContextStorageAlignment)
+{
+    coop::StackPool pool;
+    for (size_t size : {size_t(4096), size_t(16384), size_t(131072), size_t(262144)})
+    {
+        for (int round = 0; round < 64; ++round)
+        {
+            void* storage = pool.Allocate(size);
+            ASSERT_NE(storage, nullptr);
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(storage) % alignof(coop::Context), 0u);
+            pool.Free(storage, size);
+        }
+    }
+    // Fill past the cache cap to exercise eviction, then drain all retained blocks.
+    //
+    void* blocks[40];
+    for (void*& block : blocks)
+    {
+        block = pool.Allocate(16384);
+        ASSERT_NE(block, nullptr);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(block) % alignof(coop::Context), 0u);
+    }
+    for (void* block : blocks)
+        pool.Free(block, 16384);
+    EXPECT_GT(pool.GetStats().hits, 0u);
+    pool.Drain();
+    EXPECT_EQ(pool.GetStats().cached, 0u);
+}
+
+TEST(SpawnTest, EveryContextAlignedAcrossPoolReuse)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(ctx) % alignof(coop::Context), 0u);
+            for (size_t size : {size_t(4096), size_t(16384), size_t(131072), size_t(262144)})
+            {
+                for (int round = 0; round < 64; ++round)
+                {
+                    EXPECT_TRUE(ctx->GetCooperator()->Spawn(
+                        {.priority = 0, .stackSize = size},
+                        [](coop::Context* child)
+                        {
+                            EXPECT_EQ(reinterpret_cast<uintptr_t>(child) % alignof(coop::Context),
+                                      0u);
+                            EXPECT_EQ(reinterpret_cast<uintptr_t>(child->m_segment.Bottom()) % 128,
+                                      0u);
+                            EXPECT_EQ(reinterpret_cast<uintptr_t>(child->m_segment.Top()) % 16, 0u);
+                        }));
+                }
+            }
+        });
+}
+
+namespace
+{
+struct alignas(4096) AlignedSpawn
+{
+    bool* ran;
+    void operator()(coop::Context*)
+    {
+        volatile uintptr_t address = reinterpret_cast<uintptr_t>(this);
+        EXPECT_EQ(address % 4096, 0u);
+        *ran = true;
+    }
+};
+
+struct alignas(4096) AlignedLaunch : coop::Launchable
+{
+    bool* ran;
+    AlignedLaunch(coop::Context* ctx, bool* result) : Launchable(ctx), ran(result) {}
+    void Launch() final
+    {
+        volatile uintptr_t address = reinterpret_cast<uintptr_t>(this);
+        EXPECT_EQ(address % 4096, 0u);
+        *ran = true;
+    }
+};
+} // namespace
+
+TEST(SpawnTest, OverAlignedStackObjects)
+{
+    // The caller's page-aligned temporaries need room independently of child stacks.
+    //
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            for (int round = 0; round < 64; ++round)
+            {
+                bool spawned = false;
+                bool launched = false;
+                EXPECT_TRUE(ctx->GetCooperator()->Spawn(AlignedSpawn{&spawned}));
+                EXPECT_TRUE(ctx->GetCooperator()->Launch<AlignedLaunch>(&launched));
+                EXPECT_TRUE(spawned);
+                EXPECT_TRUE(launched);
+            }
+        }, {.stackSize = 65536});
+}
+
+// A page-aligned, page-sized object cannot fit after ContextVars on a 4KB stack.
+// Reject before moving/constructing it, including NDEBUG, and recycle the context cleanly.
+//
+TEST(SpawnTest, OverAlignedObjectsRefusedOnTightStack)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        auto* co = ctx->GetCooperator();
+        for (int round = 0; round < 64; ++round)
+        {
+            bool spawned = false;
+            bool launched = false;
+            coop::Context::Handle handle;
+            EXPECT_FALSE(co->Spawn({.stackSize = 4096}, AlignedSpawn{&spawned}, &handle));
+            EXPECT_FALSE(handle);
+            EXPECT_FALSE(spawned);
+            auto result = co->Launch<AlignedLaunch>(
+                {.stackSize = 4096}, &handle, &launched);
+            EXPECT_FALSE(result.spawned);
+            EXPECT_EQ(result.object, nullptr);
+            EXPECT_FALSE(handle);
+            EXPECT_FALSE(launched);
+            EXPECT_TRUE(ctx->m_children.IsEmpty());
+            // A successful ordinary spawn must still work after repeated refusal/pool reuse.
+            //
+            EXPECT_TRUE(co->Spawn({.stackSize = 4096},
+                                 [&spawned](coop::Context*) { spawned = true; }));
+            EXPECT_TRUE(spawned);
+        }
+    }, {.stackSize = 65536});
+}

@@ -6,14 +6,14 @@ fast paths. For API surface and usage patterns, see the top-level `CLAUDE.md`.
 ## StackPool (`stack_pool.h`)
 
 Size-class allocator for context stack segments, owned by `Cooperator`. Eliminates
-`mmap`/`munmap` (debug) or `malloc`/`free` (release) syscalls on the spawn/exit hot path.
+`mmap`/`munmap` (debug) or `posix_memalign`/`free` (release) syscalls on the spawn/exit hot path.
 
 **Buckets**: 6 power-of-2 sizes from 4KB to 128KB. Requests are rounded up via
 `RoundUpStackSize()`. Allocations larger than 128KB bypass the pool. Each bucket caches up to
 32 freed segments via an intrusive `FreeNode*` overlay on dead memory.
 
 **Allocation path**: `Spawn`/`Launch` call `m_stackPool.Allocate(roundedSize)` — checks the
-free list first, falls back to `RawAllocate` (mmap+guard pages in debug, malloc in release).
+free list first, falls back to `RawAllocate` (mmap+guard pages in debug, posix_memalign in release).
 `HandleCooperatorResumption(EXITED)` calls `m_stackPool.Free(ptr, size)` — returns to the
 free list (evicting oldest on cap), or `RawFree` if the bucket is full.
 
@@ -150,3 +150,23 @@ full).
 destructors run via `m_cleanup` (a typed destructor trampoline set by `Launch<T>`) after
 `m_entry` returns but before `~Context()`. This allows Launchable members (Descriptor,
 PlaintextStream, etc.) to use RAII normally — their destructors may do cooperative IO.
+
+## Placement storage alignment
+
+`Segment::m_bottom` retains 128-byte alignment so ContextVar's fixed offsets can hold types
+aligned up to 128 bytes. This is stronger than the context-switch ABI's 16-byte stack requirement.
+It also makes Context over-aligned: StackPool's release path uses `posix_memalign` with
+`alignof(Context)` and debug guard-page allocation checks that the page offset preserves it.
+Recycled blocks preserve the same alignment; their ownership and free operation do not change.
+
+Spawn/Launch align the absolute address after the ContextVar region to the callable/Launchable's
+alignment. If the aligned object does not fit below the segment top, both APIs return their
+spawn-failure result before constructing ContextVars or moving/constructing the object, in all
+build modes. Context registration is rolled back and the block returns to the pool.
+Entry and cleanup use the same typed address calculation. The bump heap already aligns
+absolute addresses for each allocated type. ContextVar rejects alignment above 128 bytes, and
+CooperatorVar rejects alignment above its 64-byte inline-storage contract at compile time.
+Detached continuations with extended alignment use matching aligned new/delete outside the
+size-only pool; ordinary continuations keep their existing pool and reuse path. Frame-hosted
+continuation result storage uses `alignas(Stored)`. Ordinary typed new (including submitted work
+and ergs) obtains extended alignment from the C++ allocator automatically.

@@ -7,7 +7,7 @@ namespace coop
 
 // A size-class allocator with per-bucket free lists for context stack allocations. Owned by
 // Cooperator (single-threaded, no locking required). Caches freed allocations to eliminate
-// mmap/munmap (debug) or malloc/free (release) syscalls on the hot path.
+// mmap/munmap (debug) or posix_memalign/free (release) syscalls on the hot path.
 //
 // Size classes are powers of 2 from 4KB to 128KB. Requests round up to the next bucket.
 // Requests larger than 128KB bypass the pool entirely.
@@ -58,7 +58,7 @@ struct StackPool
     static int BucketIndex(size_t stackSize);
     static size_t BucketSize(int index);
 
-    // Underlying alloc/free — mmap+guard pages (debug) or malloc (release)
+    // Underlying alloc/free — mmap+guard pages (debug) or posix_memalign (release)
     //
     static void* RawAllocate(size_t stackSize);
     static void RawFree(void* ptr, size_t stackSize);

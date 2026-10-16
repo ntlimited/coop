@@ -336,6 +336,18 @@ target_link_options(coop_tests PRIVATE -rdynamic
 set_source_files_properties(tests/test_introspect.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-omit-frame-pointer;-fno-optimize-sibling-calls")
 include(GoogleTest)
+
+# ABI preservation tests use the production switch directly, without scheduler or io_uring setup.
+#
+add_executable(coop_context_switch_tests
+    tests/test_context_switch.cpp
+    tests/context_switch_registers.S
+    coop/detail/context_switch.cpp
+    coop/detail/context_switch.S)
+target_include_directories(coop_context_switch_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(coop_context_switch_tests PRIVATE GTest::gtest_main)
+gtest_discover_tests(coop_context_switch_tests DISCOVERY_MODE PRE_TEST)
+
 if(CMAKE_CROSSCOMPILING)
     # The test executable targets x86. Discover it on the target host when
     # ctest runs, never on the aarch64 build host while the binary is linked.

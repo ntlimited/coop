@@ -14,15 +14,22 @@ struct Context;
 // the target's state, and returns `result` to the resumed call site.
 //
 // x86-64:  saves %rbp, %rbx, %r12-%r15; swaps RSP.
-// aarch64: saves x19-x28, fp, lr; swaps SP.
+// aarch64: saves x19-x28, fp, lr, d8-d15 (low 64 bits); swaps SP.
+// Caller-saved vector data is preserved by the compiler when live across the ordinary call.
+//
+// FP controls and status are shared by all contexts on the OS thread: MXCSR and the x87
+// control/status words on x86-64, FPCR/FPSR on aarch64. They are not saved or restored here.
+// Temporary FP mode changes (rounding, denormals, exception masks) must be restored before
+// any yield, block, spawn, or context exit that can switch contexts. Caller-saved exception flags
+// are shared too; a context cannot rely on those flags surviving a switch.
 //
 extern "C" int _coop_switch_context(void** from_sp, void* to_sp, int result);
 
 // ContextSwitch — the call-site wrapper around _coop_switch_context.
 //
 // This is a plain, compiler-visible function call on every architecture, and that is a
-// load-bearing design decision. The core saves every callee-saved register, so the ABI
-// contract of a normal call holds and the compiler models the switch like any other call:
+// load-bearing design decision. The core saves callee-saved register data, while FP controls
+// follow the shared-thread contract above. The compiler models the switch like any other call:
 // it never spills live values into the red zone across it, LTO's whole-program codegen sees a
 // real control transfer instead of an opaque asm block, and call-modeling toolchain features
 // (sanitizers, CET, PGO) observe a well-formed call.
@@ -49,6 +56,6 @@ extern "C" void _context_trampoline();
 extern "C" void CoopContextEntry(coop::Context* ctx);
 
 // Prepares a stack for first entry via ContextSwitch. Returns the initial stack pointer that
-// ContextSwitch should switch to.
+// ContextSwitch should switch to. FP controls/status remain shared with the OS thread.
 //
 void* ContextInit(void* stack_top, coop::Context* ctx);

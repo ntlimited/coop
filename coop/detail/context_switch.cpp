@@ -55,7 +55,7 @@ void* ContextInit(void* stack_top, coop::Context* ctx)
 // ContextInit prepares a fresh stack so that ContextSwitch can "resume" into it for the first
 // time. The layout mirrors what ContextSwitch would have saved via stp instructions:
 //
-//   96-byte save area (sp offsets):
+//   160-byte save area (sp offsets):
 //     +0:  x29 (fp)  = 0               ← frame chain terminator
 //     +8:  x30 (lr)  = _context_trampoline  ← ret branches here
 //     +16: x19       = ctx             ← trampoline reads this as Context*
@@ -68,6 +68,7 @@ void* ContextInit(void* stack_top, coop::Context* ctx)
 //     +72: x26       = 0
 //     +80: x27       = 0
 //     +88: x28       = 0
+//     +96..+152: d8-d15 = 0 (low 64 bits of v8-v15)
 //
 // After ContextSwitch restores registers via ldp and executes `ret`, x19 holds Context*,
 // x30 holds _context_trampoline (so ret branches there), and control transfers to
@@ -77,10 +78,10 @@ void* ContextInit(void* stack_top, coop::Context* ctx)
 {
     auto* sp = static_cast<uintptr_t*>(stack_top);
 
-    // Allocate 96 bytes (12 registers × 8 bytes) matching ContextSwitch's save area
+    // Allocate the complete GPR/SIMD save area, keeping SP 16-byte aligned.
     //
-    sp -= 12;
-    memset(sp, 0, 96);
+    sp -= 20;
+    memset(sp, 0, 160);
 
     sp[0] = 0;                                                  // x29 (fp) — frame terminator
     sp[1] = reinterpret_cast<uintptr_t>(_context_trampoline);   // x30 (lr)

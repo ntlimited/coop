@@ -82,7 +82,12 @@ register saves to a clobber list) breaks the compiler's red-zone analysis, blind
 codegen to the control transfer, and measures perf-neutral anyway — see
 `docs/context_switch_core_01.md` before changing the model. `ContextInit` seeds a fresh stack with the core's save-area layout
 (x86-64: abort, trampoline, `%rbp = Context*`, rbx/r12-r15 zeroed); the trampoline reads
-`Context*` from `%rbp` (x86-64) / `x19` (aarch64).
+`Context*` from `%rbp` (x86-64) / `x19` (aarch64). aarch64 also preserves d8-d15 (the low 64 bits
+of v8-v15), which user code may use for scalar floating point as well as SIMD. Caller-saved
+vector values, including AVX/AVX-512 on x86-64, are spilled by the compiler when live across
+the call. FP controls/status are shared by contexts on the OS thread; temporary changes must
+be restored before any operation that can switch contexts, including Spawn and blocking IO.
+The saved-stack readers in `detail/stack_walk.h` and `tools/coop_gdb.py` must match the layout.
 
 **Direct-yield fastpath** (opt-in, `CooperatorConfiguration::directYield`): a plain `Yield`
 normally trampolines through the loop (two switches). With the fastpath, a yield that finds another

@@ -93,7 +93,7 @@ TEST_F(StackWalkTest, ChecksCompleteSavedRegisterRecord)
 #if defined(__x86_64__)
     constexpr size_t words = 7, fpSlot = 5, pcSlot = 6;
 #elif defined(__aarch64__)
-    constexpr size_t words = 12, fpSlot = 0, pcSlot = 1;
+    constexpr size_t words = 20, fpSlot = 0, pcSlot = 1;
 #endif
     auto address = m_bounds.hi - words * sizeof(uintptr_t);
     auto* saved = reinterpret_cast<uintptr_t*>(address);

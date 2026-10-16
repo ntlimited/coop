@@ -132,7 +132,7 @@ def backtrace(context):
     if architecture.startswith("i386:x86-64"):
         fp_offset, pc_offset, saved_size = 40, 48, 56
     elif architecture.startswith("aarch64"):
-        fp_offset, pc_offset, saved_size = 0, 8, 96
+        fp_offset, pc_offset, saved_size = 0, 8, 160
     else:
         raise gdb.GdbError("Unsupported coop saved-register architecture: " + architecture)
     segment = context["m_segment"]

@@ -2,7 +2,7 @@
 
 The context switch is coop's most fundamental primitive: every yield, block, resume, and IO wait
 crosses `_coop_switch_context`. This document records why the switch core saves **every**
-callee-saved register and is reached only through a **plain, compiler-visible function call** —
+callee-saved data register and is reached only through a **plain, compiler-visible function call** —
 deliberately rejecting the register-save-minimization technique published for the Photon runtime,
 after implementing it, shipping it, and measuring what it actually cost here.
 
@@ -81,13 +81,40 @@ debugging before it was withdrawn.
 
 ## The shape that remains
 
-- `context_switch.S` — both cores save all callee-saved registers and swap the stack pointer.
-  x86-64: rbp, rbx, r12–r15. aarch64: x19–x28, fp, lr.
+- `context_switch.S` — both cores save the callee-saved data registers and swap the stack pointer.
+  x86-64: rbp, rbx, r12–r15. aarch64: x19–x28, fp, lr, d8–d15.
 - `context_switch.h` — `ContextSwitch` is `return _coop_switch_context(...)` on every
   architecture. No inline asm at the call site.
 - `ContextInit` seeds a fresh stack with the core's exact save-area layout, so the first switch
   into a context is indistinguishable from a resume.
 - No translation unit carries `-mno-red-zone` or any other correctness-bearing codegen flag.
+
+## SIMD values and floating-point controls
+
+User code may keep vector or scalar floating-point values live across a yield. On x86-64
+System V, XMM/YMM/ZMM and AVX-512 mask registers are caller-saved: the visible call tells the
+compiler to spill or recompute live values. Saving the entire vector register file is unnecessary.
+On aarch64, the ABI instead requires the callee to preserve the low 64 bits of v8–v15 (d8–d15).
+The core saves those registers even if the framework itself does not use them; user code may.
+
+FP controls and status are shared OS-thread state, not context-local state. The switch does not
+save MXCSR or the x87 control word on x86-64, or FPCR/FPSR on aarch64. A context that temporarily
+changes rounding, denormal handling or exception masks must restore the settings before any
+operation that can switch contexts, including Yield, blocking IO, Spawn, Launch and returning
+from the context entry function. A scope guard that restores the mode only after a yield is
+too late: other contexts and the scheduler have
+already run under that mode. Exception flags are also shared, so another context may change them.
+This contract avoids unconditional FP-environment work on every switch; coop contexts do not
+provide the independent FP environments of OS threads.
+
+Assembly and JIT callers must honor the ordinary data-register call ABI too; keeping a raw
+caller-saved vector register across a yield without spilling it is invalid.
+
+The saved record is 56 bytes on x86-64 (six GPRs and return address) and
+160 bytes on aarch64 (96 bytes of GPRs and 64 bytes of SIMD values).
+`detail/stack_walk.h` and `tools/coop_gdb.py` decode this record and must agree with both the
+core and `ContextInit`. `coop_context_switch_tests` exercises the actual core without io_uring,
+including ARM register preservation and live AVX/AVX-512 values across switches.
 
 Re-verification, should the model ever be touched: build and run the full suite at `-O2`
 (unflagged — this is the configuration the hidden call crashed) and under `-flto`. Both must
@@ -101,7 +128,7 @@ of a live local (`this`) across `Resume`, reloaded as garbage after the switch.
   compiler.
 - No TU may require a codegen-restricting compile flag (`-mno-red-zone` or kin) for
   correctness. A change that reintroduces such a requirement is wrong, whatever it buys.
-- The core preserves every ABI callee-saved register on every architecture, and `ContextInit`'s
+- The core preserves every ABI callee-saved data register on every architecture, and `ContextInit`'s
   seeded layout matches the core's save area slot for slot. A mismatch is UB that a green suite
   at one optimization level does not rule out.
 - Both architectures share one model. An arch-specific register-saving "optimization" that forks

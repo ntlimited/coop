@@ -54,7 +54,7 @@ inline bool ReadSavedStack(uintptr_t savedSp, StackBounds bounds, uintptr_t& pc,
     constexpr size_t fpSlot = 5;
     constexpr size_t pcSlot = 6;
 #elif defined(__aarch64__)
-    constexpr size_t words = 12; // x29, x30, then x19-x28
+    constexpr size_t words = 20; // x29/x30, x19-x28, d8-d15
     constexpr size_t fpSlot = 0;
     constexpr size_t pcSlot = 1;
 #else

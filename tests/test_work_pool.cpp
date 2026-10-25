@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -68,9 +69,8 @@ TEST(WorkPoolTest, StealBalancesClusteredSeed)
 
 // A reusable (caller-owned) Erg re-sheds the SAME object each stage instead of allocating a fresh
 // morsel: the substrate's headline re-shedding pipeline with zero per-stage allocation. The
-// single-owner contract is that a reusable Erg is never resident in a shard and running at once --
-// here the re-shed happens only AFTER RunErg returns (the stage's work has retired), so the object
-// is idle when it re-enters a shard. Under real concurrent stealing every stage must run exactly
+// policy in this test re-sheds only AFTER RunErg returns (the stage's work has retired), so the
+// object is idle when it re-enters a shard. Under real concurrent stealing every stage must run exactly
 // once, and no two stealers may run the same Erg concurrently. RunErg must not free it (it is
 // caller-owned), so the objects remain valid and the per-stage allocation count is zero.
 //
@@ -142,4 +142,83 @@ TEST(WorkPoolTest, ReusableErgReshedSingleOwner)
             ASSERT_EQ(stages[i].runs, K) << "rep " << rep << " pipeline " << i
                                          << " did not run every stage exactly once";
     }
+}
+
+// Publishing a reusable Erg hands it to thieves immediately, even while the publishing Run frame
+// is still unwinding. Only invocation-local state may be accessed after that handoff.
+//
+TEST(WorkPoolTest, PeerStealsReshedErgBeforeRunReturns)
+{
+    struct State
+    {
+        work::detail::Shards<work::Erg*> shards;
+        std::atomic<bool> peerRan{false};
+        std::atomic<int> runs{0};
+        bool overlapped = false;
+        int destructions = 0;
+    } state;
+    state.shards.Init(2);
+
+    struct Stage final : work::Erg
+    {
+        State* state;
+        int generation = 0;
+        explicit Stage(State* s) : state(s) { m_stealerOwned = false; }
+        ~Stage() final { ++state->destructions; }
+        void Run() final
+        {
+            State* s = state; // snapshot before publishing: the peer may modify the Erg immediately
+            s->runs.fetch_add(1, std::memory_order_relaxed);
+            if (generation == 0)
+            {
+                generation = 1;
+                EXPECT_TRUE(s->shards.Shed(0, this));
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (!s->peerRan.load(std::memory_order_acquire) &&
+                       std::chrono::steady_clock::now() < deadline)
+                {
+                    std::this_thread::yield();
+                }
+                s->overlapped = s->peerRan.load(std::memory_order_acquire);
+                // No member accesses after Shed: even generation belongs to the next invocation.
+                //
+            }
+            else
+            {
+                EXPECT_EQ(generation, 1);
+                generation = 2;
+                s->peerRan.store(true, std::memory_order_release);
+            }
+        }
+    };
+
+    {
+        Stage erg(&state);
+        ASSERT_TRUE(state.shards.Shed(0, &erg));
+        work::Erg* initial = state.shards.Pull(0);
+        ASSERT_EQ(initial, &erg);
+        std::thread thief([&]
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < deadline)
+            {
+                if (work::Erg* stolen = state.shards.Pull(1))
+                {
+                    EXPECT_EQ(stolen, &erg);
+                    work::RunErg(stolen);
+                    return;
+                }
+                std::this_thread::yield();
+            }
+        });
+        work::RunErg(initial);
+        thief.join();
+        EXPECT_TRUE(state.overlapped) << "a re-shed is visible before the publishing Run retires";
+        EXPECT_EQ(state.runs.load(), 2);
+        EXPECT_EQ(erg.generation, 2);
+        EXPECT_EQ(state.destructions, 0) << "RunErg must preserve caller-owned storage";
+        EXPECT_EQ(state.shards.Pull(0), nullptr);
+        EXPECT_EQ(state.shards.Pull(1), nullptr);
+    }
+    EXPECT_EQ(state.destructions, 1);
 }

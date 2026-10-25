@@ -24,7 +24,7 @@ class Grid;
 // this cooperator's shard index, and the doorbell its own idle stealer parks on. Owned by the Grid
 // (one per joined cooperator).
 //
-// The doorbell exists because the only consumer of a shard is its own stealer, and that stealer
+// The doorbell wakes the local consumer of a shard: its own stealer. That stealer
 // parks on an io_uring timer when idle. Without a wake, a cooperator that sheds locally and then
 // goes idle would not drain its own freshly-shed work until its stealer's next timer tick -- up to
 // the backed-off recheck cap. The doorbell closes that hole: a local Shed releases it, and because
@@ -167,7 +167,9 @@ inline void Shed(Fn&& fn)
 // Only meaningful on a cooperator that has joined a Grid (a reusable Erg is a Grid concept); returns
 // false if this cooperator does not participate, or if its shard is full. Like Shed(int,Erg*) on the
 // Grid, this pushes to the caller's own shard, so it must run on the owning cooperator's thread --
-// which the in-cooperator re-shed (stealer Run or completion continuation) always does.
+// which the in-cooperator re-shed (stealer Run or completion continuation) always does. A true
+// return publishes immediately to peers, even before this call returns; follow Erg's handoff and
+// storage-lifetime contract when re-shedding during Run().
 //
 inline bool Shed(work::Erg* e)
 {

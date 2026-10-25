@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -17,6 +18,13 @@ namespace coop
 {
 namespace work
 {
+
+namespace detail
+{
+    // Busy stealers service IO and runnable contexts at this interval between indivisible Ergs.
+    //
+    inline constexpr auto kStealerRunQuantum = std::chrono::microseconds(200);
+}
 
 class Grid;
 
@@ -46,8 +54,9 @@ struct Participation
 
 // A Grid is the work-sharing domain: a set of cooperators that balance Ergs among themselves by
 // stealing. Each joined cooperator owns one shard (a Deque) and runs a daemon stealer context that
-// pulls local work, steals from peers, runs the Erg to completion, and parks on a short io_uring
-// timer when idle (re-checking for stealable work). Opt-in: a cooperator that never joins a Grid is
+// pulls oldest local work, steals from peers, and runs each Erg to completion. Under sustained load it
+// yields between Ergs every 200us of elapsed time; idle, it parks on a short io_uring timer to
+// re-check for stealable work. Opt-in: a cooperator that never joins a Grid is
 // untouched, and Shed() on it falls back to Spawn.
 //
 class Grid

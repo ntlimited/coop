@@ -14,7 +14,7 @@ namespace detail
 
 // Sharded work-stealing pool: one bounded Deque per worker. Shed pushes to the caller's OWN shard
 // (owner-only). Pull pops the local shard, then steals from the other shards. The Deque's single-
-// owner invariant is honored because Shed(w, ...) and the local pop inside Pull(w) only ever run on
+// owner invariant is honored because Shed(w, ...) and the local pull inside Pull(w) only ever run on
 // worker w's thread; other workers reach shard w solely through Steal.
 //
 // Generic on the payload T (a trivially-copyable nullable pointer). The Grid uses T = Erg*; a caller
@@ -35,12 +35,14 @@ class Shards
     //
     bool Shed(int w, T t) { return m_shards[w].PushBottom(t); }
 
-    // Worker w: take local work (LIFO), else steal from another shard (FIFO). nullptr if all empty.
+    // Worker w: take local work, else steal from another shard (FIFO). nullptr if no item was claimed.
+    // Local work defaults to LIFO for locality; oldestFirst uses the thief end to prevent newer
+    // re-sheds overtaking queued work when Grid interleaves pulls with completion service.
     //
-    T Pull(int w)
+    T Pull(int w, bool oldestFirst = false)
     {
         T t;
-        if (m_shards[w].PopBottom(t)) return t;
+        if (oldestFirst ? m_shards[w].Steal(t) : m_shards[w].PopBottom(t)) return t;
         for (int i = 1; i < m_n; i++)
         {
             if (m_shards[(w + i) % m_n].Steal(t)) return t;

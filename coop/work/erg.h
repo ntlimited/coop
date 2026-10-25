@@ -24,11 +24,15 @@ namespace work
 // same object will be shed again. Caller-owned removes the per-shed malloc/free entirely for the
 // re-shedding pattern (the substrate's headline workload), where the allocation is pure waste.
 //
-// The single-owner contract a reusable Erg must honor: it is never resident in a shard and running
-// at the same time. The IO-pipeline pattern guarantees this -- a stage runs, submits its async op,
-// and only the op's completion continuation re-sheds the Erg, by which point the prior Run() has
-// fully retired. A re-shed lands on the running stealer's own local shard, so a peer cannot observe
-// it until the stealer returns and loops.
+// A successful shed publishes the Erg immediately: a peer can steal it and enter the next Run()
+// before the publishing Run() returns. Finish all shared-state updates before re-shedding; after
+// that handoff, the old invocation may use only invocation-local state or explicitly synchronized
+// external state, not the Erg's fields. A failed shed leaves ownership with the caller. Never
+// publish the same Erg twice without an intervening pull.
+//
+// The caller must keep reusable storage alive, and m_stealerOwned unchanged, until every Run()
+// invocation has retired. An IO pipeline can avoid overlapping invocations by re-shedding only
+// from the submitting cooperator's completion continuation, which runs after its prior Run returns.
 //
 struct Erg : Thunk
 {
@@ -55,12 +59,11 @@ inline Erg* MakeErg(Fn&& fn)
 inline void RunErg(Erg* e)
 {
     coop::detail::ThunkScope inThunk;    // debug: forbid suspending inside the Erg's Run
+    // Snapshot disposition before invoking user code: a reusable Erg can publish itself to a
+    // peer during Run(). The retiring invocation must not access caller-owned e afterward.
+    //
     const bool owned = e->m_stealerOwned;
     e->Run();
-    // A caller-owned (reusable) Erg may have already re-shed itself during Run(); the stealer must
-    // not free it. Read m_stealerOwned BEFORE Run() so a re-shed peer touching the object cannot
-    // race this load.
-    //
     if (owned)
     {
         delete e;

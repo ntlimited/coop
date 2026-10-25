@@ -425,8 +425,8 @@ TEST(SleepTest, SleepCompletesNormally)
 
 TEST(SleepTest, SlackSleepIsOneSided)
 {
-    // Covenant: slack may only push a deadline later, never earlier. A slack sleep must wake no
-    // sooner than its requested interval, and overshoot by at most ~one slack tick.
+    // Slack may only push a deadline later, never earlier. Host scheduling can delay the wake;
+    // TimerSlackTest checks the quantization bound with virtual time through the production Sleeper.
     //
     test::RunInCooperator([](coop::Context* ctx)
     {
@@ -440,7 +440,6 @@ TEST(SleepTest, SlackSleepIsOneSided)
 
         EXPECT_EQ(result, coop::time::SleepResult::Ok);
         EXPECT_GE(elapsed.count(), requested.count());          // never early
-        EXPECT_LT(elapsed.count(), requested.count() + slack.count() + 2000);  // bounded overshoot
     });
 }
 

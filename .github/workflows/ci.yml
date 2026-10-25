@@ -13,6 +13,49 @@ on:
   pull_request:
 
 jobs:
+  bazel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: debug
+            config: debug
+            runner: ubuntu-24.04
+          - lane: release
+            config: lto
+            runner: ubuntu-24.04
+          - lane: release-nolto
+            config: release
+            runner: ubuntu-24.04
+          - lane: o2-nolto
+            config: o2
+            runner: ubuntu-24.04
+          - lane: debug-arm64
+            config: debug
+            runner: ubuntu-24.04-arm
+          - lane: release-arm64
+            config: lto
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-version: 1.x
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-${{ matrix.lane }}
+          repository-cache: true
+      - name: Probe io_uring availability
+        run: |
+          sysctl kernel.io_uring_disabled 2>/dev/null || true
+          uname -r
+      - name: Build libraries, examples, and benchmarks
+        # Ubuntu 6.8 runners need the guarded provided-buffer compatibility path.
+        run: bazelisk build //... --config=${{ matrix.config }} --config=ubuntu_pbuf_workaround
+      - name: Test (including concurrent repeated runs)
+        run: bazelisk test //... --config=${{ matrix.config }} --config=ubuntu_pbuf_workaround --runs_per_test=3
+
   test:
     strategy:
       fail-fast: false
@@ -59,8 +102,8 @@ jobs:
           uname -r
 
       - name: Configure
-        # Keep each lane's optimization settings and include symbols for failed-test cores.
-        run: cmake -S . -B build ${{ matrix.cmake_args }} -DCMAKE_CXX_FLAGS=-g
+        # Preserve optimization and symbols; opt in to the guarded Ubuntu compatibility path.
+        run: cmake -S . -B build ${{ matrix.cmake_args }} -DCMAKE_CXX_FLAGS=-g -DCOOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"

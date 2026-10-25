@@ -1,0 +1,25 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load(":consumer_test.bzl", "consumer_test")
+
+# These headers belong to the fictional consumer, rather than the runtime target.
+cc_library(
+    name = "consumer_defs",
+    hdrs = ["counters.def", "families.def"],
+    visibility = ["//visibility:public"],
+)
+
+# Only the wrapper builds this binary, with the consumer configuration transition.
+cc_binary(
+    name = "consumer_binary",
+    testonly = True,
+    srcs = ["consumer.cpp"],
+    copts = ["-std=c++20"],
+    tags = ["manual"],
+    deps = ["//:coop"],
+)
+
+consumer_test(
+    name = "consumer_settings_test",
+    size = "small",
+    binary = ":consumer_binary",
+)

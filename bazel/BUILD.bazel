@@ -1,0 +1,25 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "int_flag", "string_flag")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load(":settings.bzl", "coop_configuration")
+
+package(default_visibility = ["//visibility:public"])
+
+# Keep native CPU selection while supplying io_uring-era Linux UAPI headers.
+platform(
+    name = "linux",
+    parents = ["@local_config_platform//:host"],
+    constraint_values = ["@llvm//constraints/libc:gnu.2.31"],
+)
+
+int_flag(name = "default_stack_size", build_setting_default = 16384)
+int_flag(name = "perf_mode", build_setting_default = 1)
+int_flag(name = "spdlog_active_level", build_setting_default = 2)
+string_flag(name = "perf_user_counters", build_setting_default = "")
+string_flag(name = "perf_user_families", build_setting_default = "")
+bool_flag(name = "workaround_ubuntu_pbuf_reserved_check", build_setting_default = False)
+
+# A consumer can supply a cc_library with .def headers and their include paths.
+cc_library(name = "empty_perf_defs")
+label_flag(name = "perf_user_defs", build_setting_default = ":empty_perf_defs")
+
+coop_configuration(name = "configuration")

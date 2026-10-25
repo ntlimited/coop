@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -132,4 +133,49 @@ TEST(GridTest, ShedReusableErgNotFreed)
     for (int i = 0; i < N; i++)
         EXPECT_EQ(ergs[i].runs.load(std::memory_order_relaxed), 1)
             << "caller-owned Erg " << i << " must run exactly once and survive (not be freed)";
+}
+
+// A burst larger than the bounded shard must execute every closure and release every capture.
+// With a single cooperator, nothing can drain the shard until the producer yields.
+//
+TEST(GridTest, ClosureOverflowRunsInlineAndReleasesCaptures)
+{
+    constexpr int N = 9000; // exceeds the shard's 8192 slots
+    std::vector<int> runs(N, 0);
+    auto lifetime = std::make_shared<int>(0);
+    int completed = 0;
+    work::Grid grid;
+    grid.Init(1);
+    Cooperator co;
+    {
+        Thread thread(&co);
+        grid.Join(&co);
+        ASSERT_TRUE(co.Submit([&](Context* ctx)
+        {
+            for (int i = 0; i < N; ++i)
+            {
+                Shed([&, i, keep = lifetime]
+                {
+#ifndef NDEBUG
+                    EXPECT_TRUE(coop::detail::InThunk());
+#endif
+                    ++runs[i];
+                    ++completed;
+                });
+            }
+            EXPECT_GT(completed, 0) << "overflow must run on the producer before it yields";
+#ifndef NDEBUG
+            EXPECT_FALSE(coop::detail::InThunk()) << "inline execution must restore thunk scope";
+#endif
+            const auto deadline = Clock::now() + std::chrono::seconds(2);
+            while (completed < N && Clock::now() < deadline)
+            {
+                ctx->Yield(true);
+            }
+            co.Shutdown();
+        }));
+    }
+    EXPECT_EQ(completed, N);
+    EXPECT_EQ(runs, std::vector<int>(N, 1)) << "each closure must run exactly once";
+    EXPECT_EQ(lifetime.use_count(), 1) << "no closure captures may leak on overflow";
 }

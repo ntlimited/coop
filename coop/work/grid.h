@@ -118,7 +118,8 @@ class Grid
 // sheds a run-to-completion Erg that any participating cooperator may steal; otherwise it falls back
 // to Spawn (the "shed = spawn" default). The run-to-completion contract (no suspending) applies only
 // on the Grid path, where the Erg runs on a shared stealer; the Spawn fallback gives fn its own
-// context and may block.
+// context and may block. A full Grid shard runs the closure inline on the shedding context,
+// under the same run-to-completion contract, so overflow never loses work or its captures.
 //
 // Constrained off any pointer convertible to work::Erg* so a caller passing its own (reusable) Erg
 // subclass pointer binds the zero-allocation Shed(Erg*) overload below, not this allocating closure
@@ -131,7 +132,14 @@ inline void Shed(Fn&& fn)
     Cooperator* co = GetCooperator();
     if (work::Participation* p = co->m_participation)
     {
-        p->grid->ShedErg(p->shard, work::MakeErg(std::forward<Fn>(fn)));
+        work::Erg* e = work::MakeErg(std::forward<Fn>(fn));
+        if (!p->grid->ShedErg(p->shard, e))
+        {
+            // The bounded shard cannot take ownership. Execute and free the Erg here rather than
+            // lose a closure behind a void API; RunErg also enforces the no-suspension contract.
+            //
+            work::RunErg(e);
+        }
 
         // Ring the doorbell so an idle local stealer drains this Erg on the next scheduler pass
         // instead of waiting out its backed-off recheck timer. schedule=false: do not switch to

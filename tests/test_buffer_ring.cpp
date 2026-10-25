@@ -238,7 +238,8 @@ TEST(BufferRingContractTest, HealthyKernelKeepsOrdinaryRegistrationAndCleanup)
 
 TEST(BufferRingContractTest, InvertedKernelRequiresBuildOptInAndPairedCleanup)
 {
-    for (const char* release : {"6.8.0-139-generic", "6.8.0-142-generic"})
+    for (const char* release : {"6.8.0-139-generic", "6.8.0-142-generic",
+                                "6.8.0-147-generic"})
     {
         SCOPED_TRACE(release);
         BufferRingKernel fake;

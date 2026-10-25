@@ -30,7 +30,8 @@ namespace io
                 return false;
             }
             return (std::strcmp(kernel->release, "6.8.0-139-generic") == 0 ||
-                    std::strcmp(kernel->release, "6.8.0-142-generic") == 0) &&
+                    std::strcmp(kernel->release, "6.8.0-142-generic") == 0 ||
+                    std::strcmp(kernel->release, "6.8.0-147-generic") == 0) &&
                    std::strstr(kernel->version, "-Ubuntu") != nullptr;
         }
 
@@ -48,7 +49,7 @@ namespace io
         {
             utsname kernel{};
             // The ordinary helper has already rejected this request. Retry only a valid userspace
-            // ring on the two Ubuntu builds known to invert the reserved-field check.
+            // ring on the Ubuntu builds known to invert the reserved-field check.
             //
             if (m_entries != 0 && m_entries <= 32768 && (m_entries & (m_entries - 1)) == 0 &&
                 m_bufSize != 0 && m_storage.size() == size_t(m_entries) * m_bufSize &&

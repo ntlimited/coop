@@ -32,10 +32,11 @@ staged slots visible to the kernel in one ring advance.
 
 #### Ubuntu registration compatibility
 
-Ubuntu kernels `6.8.0-139-generic` and `6.8.0-142-generic` invert the provided-buffer-ring
-reserved-field check (Ubuntu bug [2162843](https://bugs.launchpad.net/bugs/2162843)). The
-default-off `COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK` CMake option permits a retry with
-`resv[0]=1` only after normal registration returns `-EINVAL`, the release matches exactly,
+Ubuntu kernels `6.8.0-139-generic`, `6.8.0-142-generic`, and `6.8.0-147-generic` invert the
+provided-buffer-ring reserved-field check
+(Ubuntu bug [2162843](https://bugs.launchpad.net/bugs/2162843)). The default-off
+`COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK` CMake option permits a retry with `resv[0]=1`
+only after normal registration returns `-EINVAL`, the release matches exactly,
 the kernel version contains `-Ubuntu`, and the ring parameters are valid. Workaround rings
 use the same reserved value for unregister;
 teardown stops the process if unregister fails, so kernel-owned buffers are never freed. Other

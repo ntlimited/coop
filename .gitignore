@@ -7,3 +7,5 @@ io/ssl
 benchmarks/results/
 benchmarks/reports/runs/*.json
 benchmarks/reports/runs/*.md
+bazel-*
+user.bazelrc

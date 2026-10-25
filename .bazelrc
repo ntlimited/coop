@@ -1,0 +1,30 @@
+# Standalone defaults match CMake Debug. Dependencies and the C++ toolchain are fetched.
+build --compilation_mode=dbg
+build --platforms=//bazel:linux
+build --cxxopt=-std=c++20
+build --jobs=8
+build --@curl//:ssl_lib=openssl
+test --test_output=errors
+
+build:debug --compilation_mode=dbg
+build:debug --//bazel:perf_mode=1
+build:debug --//bazel:spdlog_active_level=2
+
+# Release is -O3 without LTO; add --config=lto for the shipping CMake Release lane.
+build:release --compilation_mode=opt
+build:release --copt=-O3
+build:release --//bazel:perf_mode=2
+build:release --//bazel:spdlog_active_level=3
+build:lto --config=release
+build:lto --features=thin_lto
+build:o2 --config=release
+build:o2 --copt=-O2
+
+# Opt in only on affected Ubuntu 6.8 kernels, matching the CMake option of this name.
+build:ubuntu_pbuf_workaround --//bazel:workaround_ubuntu_pbuf_reserved_check=true
+
+# Compile checks from an x86_64 client; native ARM CI uses the default platform.
+build:aarch64 --platforms=@llvm//platforms:linux_aarch64_gnu.2.31
+
+# Remote execution, credentials, and machine-specific settings belong to the user.
+try-import %workspace%/user.bazelrc

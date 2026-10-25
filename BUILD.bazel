@@ -1,0 +1,404 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+COOP_COPTS = ["-std=c++20", "-Wcpp", "-fno-omit-frame-pointer"] + select({
+    "@platforms//cpu:x86_64": ["-msse4.2"],
+    "@platforms//cpu:aarch64": ["-march=armv8.2-a+crc"],
+    "//conditions:default": [],
+})
+
+# Headers share the runtime configuration, including consumer-owned perf definitions.
+cc_library(
+    name = "headers",
+    hdrs = glob(["coop/**/*.h", "coop/**/*.hpp"]),
+    strip_include_prefix = "/",
+    # LLD otherwise discards the dynamic perf registry under --gc-sections.
+    linkopts = ["-ldl", "-pthread", "-Wl,-z,nostart-stop-gc"],
+    deps = [
+        "//bazel:configuration",
+        "@liburing//:liburing",
+        "@openssl//:ssl",
+        "@spdlog//:spdlog",
+    ],
+)
+
+cc_library(
+    name = "chan",
+    srcs = glob(["coop/chan/*.cpp"]),
+    copts = COOP_COPTS,
+    deps = [":headers"],
+)
+
+cc_library(
+    name = "coop",
+    srcs = glob(["coop/**/*.cpp", "coop/**/*.S"], exclude = ["coop/chan/*.cpp"]),
+    copts = COOP_COPTS,
+    deps = [":chan", ":headers"],
+)
+
+filegroup(name = "http_static", srcs = glob(["coop/http/static/**"]))
+
+genrule(
+    name = "static_files",
+    srcs = ["coop/http/static/index.html"],
+    outs = ["static/index.html"],
+    cmd = "cp $(SRCS) $@",
+)
+
+genrule(
+    name = "test_certs",
+    outs = ["cert.pem", "key.pem"],
+    cmd = "$(location @openssl//:openssl) req -config /dev/null -x509 -newkey rsa:2048 " +
+          "-keyout $(location key.pem) -out $(location cert.pem) " +
+          "-days 365 -nodes -subj /CN=localhost",
+    tools = ["@openssl//:openssl"],
+)
+
+cc_library(
+    name = "test_helpers",
+    testonly = True,
+    hdrs = ["tests/test_helpers.h", "tests/completion_observer.h"],
+    strip_include_prefix = "/",
+    includes = ["tests"],
+    deps = [":coop", "@googletest//:gtest"],
+)
+
+cc_library(
+    name = "test_ws",
+    testonly = True,
+    srcs = ["tests/test_ws.cpp"],
+    alwayslink = True,
+    copts = COOP_COPTS,
+    deps = [":test_helpers"],
+)
+
+cc_library(
+    name = "test_introspect",
+    testonly = True,
+    srcs = ["tests/test_introspect.cpp"],
+    alwayslink = True,
+    copts = COOP_COPTS + ["-fno-optimize-sibling-calls"],
+    linkopts = ["-rdynamic"],
+    deps = [":test_helpers"],
+)
+
+# --wrap must see native calls even in the LTO lane. Resolve this object before
+# the production archive, just as the CMake test binary does.
+cc_library(
+    name = "test_completion_dispatch",
+    testonly = True,
+    srcs = ["coop/io/uring.cpp"],
+    alwayslink = True,
+    copts = COOP_COPTS + ["-fno-lto"],
+    features = ["-thin_lto"],
+    deps = [":headers"],
+)
+
+cc_library(
+    name = "test_cases",
+    testonly = True,
+    alwayslink = True,
+    srcs = [
+        "tests/test_coordinator.cpp",
+        "tests/test_fiber_sanitizer.cpp",
+        "tests/test_signal_stack.cpp",
+        "tests/test_continuation.cpp",
+        "tests/test_registered.cpp",
+        "tests/test_semaphore.cpp",
+        "tests/test_deadline.cpp",
+        "tests/test_group.cpp",
+        "tests/test_virtual_time.cpp",
+        "tests/test_stall_detector.cpp",
+        "tests/test_reactor.cpp",
+        "tests/test_stack_walk.cpp",
+        "tests/test_prng.cpp",
+        "tests/test_drain.cpp",
+        "tests/test_direct_yield.cpp",
+        "tests/test_scheduling.cpp",
+        "tests/test_timer.cpp",
+        "tests/test_work_deque.cpp",
+        "tests/test_work_pool.cpp",
+        "tests/test_grid.cpp",
+        "tests/test_cooperate.cpp",
+        "tests/test_spawn.cpp",
+        "tests/test_signal.cpp",
+        "tests/test_channel.cpp",
+        "tests/test_guarded_passage.cpp",
+        "tests/test_shutdown.cpp",
+        "tests/test_uring_lifecycle.cpp",
+        "tests/test_io.cpp",
+        "tests/completion_observer.cpp",
+        "tests/test_handle_completion.cpp",
+        "tests/test_handle_completion_callbacks.cpp",
+        "tests/test_dns_runtime.cpp",
+        "tests/test_armed_handle.cpp",
+        "tests/test_buffer_ring.cpp",
+        "tests/test_stress.cpp",
+        "tests/test_http.cpp",
+        "tests/test_perf.cpp",
+        "tests/test_alloc.cpp",
+        "tests/test_topology.cpp",
+        "tests/test_epoch.cpp",
+        "tests/test_coop_var.cpp",
+    ],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"] + ["-Wl,--wrap=" + symbol for symbol in [
+        "_ZN4coop2io6Handle8CallbackEP12io_uring_cqe",
+        "io_uring_setup_buf_ring",
+        "io_uring_free_buf_ring",
+        "io_uring_register_buf_ring",
+        "io_uring_unregister_buf_ring",
+        "io_uring_register",
+        "uname",
+        "mmap",
+        "munmap",
+    ]],
+    deps = [
+        ":test_completion_dispatch",
+        ":test_helpers",
+        ":test_introspect",
+        ":test_ws",
+    ],
+)
+
+cc_test(
+    name = "coop_tests",
+    size = "large",
+    deps = [":test_cases", "@googletest//:gtest_main"],
+)
+
+cc_test(
+    name = "coop_context_switch_tests",
+    srcs = [
+        "tests/test_context_switch.cpp",
+        "tests/context_switch_registers.S",
+        "coop/detail/context_switch.cpp",
+        "coop/detail/context_switch.S",
+        "coop/detail/context_switch.h",
+        "coop/detail/asan_fiber.h",
+    ],
+    copts = COOP_COPTS,
+    deps = ["@googletest//:gtest_main"],
+)
+
+cc_test(
+    name = "coop_http_parser_tests",
+    srcs = ["tests/test_http_client_parser.cpp"],
+    copts = COOP_COPTS,
+    deps = [":coop", "@googletest//:gtest_main"],
+)
+
+cc_test(
+    name = "coop_tls_config_tests",
+    srcs = ["tests/test_tls_client_config.cpp"],
+    copts = COOP_COPTS,
+    deps = [":coop", "@googletest//:gtest_main"],
+)
+
+cc_test(
+    name = "coop_http_server_parser_tests",
+    srcs = ["tests/test_http_server_parser.cpp"],
+    copts = COOP_COPTS,
+    deps = [":coop", "@googletest//:gtest_main"],
+)
+
+cc_test(
+    name = "coop_ws_parser_tests",
+    srcs = ["tests/test_ws_parser.cpp"],
+    copts = COOP_COPTS,
+    deps = [":coop", "@googletest//:gtest_main"],
+)
+
+cc_test(
+    name = "coop_dns_parser_tests",
+    srcs = ["tests/test_dns_parser.cpp"],
+    copts = COOP_COPTS,
+    deps = [":coop", "@googletest//:gtest_main"],
+)
+
+cc_binary(
+    name = "coop_gdb_fixture",
+    testonly = True,
+    srcs = ["tests/gdb_fixture.cpp"],
+    copts = COOP_COPTS + ["-g", "-fno-optimize-sibling-calls", "-fno-inline"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "echo_server",
+    srcs = ["examples/echo_server.cpp"],
+    data = [":static_files", ":test_certs"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "echo_client",
+    srcs = ["examples/echo_client.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "chat_server",
+    srcs = ["examples/chat_server.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "tcp_proxy",
+    srcs = ["examples/tcp_proxy.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "pipeline",
+    srcs = ["examples/pipeline.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "context_dump",
+    srcs = ["examples/context_dump.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "http_fetch",
+    srcs = ["examples/http_fetch.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "curl_fetch",
+    srcs = ["examples/curl_fetch.cpp", "examples/curl_coop.h"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop", "@curl//:curl"],
+)
+
+cc_binary(
+    name = "coop_benchmarks",
+    data = [":test_certs"],
+    srcs = [
+        "benchmarks/bench_embedded_list.cpp",
+        "benchmarks/bench_channel.cpp",
+        "benchmarks/bench_coordinator.cpp",
+        "benchmarks/bench_continuation.cpp",
+        "benchmarks/bench_fanout.cpp",
+        "benchmarks/bench_fanout_pool.cpp",
+        "benchmarks/bench_grid.cpp",
+        "benchmarks/bench_io.cpp",
+        "benchmarks/bench_pthread.cpp",
+        "benchmarks/bench_io_baseline.cpp",
+        "benchmarks/bench_scheduler.cpp",
+        "benchmarks/bench_uring_config.cpp",
+        "benchmarks/bench_ssl.cpp",
+        "benchmarks/bench_http.cpp",
+        "benchmarks/bench_perf.cpp",
+    ],
+    copts = COOP_COPTS,
+    deps = [":coop", "@google_benchmark//:benchmark_main"],
+)
+
+cc_binary(
+    name = "bench_http_parser",
+    srcs = ["benchmarks/bench_http_parser.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop", "@google_benchmark//:benchmark"],
+)
+
+cc_binary(
+    name = "bench_curl",
+    srcs = ["benchmarks/bench_curl.cpp", "examples/curl_coop.h"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop", "@curl//:curl"],
+)
+
+cc_binary(
+    name = "bench_buffer_ring_throughput",
+    srcs = ["benchmarks/bench_buffer_ring_throughput.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_disk_path",
+    srcs = ["benchmarks/bench_disk_path.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_pbuf_http",
+    srcs = ["benchmarks/bench_pbuf_http.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_timer_fanout",
+    srcs = ["benchmarks/bench_timer_fanout.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_work_yield",
+    srcs = ["benchmarks/bench_work_yield.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_yield_latency",
+    srcs = ["benchmarks/bench_yield_latency.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_server",
+    srcs = ["benchmarks/bench_server.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_client",
+    srcs = ["benchmarks/bench_client.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "diag_ktls",
+    srcs = ["benchmarks/diag_ktls.cpp"],
+    data = [":test_certs"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)

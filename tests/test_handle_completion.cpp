@@ -116,7 +116,7 @@ struct ProducerGate
 
 uint64_t TestSeed()
 {
-    auto* value = std::getenv("STRATA_COOP_COMPLETION_SEED");
+    auto* value = std::getenv("COOP_COMPLETION_SEED");
     if (value && *value)
     {
         char* end = nullptr;

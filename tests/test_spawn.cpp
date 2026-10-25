@@ -462,8 +462,8 @@ namespace
 // coop/io/shutdown_on_kill.cpp). Before the LAUNCHING state, the outer
 // context sat in m_contexts as YIELDED without m_yielded membership while
 // its constructor ran, and the inner Spawn's EnterContext SanityCheck
-// aborted (`yielded == YieldedCount()`, first hit via strata_server's
-// /healthz HttpConnection, 2026-08-01).
+// aborted (`yielded == YieldedCount()`) when a server's HttpConnection
+// constructor spawned its shutdown-on-kill helper.
 struct SpawnInCtorLaunchable : coop::Launchable
 {
     SpawnInCtorLaunchable(coop::Context* ctx, bool* ctorSpawnRan, bool* launched)

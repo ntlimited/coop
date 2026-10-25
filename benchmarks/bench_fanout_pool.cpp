@@ -268,16 +268,19 @@ static void BM_FanOut_Pool_Grid(benchmark::State& state)
 
     for (auto _ : state)
     {
-        Fabric fab(M);
+        // Join all participant threads before destroying the Grid or any pipeline storage.
+        // The stealers may still be returning from their final Run or parking at shutdown.
+        //
         coop::work::Grid grid;
         grid.Init(M);
+        std::vector<GridPipeline> pipes(kPipelines);
+        Driver drv;
+        Fabric fab(M);
         for (int m = 0; m < M; m++)
         {
             grid.Join(fab.coops[m]);
         }
 
-        std::vector<GridPipeline> pipes(kPipelines);
-        Driver drv;
         drv.sleep = std::chrono::microseconds(kSleepUs);
         drv.remaining.store(kPipelines, std::memory_order_relaxed);
         for (int i = 0; i < kPipelines; i++)

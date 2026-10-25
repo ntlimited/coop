@@ -72,9 +72,9 @@ headroom to push ~53 → ~40 ms.
 ## Approach
 
 1. **Per-cooperator shard, work-stealing deque.** Each cooperator owns one Chase-Lev-style
-   deque. The owner pushes/pops its own end LIFO (recently-shed work is cache-hot); idle
-   thieves steal the far end FIFO (oldest task, likely the largest remaining subtree).
-   This is the structure Go, Rayon, and similar runtimes converged on; no reason to be cleverer first.
+   deque. Pushes use the owner end; Grid pulls and peer steals use the oldest end FIFO.
+   Generic `detail::Shards::Pull` also supports local LIFO for callers prioritizing locality.
+   The bounded deque supplies both policies without a shared injector.
 
 2. **Pull, not push.** `Shed(task)` enqueues to the *local* shard (or the caller's nearest
    shard if shed from a non-cooperator thread). An idle cooperator — at the same point in
@@ -114,8 +114,11 @@ headroom to push ~53 → ~40 ms.
   continuation pool cannot back it (a stolen task is freed on a different core than it was
   shed). The task pool is a per-cooperator slab with cross-thread free — the one genuinely new
   concurrency primitive this design introduces.
-- **Fairness vs locality: start with classic Chase-Lev (LIFO-local, FIFO-steal) and measure.**
-  No anti-starvation knob until the calibration shows one is needed.
+- **Fairness vs locality: Grid uses oldest-first pulls.** The initial LIFO-local policy let
+  completion-driven re-sheds repeatedly overtake older pipelines once active stealers began
+  yielding. Measured clustered makespan regressed despite earlier IO service. Taking local work
+  from the thief end prevents this admission inversion; the generic shard pool keeps LIFO as its
+  default for callers that prefer locality.
 
 ## Implementation slices
 
@@ -295,9 +298,9 @@ the cheaper instrument for the cross-cooperator path.
 ## Local-shed self-wake — the doorbell (Slice 3 completion)
 
 Adaptive backoff buys idle-wakeup savings with cold-pickup latency, and that bargain has a sharp
-edge for a workload that sheds onto its **own** cooperator and then goes idle. The only consumer of
-a shard is that shard's own stealer; when the stealer has parked on a backed-off timer, freshly shed
-local work sits in the deque until the timer fires — up to `recheckMax`. Pushing the cap higher to
+edge for a workload that sheds onto its **own** cooperator and then goes idle. The local consumer
+of a shard is that shard's own stealer; when it and its peers have parked on backed-off timers,
+freshly shed local work waits for a timer to fire — up to `recheckMax`. Pushing the cap higher to
 save more idle wakeups makes this strictly worse. The work and its consumer are on the same thread,
 so paying a steal-timer's latency to connect them is pure waste.
 
@@ -327,3 +330,26 @@ only on real local sheds (an idle grid sheds nothing), and clustered makespan is
 (if anything tighter, because the burst's local shard drains promptly instead of stalling on a
 timer). Because local pickup no longer rides on `recheckMax`, the cap is now free to be pushed higher
 purely on the idle-wakeup/cross-cooperator-latency trade — the local hole it used to open is closed.
+
+## Active stealer fairness
+
+A busy shard must not prevent its cooperator from servicing IO completions, channels, or other
+contexts. Each stealer checks elapsed monotonic time after every indivisible Erg. After 200µs it
+polls its ring, then yields through the existing cooperator path. The explicit poll flushes queued
+SQEs and reaps completions: scheduler yields alone can otherwise defer submission until a batch
+of resumes finishes, stretching the service interval when only the stealer is runnable.
+
+This is a service interval, not a calibrated batch size: the stealer measures actual elapsed time
+rather than assuming a cost per morsel. An individual Erg still must return promptly, so it can
+exceed the quantum by its own runtime or OS preemption. The clock resets when the stealer resumes
+from a quantum yield or an idle wait.
+
+The poll and yield happen outside the Erg's ThunkScope. All clock reads and pacing state belong
+to the opt-in stealer daemon. Non-participant scheduler and coordinator paths carry no Grid
+fairness checks.
+
+Grid also takes local work oldest-first. Early completion service can re-shed pipeline stages
+while the original backlog is still queued; local LIFO would let those stages repeatedly jump
+ahead of older pipelines and lengthen the tail. Oldest-first admission preserves progress across
+the backlog without a tuned item quota. The bounded Chase-Lev deque and single-owner push rule
+are unchanged; a local oldest-first pull arbitrates with peer steals through the same top CAS.

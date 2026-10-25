@@ -58,16 +58,35 @@ void Grid::StealerLoop(Context* ctx, int shard)
     time::Interval interval = m_recheckMin;
     int idleRun = 0;
 
+    // Busy stealers must give the cooperator time to reap CQEs and service other contexts. Use a
+    // 200us service interval, measured live between indivisible Ergs, rather than an item count
+    // whose latency would depend on morsel cost. This clock and the yield belong only to stealers.
+    //
+    using Clock = std::chrono::steady_clock;
+    auto runStart = Clock::now();
+
     Coordinator& doorbell = m_parts[shard].doorbell;
 
     while (!ctx->IsKilled())
     {
-        if (Erg* e = m_shards.Pull(shard))
+        // CQE service can re-shed a pipeline while older work is still queued. Pull oldest first
+        // so fresh stages cannot continually jump ahead and lengthen the older pipelines' tails.
+        //
+        if (Erg* e = m_shards.Pull(shard, true /* oldestFirst */))
         {
             RunErg(e);                                       // run-to-completion on this stealer
             m_pulls.fetch_add(1, std::memory_order_relaxed);
             interval = m_recheckMin;                         // work found: snap back to aggressive
             idleRun = 0;
+            if (Clock::now() - runStart >= detail::kStealerRunQuantum)
+            {
+                // The scheduler batches SQE submission across resumes. Flush and reap here so
+                // this quantum also bounds IO service when the stealer is the only runnable context.
+                //
+                ctx->GetCooperator()->GetUring()->Poll();
+                ctx->Yield(true); // outside RunErg's ThunkScope; force a scheduling opportunity
+                runStart = Clock::now();
+            }
             continue;
         }
 
@@ -114,6 +133,7 @@ void Grid::StealerLoop(Context* ctx, int shard)
         // doorbell, so the next idle pass parks correctly rather than spinning.
         //
         CoordinateWithKill(ctx, &doorbell, sleeper.GetCoordinator());
+        runStart = Clock::now(); // idle time does not consume the next active quantum
     }
 }
 

@@ -9,6 +9,7 @@
 #include "coop/cooperator.h"
 #include "coop/cooperator_configuration.h"
 #include "coop/context.h"
+#include "coop/io/uring.h"
 #include "coop/coordinator.h"
 #include "coop/thread.h"
 #include "coop/time/sleep.h"
@@ -21,10 +22,12 @@ using namespace std::chrono_literals;
 // run their assertions under BOTH modes so the userspace queue is proven to match the proven
 // kernel-per-timer path, not merely to pass on its own.
 //
-static void RunWithTimerMode(coop::TimerMode mode, std::function<void(coop::Context*)> fn)
+static void RunWithTimerMode(coop::TimerMode mode, std::function<void(coop::Context*)> fn,
+                             bool virtualTime = false)
 {
     coop::CooperatorConfiguration cfg;
     cfg.timerMode = mode;
+    cfg.virtualTime = virtualTime;
     coop::Cooperator cooperator(cfg);
     coop::Thread t(&cooperator);
 
@@ -238,9 +241,8 @@ TEST_P(TimerIntegrationTest, ConcurrentSleepsDoNotFireEarly)
     });
 }
 
-// A mix of exact and slack sleeps: every sleep still wakes no earlier than its requested interval,
-// and a slack sleep overshoots by at most ~one slack tick. Exact and slack deadlines coexist in one
-// queue without disturbing each other.
+// Exact and slack sleeps coexist without firing early. Wall-clock wake latency also includes
+// scheduler and host delays; the quantization bound is checked with virtual time below.
 //
 TEST_P(TimerIntegrationTest, MixedSlackAndExact)
 {
@@ -270,12 +272,6 @@ TEST_P(TimerIntegrationTest, MixedSlackAndExact)
                 {
                     failures++;
                 }
-                // Slack overshoot bounded to roughly one slack tick (plus scheduler latency slack).
-                //
-                if (slackUs > 0 && elapsed > requestedUs + slackUs + 3000)
-                {
-                    failures++;
-                }
                 completed++;
             });
         }
@@ -285,6 +281,78 @@ TEST_P(TimerIntegrationTest, MixedSlackAndExact)
             ctx->Yield(true);
         }
         EXPECT_EQ(failures.load(), 0);
+    });
+}
+
+// Exercise the production Sleeper and timer service with a clock that advances only to queued
+// deadlines. Host scheduling cannot contribute to this elapsed time, so the slack bound is exact.
+//
+TEST(TimerSlackTest, QuantizationAddsLessThanOneTick)
+{
+    RunWithTimerMode(coop::TimerMode::UserspaceQueue, [](coop::Context* ctx)
+    {
+        auto* co = ctx->GetCooperator();
+        for (int64_t requestedUs : {1, 999, 1000, 1001, 3199, 3200})
+        {
+            for (int64_t slackUs : {0, 1000})
+            {
+                SCOPED_TRACE(::testing::Message()
+                    << "requestedUs=" << requestedUs << " slackUs=" << slackUs);
+                int64_t start = co->NowUs();
+                auto result = coop::time::Sleep(ctx, std::chrono::microseconds(requestedUs),
+                                               std::chrono::microseconds(slackUs));
+                int64_t end = co->NowUs();
+                ASSERT_EQ(result, coop::time::SleepResult::Ok);
+                EXPECT_GE(end - start, requestedUs);
+                if (slackUs == 0)
+                {
+                    EXPECT_EQ(end - start, requestedUs);
+                }
+                else
+                {
+                    EXPECT_LT(end - start, requestedUs + slackUs);
+                    EXPECT_EQ(end % slackUs, 0);
+                }
+            }
+        }
+    }, true);
+}
+
+// Observe the relative timeout produced by Sleeper::Arm before the scheduler submits its SQE.
+// QuantizedInterval reads the real clock, but for every clock value its output must add less than
+// one slack interval. Checking the submitted timespec excludes host wake latency from the bound.
+// The Sleeper destructor cancels and drains the operation after each observation.
+//
+TEST(TimerSlackTest, KernelTimeoutAddsLessThanOneTick)
+{
+    RunWithTimerMode(coop::TimerMode::KernelPerTimer, [](coop::Context* ctx)
+    {
+        auto* ring = ctx->GetCooperator()->GetUring()->Ring();
+        for (int64_t requestedUs : {1, 999, 1000, 1001, 3199, 3200, 1'000'001})
+        {
+            for (int64_t slackUs : {0, 37, 1000})
+            {
+                SCOPED_TRACE(::testing::Message()
+                    << "requestedUs=" << requestedUs << " slackUs=" << slackUs);
+                coop::time::Sleeper sleeper(ctx, std::chrono::microseconds(requestedUs),
+                                           std::chrono::microseconds(slackUs));
+                ASSERT_TRUE(sleeper.Arm());
+                const auto& sqe = ring->sq.sqes[(ring->sq.sqe_tail - 1) & ring->sq.ring_mask];
+                ASSERT_EQ(sqe.opcode, IORING_OP_TIMEOUT);
+                const auto* timeout = reinterpret_cast<const __kernel_timespec*>(sqe.addr);
+                const int64_t intervalUs = timeout->tv_sec * 1'000'000 + timeout->tv_nsec / 1000;
+                EXPECT_EQ(timeout->tv_nsec % 1000, 0);
+                EXPECT_GE(intervalUs, requestedUs);
+                if (slackUs == 0)
+                {
+                    EXPECT_EQ(intervalUs, requestedUs);
+                }
+                else
+                {
+                    EXPECT_LT(intervalUs, requestedUs + slackUs);
+                }
+            }
+        }
     });
 }
 

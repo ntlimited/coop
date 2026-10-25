@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <iterator>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -90,6 +91,63 @@ struct ListeningSocket
         if (fd >= 0) close(fd);
     }
 };
+
+// Own the DNS endpoint and its answer so resolution tests need no external nameserver.
+// A bounded native responder lets the client exercise its cooperative UDP operations.
+//
+void ResolveFromLoopback(bool missing)
+{
+    test::RunInCooperator([missing](coop::Context*)
+    {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        ASSERT_GE(fd, 0);
+        coop::io::Descriptor server(fd);
+        sockaddr_in nameserver{};
+        nameserver.sin_family = AF_INET;
+        nameserver.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(bind(fd, reinterpret_cast<sockaddr*>(&nameserver), sizeof(nameserver)), 0);
+        socklen_t addressSize = sizeof(nameserver);
+        ASSERT_EQ(getsockname(fd, reinterpret_cast<sockaddr*>(&nameserver), &addressSize), 0);
+
+        std::jthread responder([fd, missing]
+        {
+            pollfd ready{.fd = fd, .events = POLLIN};
+            ASSERT_EQ(::poll(&ready, 1, 3000), 1);
+            uint8_t query[512];
+            sockaddr_in client{};
+            socklen_t clientSize = sizeof(client);
+            ssize_t size = recvfrom(fd, query, sizeof(query), 0,
+                reinterpret_cast<sockaddr*>(&client), &clientSize);
+            ASSERT_GE(size, 12);
+            std::vector<uint8_t> reply(query, query + size);
+            reply[2] = 0x81;
+            reply[3] = missing ? 0x83 : 0x80;
+            if (!missing)
+            {
+                reply[7] = 1;
+                // Associated IN A answer, with its owner compressed to the original question.
+                //
+                const uint8_t answer[] = {
+                    0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 127, 0, 0, 1};
+                reply.insert(reply.end(), std::begin(answer), std::end(answer));
+            }
+            EXPECT_EQ(sendto(fd, reply.data(), reply.size(), 0,
+                reinterpret_cast<sockaddr*>(&client), clientSize),
+                static_cast<ssize_t>(reply.size()));
+        });
+
+        coop::io::ResolverConfig config{
+            .nameservers = std::span<const sockaddr_in>(&nameserver, 1),
+            .hosts = {},
+            .timeout = std::chrono::seconds(2),
+            .attempts = 1,
+        };
+        in_addr result{};
+        int ret = coop::io::Resolve4(config, "answer.example.test", &result);
+        EXPECT_EQ(ret, missing ? -ENOENT : 0);
+        EXPECT_EQ(result.s_addr, missing ? 0u : htonl(INADDR_LOOPBACK));
+    });
+}
 
 } // end anonymous namespace
 
@@ -793,33 +851,14 @@ TEST(ResolveTest, NumericPassthrough)
     });
 }
 
-TEST(ResolveTest, PublicHostname)
+TEST(ResolveTest, LoopbackDnsAnswer)
 {
-    test::RunInCooperator([](coop::Context* ctx)
-    {
-        struct in_addr result;
-        int ret = coop::io::Resolve4("dns.google", &result,
-            std::chrono::seconds(10));
-        ASSERT_EQ(ret, 0);
-
-        // dns.google resolves to 8.8.8.8 or 8.8.4.4
-        //
-        struct in_addr expected1, expected2;
-        inet_pton(AF_INET, "8.8.8.8", &expected1);
-        inet_pton(AF_INET, "8.8.4.4", &expected2);
-        EXPECT_TRUE(result.s_addr == expected1.s_addr || result.s_addr == expected2.s_addr);
-    });
+    ResolveFromLoopback(false);
 }
 
-TEST(ResolveTest, NonExistent)
+TEST(ResolveTest, LoopbackDnsNameDoesNotExist)
 {
-    test::RunInCooperator([](coop::Context* ctx)
-    {
-        struct in_addr result;
-        int ret = coop::io::Resolve4("this.does.not.exist.example.", &result,
-            std::chrono::seconds(10));
-        EXPECT_EQ(ret, -ENOENT);
-    });
+    ResolveFromLoopback(true);
 }
 
 TEST(ResolveTest, ConnectWithHostname)
@@ -843,7 +882,7 @@ TEST(ResolveTest, ConnectWithHostname)
             coop::io::Descriptor desc(fd, ring);
 
             // Exercise hostname resolution and connection against a listener owned by this test.
-            // Public DNS query behavior is covered separately; this needs no external TCP service.
+            // DNS query behavior is covered separately; this needs no external TCP service.
             //
             int ret = coop::io::Connect(desc, "localhost", ntohs(address.sin_port));
             EXPECT_GE(ret, 0);

@@ -230,6 +230,18 @@ struct Manager
     //
     size_t PendingCount() const { return m_retireCount; }
 
+    // Runs on this cooperator, after an entry is linked, before Retire returns.
+    // The observer must not yield and must not call Retire. A null observer
+    // clears it. A parked drain fiber uses this to hear retirements that would
+    // otherwise leave it asleep with PendingCount already non-zero.
+    //
+    using RetireObserver = void (*)(void*);
+    void SetRetireObserver(RetireObserver observer, void* arg)
+    {
+        m_retireObserver = observer;
+        m_retireObserverArg = arg;
+    }
+
     // ---- Observability ----
 
     // Snapshot of pin state across all contexts and manager-owned application
@@ -284,6 +296,8 @@ private:
     RetireEntry*    m_retireHead{nullptr};
     RetireEntry*    m_retireTail{nullptr};
     size_t          m_retireCount{0};
+    RetireObserver  m_retireObserver{nullptr};
+    void*           m_retireObserverArg{nullptr};
 };
 
 // RAII traversal guard. Pins the current context's traversal slot at the

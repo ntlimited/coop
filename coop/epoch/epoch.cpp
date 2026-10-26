@@ -250,6 +250,12 @@ void Manager::Retire(RetireEntry* entry)
     }
     m_retireTail = entry;
     m_retireCount++;
+
+    // The observer runs on this stack, before any other fiber can retire or
+    // reclaim. It must not yield and must not call Retire.
+    //
+    if (m_retireObserver)
+        m_retireObserver(m_retireObserverArg);
 }
 
 Manager::PinSnapshot Manager::SnapshotPins()

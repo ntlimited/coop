@@ -425,3 +425,34 @@ TEST(EpochTest, CrossCooperatorPinBlocksReclaim)
         ctx->GetCooperator()->Shutdown();
     });
 }
+
+// A retire observer fires once per Retire, on this cooperator, and stops when
+// cleared. Each entry is retired once: retiring the same entry twice corrupts
+// the list. Both entries are reclaimed before the manager goes away.
+//
+TEST(EpochTest, RetireObserverRunsOnceThenStops)
+{
+    RunWithEpoch([](coop::Context*, coop::epoch::Manager& mgr)
+    {
+        int calls = 0;
+        auto count = [](void* arg) { ++*static_cast<int*>(arg); };
+        mgr.SetRetireObserver(count, &calls);
+
+        bool reclaimedA = false;
+        bool reclaimedB = false;
+        TestEntry a;
+        TestEntry b;
+        a.Init(&reclaimedA);
+        b.Init(&reclaimedB);
+
+        mgr.Retire(&a);
+        EXPECT_EQ(calls, 1);
+        mgr.SetRetireObserver(nullptr, nullptr);
+        mgr.Retire(&b);
+        EXPECT_EQ(calls, 1);
+        EXPECT_EQ(mgr.Reclaim(), 2u);
+        EXPECT_TRUE(reclaimedA);
+        EXPECT_TRUE(reclaimedB);
+        EXPECT_EQ(mgr.PendingCount(), 0u);
+    });
+}

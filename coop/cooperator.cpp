@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cerrno>
 #include <liburing.h>
@@ -212,10 +214,19 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 , m_uring(config.uring)
 , m_scheduled(nullptr)
 , m_name{}
-, m_submitFd(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
+, m_submitFd(-1)
 , m_epochMgr(this)
 {
-    assert(m_submitFd >= 0);
+    if (config.tieredWake)
+    {
+        m_wakeUsesMsgRing = m_wakeRing.Prepare();
+        m_wakeMonitor = detail::DetectMonitor();
+    }
+    if (!m_wakeUsesMsgRing)
+    {
+        m_submitFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        assert(m_submitFd >= 0);
+    }
     memcpy(m_name, config.name, sizeof(m_name));
 
     // Virtual time cannot use kernel timers; force the userspace queue and seed the clock
@@ -348,9 +359,91 @@ bool Cooperator::PushSubmission(SubmissionEntry* entry, bool completionNotificat
 
 void Cooperator::WakeCooperator(char const* site)
 {
+    if (m_config.tieredWake)
+    {
+        auto tier = m_doorbell.Notify();
+        if (m_config.wakeDiagnostics)
+            m_wakeCounts[uint64_t(tier)].fetch_add(1);
+        if (tier != detail::WakeTier::Cold)
+            return;
+        if (m_wakeUsesMsgRing)
+        {
+            m_wakeRing.Send();
+            return;
+        }
+    }
     uint64_t val = 1;
     auto ret = write(m_submitFd, &val, sizeof(val));
     CooperatorLedgerWakeWrite(site, this, m_submitFd, ret);
+}
+
+bool Cooperator::RetireSubmissionDrainer(bool shutdownKillDone, Context::Handle& drainer)
+{
+    // Admitted replies and cleanup still need the eventfd wake source. Once only its own read
+    // remains, shutdown must cancel it before any kernel park, including after idle polling.
+    //
+    if (!shutdownKillDone || !drainer || m_pendingCooperateReplies != 0 || !m_yielded.IsEmpty() ||
+        !m_pendingContinuations.IsEmpty() || m_uring.PendingOps() != 1 ||
+        drainer.m_context->IsKilled())
+        return false;
+
+    Spawn([&drainer](Context* ctx) { ctx->Kill(drainer.m_context, false /* schedule */); });
+    return true;
+}
+
+// Only the final idle boundary uses the tiered protocol. Poll flushes pending native IO
+// before user waiting, and each iteration services completions and timer readiness.
+void Cooperator::WaitTiered(bool shutdownKillDone, Context::Handle& submissionDrainer)
+{
+    using detail::WakeTier;
+    auto ready = [this, shutdownKillDone, &submissionDrainer]
+    {
+        m_uring.Poll();
+        ServiceExpiredTimers();
+        if (RetireSubmissionDrainer(shutdownKillDone, submissionDrainer))
+            return true;
+        return (m_shutdown.load(detail::kLoadFlag) && !shutdownKillDone) ||
+               m_hasSubmissions.load(std::memory_order_acquire) || !m_yielded.IsEmpty() ||
+               !m_pendingContinuations.IsEmpty();
+    };
+    auto waitUntil = [&](uint32_t budgetUs, WakeTier tier)
+    {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::microseconds(std::min(budgetUs, uint32_t(100)));
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            uint64_t expected = m_doorbell.Snapshot();
+            if (ready())
+                return true;
+            if (!m_doorbell.Enter(expected, tier))
+                return true;
+            if (tier == WakeTier::SemiCold)
+                detail::MonitorWait(m_doorbell, (expected & ~uint64_t(3)) | uint64_t(tier),
+                                    m_wakeMonitor);
+            else
+                detail::WakePause();
+            m_doorbell.Hot();
+        }
+        return false;
+    };
+    if (waitUntil(m_config.wakeHotUs, WakeTier::Hot) ||
+        waitUntil(m_config.wakeSemiColdUs, WakeTier::SemiCold))
+        return;
+
+    uint64_t expected = m_doorbell.Snapshot();
+    if (ready())
+        return;
+    if (!m_doorbell.Enter(expected, WakeTier::Cold))
+        return;
+    m_uring.WaitAndPoll();
+    m_doorbell.Hot();
+}
+void Cooperator::InvokeReply(SubmissionEntry* entry)
+{
+    assert(m_pendingCooperateReplies > 0);
+    --m_pendingCooperateReplies;
+    entry->m_invoke(entry, m_scheduled);
+    entry->m_destroy(entry);
 }
 
 void Cooperator::DrainSubmissions()
@@ -375,8 +468,7 @@ void Cooperator::DrainSubmissions()
         head = head->m_next;
         if (entry->m_inline)
         {
-            entry->m_invoke(entry, m_scheduled);
-            entry->m_destroy(entry);
+            InvokeReply(entry);
             continue;
         }
         SpawnFromSubmission(entry);
@@ -458,8 +550,7 @@ void Cooperator::DrainRemainingSubmissions()
 
         if (entry->m_inline)
         {
-            entry->m_invoke(entry, m_scheduled);
-            entry->m_destroy(entry);
+            InvokeReply(entry);
             continue;
         }
 
@@ -610,41 +701,50 @@ void Cooperator::Launch()
     struct UringTeardownGuard
     {
         io::Uring& ring;
+        io::WakeRing& wakeRing;
         ~UringTeardownGuard()
         {
+            wakeRing.Close();
             ring.Teardown();
         }
-    } uringGuard{m_uring};
+    } uringGuard{m_uring, m_wakeRing};
+
+    if (m_wakeUsesMsgRing)
+        m_wakeRing.Init(m_uring.RingFd());
 
     // Spawn a detached context that reads the eventfd and drains cross-thread submissions.
     // The eventfd is just another fd with a normal io_uring read — no special-case CQE handling
     // in Poll(). This keeps a CQE-producing wake source in flight even when no user contexts are
     // runnable, so WaitAndPoll() can sleep on submissions instead of spinning.
     //
-    Spawn([this](Context* ctx)
-    {
-        ctx->SetName("SubmissionDrainer");
-
-        io::Descriptor desc(io::borrowed, m_submitFd);
-
-        while (true)
-        {
-            bool killed = ctx->IsKilled();
-            CooperatorLedgerKillCheck("SubmissionDrainer.while", ctx, killed);
-            if (killed)
+    Context::Handle submissionDrainer;
+    if (!m_wakeUsesMsgRing)
+        Spawn(
+            [this](Context* ctx)
             {
-                break;
-            }
+                ctx->SetName("SubmissionDrainer");
 
-            uint64_t val;
-            int ret = io::ReadKill(desc, &val, sizeof(val));
-            if (ret == -ECANCELED || ctx->IsKilled())
-            {
-                break;
-            }
-            DrainSubmissions();
-        }
-    });
+                io::Descriptor desc(io::borrowed, m_submitFd);
+
+                while (true)
+                {
+                    bool killed = ctx->IsKilled();
+                    CooperatorLedgerKillCheck("SubmissionDrainer.while", ctx, killed);
+                    if (killed)
+                    {
+                        break;
+                    }
+
+                    uint64_t val;
+                    int ret = io::ReadKill(desc, &val, sizeof(val));
+                    if (ret == -ECANCELED || ctx->IsKilled())
+                    {
+                        break;
+                    }
+                    DrainSubmissions();
+                }
+            },
+            &submissionDrainer);
 
     // Check COOP_PERF=1 env var to enable dynamic perf probes at startup (mode 2 only).
     // Static local ensures this runs once even with multiple cooperators.
@@ -668,7 +768,8 @@ void Cooperator::Launch()
     while (!m_yielded.IsEmpty() || !m_shutdown.load(detail::kLoadFlag)
                                  || !shutdownKillDone
                                  || !m_pendingContinuations.IsEmpty()
-                                 || m_uring.PendingOps() > 0)
+                                 || m_uring.PendingOps() > 0
+                                 || m_pendingCooperateReplies > 0)
     {
         ++m_loops;   // scheduler heartbeat (Cooperator::Loops)
 
@@ -685,17 +786,19 @@ void Cooperator::Launch()
         {
             shutdownKillDone = true;
             DrainSubmissions();
-            Spawn([this](Context* killCtx)
-            {
-                m_contexts.Visit([&](Context* c) -> bool
+            Spawn(
+                [this, &submissionDrainer](Context* killCtx)
                 {
-                    if (c != killCtx && !c->IsKilled())
-                    {
-                        killCtx->Kill(c, false /* schedule */);
-                    }
-                    return true;
+                    m_contexts.Visit(
+                        [&](Context* c) -> bool
+                        {
+                            if (c != killCtx && c != submissionDrainer.m_context && !c->IsKilled())
+                            {
+                                killCtx->Kill(c, false /* schedule */);
+                            }
+                            return true;
+                        });
                 });
-            });
 
             // Wake the eventfd so any already-completable submission-drainer read is serviced
             // promptly. The read is also kill-aware, so shutdown does not rely on this write
@@ -703,6 +806,8 @@ void Cooperator::Launch()
             //
             WakeCooperator("Cooperator::Launch.shutdown");
         }
+
+        RetireSubmissionDrainer(shutdownKillDone, submissionDrainer);
 
         if (m_yielded.IsEmpty())
         {
@@ -754,11 +859,18 @@ void Cooperator::Launch()
                 continue;
             }
 
+            // Polling and detached cleanup can finish the last external work without waking
+            // a context. Retire the drainer now rather than parking on its own eventfd read.
+            //
+            if (RetireSubmissionDrainer(shutdownKillDone, submissionDrainer))
+                continue;
+
             // No runnable contexts. Sleep in io_uring until the next CQE instead of spinning.
             // The submission drainer's eventfd read is an ordinary in-flight uring op, so
             // cross-thread Submit() also wakes this path via CQE delivery.
             //
-            if (!m_blocked.IsEmpty() || m_uring.PendingOps() > 0)
+            if ((m_config.tieredWake && !shutdownKillDone) || !m_blocked.IsEmpty() ||
+                m_uring.PendingOps() > 0 || m_pendingCooperateReplies > 0)
             {
                 // Virtual time: rather than really sleeping, jump the clock forward to the
                 // nearest timer deadline. The next iteration's ServiceExpiredTimers (which
@@ -776,11 +888,10 @@ void Cooperator::Launch()
                     continue;
                 }
 
-                // Ensure one kernel timer is armed for the nearest deadline before sleeping, so the
-                // wait wakes when the soonest sleep comes due. WaitAndPoll submits the SQE.
-                //
-                ArmNearestTimer();
-                m_uring.WaitAndPoll();
+                if (m_config.tieredWake)
+                    WaitTiered(shutdownKillDone, submissionDrainer);
+                else
+                    m_uring.WaitAndPoll();
                 continue;
             }
 
@@ -1256,32 +1367,33 @@ void Cooperator::ServiceExpiredTimers()
     {
         node->GetCoordinator()->Release(nullptr, false /* schedule */);
     }
+
+    // Every scheduler poll services timers here, including polls inside the tiered idle wait.
+    // An obsolete timer can expire without releasing a sleeper (its original sleep was cancelled).
+    // Restore the nearest-deadline invariant before any subsequent monitor or kernel wait.
+    // Virtual time advances the queue directly and must never arm a real kernel timer.
+    if (!m_virtualTime)
+        ArmNearestTimer();
 }
 
 void Cooperator::ArmTimerKernel(int64_t deadlineUs, bool update)
 {
-    // Relative timeout from now to the deadline, clamped non-negative (a past deadline fires
-    // immediately). io_uring copies the timespec into the kernel request at submit, so backing it
-    // with the single m_timerTs member is safe: the prior armed SQE was already submitted by an
-    // earlier WaitAndPoll before this call overwrites it.
-    //
-    int64_t relUs = deadlineUs - time::MonotonicMicros();
-    if (relUs < 0)
-    {
-        relUs = 0;
-    }
-    m_timerTs.tv_sec  = relUs / 1000000;
-    m_timerTs.tv_nsec = (relUs % 1000000) * 1000;
+    // Absolute monotonic deadlines survive deferred submission: runnable application work can
+    // execute between preparing this SQE and the next Poll. Multiple pending arms may share this
+    // timespec; tightening it only makes an older arm fire earlier, preserving the invariant.
+    m_timerTs.tv_sec = deadlineUs / 1000000;
+    m_timerTs.tv_nsec = (deadlineUs % 1000000) * 1000;
 
     auto* sqe = m_uring.GetSqe();
     assert(sqe);
     if (!update)
     {
         // Fresh timeout. Deliberately not counted in Uring::PendingOps(): a lingering far-future
-        // timer must not hold the shutdown loop open, and need not, because sleeping contexts in
-        // m_blocked already keep the loop alive exactly as long as there are sleeps to service.
+        // timer must not hold the shutdown loop open. Queue registrations are passive during
+        // shutdown: metadata owners may cancel them after join. Counted IO and admitted
+        // completion replies govern teardown, independently of these deadlines.
         //
-        io_uring_prep_timeout(sqe, &m_timerTs, 0, 0);
+        io_uring_prep_timeout(sqe, &m_timerTs, 0, IORING_TIMEOUT_ABS);
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(detail::kTimerTag));
     }
     else
@@ -1290,7 +1402,7 @@ void Cooperator::ArmTimerKernel(int64_t deadlineUs, bool update)
         // armed deadline, so it always finds a live timer; its own acknowledgement CQE carries the
         // ack tag and is ignored. The single timeout object still delivers exactly one expiry CQE.
         //
-        io_uring_prep_timeout_update(sqe, &m_timerTs, detail::kTimerTag, 0);
+        io_uring_prep_timeout_update(sqe, &m_timerTs, detail::kTimerTag, IORING_TIMEOUT_ABS);
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(detail::kTimerAckTag));
     }
 }

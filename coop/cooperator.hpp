@@ -253,6 +253,8 @@ bool Cooperator::Cooperate(Fn&& fn, CooperateHandle* handle,
         entry->m_destroy(entry);
         return false;
     }
+    if (handle)
+        ++thread_cooperator->m_pendingCooperateReplies;
     WakeCooperator();
     return true;
 }

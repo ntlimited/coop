@@ -280,6 +280,7 @@ add_executable(coop_tests
     tests/test_work_pool.cpp
     tests/test_grid.cpp
     tests/test_cooperate.cpp
+    tests/test_wake.cpp
     tests/test_spawn.cpp
     tests/test_signal.cpp
     tests/test_channel.cpp
@@ -326,6 +327,7 @@ target_link_options(coop_tests PRIVATE -rdynamic
     -Wl,--wrap=io_uring_register_buf_ring
     -Wl,--wrap=io_uring_unregister_buf_ring
     -Wl,--wrap=io_uring_register
+    -Wl,--wrap=io_uring_register_probe
     -Wl,--wrap=uname
     -Wl,--wrap=mmap
     -Wl,--wrap=munmap)
@@ -442,5 +444,8 @@ target_link_options(bench_client PRIVATE -rdynamic)
 add_executable(diag_ktls benchmarks/diag_ktls.cpp)
 target_link_libraries(diag_ktls PRIVATE coop)
 add_dependencies(diag_ktls test-certs)
+
+add_executable(bench_wake benchmarks/bench_wake.cpp)
+target_link_libraries(bench_wake PRIVATE coop)
 
 endif() # COOP_STANDALONE

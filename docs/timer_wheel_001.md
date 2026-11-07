@@ -75,24 +75,25 @@ Find-min is the root pointer; no separate cached-leftmost is needed.
 
 ## Servicing and arming
 
-The scheduler loop (`Cooperator::Launch`) drives the kernel timer at exactly two points, and a
-sleeping context is always `BLOCKED`, which is what guarantees the loop reaches them:
+The scheduler services the timer queue after polling completions, both at batch boundaries
+and inside idle waits. A sleeping context is `BLOCKED`, which keeps the loop alive:
 
 - **Service** (`ServiceExpiredTimers`): pop every node whose deadline is `<= now` and `Release` its
   coordinator (`schedule=false`, so the woken context joins the yielded list rather than being
   switched to mid-loop). Called at the batch boundary after running contexts, and again in the idle
-  branch after `Poll`. The batch-boundary call is what services sleeps in a *saturated* loop that
-  never goes idle: the loop's own iteration rate is the clock, and no kernel timer is needed at all
-  while there is other work to run.
+  branch and tiered readiness checks after `Poll`. The batch-boundary call services sleeps in a
+  saturated loop that never goes idle.
 
-- **Arm** (`ArmNearestTimer`): called only in the idle branch, immediately before the loop blocks in
-  `WaitAndPoll`. It maintains the invariant *if the queue is non-empty, an armed kernel timer exists
-  whose deadline is no later than the nearest queued deadline*. If nothing is armed it arms a fresh
-  `IORING_OP_TIMEOUT` for the nearest deadline. If a timer is already armed but a *nearer* deadline
-  has since appeared, it reschedules that one timer in place with `IORING_TIMEOUT_UPDATE` — one SQE,
+- **Arm** (`ArmNearestTimer`): timer servicing restores the invariant *if the queue is non-empty,
+  an armed kernel timer exists whose deadline is no later than the nearest queued deadline*. If nothing is armed it arms a fresh
+  `IORING_OP_TIMEOUT` with `IORING_TIMEOUT_ABS` for the nearest monotonic deadline. Absolute
+  deadlines keep a prepared SQE correct even when application work delays submission.
+  If a timer is already armed but a *nearer* deadline has since appeared, it reschedules that one timer in place with `IORING_TIMEOUT_UPDATE` — one SQE,
   no cancel, no second timer object. An armed timer that turns out to be *earlier* than needed is
-  left alone: it fires early, services nothing, and re-arms for the true nearest on the next idle
-  pass. Early is harmless; late is the only thing the invariant forbids.
+  left alone: it fires early, services nothing, and re-arms for the true nearest during servicing.
+  This also applies when a tiered readiness poll consumes an obsolete timeout after cancellation;
+  no blocking tier may proceed without restoring the invariant. Virtual time services its queue
+  without arming any kernel timeout. Early is harmless; late is the only thing the invariant forbids.
 
 Why arming can be this simple: a cooperator mutates its own queue only while running one of its
 contexts, and that only happens *between* `WaitAndPoll` calls. While the cooperator is blocked in the

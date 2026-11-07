@@ -7,6 +7,8 @@
 #include <semaphore>
 
 #include "detail/asan_fiber.h"
+#include "detail/doorbell.h"
+#include "io/wake_ring.h"
 #include "detail/embedded_list.h"
 #include "detail/memory_order.h"
 #include "context.h"
@@ -65,6 +67,12 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     }
 
     void Launch();
+
+    // Observation only: useful for diagnostics, never a substitute for publishing a notification.
+    detail::WakeTier WakeState() const { return detail::Doorbell::Tier(m_doorbell.Snapshot()); }
+    detail::MonitorKind WakeMonitor() const { return m_wakeMonitor; }
+    bool WakeUsesMsgRing() const { return m_wakeUsesMsgRing; }
+    uint64_t WakeCount(detail::WakeTier tier) const { return m_wakeCounts[uint64_t(tier)].load(); }
 
     // Spawn is an in-context API that code running under a cooperator is allowed to invoke
     // on its own cooperator, as that physical thread has uncontended access to the internals
@@ -454,7 +462,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
 
     // Timer-queue servicing and the single kernel timer. ServiceExpiredTimers releases every sleep
     // whose deadline has passed; ArmNearestTimer keeps one IORING_OP_TIMEOUT armed (or rescheduled
-    // via IORING_TIMEOUT_UPDATE) for the nearest deadline before the loop blocks. See
+    // via IORING_TIMEOUT_UPDATE) for the nearest deadline after servicing, before any wait. See
     // docs/timer_wheel_001.md.
     //
     void ServiceExpiredTimers();
@@ -573,13 +581,23 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     bool PushSubmission(SubmissionEntry* entry, bool completionNotification = false);
     void WakeCooperator(char const* site = "Cooperator::WakeCooperator");
     void DrainSubmissions();
+    void InvokeReply(SubmissionEntry* entry);
     void SpawnFromSubmission(SubmissionEntry* entry);
     void DrainRemainingSubmissions();
+
+    bool RetireSubmissionDrainer(bool shutdownKillDone, Context::Handle& drainer);
+    void WaitTiered(bool shutdownKillDone, Context::Handle& submissionDrainer);
+    detail::Doorbell m_doorbell;
+    detail::MonitorKind m_wakeMonitor{detail::MonitorKind::Pause};
+    io::WakeRing m_wakeRing;
+    bool m_wakeUsesMsgRing{false};
+    std::atomic<uint64_t> m_wakeCounts[3]{};
 
     alignas(64) int         m_submitFd;
     std::mutex              m_submissionLock;
     SubmissionEntry*        m_submissionHead{nullptr};
     SubmissionEntry*        m_submissionTail{nullptr};
+    size_t m_pendingCooperateReplies{0}; // Owner-thread count; keeps reply wake IO alive.
     std::atomic<bool>                   m_hasSubmissions{false};
 
     // Minimum pinned epoch across all contexts on this cooperator. Written by the cooperator
@@ -602,6 +620,7 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // place the destruction happens, strictly speaking, but the context-destructing gets
     // super complex as it is right now.
     //
+    friend struct TieredWakeTestAccess;
     friend struct Context;
     friend struct epoch::Manager;
     friend void ::CoopContextEntry(::coop::Context*);

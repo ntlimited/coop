@@ -58,11 +58,20 @@ while (has yielded contexts OR not shutdown OR shutdown kill not done):
          resumes is what unblocks Handle::Flash barriers during destruction
 ```
 
-**Submission system**: eventfd-based. External threads push `SubmissionEntry` nodes to an
+**Submission system**: eventfd-based by default. External threads push `SubmissionEntry` nodes to an
 intrusive FIFO (mutex-protected), then `write()` to the eventfd. A dedicated submission-drainer
 context keeps a blocking eventfd read in flight through io_uring, so cross-thread submits wake
 the scheduler as an ordinary CQE. The scheduler also opportunistically checks `m_hasSubmissions`
 and drains the list directly on scheduler iterations.
+
+**Experimental tiered wake** (`tieredWake`, off by default): `WaitTiered` replaces only the
+final idle wait; HOT and SEMI-COLD notifications increment an isolated doorbell word, while
+COLD notifications send MSG_RING from a separately serialized sender ring. The MSG_RING backend
+has no submission drainer or eventfd; unsupported kernels retain both through the eventfd fallback.
+The doorbell generation and state share one atomic word so the final COLD CAS cannot miss a
+store-only notification. Shutdown with pending
+cleanup IO may still park; shutdown with no blocked work or pending IO reaches loop exit.
+See `docs/tiered_wake_01.md` for the ordering proof and ISA/power limits.
 
 **Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and writes to the eventfd.
 The loop spawns a temporary kill context that visits all live contexts and fires their kill
@@ -70,6 +79,10 @@ signals (`schedule=false` -> moved to yielded, not immediately switched to). Han
 loop (accept loops, read loops) must use an explicit wake path — generated blocking `*Kill`
 wrappers, explicit `CoordinateWithKill` composition, timeouts, or a socket shutdown guard.
 Handle destructors run Cancel + Flash during stack unwind, draining in-flight IO.
+The eventfd drainer remains alive for admitted replies, runnable cleanup, continuations and
+other counted IO. Retirement is checked after idle polling and continuation draining,
+including polls inside the tiered wait, before kernel parking. Once only the drainer's own
+read remains, shutdown cancels it rather than parking on it indefinitely.
 
 **Important**: the loop condition includes `!shutdownKillDone` (guarantees the kill logic runs
 even when all contexts are blocked) and `m_uring.PendingOps() > 0` (keeps the loop alive to

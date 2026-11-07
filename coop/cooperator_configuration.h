@@ -96,6 +96,13 @@ struct CooperatorConfiguration
     //
     int cpuAffinity = -1;
 
+    // Experimental targeted wake protocol (docs/tiered_wake_01.md). Resource budgets are
+    // clamped to 100us each. Zero skips a tier. Disabled preserves the eventfd path.
+    bool tieredWake = false;
+    bool wakeDiagnostics = false;
+    uint32_t wakeHotUs = 1;
+    uint32_t wakeSemiColdUs = 10;
+
     // Backing strategy for pure-timer deadlines. Defaults to the proven kernel-per-timer path; the
     // userspace deadline queue is opt-in (see TimerMode).
     //

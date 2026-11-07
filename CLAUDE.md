@@ -137,7 +137,10 @@ Both are available as free functions (prefer these) or as `Cooperator` methods.
 
 ### Submit (`coop/cooperator.h`)
 Cross-thread API for queuing work onto a cooperator from external threads. Uses eventfd for
-wake notification and an intrusive linked list (unbounded, no capacity limit).
+wake notification by default and an intrusive linked list (unbounded, no capacity limit).
+`CooperatorConfiguration::tieredWake` opts into an experimental store/monitor/MSG_RING
+notification protocol; it retains the same queue and admission rules and is disabled by
+default. See `docs/tiered_wake_01.md` for the protocol, resource budgets and limitations.
 `Cooperate` is the in-context sibling: the spawn-result wake is embedded in
 `CooperateHandle` and runs inline on the caller, so the target never heap-allocates
 to notify.

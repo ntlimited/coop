@@ -356,6 +356,9 @@ void Handle::OnSecondaryComplete(struct io_uring_cqe* cqe)
 void Handle::Callback(struct io_uring_cqe* cqe)
 {
     auto data = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
+    // Reserved MSG_RING doorbell cookie: notification only, with no Handle ownership.
+    if (data == 0)
+        return;
 
     // Bit 1 (0x2) marks a multishot ArmedHandle CQE -- a distinct lifecycle that holds its
     // coordinator across an unbounded CQE stream rather than the one-shot count-to-zero this

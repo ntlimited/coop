@@ -44,6 +44,7 @@ enum class SchedulerJumpResult
 
 struct Launchable;
 struct CooperateHandle;
+class CountdownLatch;
 
 namespace work { struct Participation; }
 
@@ -71,6 +72,13 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // Observation only: useful for diagnostics, never a substitute for publishing a notification.
     detail::WakeTier WakeState() const { return detail::Doorbell::Tier(m_doorbell.Snapshot()); }
     detail::MonitorKind WakeMonitor() const { return m_wakeMonitor; }
+    // Live runtime-owned wake contexts, read on the owner thread or after join.
+    // Application drain/checkpoint censuses exclude these, independently of parentage.
+    size_t WakeContextCount() const { return m_wakeContext ? 1 : 0; }
+    bool IsWakeContext(Context const* context) const
+    {
+        return context && context == m_wakeContext;
+    }
     bool WakeUsesMsgRing() const { return m_wakeUsesMsgRing; }
     uint64_t WakeCount(detail::WakeTier tier) const { return m_wakeCounts[uint64_t(tier)].load(); }
 
@@ -578,10 +586,15 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // Public work must pass the shutdown gate. Completion notifications finish already-admitted
     // Cooperate calls and must still be queued while their caller is shutting down.
     //
+    friend class CountdownLatch;
+    void BeginCompletionWait();
+    void EndCompletionWait();
+    size_t m_completionWaits{0};
+    Context* m_wakeContext{nullptr};
     bool PushSubmission(SubmissionEntry* entry, bool completionNotification = false);
     void WakeCooperator(char const* site = "Cooperator::WakeCooperator");
     void DrainSubmissions();
-    void InvokeReply(SubmissionEntry* entry);
+    void InvokeNotification(SubmissionEntry* entry);
     void SpawnFromSubmission(SubmissionEntry* entry);
     void DrainRemainingSubmissions();
 
@@ -597,7 +610,6 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     std::mutex              m_submissionLock;
     SubmissionEntry*        m_submissionHead{nullptr};
     SubmissionEntry*        m_submissionTail{nullptr};
-    size_t m_pendingCooperateReplies{0}; // Owner-thread count; keeps reply wake IO alive.
     std::atomic<bool>                   m_hasSubmissions{false};
 
     // Minimum pinned epoch across all contexts on this cooperator. Written by the cooperator

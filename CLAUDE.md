@@ -141,8 +141,8 @@ wake notification by default and an intrusive linked list (unbounded, no capacit
 `CooperatorConfiguration::tieredWake` opts into an experimental store/monitor/MSG_RING
 notification protocol; it retains the same queue and admission rules and is disabled by
 default. See `docs/tiered_wake_01.md` for the protocol, resource budgets and limitations.
-`Cooperate` is the in-context sibling: the spawn-result wake is embedded in
-`CooperateHandle` and runs inline on the caller, so the target never heap-allocates
+`Cooperate` is the in-context sibling: the spawn-result countdown is embedded in
+`CooperateHandle` and notifies on the caller, so the target never heap-allocates
 to notify.
 ```cpp
 // Fire-and-forget with lambda (heap-allocated, freed after execution)
@@ -175,6 +175,14 @@ auto r = Launch<MyHandler>(fd, ...);
 if (!r) { /* spawn failed */ }
 // r.object is live only if Launch() yielded
 ```
+
+### CountdownLatch (`coop/countdown_latch.h`)
+One cooperative waiter joins a fixed number of arrivals from any thread without
+per-latch allocation or kernel objects. Reset before publication, arrive exactly
+N times, and retain storage through Wait. WaitKill reports cancellation promptly
+and then drains accepted arrivals. Completion uses the owner's existing wake
+transport, including tiered wake when configured. Registered waits retain the
+scheduler and its wake transport through shutdown. See `docs/countdown_latch.md`.
 
 ### Coordinator (`coop/coordinator.h`)
 Mutex facsimile — one context holds, others block in a FIFO queue.

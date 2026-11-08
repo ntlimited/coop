@@ -74,12 +74,12 @@ cleanup IO may still park; shutdown with no blocked work or pending IO reaches l
 See `docs/tiered_wake_01.md` for the ordering proof and ISA/power limits.
 
 **Shutdown sequence**: `Shutdown()` sets `m_shutdown` flag and writes to the eventfd.
-The loop spawns a temporary kill context that visits all live contexts and fires their kill
+The owner loop visits all live contexts and fires their kill
 signals (`schedule=false` -> moved to yielded, not immediately switched to). Handlers that
 loop (accept loops, read loops) must use an explicit wake path — generated blocking `*Kill`
 wrappers, explicit `CoordinateWithKill` composition, timeouts, or a socket shutdown guard.
 Handle destructors run Cancel + Flash during stack unwind, draining in-flight IO.
-The eventfd drainer remains alive for admitted replies, runnable cleanup, continuations and
+The eventfd drainer remains alive for registered countdown waits (including dispatch replies), runnable cleanup, continuations and
 other counted IO. Retirement is checked after idle polling and continuation draining,
 including polls inside the tiered wait, before kernel parking. Once only the drainer's own
 read remains, shutdown cancels it rather than parking on it indefinitely.
@@ -188,3 +188,16 @@ Detached continuations with extended alignment use matching aligned new/delete o
 size-only pool; ordinary continuations keep their existing pool and reuse path. Frame-hosted
 continuation result storage uses `alignas(Stored)`. Ordinary typed new (including submitted work
 and ergs) obtains extended alignment from the C++ allocator automatically.
+
+Submission-drainer stack allocation failure closes admission before entering the
+scheduler. Queued work is rejected through the ordinary final-drain completion
+path, so synchronous callers receive failure and teardown cannot depend on an
+unspawned context. `StackPool::FailNextAllocationForTesting` injects one owner-thread
+allocation refusal before Launch to exercise this path on every wake fallback.
+
+Shutdown kill delivery and wake-reader retirement do not allocate helper stacks;
+unscheduled kills run on the owner thread and queue resumed waiters. Application
+drain censuses use `WakeContextCount()` and `IsWakeContext()` rather than assuming
+that every transport contributes a reader. The owner records the reader before
+application dispatch and withdraws it only at actual context exit. This also
+lets cleanup exclude a runtime reader independently of application parentage.

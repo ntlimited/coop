@@ -71,7 +71,7 @@ void CheckShutdownAdmission(SubmissionMode mode)
         {
             coop::CooperateHandle handle(ctx);
             accepted = target.Cooperate(GatedSubmission(&gate), &handle);
-            EXPECT_FALSE(handle.m_signal.IsSignaled());
+            EXPECT_FALSE(handle.m_completion.IsReady());
         }
         else if (mode == SubmissionMode::Sync)
         {

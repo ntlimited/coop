@@ -100,7 +100,11 @@ protocol assumes that cannot happen within one bounded idle attempt.
 ## Lifetime, shutdown and cancellation
 
 Bind a prepared MSG_RING sender after the native ring on the owning Launch thread.
-For eventfd, launch the existing kill-aware submission drainer before entering the loop.
+For eventfd, launch the kill-aware submission drainer as a runtime daemon before
+entering the loop. It is excluded from `NonDaemonContexts()` while ordinary
+submitted work retains its own non-daemon classification. Application cleanup can
+therefore observe quiescence while the runtime still services its transport; native
+IO and admitted replies continue to hold the scheduler loop open independently.
 Publish COLD only after initialization. Notifications before Launch remain in the
 queue; HOT stores suffice. Sender initialization and teardown share its mutex
 with sends. Teardown clears the destination under that mutex before destroying

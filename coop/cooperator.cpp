@@ -712,7 +712,8 @@ void Cooperator::Launch()
     if (m_wakeUsesMsgRing)
         m_wakeRing.Init(m_uring.RingFd());
 
-    // Spawn a detached context that reads the eventfd and drains cross-thread submissions.
+    // The eventfd submission service is a runtime daemon, not application work. Submitted
+    // children retain their own configuration and remain visible to application drain counts.
     // The eventfd is just another fd with a normal io_uring read — no special-case CQE handling
     // in Poll(). This keeps a CQE-producing wake source in flight even when no user contexts are
     // runnable, so WaitAndPoll() can sleep on submissions instead of spinning.
@@ -720,6 +721,7 @@ void Cooperator::Launch()
     Context::Handle submissionDrainer;
     if (!m_wakeUsesMsgRing)
         Spawn(
+            {.priority = 0, .stackSize = COOP_DEFAULT_STACK_SIZE, .daemon = true},
             [this](Context* ctx)
             {
                 ctx->SetName("SubmissionDrainer");

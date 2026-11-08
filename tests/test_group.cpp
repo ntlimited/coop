@@ -239,3 +239,39 @@ TEST(DaemonTest, DaemonExcludedFromNonDaemonCount)
         EXPECT_EQ(co->NonDaemonContexts(), baseNonDaemon);
     });
 }
+
+TEST(DaemonTest, SubmissionServiceIsExcludedDuringShutdownCleanup)
+{
+    bool finish = false;
+    test::RunInCooperator(
+        [&](coop::Context* ctx)
+        {
+            auto* co = ctx->GetCooperator();
+            EXPECT_EQ(co->NonDaemonContexts(), 1u);
+
+            // Ordinary work remains counted even after it has been killed. The runtime's
+            // submission service must not prevent this caller from observing that drain.
+            coop::Context::Handle child;
+            bool const spawned = co->Spawn(
+                [&](coop::Context* worker)
+                {
+                    while (!finish)
+                        worker->Yield(true);
+                },
+                &child);
+            EXPECT_TRUE(spawned);
+            EXPECT_EQ(co->NonDaemonContexts(), 2u);
+
+            co->Shutdown();
+            for (uint32_t pass = 0; pass != 1024 && !ctx->IsKilled(); ++pass)
+                ctx->Yield(true);
+            EXPECT_TRUE(ctx->IsKilled());
+            EXPECT_EQ(co->NonDaemonContexts(), 2u);
+
+            finish = true;
+            for (uint32_t pass = 0; pass != 1024 && child; ++pass)
+                ctx->Yield(true);
+            EXPECT_FALSE(child);
+            EXPECT_EQ(co->NonDaemonContexts(), 1u);
+        });
+}

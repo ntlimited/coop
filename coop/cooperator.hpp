@@ -222,7 +222,7 @@ bool Cooperator::Cooperate(Fn&& fn, CooperateHandle* handle,
         if (handle)
         {
             handle->m_spawnOk = spawned;
-            handle->m_signal.Notify(thread_cooperator->Scheduled(), false);
+            handle->m_completion.Arrive();
         }
         return spawned;
     }
@@ -240,12 +240,10 @@ bool Cooperator::Cooperate(Fn&& fn, CooperateHandle* handle,
     if (handle)
     {
         // Tag-bit encoding: bit 0 of m_completion distinguishes Cooperate from SubmitSync.
-        // m_completionOk is reinterpreted as the caller's Cooperator*.
-        // Reverse notify lives on the handle; the target must not allocate to wake us.
+        // The handle owns a countdown; completion never allocates on the target.
         //
         entry->m_completion = reinterpret_cast<std::binary_semaphore*>(
             reinterpret_cast<uintptr_t>(handle) | 1);
-        entry->m_completionOk = reinterpret_cast<bool*>(thread_cooperator);
     }
 
     if (!PushSubmission(entry))
@@ -253,8 +251,6 @@ bool Cooperator::Cooperate(Fn&& fn, CooperateHandle* handle,
         entry->m_destroy(entry);
         return false;
     }
-    if (handle)
-        ++thread_cooperator->m_pendingCooperateReplies;
     WakeCooperator();
     return true;
 }

@@ -176,7 +176,7 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
 
     // Kill this context's own subtree with a cause — the self-abort entry a
     // deadline-expiring wait uses. Runs on this cooperator (this == running context or
-    // an ancestor of it); schedule=false since the caller is mid-wait-unwind.
+    // an ancestor of it, or its owner scheduler); schedule=false so delivery cannot switch stacks.
     //
     void KillSelf(KillCause cause) { Kill(this, false, cause); }
 

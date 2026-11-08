@@ -56,6 +56,7 @@ TEST(TieredWakeTest, OptInCreatesEventfdOnlyForFallback)
 #include "coop/detail/doorbell.h"
 #include "coop/thread.h"
 #include "coop/cooperate.h"
+#include "coop/countdown_latch.h"
 #include "coop/io/read.h"
 #include "coop/io/descriptor.h"
 #include "coop/time/sleep.h"
@@ -343,11 +344,20 @@ struct TieredWakeTestAccess
             });
         return drainer;
     }
+    static void FailNextStackAllocation(Cooperator& co)
+    {
+        co.m_stackPool.FailNextAllocationForTesting();
+    }
     static void Arm(Cooperator& co) { co.ArmNearestTimer(); }
     static void Wait(Cooperator& co)
     {
         Context::Handle drainer;
         co.WaitTiered(false, drainer);
+    }
+    static void WaitDuringShutdown(Cooperator& co)
+    {
+        Context::Handle drainer;
+        co.WaitTiered(true, drainer);
     }
     static void Service(Cooperator& co) { co.ServiceExpiredTimers(); }
 };
@@ -759,3 +769,241 @@ TEST_P(ParkedShutdownDeathTest, FinalCompletionOnlyWakesDetachedCleanup)
 
 INSTANTIATE_TEST_SUITE_P(AllWakeBackends, ParkedShutdownDeathTest, ::testing::Values(0, 1, 2));
 } // namespace
+
+TEST(TieredWakeDeathTest, DrainerSpawnFailureRejectsQueuedWorkAndJoins)
+{
+    EXPECT_EXIT(
+        {
+            alarm(5);
+            for (bool tiered : {false, true})
+            {
+                auto config = RunningTiered::Config(1, 10);
+                config.tieredWake = tiered;
+                denyMsgRingProbe = true;
+                coop::Cooperator co(config);
+                denyMsgRingProbe = false;
+                EXPECT_FALSE(co.WakeUsesMsgRing());
+                coop::TieredWakeTestAccess::FailNextStackAllocation(co);
+                bool ran = false;
+                EXPECT_TRUE(co.Submit([&](coop::Context*) { ran = true; }));
+                {
+                    coop::Thread thread(&co);
+                    EXPECT_FALSE(co.SubmitSync([](coop::Context*) {}));
+                    EXPECT_TRUE(co.IsShuttingDown());
+                    co.Shutdown();
+                }
+                EXPECT_FALSE(ran);
+                EXPECT_FALSE(co.Submit([](coop::Context*) {}));
+            }
+            _Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST_P(ParkedShutdownDeathTest, CountdownArrivalUsesRetainedWakeTransport)
+{
+    int const mode = GetParam();
+    EXPECT_EXIT(
+        {
+            alarm(10);
+            for (bool cancel : {false, true})
+            {
+                auto config = RunningTiered::Config(1, 10);
+                config.tieredWake = mode != 0;
+                config.wakeDiagnostics = true;
+                denyMsgRingProbe = mode == 2;
+                coop::Cooperator co(config);
+                denyMsgRingProbe = false;
+                coop::CountdownLatch latch(1);
+                std::atomic<bool> registered{false};
+                std::atomic<bool> cancelled{false};
+                std::atomic<bool> finished{false};
+                struct State
+                {
+                    std::atomic<bool>& registered;
+                    std::atomic<bool>& cancelled;
+                } state(registered, cancelled);
+                EXPECT_TRUE(co.Submit(
+                    [&](coop::Context* ctx)
+                    {
+                        auto status = latch.WaitKill(
+                            ctx,
+                            [](void* p, coop::CountdownLatch::WaitStatus)
+                            { static_cast<State*>(p)->cancelled.store(true); },
+                            &state,
+                            [](void* p) { static_cast<State*>(p)->registered.store(true); });
+                        EXPECT_EQ(status, cancel ? coop::CountdownLatch::WaitStatus::Killed
+                                                 : coop::CountdownLatch::WaitStatus::Completed);
+                        finished.store(true);
+                        co.Shutdown();
+                    }));
+                {
+                    coop::Thread thread(&co);
+                    while (!registered.load())
+                        std::this_thread::yield();
+                    EXPECT_TRUE(AwaitKernelPark(co));
+                    if (cancel)
+                    {
+                        co.Shutdown();
+                        while (!cancelled.load())
+                            std::this_thread::yield();
+                        EXPECT_TRUE(AwaitKernelPark(co));
+                    }
+                    auto const cold = co.WakeCount(coop::detail::WakeTier::Cold);
+                    latch.Arrive();
+                    if (mode)
+                        EXPECT_GT(co.WakeCount(coop::detail::WakeTier::Cold), cold);
+                }
+                EXPECT_TRUE(finished.load());
+            }
+            _Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+namespace
+{
+// A timeout's teardown can suspend after coordination has selected completion.
+// Inject the kill at its return boundary so the ordering is deterministic.
+coop::Context* killAfterHandleCleanup = nullptr;
+}
+extern "C" void __real__ZN4coop2io6HandleD1Ev(coop::io::Handle*);
+extern "C" void __wrap__ZN4coop2io6HandleD1Ev(coop::io::Handle* handle)
+{
+    __real__ZN4coop2io6HandleD1Ev(handle);
+    if (killAfterHandleCleanup && coop::Self() == killAfterHandleCleanup)
+    {
+        auto* ctx = killAfterHandleCleanup;
+        killAfterHandleCleanup = nullptr;
+        ctx->KillSelf(coop::KillCause::Kill);
+    }
+}
+
+TEST(CountdownLatchCancellationTest, KillAfterCompletionDuringTimeoutCleanup)
+{
+    coop::Cooperator co;
+    {
+        coop::Thread thread(&co);
+        EXPECT_TRUE(co.SubmitSync(
+            [&](coop::Context* ctx)
+            {
+                coop::CountdownLatch latch(1);
+                uint32_t cancellations = 0;
+                struct State
+                {
+                    coop::CountdownLatch& latch;
+                    uint32_t& cancellations;
+                } state{latch, cancellations};
+                ctx->SetDeadlineIn(std::chrono::seconds(5));
+                killAfterHandleCleanup = ctx;
+                auto status = latch.WaitKill(
+                    ctx,
+                    [](void* p, coop::CountdownLatch::WaitStatus status)
+                    {
+                        EXPECT_EQ(status, coop::CountdownLatch::WaitStatus::Killed);
+                        ++static_cast<State*>(p)->cancellations;
+                    },
+                    &state, [](void* p) { static_cast<State*>(p)->latch.Arrive(); });
+                EXPECT_EQ(killAfterHandleCleanup, nullptr); // the destructor hook ran
+                EXPECT_TRUE(ctx->IsKilled());
+                EXPECT_EQ(status, coop::CountdownLatch::WaitStatus::Killed);
+                EXPECT_EQ(cancellations, 1u);
+                EXPECT_TRUE(latch.IsReady());
+                killAfterHandleCleanup = nullptr;
+            }));
+        co.Shutdown();
+    }
+}
+
+TEST_P(ParkedShutdownDeathTest, ShutdownDoesNotNeedAHelperStack)
+{
+    int const mode = GetParam();
+    EXPECT_EXIT(
+        {
+            alarm(5);
+            auto config = RunningTiered::Config(1, 10);
+            config.tieredWake = mode != 0;
+            denyMsgRingProbe = mode == 2;
+            coop::Cooperator co(config);
+            denyMsgRingProbe = false;
+            coop::CountdownLatch latch(1);
+            std::atomic<bool> cancelled{false};
+            std::thread arrival(
+                [&]
+                {
+                    while (!cancelled.load())
+                        std::this_thread::yield();
+                    latch.Arrive();
+                });
+            {
+                coop::Thread thread(&co);
+                EXPECT_TRUE(co.SubmitSync(
+                    [&](coop::Context* ctx)
+                    {
+                        coop::TieredWakeTestAccess::FailNextStackAllocation(co);
+                        co.Shutdown();
+                        EXPECT_EQ(latch.WaitKill(
+                                      ctx,
+                                      [](void* p, coop::CountdownLatch::WaitStatus)
+                                      { static_cast<std::atomic<bool>*>(p)->store(true); },
+                                      &cancelled),
+                                  coop::CountdownLatch::WaitStatus::Killed);
+                    }));
+            }
+            arrival.join();
+            _Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST(TieredWakeDeathTest, ShutdownQuiescenceDoesNotReparkWithoutPendingIO)
+{
+    {
+        auto config = RunningTiered::Config(0, 0);
+        coop::Cooperator probe(config);
+        if (!probe.WakeUsesMsgRing())
+            GTEST_SKIP() << "MSG_RING unavailable; eventfd retains a counted reader";
+    }
+
+    EXPECT_EXIT(
+        {
+            alarm(5);
+            auto config = RunningTiered::Config(0, 0);
+            coop::Cooperator co(config);
+            if (co.WakeUsesMsgRing())
+            {
+                coop::Thread thread(&co);
+                EXPECT_TRUE(co.SubmitSync(
+                    [&](coop::Context*)
+                    {
+                        EXPECT_EQ(co.GetUring()->PendingOps(), 0u);
+                        coop::TieredWakeTestAccess::WaitDuringShutdown(co);
+                    }));
+                co.Shutdown();
+            }
+            _Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST(TieredWakeTest, RuntimeContextCensusMatchesSelectedTransport)
+{
+    alarm(10);
+    for (int mode : {0, 1, 2})
+    {
+        auto config = RunningTiered::Config(1, 10);
+        config.tieredWake = mode != 0;
+        denyMsgRingProbe = mode == 2;
+        coop::Cooperator co(config);
+        denyMsgRingProbe = false;
+        {
+            coop::Thread thread(&co);
+            EXPECT_TRUE(co.SubmitSync(
+                [&](coop::Context*)
+                { EXPECT_EQ(co.NonDaemonContexts(), 1 + co.WakeContextCount()); }));
+            co.Shutdown();
+        }
+        EXPECT_EQ(co.WakeContextCount(), 0u);
+    }
+    alarm(0);
+}

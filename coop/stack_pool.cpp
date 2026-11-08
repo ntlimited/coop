@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdlib>
+#include <cerrno>
 
 #ifndef NDEBUG
 #include <sys/mman.h>
@@ -38,6 +39,13 @@ size_t StackPool::RoundUpStackSize(size_t stackSize)
 
 void* StackPool::Allocate(size_t stackSize)
 {
+    if (m_failNextAllocation)
+    {
+        m_failNextAllocation = false;
+        errno = ENOMEM;
+        return nullptr;
+    }
+
     if (stackSize > MAX_POOLED_STACK)
     {
         m_misses++;

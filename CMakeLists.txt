@@ -279,6 +279,7 @@ add_executable(coop_tests
     tests/test_work_deque.cpp
     tests/test_work_pool.cpp
     tests/test_grid.cpp
+    tests/test_countdown_latch.cpp
     tests/test_cooperate.cpp
     tests/test_wake.cpp
     tests/test_spawn.cpp
@@ -328,6 +329,7 @@ target_link_options(coop_tests PRIVATE -rdynamic
     -Wl,--wrap=io_uring_unregister_buf_ring
     -Wl,--wrap=io_uring_register
     -Wl,--wrap=io_uring_register_probe
+    -Wl,--wrap=_ZN4coop2io6HandleD1Ev
     -Wl,--wrap=uname
     -Wl,--wrap=mmap
     -Wl,--wrap=munmap)

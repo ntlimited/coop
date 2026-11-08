@@ -116,7 +116,7 @@ TEST(CooperateTest, CooperateSelfFastPath)
 
         // Self-cooperator fast path: handle is signaled synchronously.
         //
-        EXPECT_TRUE(handle.m_signal.IsSignaled());
+        EXPECT_TRUE(handle.m_completion.IsReady());
         EXPECT_TRUE(handle.m_spawnOk);
         EXPECT_TRUE(workRan);
 
@@ -146,7 +146,7 @@ TEST(CooperateTest, CooperateTargetShutdown)
 
         // Handle should NOT have been signaled since we returned false immediately.
         //
-        EXPECT_FALSE(handle.m_signal.IsSignaled());
+        EXPECT_FALSE(handle.m_completion.IsReady());
 
         caller.Shutdown();
     });

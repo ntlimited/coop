@@ -35,6 +35,9 @@ struct StackPool
 
     Stats GetStats() const;
 
+    // Owner-thread fault injection, configured before allocation begins.
+    void FailNextAllocationForTesting() { m_failNextAllocation = true; }
+
   private:
     struct FreeNode { FreeNode* next; };
 
@@ -50,6 +53,8 @@ struct StackPool
     static constexpr size_t MAX_POOLED_STACK = 131072;
 
     Bucket m_buckets[NUM_BUCKETS];
+
+    bool m_failNextAllocation = false;
 
     size_t m_hits = 0;
     size_t m_misses = 0;

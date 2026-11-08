@@ -5,8 +5,8 @@ Status: experimental, disabled by default.
 A targeted submission needs prompt pickup without keeping an idle CPU busy forever.
 `Cooperator::Submit` already supplies the queue and admission contract; this design
 changes only its notification and the scheduler's final idle boundary. It also
-serves notifications for existing `Cooperate` replies and `Shutdown`. It does not
-implement a completion latch, move contexts, or change work-sharing policy.
+serves notifications for existing `Cooperate` replies and `Shutdown`. It carries countdown-latch notifications through the same queue and transport;
+it does not move contexts or change work-sharing policy.
 `InstallShutdownHandler` retains its separate process-wide, async-signal-safe
 eventfd bridge to its watcher thread; that bridge calls `ShutdownAll`, whose
 individual cooperator notifications use this protocol.
@@ -113,10 +113,10 @@ The Cooperator object must outlive all callers, as with the existing Submit API.
 No new acceptance gate is introduced: `PushSubmission` retains shutdown rejection
 and completion-notification exceptions. The owner drains admitted replies and
 normal cancel CQEs before ring destruction. The eventfd submission drainer is
-excluded from the shutdown kill sweep while admitted Cooperate replies remain
-outstanding. An owner-thread count increases on accepted dispatch and decreases
-at the shared reply-invocation boundary. Shutdown retains the drainer for admitted
-replies, runnable cleanup, continuations and counted native IO. Retirement is rechecked
+excluded from the shutdown kill sweep while registered countdown waits (including
+dispatch-reply waits) remain outstanding. The owner-thread count starts before
+waiter publication and ends after consuming the terminal notification. Shutdown retains the drainer for admitted
+registered waits, runnable cleanup, continuations and counted native IO. Retirement is rechecked
 on the owner thread after idle polling and continuation draining, including the polls
 inside tiered waiting, before entering a kernel wait. If only the drainer's own read
 remains, it is cancelled rather than parked on indefinitely. Queued timers stay

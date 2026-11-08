@@ -59,7 +59,7 @@ bool InThunk()
     auto* co = Cooperator::thread_cooperator;
     return co && co->m_inThunk;
 }
-}
+} // namespace detail
 #endif
 
 std::atomic<bool>        Cooperator::s_registryShutdown{false};
@@ -354,6 +354,9 @@ bool Cooperator::PushSubmission(SubmissionEntry* entry, bool completionNotificat
     }
     m_submissionTail = entry;
     m_hasSubmissions.store(true, std::memory_order_release);
+    // Finish the wake before consumption can retire the notification and its owner.
+    if (completionNotification)
+        WakeCooperator();
     return true;
 }
 
@@ -373,7 +376,12 @@ void Cooperator::WakeCooperator(char const* site)
         }
     }
     uint64_t val = 1;
-    auto ret = write(m_submitFd, &val, sizeof(val));
+    ssize_t ret;
+    do
+    {
+        ret = write(m_submitFd, &val, sizeof(val));
+    } while (ret < 0 && errno == EINTR);
+    assert(ret == sizeof(val) || (ret < 0 && errno == EAGAIN));
     CooperatorLedgerWakeWrite(site, this, m_submitFd, ret);
 }
 
@@ -382,12 +390,13 @@ bool Cooperator::RetireSubmissionDrainer(bool shutdownKillDone, Context::Handle&
     // Admitted replies and cleanup still need the eventfd wake source. Once only its own read
     // remains, shutdown must cancel it before any kernel park, including after idle polling.
     //
-    if (!shutdownKillDone || !drainer || m_pendingCooperateReplies != 0 || !m_yielded.IsEmpty() ||
+    if (!shutdownKillDone || !drainer || m_completionWaits != 0 || !m_yielded.IsEmpty() ||
         !m_pendingContinuations.IsEmpty() || m_uring.PendingOps() != 1 ||
         drainer.m_context->IsKilled())
         return false;
 
-    Spawn([&drainer](Context* ctx) { ctx->Kill(drainer.m_context, false /* schedule */); });
+    // Scheduler-owned cleanup cannot depend on another stack allocation.
+    drainer.m_context->KillSelf(KillCause::Kill);
     return true;
 }
 
@@ -402,7 +411,8 @@ void Cooperator::WaitTiered(bool shutdownKillDone, Context::Handle& submissionDr
         ServiceExpiredTimers();
         if (RetireSubmissionDrainer(shutdownKillDone, submissionDrainer))
             return true;
-        return (m_shutdown.load(detail::kLoadFlag) && !shutdownKillDone) ||
+        return (shutdownKillDone && m_completionWaits == 0 && m_uring.PendingOps() == 0) ||
+               (m_shutdown.load(detail::kLoadFlag) && !shutdownKillDone) ||
                m_hasSubmissions.load(std::memory_order_acquire) || !m_yielded.IsEmpty() ||
                !m_pendingContinuations.IsEmpty();
     };
@@ -438,10 +448,20 @@ void Cooperator::WaitTiered(bool shutdownKillDone, Context::Handle& submissionDr
     m_uring.WaitAndPoll();
     m_doorbell.Hot();
 }
-void Cooperator::InvokeReply(SubmissionEntry* entry)
+void Cooperator::BeginCompletionWait()
 {
-    assert(m_pendingCooperateReplies > 0);
-    --m_pendingCooperateReplies;
+    assert(thread_cooperator == this);
+    ++m_completionWaits;
+}
+
+void Cooperator::EndCompletionWait()
+{
+    assert(thread_cooperator == this && m_completionWaits);
+    --m_completionWaits;
+}
+
+void Cooperator::InvokeNotification(SubmissionEntry* entry)
+{
     entry->m_invoke(entry, m_scheduled);
     entry->m_destroy(entry);
 }
@@ -468,7 +488,7 @@ void Cooperator::DrainSubmissions()
         head = head->m_next;
         if (entry->m_inline)
         {
-            InvokeReply(entry);
+            InvokeNotification(entry);
             continue;
         }
         SpawnFromSubmission(entry);
@@ -484,7 +504,6 @@ void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
     {
         auto* handle = reinterpret_cast<CooperateHandle*>(
             reinterpret_cast<uintptr_t>(entry->m_completion) & ~uintptr_t(1));
-        auto* callerCoop = reinterpret_cast<Cooperator*>(entry->m_completionOk);
 
         bool spawned = Spawn(entry->m_config, [entry](Context* ctx)
         {
@@ -494,13 +513,10 @@ void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
         if (!spawned)
             entry->m_destroy(entry);
 
-        if (handle && callerCoop)
+        if (handle)
         {
             handle->m_spawnOk = spawned;
-            // Reverse notify is embedded in the handle — no heap on this path.
-            //
-            callerCoop->PushSubmission(&handle->m_reply, true /* completionNotification */);
-            callerCoop->WakeCooperator();
+            handle->m_completion.Arrive();
         }
         return;
     }
@@ -550,7 +566,7 @@ void Cooperator::DrainRemainingSubmissions()
 
         if (entry->m_inline)
         {
-            InvokeReply(entry);
+            InvokeNotification(entry);
             continue;
         }
 
@@ -559,13 +575,11 @@ void Cooperator::DrainRemainingSubmissions()
         {
             auto* handle = reinterpret_cast<CooperateHandle*>(
                 reinterpret_cast<uintptr_t>(entry->m_completion) & ~uintptr_t(1));
-            auto* callerCoop = reinterpret_cast<Cooperator*>(entry->m_completionOk);
 
-            if (handle && callerCoop)
+            if (handle)
             {
                 handle->m_spawnOk = false;
-                callerCoop->PushSubmission(&handle->m_reply, true /* completionNotification */);
-                callerCoop->WakeCooperator();
+                handle->m_completion.Arrive();
             }
 
             entry->m_destroy(entry);
@@ -613,6 +627,8 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
         {
             COOP_PERF_INC(m_perf, perf::Counter::ContextExit);
             Context* exited = m_scheduled;
+            if (exited == m_wakeContext)
+                m_wakeContext = nullptr;
             size_t stackSize = exited->m_segment.Size();
             // Signal-based diagnostics may interrupt Free(), including after it unmaps the
             // segment. Withdraw the scheduled pointer before its storage stops being readable.
@@ -719,11 +735,13 @@ void Cooperator::Launch()
     // runnable, so WaitAndPoll() can sleep on submissions instead of spinning.
     //
     Context::Handle submissionDrainer;
-    if (!m_wakeUsesMsgRing)
+    bool const wakeReady =
+        m_wakeUsesMsgRing ||
         Spawn(
             {.priority = 0, .stackSize = COOP_DEFAULT_STACK_SIZE, .daemon = true},
             [this](Context* ctx)
             {
+                m_wakeContext = ctx;
                 ctx->SetName("SubmissionDrainer");
 
                 io::Descriptor desc(io::borrowed, m_submitFd);
@@ -748,6 +766,15 @@ void Cooperator::Launch()
             },
             &submissionDrainer);
 
+    // Without its wake reader this backend cannot service accepted submissions.
+    // Close admission before draining them as failed, rather than entering an
+    // unwakeable scheduler or waiting for a context that never existed.
+    if (!wakeReady)
+    {
+        fprintf(stderr, "coop: submission drainer startup failed\n");
+        Shutdown();
+    }
+
     // Check COOP_PERF=1 env var to enable dynamic perf probes at startup (mode 2 only).
     // Static local ensures this runs once even with multiple cooperators.
     //
@@ -767,11 +794,12 @@ void Cooperator::Launch()
 
     bool shutdownKillDone = false;
 
-    while (!m_yielded.IsEmpty() || !m_shutdown.load(detail::kLoadFlag)
+    while (wakeReady &&
+           (!m_yielded.IsEmpty() || !m_shutdown.load(detail::kLoadFlag)
                                  || !shutdownKillDone
                                  || !m_pendingContinuations.IsEmpty()
                                  || m_uring.PendingOps() > 0
-                                 || m_pendingCooperateReplies > 0)
+                                 || m_completionWaits > 0))
     {
         ++m_loops;   // scheduler heartbeat (Cooperator::Loops)
 
@@ -788,18 +816,14 @@ void Cooperator::Launch()
         {
             shutdownKillDone = true;
             DrainSubmissions();
-            Spawn(
-                [this, &submissionDrainer](Context* killCtx)
+            // Kill hooks cannot block, and unscheduled kill delivery only queues
+            // waiters. Run on the owner thread without allocating a helper stack.
+            m_contexts.Visit(
+                [&](Context* c) -> bool
                 {
-                    m_contexts.Visit(
-                        [&](Context* c) -> bool
-                        {
-                            if (c != killCtx && c != submissionDrainer.m_context && !c->IsKilled())
-                            {
-                                killCtx->Kill(c, false /* schedule */);
-                            }
-                            return true;
-                        });
+                    if (c != submissionDrainer.m_context && !c->IsKilled())
+                        c->KillSelf(KillCause::Kill);
+                    return true;
                 });
 
             // Wake the eventfd so any already-completable submission-drainer read is serviced
@@ -872,7 +896,7 @@ void Cooperator::Launch()
             // cross-thread Submit() also wakes this path via CQE delivery.
             //
             if ((m_config.tieredWake && !shutdownKillDone) || !m_blocked.IsEmpty() ||
-                m_uring.PendingOps() > 0 || m_pendingCooperateReplies > 0)
+                m_uring.PendingOps() > 0 || m_completionWaits > 0)
             {
                 // Virtual time: rather than really sleeping, jump the clock forward to the
                 // nearest timer deadline. The next iteration's ServiceExpiredTimers (which

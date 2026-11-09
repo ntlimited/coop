@@ -1000,7 +1000,12 @@ TEST(TieredWakeTest, RuntimeContextCensusMatchesSelectedTransport)
             coop::Thread thread(&co);
             EXPECT_TRUE(co.SubmitSync(
                 [&](coop::Context*)
-                { EXPECT_EQ(co.NonDaemonContexts(), 1 + co.WakeContextCount()); }));
+                {
+                    // The eventfd reader is a daemon runtime service: it exists exactly
+                    // for that transport and is never counted as application work.
+                    EXPECT_EQ(co.NonDaemonContexts(), 1u);
+                    EXPECT_EQ(co.WakeContextCount(), co.WakeUsesMsgRing() ? 0u : 1u);
+                }));
             co.Shutdown();
         }
         EXPECT_EQ(co.WakeContextCount(), 0u);

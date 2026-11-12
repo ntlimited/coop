@@ -288,6 +288,7 @@ add_executable(coop_tests
     tests/test_guarded_passage.cpp
     tests/test_shutdown.cpp
     tests/test_uring_lifecycle.cpp
+    tests/test_uring_overflow.cpp
     tests/test_io.cpp
     tests/completion_observer.cpp
     tests/test_handle_completion.cpp

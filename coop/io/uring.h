@@ -61,10 +61,11 @@ struct Uring
     BufferArena* GetBufferArena() const { return m_bufferArena.get(); }
 
     // True when io_uring has completions waiting to be harvested -- either CQEs already sitting in
-    // the completion ring, or, under COOP_TASKRUN, kernel task_work that will materialize CQEs on
-    // the next io_uring_enter(). It is a pure userspace read of kernel-mapped ring memory (the CQ
-    // head/tail and the SQ kflags word), no syscall. The continuation drain uses it to yield back
-    // to the scheduler the instant real IO is ready, rather than running a fixed thunk budget.
+    // the completion ring, on the kernel CQ overflow list, or, under COOP_TASKRUN, kernel
+    // task_work that will materialize CQEs on the next io_uring_enter(). It is a pure userspace
+    // read of kernel-mapped ring memory (the CQ head/tail and the SQ kflags word), no syscall. The
+    // continuation drain uses it to yield back to the scheduler the instant real IO is ready,
+    // rather than running a fixed thunk budget.
     //
     bool HasPendingCompletions() const;
 

@@ -666,7 +666,7 @@ void Uring::HandleFatalEnterError(char const* site, int err)
 
 bool Uring::HasPendingCompletions() const
 {
-    // Two independent signals that real IO is ready to service. The continuation drain consults
+    // Three independent signals that real IO is ready to service. The continuation drain consults
     // this to decide whether to yield mid-chain.
     //
     //   1. io_uring_cq_ready: CQEs already materialized in the completion ring, waiting for Poll
@@ -676,9 +676,11 @@ bool Uring::HasPendingCompletions() const
     //      the next io_uring_enter(). During a synchronous continuation chain no enter() happens,
     //      so cq_ready stays zero even though completions are pending -- this flag is the live
     //      signal for that case. A volatile read of kernel-mapped SQ ring memory.
+    //   3. IORING_SQ_CQ_OVERFLOW: completed operations parked on the kernel overflow list
+    //      also need an enter, even when the mapped CQ is empty and TASKRUN is clear.
     //
-    return io_uring_cq_ready(&m_ring) > 0
-        || (IO_URING_READ_ONCE(*m_ring.sq.kflags) & IORING_SQ_TASKRUN);
+    return io_uring_cq_ready(&m_ring) > 0 ||
+           (IO_URING_READ_ONCE(*m_ring.sq.kflags) & (IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW));
 }
 
 int Uring::Poll()
@@ -692,7 +694,7 @@ int Uring::Poll()
     //
     COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollCycle);
 
-    // Two conditions require a submit:
+    // Three conditions require a submit:
     //   1. m_pendingSqes > 0: new SQEs from Handle::Submit/SubmitLinked/Cancel need flushing.
     //      io_uring_enter() also runs task_work as a side effect, so this covers both.
     //   2. IORING_SQ_TASKRUN flag set (COOP_TASKRUN mode only): the kernel completed an
@@ -700,14 +702,17 @@ int Uring::Poll()
     //      in the CQ ring and blocked contexts would never wake. The flag is a volatile read
     //      from kernel-mapped memory (sq.kflags); SINGLE_ISSUER keeps it uncontended.
     //
-    // Note: liburing also checks CQ overflow inside sq_ring_needs_enter(). We skip that here;
-    // CQ overflow is pathological (means CQEs aren't being drained fast enough) and the next
-    // real submit catches it. Not worth an extra branch on every Poll().
+    //   3. IORING_SQ_CQ_OVERFLOW: the kernel has completed operations on its overflow
+    //      list. Once the mapped CQ drains, only an enter can make them visible; a busy
+    //      cooperator need never submit another SQE or go idle. liburing requests GETEVENTS
+    //      for either SQ flag, including with SQPOLL and no pending SQEs. Testing both bits
+    //      uses the same flag read and branch as TASKRUN alone; a quiet ring adds no syscall.
     //
-    // For DEFER_TASKRUN: io_uring_submit() cannot flush deferred completions (it doesn't pass
-    // IORING_ENTER_GETEVENTS when submitted==0). io_uring_get_events() is required separately.
+    // For DEFER_TASKRUN: absent the SQ flags above, io_uring_submit() need not enter with
+    // GETEVENTS. io_uring_get_events() is required separately to service deferred task_work.
     //
-    if (m_pendingSqes > 0 || (IO_URING_READ_ONCE(*m_ring.sq.kflags) & IORING_SQ_TASKRUN))
+    if (m_pendingSqes > 0 ||
+        (IO_URING_READ_ONCE(*m_ring.sq.kflags) & (IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW)))
     {
         COOP_PERF_INC(Cooperator::thread_cooperator->GetPerfCounters(), perf::Counter::PollSubmit);
         int pendingSqesBefore = m_pendingSqes;

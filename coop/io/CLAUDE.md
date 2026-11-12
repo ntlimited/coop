@@ -85,11 +85,13 @@ task_work. For `DEFER_TASKRUN`, `io_uring_get_events()` is additionally called s
 `io_uring_submit()` alone cannot flush deferred completions. `Uring::GetSqe()` provides
 self-correcting SQE acquisition: if the SQ ring is full, it flushes pending SQEs and retries.
 
-`Poll()` checks `m_pendingSqes > 0 || (*m_ring.sq.kflags & IORING_SQ_TASKRUN)` before calling
-`io_uring_submit()`. The `IORING_SQ_TASKRUN` flag (a volatile read from kernel-mapped SQ ring
-memory) is set by the kernel when completions are pending under `COOP_TASKRUN` mode. When
-neither SQEs nor task_work are pending — the common case on pure-yield resumes — the submit
-is skipped entirely, saving ~9ns per Poll() (~3% of yield cost).
+`Poll()` checks pending SQEs and `IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW` before calling
+`io_uring_submit()`. TASKRUN signals pending kernel task_work; CQ_OVERFLOW signals completed
+operations parked outside the mapped CQ. liburing enters with GETEVENTS for either flag,
+even with no SQEs and with SQPOLL. Both bits share one volatile read and one mask test;
+when neither flag nor SQEs are present, no submit or additional syscall is requested.
+DEFER_TASKRUN retains its separate get_events call. `HasPendingCompletions()` recognizes
+the same flags, so the direct-yield IO governor and continuation pacing see overflow too.
 
 **CQ reaping**: after submitting, `Poll()` reaps the whole ready batch with `io_uring_for_each_cqe`
 and then advances the kernel-visible CQ head exactly once via `io_uring_cq_advance(n)`. The
@@ -99,8 +101,10 @@ batched form is safe because each callback only reads `cqe->res` and never depen
 reclaiming a slot mid-drain. The win scales with how many completions land in one window: a Poll
 that reaps a single CQE is one head store either way (and still drops the peek probe), while a
 fan-out burst that reaps a large batch collapses N head stores into one. Completions that overflow
-the ring stay on the kernel overflow list and surface on the next Poll — the scheduler polls
-continuously, so nothing is lost, only deferred one iteration.
+the ring stay on the kernel overflow list. `ReapOnly()` deliberately performs no kernel entry;
+its callers reach `Poll()` at each finite scheduler batch boundary. Direct yields also have
+a finite switch budget, including when their IO governor is disabled. Thus a continuously
+runnable context cannot indefinitely defer the enter needed to harvest overflow.
 
 **Non-native urings** (running as dedicated contexts via `Uring::Run()`) use the same deferred
 model — their `Poll()` submits + processes CQEs on each scheduling round. IO latency is bounded

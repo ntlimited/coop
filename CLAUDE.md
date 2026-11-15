@@ -260,9 +260,12 @@ for the full loop, shutdown sequence, and loop condition details.
 
 ### Context Lifecycle (`coop/context.cpp`)
 Contexts form a parent-child tree. Construction registers in parent's `m_children` list.
-Kill propagation uses iterative post-order traversal. Destruction: detach, kill children, wait
-for children to exit via `m_lastChild` coordinator, then `ContextSwitch(EXITED)` back to the
-cooperator. See `coop/CLAUDE.md` for the full lifecycle and Launchable destruction details.
+Kill propagation uses iterative post-order traversal. Destruction kills children, waits for
+attached child subtrees via `m_lastChild`, then detaches and retires before
+`ContextSwitch(EXITED)` back to the cooperator. A parent's child join therefore covers attached
+descendants, including cleanup that ignores kill. Explicit `Detach()` excludes its subtree.
+Task locals, callable/Launchable cleanup, and ContextVars have earlier lifetimes; drain children
+explicitly before destroying state they borrow. See `coop/CLAUDE.md` for the full lifecycle.
 
 ### IO (`coop/io/`)
 All IO goes through io_uring. Each operation has 4 variants:

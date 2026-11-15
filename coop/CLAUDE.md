@@ -154,11 +154,22 @@ the caller's `schedule` flag. Contexts blocked on coordinators are woken via `Co
 kill signal multiplexing when they are next scheduled.
 
 **Destruction** (runs on the context's own stack, in `CoopContextEntry`):
-1. `Detach()` from parent — removes from children list; last child `Release`s `m_lastChild`
-2. `Kill(this)` if not already killed — propagates to any remaining children
-3. Clear `m_handle->m_context` pointer
-4. `m_lastChild.Acquire(this)` — blocks until all children have exited and detached
+1. `Kill(this)` if not already killed — propagates to any remaining children
+2. Clear `m_handle->m_context` pointer
+3. `m_lastChild.Acquire(this)` — blocks until all attached child subtrees have finished
+4. `Detach()` from parent — removes from children list; last child `Release`s `m_lastChild`
 5. Remove from cooperator's `m_contexts` list
+
+The parent link survives the descendant wait, so acquiring `m_lastChild` joins attached
+descendants transitively. This wait is not kill-aware: kill requests termination but does not
+prove completion. Automatic detach queues the parent without switching to it; context retirement
+finishes before the parent resumes. Explicit `Detach()` still removes a subtree immediately from
+parental cancellation and joining; its caller must provide the independent lifetime contract.
+
+This boundary does not preserve task locals, callable captures, Launchable members, or ContextVars:
+their cleanup runs before `~Context()`. Drain children explicitly before destroying any such state
+they borrow. A cleared Handle, `SubmitSync` return, or `Group::Wait()` return is also not a
+transitive Context join; these report their respective earlier task-completion boundaries.
 
 After `~Context()`, `CoopContextEntry` does `ContextSwitch(EXITED)` back to the cooperator,
 which returns the allocation to the `StackPool` for reuse (or frees it if the pool bucket is

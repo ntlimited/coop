@@ -62,6 +62,233 @@ TEST(SpawnTest, ParentChild)
     });
 }
 
+namespace
+{
+
+void CheckDescendantJoin(bool killDuringWait)
+{
+    test::RunInCooperator(
+        [=](coop::Context* ctx)
+        {
+            coop::Coordinator finish(ctx);
+            coop::Context::Handle childHandle;
+            bool childStarted = false;
+            bool parentWaiting = false;
+            bool joined = false;
+            bool grandchildFinished = false;
+            bool parentKilled = false;
+
+            ASSERT_TRUE(ctx->GetCooperator()->Spawn(
+                [&](coop::Context* parent)
+                {
+                    EXPECT_TRUE(parent->GetCooperator()->Spawn(
+                        [&](coop::Context* child)
+                        {
+                            childStarted = true;
+                            EXPECT_TRUE(child->GetCooperator()->Spawn(
+                                [&](coop::Context* grandchild)
+                                {
+                                    struct Cleanup
+                                    {
+                                        coop::Context* ctx;
+                                        coop::Coordinator& finish;
+                                        bool& finished;
+                                        ~Cleanup()
+                                        {
+                                            // Ignore kill while draining RAII cleanup. The outer
+                                            // observer owns the gate and captures until this
+                                            // destructor completes.
+                                            finish.Acquire(ctx);
+                                            EXPECT_TRUE(ctx->IsKilled());
+                                            finished = true;
+                                        }
+                                    } cleanup{grandchild, finish, grandchildFinished};
+                                }));
+                        },
+                        &childHandle));
+
+                    parentWaiting = true;
+                    parent->m_lastChild.Acquire(parent);
+                    parent->m_lastChild.Release(parent, false);
+                    parentKilled = parent->IsKilled();
+                    joined = true;
+                }));
+
+            // A cleared handle marks entry into ~Context, before its descendant wait.
+            // Synchronize on this rather than assuming a fixed number of scheduler turns.
+            while (!childStarted || childHandle || !parentWaiting)
+                ctx->Yield(true);
+            if (killDuringWait)
+                ctx->KillSelf(coop::KillCause::Kill);
+            ctx->Yield(true);
+            EXPECT_FALSE(grandchildFinished);
+            EXPECT_FALSE(joined);
+
+            finish.Release(ctx, false);
+            ctx->m_lastChild.Acquire(ctx);
+            ctx->m_lastChild.Release(ctx, false);
+            // Also settle the intentionally broken implementation during red calibration.
+            while (!grandchildFinished || !joined)
+                ctx->Yield(true);
+            EXPECT_EQ(parentKilled, killDuringWait);
+        });
+}
+
+} // namespace
+
+TEST(SpawnTest, ChildJoinWaitsForGrandchild)
+{
+    CheckDescendantJoin(false);
+}
+
+TEST(SpawnTest, KillDuringChildJoinStillWaitsForGrandchild)
+{
+    CheckDescendantJoin(true);
+}
+
+TEST(SpawnTest, ChildJoinWithoutDescendantsDoesNotBlock)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            coop::Context::Handle handle;
+            const auto blocks = ctx->m_statistics.blocks;
+            EXPECT_TRUE(ctx->GetCooperator()->Spawn([](coop::Context*) {}, &handle));
+            EXPECT_FALSE(handle);
+            EXPECT_TRUE(ctx->m_children.IsEmpty());
+            ctx->m_lastChild.Acquire(ctx);
+            ctx->m_lastChild.Release(ctx, false);
+            EXPECT_EQ(ctx->m_statistics.blocks, blocks);
+        });
+}
+
+TEST(SpawnTest, ExplicitDetachExcludesDescendantsFromJoin)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            coop::Coordinator finish(ctx);
+            bool detached = false;
+            bool finished = false;
+            EXPECT_TRUE(ctx->GetCooperator()->Spawn(
+                [&](coop::Context* child)
+                {
+                    child->Detach();
+                    detached = true;
+                    finish.Acquire(child);
+                    EXPECT_FALSE(child->IsKilled());
+                    finished = true;
+                }));
+            EXPECT_TRUE(detached);
+            ctx->m_lastChild.Acquire(ctx);
+            ctx->m_lastChild.Release(ctx, false);
+            EXPECT_FALSE(finished);
+            ctx->KillSelf(coop::KillCause::Kill);
+            finish.Release(ctx, false);
+            while (!finished)
+                ctx->Yield(true);
+        });
+}
+
+TEST(SpawnTest, ChildJoinDrainsDeepTreeOnSmallStacks)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            constexpr int depth = 512;
+            coop::Coordinator finish(ctx);
+            int started = 0;
+            int returned = 0;
+            bool leafFinished = false;
+            std::function<void(coop::Context*, int)> spawnChain;
+            spawnChain = [&](coop::Context* parent, int level)
+            {
+                EXPECT_TRUE(parent->GetCooperator()->Spawn({.stackSize = 16384},
+                                                           [&, level](coop::Context* child)
+                                                           {
+                                                               ++started;
+                                                               if (level < depth)
+                                                                   spawnChain(child, level + 1);
+                                                               else
+                                                               {
+                                                                   finish.Acquire(child);
+                                                                   leafFinished = true;
+                                                               }
+                                                               ++returned;
+                                                           }));
+            };
+            spawnChain(ctx, 1);
+            while (started != depth || returned != depth - 1)
+                ctx->Yield(true);
+            EXPECT_FALSE(ctx->m_children.IsEmpty());
+            ctx->KillSelf(coop::KillCause::Kill);
+            finish.Release(ctx, false);
+            ctx->m_lastChild.Acquire(ctx);
+            ctx->m_lastChild.Release(ctx, false);
+            EXPECT_TRUE(leafFinished);
+            while (returned != depth)
+                ctx->Yield(true);
+        },
+        {.stackSize = 65536});
+}
+
+namespace
+{
+
+struct SpawnDuringCleanup : coop::Launchable
+{
+    coop::Coordinator* finish;
+    bool* started;
+    bool* finished;
+
+    SpawnDuringCleanup(coop::Context* ctx, coop::Coordinator* gate, bool* began, bool* ended)
+        : Launchable(ctx), finish(gate), started(began), finished(ended)
+    {
+    }
+
+    void Launch() final {}
+
+    ~SpawnDuringCleanup()
+    {
+        EXPECT_TRUE(GetContext()->GetCooperator()->Spawn(
+            [gate = finish, began = started, ended = finished](coop::Context* child)
+            {
+                *began = true;
+                gate->Acquire(child);
+                EXPECT_TRUE(child->IsKilled());
+                EXPECT_FALSE(child->GetCooperator()->Spawn([](coop::Context*) {}));
+                *ended = true;
+            }));
+    }
+};
+
+} // namespace
+
+TEST(SpawnTest, ChildJoinIncludesChildrenSpawnedDuringCleanup)
+{
+    test::RunInCooperator(
+        [](coop::Context* ctx)
+        {
+            coop::Coordinator finish(ctx);
+            coop::Context::Handle handle;
+            bool started = false;
+            bool finished = false;
+            auto launched = ctx->GetCooperator()->Launch<SpawnDuringCleanup>(
+                coop::s_defaultConfiguration, &handle, &finish, &started, &finished);
+            ASSERT_TRUE(launched.spawned);
+            while (!started || handle)
+                ctx->Yield(true);
+            EXPECT_FALSE(ctx->m_children.IsEmpty());
+            EXPECT_FALSE(finished);
+            finish.Release(ctx, false);
+            ctx->m_lastChild.Acquire(ctx);
+            ctx->m_lastChild.Release(ctx, false);
+            EXPECT_TRUE(finished);
+            while (!finished)
+                ctx->Yield(true);
+        });
+}
+
 TEST(SpawnTest, KillChild)
 {
     test::RunInCooperator([](coop::Context* ctx)

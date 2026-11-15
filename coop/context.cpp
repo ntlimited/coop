@@ -52,11 +52,6 @@ Context::Context(
 
 Context::~Context()
 {
-    if (m_parent)
-    {
-        Detach();
-    }
-
     // Properly kill this if we were not already. Note that this propagates down to child contexts
     //
     if (!m_killedSignal.IsSignaled())
@@ -72,6 +67,13 @@ Context::~Context()
     // Wait on the last child before we allow the context to be cleaned up
     //
     m_lastChild.Acquire(this);
+    // Keep the parent's join held until our attached descendants have finished too.
+    // Detach queues the parent without switching, so retirement below finishes first.
+    //
+    if (m_parent)
+    {
+        Detach();
+    }
     if (m_daemon)
     {
         m_cooperator->m_daemonCount--;

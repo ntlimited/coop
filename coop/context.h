@@ -238,9 +238,9 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     //
     AllocBuffer AllocateBuffer(size_t size);
 
-    // Detach disassociates the context from its parent so that it will not be killed when the
-    // parent is. If you have a reason to use this, it is assumed you're able to make sure no
-    // there's a coherent contract where no one else is going to or already detached it.
+    // Detach disassociates the context from its parent, excluding it from the parent's join
+    // and kill propagation. Callers must ensure no other code is going to detach it or has
+    // already done so.
     //
     void Detach();
 

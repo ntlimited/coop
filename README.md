@@ -51,9 +51,15 @@ access to the public archives is needed. Tests require a kernel and syscall poli
 permit `io_uring`, loopback networking, and executable-memory patching for perf mode 2.
 No tests are excluded by default. Docker's default seccomp policy may block `io_uring`;
 use a container policy that permits its setup, enter, and register syscalls.
-On affected Ubuntu 6.8 kernels where provided-buffer registration returns `EINVAL`,
-add `--config=ubuntu_pbuf_workaround` to enable coop's existing compatibility path
-(CMake: `-DCOOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK=ON`). It stays off by default.
+To support Ubuntu 6.8 kernels with the inverted provided-buffer reserved-field check, add
+`--config=ubuntu_pbuf_workaround` (CMake:
+`-DCOOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK=ON`). It stays off by default.
+When on, the option permits a nonzero-reserved retry only after valid ordinary `-EINVAL`,
+with a `6.8.0-` release prefix and `-Ubuntu` in the version string. Successful discovery is
+cached per process without individual release lists or receive-path overhead. Cached nonzero
+`-EINVAL` permits one ordinary attempt to recover a restored standard ABI. See
+[registration compatibility](docs/buffer_ring_multishot_01.md#ubuntu-registration-compatibility)
+for errors, cleanup and live-fix limits.
 
 | CMake CI lane | Bazel options |
 | --- | --- |

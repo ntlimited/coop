@@ -43,7 +43,7 @@ if(COOP_COVERAGE)
 endif()
 
 option(COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK
-    "Enable the provided-buffer-ring workaround for affected Ubuntu 6.8 kernels" OFF)
+    "Discover and support the inverted Ubuntu 6.8 provided-buffer-ring ABI" OFF)
 
 # AddressSanitizer. Worth a switch of its own because a cooperative runtime is not something ASan
 # can follow unaided: it tracks one stack per thread, and coop moves between many. The annotations

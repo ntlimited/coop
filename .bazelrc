@@ -20,7 +20,7 @@ build:lto --features=thin_lto
 build:o2 --config=release
 build:o2 --copt=-O2
 
-# Opt in only on affected Ubuntu 6.8 kernels, matching the CMake option of this name.
+# Opt in to bounded Ubuntu 6.8 pbuf ABI discovery, matching the CMake option.
 build:ubuntu_pbuf_workaround --//bazel:workaround_ubuntu_pbuf_reserved_check=true
 
 # Compile checks from an x86_64 client; native ARM CI uses the default platform.

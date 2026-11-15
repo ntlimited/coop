@@ -32,16 +32,34 @@ staged slots visible to the kernel in one ring advance.
 
 #### Ubuntu registration compatibility
 
-Ubuntu kernels `6.8.0-139-generic`, `6.8.0-142-generic`, and `6.8.0-147-generic` invert the
-provided-buffer-ring reserved-field check
-(Ubuntu bug [2162843](https://bugs.launchpad.net/bugs/2162843)). The default-off
-`COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK` CMake option permits a retry with `resv[0]=1`
-only after normal registration returns `-EINVAL`, the release matches exactly,
-the kernel version contains `-Ubuntu`, and the ring parameters are valid. Workaround rings
-use the same reserved value for unregister;
-teardown stops the process if unregister fails, so kernel-owned buffers are never freed. Other
-kernels and errors retain the normal liburing path. Remove the macro when affected kernels are
-retired or repaired.
+Some Ubuntu 6.8 backports invert the provided-buffer-ring reserved-field check
+(Ubuntu bug [2162843](https://bugs.launchpad.net/bugs/2162843)), rejecting liburing's
+zero-reserved registration. The default-off `COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK`
+option permits discovering that encoding only within the Ubuntu 6.8 family:
+`uname.release` must start with `6.8.0-` and `uname.version` must contain `-Ubuntu`.
+There is no list of individual package releases. This family bound avoids sending a nonzero
+reserved field to unrelated kernels that may assign it another meaning in the future. It is a
+compatibility policy for the affected backport family, not a guarantee about arbitrary future
+Ubuntu 6.8 patches or kernels with customized identity strings.
+
+The first registration uses ordinary liburing setup. Only `-EINVAL` on a valid userspace-ring
+request triggers the family check and permits one retry with `resv[0]=1`; flags, count and buffer
+group stay unchanged. A rejected or failed family check returns the original `-EINVAL`, without
+allocating or registering a compatibility mapping and without classifying the process. Within
+this family, healthy kernels reject the nonzero value and affected kernels still validate the
+other arguments. Only a successful registration caches the standard or nonzero encoding.
+Subsequent valid registrations use that encoding directly, with no extra syscall or family
+check. Concurrent initial registrations may each probe before success is published.
+
+In cached nonzero mode, `-EINVAL` permits one ordinary registration attempt, to recover when a
+live fix restores the standard ABI. Only ordinary success changes the cache to standard; a
+failed recovery returns its errno and leaves the cache unchanged. Other nonzero-form errors
+never retry. Registration cannot cycle between forms within one call.
+
+Each ring remembers its own successful encoding for unregister. Teardown stops the process if
+unregister fails, so kernel-owned buffers are never freed. Recovery concerns new registrations;
+a live change that invalidates an existing ring's paired unregister still fails loudly. A
+partial backport that changes register without matching unregister is unsupported.
 
 Enable it in a separate build directory:
 
@@ -55,6 +73,10 @@ cmake --build build/debug-ubuntu-pbuf -j
 Both ordinary and workaround registration retain ownership until successful unregister.
 An unregister error stops the process before the backing buffer storage is destroyed.
 The compile-time option changes only setup and teardown; it adds no receive-path check.
+With the option disabled, all registrations use the ordinary liburing path. A failed optional
+default-ring registration is logged by `Uring::Init`, which leaves `GetBufferRing() == nullptr`
+and permits classic recv. Direct `BufferRing::Register` users must check its negative errno;
+it does not supply a receive fallback.
 
 ### `ArmedHandle` (`coop/io/armed_handle.{h,cpp}`)
 

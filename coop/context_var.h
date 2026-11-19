@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -65,7 +66,7 @@ struct ContextVarRegistry
     //
     size_t Register(size_t size, size_t align, void (*ctor)(void*), void (*dtor)(void*))
     {
-        assert(!m_frozen && "ContextVar registered after first Context creation");
+        assert(!m_frozen.load(std::memory_order_relaxed) && "ContextVar registered after first Context creation");
         assert(m_count < MAX_VARS);
 
         // Align the current watermark
@@ -92,7 +93,7 @@ struct ContextVarRegistry
     //
     void ConstructAll(void* segmentBase)
     {
-        m_frozen = true;
+        m_frozen.store(true, std::memory_order_relaxed);
         for (size_t i = 0; i < m_count; i++)
         {
             m_entries[i].construct(static_cast<char*>(segmentBase) + m_entries[i].offset);
@@ -121,7 +122,7 @@ private:
     Entry   m_entries[MAX_VARS] = {};
     size_t  m_count{0};
     size_t  m_totalSize{0};
-    bool    m_frozen{false};
+    std::atomic<bool> m_frozen{false};
 };
 
 } // end namespace coop::detail

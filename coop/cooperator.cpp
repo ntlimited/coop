@@ -695,10 +695,13 @@ void Cooperator::Launch()
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
 
     // Pin this thread to a CPU core. If the config specifies a core, use it; otherwise
-    // auto-assign round-robin across available cores. COOP_NO_PIN=1 disables pinning.
+    // auto-assign using COOP_CPU_POLICY. COOP_NO_PIN=1 disables pinning.
     //
     if (!PinningDisabled())
     {
+        // Capture the inherited affinity before an explicit assignment narrows it.
+        //
+        auto const& topology = GetTopology();
         int cpu = m_config.cpuAffinity;
         if (cpu < 0)
         {
@@ -707,7 +710,7 @@ void Cooperator::Launch()
         if (cpu >= 0 && PinThread(cpu) == 0)
         {
             m_cpuId = cpu;
-            m_numaNode = GetTopology().NumaNodeForCpu(cpu);
+            m_numaNode = topology.NumaNodeForCpu(cpu);
         }
     }
 

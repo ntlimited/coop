@@ -221,3 +221,56 @@ and total transaction deadlines to application policy.
 The [resolver guide](docs/dns_resolver.md) covers explicit configuration, borrowed
 nameserver/hosts storage, lookup policy, and the system-configuration convenience API.
 `coop_dns_parser_tests` exercises packet and configuration parsing without io_uring.
+
+## CPU placement
+
+Automatic cooperator pinning can trade physical-core capacity for sibling locality.
+`COOP_CPU_POLICY` selects the repeating placement cycle:
+
+| Value | Order |
+| --- | --- |
+| `cpu-order` (default) | Allowed logical CPU IDs in ascending order, including across NUMA nodes. |
+| `cores-first` | One allowed thread per physical core before using further siblings, within each NUMA node. |
+| `siblings-first` | All allowed SMT siblings of a core before the next core, within each NUMA node. |
+| `no-smt` | One allowed thread per physical core; additional cooperators reuse these threads rather than selecting a second sibling. |
+
+For example, on one node with allowed CPUs `0,1,8,9` and sibling pairs
+`0,8` and `1,9`, `cores-first` produces `0,1,8,9`, `siblings-first` produces
+`0,8,1,9`, and `no-smt` cycles over `0,1`. With adjacent sibling numbering
+`0,1` and `2,3`, `cores-first` instead produces `0,2,1,3`. Set, for example,
+`COOP_CPU_POLICY=siblings-first` before launching the runtime; `COOP_CPUS`
+can further limit which siblings are eligible.
+
+Topology-aware modes finish each NUMA node before moving to the next, with nodes
+ordered by node ID, cores by their lowest system sibling ID, and siblings by CPU
+ID. They support any number of siblings. `cpu-order` preserves numeric ordering
+for compatibility; it does not promise NUMA locality. The default retains that
+portable compatibility behavior because the best placement depends on the
+machine, affinity mask and workload.
+
+Discovery intersects `sched_getaffinity` with the online CPUs when available,
+then applies `COOP_CPUS` (a CPU list such as `0-3,8`) and `COOP_NUMA_NODE` (one node
+ID) by intersection. Siblings outside that set identify the core but are never
+selected. Physical-core identity comes from Linux sysfs `thread_siblings_list`.
+If these files are missing, unreadable, malformed or inconsistent for any
+selected CPU, all policies fall back to ascending allowed CPU IDs. In that
+fallback, `no-smt` cannot guarantee physical-core separation. CPU lists are
+bounded by `CPU_SETSIZE`; unsupported sysfs lists also trigger this fallback.
+The environment filters preserve their permissive syntax: `COOP_CPUS` splits
+at commas or newlines, accepts signed numeric prefixes and ranges via `sscanf`,
+ignores unrecognized tokens and consumes at most 4095 bytes. For example,
+`COOP_CPUS="0, 2"` selects CPUs 0 and 2, and `COOP_CPUS="junk,2tail"` selects CPU 2.
+`COOP_NUMA_NODE` accepts a signed numeric prefix; a value with no numeric prefix
+prints a diagnostic and leaves the NUMA filter unapplied. A parsed node that does
+not exist selects no CPUs. These environment rules do not relax strict sysfs
+validation. An empty allowed set after environment filtering prints a diagnostic
+and produces no automatic pinning; it never broadens the requested selection.
+
+Topology and placement configuration are sampled once at first use; set variables
+before starting cooperators. An unrecognized or empty `COOP_CPU_POLICY` prints a
+diagnostic and aborts at the first automatic assignment. Explicit
+`CooperatorConfiguration::cpuAffinity` takes precedence over automatic placement
+and its filters. `COOP_NO_PIN=1` disables both explicit and automatic pinning,
+without consulting the placement policy. Assignment cycles are process-wide;
+startup order determines which cooperator receives each CPU. Oversubscribing a
+cycle reuses CPUs and does not reserve cores exclusively for a cooperator.

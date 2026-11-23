@@ -89,6 +89,10 @@ struct ConnectionBase
     virtual bool Reusable() const = 0;
     virtual bool SetParserOptions(ServerParserOptions options) = 0;
     virtual const ServerParserOptions& GetParserOptions() const = 0;
+    // Completes header parsing and returns the advertised length, including explicit zero.
+    // Returns -1 if absent or parsing failed; inspect Error() to distinguish failure.
+    // An absent request length means no body unless Transfer-Encoding selects chunked.
+    //
     virtual int64_t ContentLength() = 0;
 
     // Receive the remaining body directly into a file at `offset` — the receive-to-disk

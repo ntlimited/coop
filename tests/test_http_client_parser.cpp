@@ -867,4 +867,54 @@ TEST(HttpClientParser, SuccessfulConnectIgnoresEmptyTransferEncoding)
     }
 }
 
+TEST(HttpClientParser, AbsentAndZeroContentLengthSelectDifferentResponseBoundaries)
+{
+    for (const std::string fields : {"", "Content-Length: 0\r\n"})
+    {
+        const bool fixed = !fields.empty();
+        const std::string wire = "HTTP/1.1 200 OK\r\n" + fields + "\r\n";
+        for (size_t split = 1; split < wire.size(); ++split)
+        {
+            SCOPED_TRACE(fields);
+            SCOPED_TRACE(split);
+            Parser parser({wire.substr(0, split), wire.substr(split), "body"});
+            EXPECT_EQ(parser.client->ContentLength(), fixed ? 0 : -1);
+            const size_t reads = parser.script.reads;
+            EXPECT_EQ(parser.client->ContentLength(), fixed ? 0 : -1);
+            EXPECT_EQ(parser.script.reads, reads);
+            EXPECT_EQ(parser.client->Complete(), fixed);
+            EXPECT_EQ(parser.Body(), fixed ? "" : "body");
+            EXPECT_EQ(parser.client->Error(), 0);
+            EXPECT_TRUE(parser.client->Complete());
+            EXPECT_EQ(parser.client->Reusable(), fixed);
+            EXPECT_EQ(parser.client->Reset(), fixed);
+        }
+    }
+}
+
+TEST(HttpClientParser, ContentLengthQueryRejectsInvalidFramingAfterPartialIteration)
+{
+    for (const std::string later : {"Content-Length: 1\r\n", "Content-Length: nope\r\n",
+                                    "Transfer-Encoding: chunked\r\n"})
+    {
+        const std::string wire = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" + later + "\r\n";
+        for (size_t split = 1; split < wire.size(); ++split)
+        {
+            SCOPED_TRACE(later);
+            SCOPED_TRACE(split);
+            Parser parser({wire.substr(0, split), wire.substr(split), "body"});
+            ASSERT_STREQ(parser.client->NextHeaderName(), "Content-Length");
+            parser.client->SkipHeaderValue();
+            EXPECT_EQ(parser.client->ContentLength(), -1);
+            EXPECT_LT(parser.client->Error(), 0);
+            EXPECT_FALSE(parser.client->Complete());
+            EXPECT_FALSE(parser.client->Reusable());
+            const size_t reads = parser.script.reads;
+            EXPECT_EQ(parser.client->ContentLength(), -1);
+            EXPECT_FALSE(parser.client->Reset());
+            EXPECT_EQ(parser.script.reads, reads);
+        }
+    }
+}
+
 } // namespace

@@ -424,4 +424,57 @@ TEST(HttpServerParser, EmptyListMembersPreserveValidTransferCodingsAndReset)
     }
 }
 
+TEST(HttpServerParser, ContentLengthQueriesPreserveAbsentZeroAndChunkedFraming)
+{
+    for (const std::string fields : {"", "Content-Length: 0\r\n",
+                                     "Transfer-Encoding: chunked\r\n"})
+    {
+        SCOPED_TRACE(fields);
+        const bool chunked = fields.find("chunked") != std::string::npos;
+        const int64_t expected = fields == "Content-Length: 0\r\n" ? 0 : -1;
+        const std::string body = chunked ? "1\r\nx\r\n0\r\n\r\n" : "";
+        const std::string wire = "POST / HTTP/1.1\r\n" + fields + "\r\n" + body + next;
+        for (size_t split = 1; split < wire.size(); ++split)
+        {
+            SCOPED_TRACE(split);
+            Parser parser({wire.substr(0, split), wire.substr(split)});
+            EXPECT_EQ(parser.conn->ContentLength(), expected);
+            const size_t reads = parser.script.reads;
+            EXPECT_EQ(parser.conn->ContentLength(), expected);
+            EXPECT_EQ(parser.script.reads, reads);
+            EXPECT_EQ(parser.conn->Error(), 0);
+            EXPECT_EQ(parser.Body(), chunked ? "x" : "");
+            ASSERT_TRUE(parser.conn->Reset());
+            EXPECT_EQ(parser.conn->ContentLength(), -1);
+            EXPECT_TRUE(parser.conn->Complete());
+        }
+    }
+}
+
+TEST(HttpServerParser, ContentLengthQueryValidatesAllHeadersAfterPartialIteration)
+{
+    for (const std::string later : {"Content-Length: 1\r\n", "Content-Length: nope\r\n",
+                                    "Transfer-Encoding: chunked\r\n"})
+    {
+        const std::string wire = "POST / HTTP/1.1\r\nContent-Length: 0\r\n" + later + "\r\n";
+        for (size_t split = 1; split < wire.size(); ++split)
+        {
+            SCOPED_TRACE(later);
+            SCOPED_TRACE(split);
+            Parser parser({wire.substr(0, split), wire.substr(split), next});
+            ASSERT_STREQ(parser.conn->NextHeaderName(), "Content-Length");
+            parser.conn->SkipHeaderValue();
+            EXPECT_EQ(parser.conn->ContentLength(), -1);
+            EXPECT_EQ(parser.conn->ParseError(), 400);
+            EXPECT_LT(parser.conn->Error(), 0);
+            EXPECT_FALSE(parser.conn->Complete());
+            EXPECT_FALSE(parser.conn->Reusable());
+            const size_t reads = parser.script.reads;
+            EXPECT_EQ(parser.conn->ContentLength(), -1);
+            EXPECT_FALSE(parser.conn->Reset());
+            EXPECT_EQ(parser.script.reads, reads);
+        }
+    }
+}
+
 }

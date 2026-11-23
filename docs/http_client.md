@@ -80,7 +80,9 @@ Destroy the connection's owning descriptor to abandon a body without draining it
 `Reset()` returns false for incomplete, failed, close-delimited, and upgraded connections.
 It never drains input, erases failure, reconnects, or retries. A transport/parser failure is
 terminal for this HTTP client. `ContentLength()` parses headers if necessary, reports the
-advertised entity length, and remains `-1` when none was declared; it never changes framing.
+advertised entity length (including explicit zero), and returns `-1` when none was declared
+or parsing failed. Inspect `Error()` to distinguish absence from failure; an earlier numeric
+value is never reported after failure. Queries never change framing or consume body bytes.
 Successful CONNECT ignores Content-Length/Transfer-Encoding and reports length `-1`.
 
 ## Framing and caller policy

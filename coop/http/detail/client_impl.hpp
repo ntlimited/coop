@@ -603,7 +603,7 @@ int64_t ClientConnectionImpl<Derived>::ContentLength()
     // earlier length. -1 means absent (including chunked/close-delimited framing).
     //
     if (m_phase < BODY) AdvanceToPhase(BODY);
-    return m_contentLength;
+    return m_error ? -1 : m_contentLength;
 }
 
 template<typename Derived>

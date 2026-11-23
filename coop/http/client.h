@@ -109,8 +109,9 @@ struct ClientConnectionImpl : detail::ParserBuffer<Derived>
     BodyResult NextBody();
     bool SkipBody();
 
-    // Completes header parsing and returns the advertised length, or -1 if absent.
-    // Does not turn an unknown length into an empty body. Inspect Error() on failure.
+    // Completes header parsing and returns the advertised length, including explicit zero.
+    // Returns -1 if absent or parsing failed; inspect Error() to distinguish failure.
+    // Does not turn an unknown length into an empty body.
     //
     int64_t ContentLength();
 

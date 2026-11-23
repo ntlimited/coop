@@ -493,7 +493,7 @@ bool ConnectionImpl<Derived>::FinishHeaders()
     // Content-Length and Transfer-Encoding are two different answers to "where does this
     // body end". Accepting both lets two readers of the same bytes disagree about the
     // message boundary, and the trailing bytes then become a request nobody sent
-    // (RFC 7230 3.3.3). There is no reading that is safe to guess at.
+    // (RFC 9112 6.3). There is no reading that is safe to guess at.
     //
     if (m_contentLength >= 0 && m_haveTransferEncoding)
     {
@@ -1015,15 +1015,11 @@ void ConnectionImpl<Derived>::SkipHeaders()
 template<typename Derived>
 int64_t ConnectionImpl<Derived>::ContentLength()
 {
-    if (m_contentLength >= 0) return m_contentLength;
-
-    if (m_phase < BODY)
-    {
-        AdvanceToPhase(BODY);
-    }
-
-    if (m_contentLength < 0) m_contentLength = 0;
-    return m_contentLength;
+    // Later fields can contradict an earlier length. Report only validated metadata,
+    // preserving absence independently of the request's implicit empty body.
+    //
+    if (m_phase < BODY) AdvanceToPhase(BODY);
+    return m_error ? -1 : m_contentLength;
 }
 
 template<typename Derived>

@@ -80,6 +80,14 @@ must tolerate a null `GetRequestLine()` and inspect `ParseError()`.
 
 ## Framing and file paths
 
+`ContentLength()` finishes the entire header block before reporting a validated advertised
+length: `0` means explicit zero, and `-1` means no Content-Length or a parsing failure.
+Check `Error()` to distinguish absence from failure. Repeated queries do not change framing
+or consume body bytes. Consumers that treated an absent length as zero must handle `-1`.
+Under [RFC 9112 section 6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3), a request
+without Content-Length or Transfer-Encoding has no body; a response without either is
+close-delimited unless its method or status forbids a body.
+
 Content-Length is parsed with checked arithmetic. Repeated or comma-joined lengths must agree.
 Content-Length together with any Transfer-Encoding field is rejected, including an empty field.
 Transfer codings remain opaque; the combined request transfer-coding list must be nonempty and

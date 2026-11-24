@@ -95,6 +95,16 @@ struct ConnectionBase
     //
     virtual int64_t ContentLength() = 0;
 
+    // Opt into a request with no body before invoking application work or sending a response.
+    // Consumes remaining arguments and headers, but no body bytes. Nonzero Content-Length
+    // or any Transfer-Encoding sends 400 and closes. This call owns newly encountered
+    // protocol-error responses, even with Caller error-response policy.
+    // Consume query arguments first if needed. False also reports existing parse/IO failure.
+    //
+    // Implementations without framing admission support refuse conservatively.
+    //
+    virtual bool RequireNoBody() { ForceClose(); return false; }
+
     // Receive the remaining body directly into a file at `offset` — the receive-to-disk
     // idiom. Body bytes already pulled into the recv buffer during header parsing are
     // written first; the framed remainder then moves socket -> pipe -> page cache without
@@ -228,6 +238,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
         return true;
     }
     int64_t ContentLength() override;
+    bool RequireNoBody() override;
     int64_t ReadBodyToFile(int fileFd, off_t offset) override;
     bool Send(int status, const char* contentType, const void* body, size_t size) override;
     bool Send(int status, const char* contentType, const std::string& body) override;
@@ -353,8 +364,9 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     //
     bool ResponseClosed() const
     {
-        return m_error && (m_options.errorResponse == ParserErrorResponse::Automatic ||
-                           m_parseError == 0);
+        return m_noBodyRejected ||
+            (m_error && (m_options.errorResponse == ParserErrorResponse::Automatic ||
+                         m_parseError == 0));
     }
 
     io::Descriptor& m_desc;
@@ -401,6 +413,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     size_t          m_headerBytes;
     bool            m_haveContentLength;
     bool            m_haveTransferEncoding;
+    bool            m_noBodyRejected;
     ServerParserOptions m_options;
     int             m_error;
     uint64_t        m_fieldNumber;

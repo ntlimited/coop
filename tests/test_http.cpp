@@ -2,6 +2,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -14,6 +15,7 @@
 #include "coop/self.h"
 #include "coop/io/descriptor.h"
 #include "coop/io/recv.h"
+#include "coop/io/poll.h"
 #include "coop/io/connect.h"
 #include "coop/io/send.h"
 #include "coop/io/write.h"
@@ -21,6 +23,7 @@
 #include "coop/http/client.h"
 #include "coop/http/server.h"
 #include "coop/http/server_handle.h"
+#include "coop/http/status.h"
 #include "coop/coordinate_with.h"
 #include "coop/ws/upgrade.h"
 #include "coop/io/recv_source.h"
@@ -37,8 +40,8 @@ static constexpr size_t HTTP_EXTRA = HttpConn::ExtraBytes();
 
 #include "test_helpers.h"
 #include "send_test_helpers.h"
-#include "coop/http/detail/server_impl.hpp"
 #include "tls_pair_helpers.h"
+#include "coop/http/detail/server_impl.hpp"
 
 namespace
 {
@@ -3745,6 +3748,245 @@ TEST(HttpTest, TlsConnectionStateClosesAfterHandshakeFailureWithoutHandler)
     }, {.stackSize = 65536});
 }
 
+TEST(HttpTest, NoBodyEndpointsRejectMalformedChunkBeforeHandlerAndClose)
+{
+    coop::http::ServerHandle control;
+    bool handlerRan = false;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        coop::Context::Handle serverHandle;
+        ctx->GetCooperator()->Spawn({.priority = 0, .stackSize = 65536},
+            [&](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.timeout = std::chrono::milliseconds(500);
+            config.handler = [](coop::http::ConnectionBase& conn, void* data)
+            {
+                auto path = conn.GetRequestLine()->path;
+                if (coop::http::StatusDispatch(conn, path)) return;
+                if (!conn.RequireNoBody()) return;
+                *static_cast<bool*>(data) = true;
+                conn.Send(200, "text/plain", "ok");
+            };
+            config.userData = &handlerRan;
+            coop::http::RunServer(serverCtx, config);
+        }, &serverHandle);
+        const auto port = control.Port();
+        ASSERT_NE(port, 0);
+
+        for (const char* path : {"/no-body", "/api/sampler"})
+        {
+            SCOPED_TRACE(path);
+            int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            ASSERT_GE(fd, 0);
+            coop::io::Descriptor client(fd, coop::GetUring());
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(port);
+            ASSERT_EQ(coop::io::ConnectKill(client,
+                reinterpret_cast<sockaddr*>(&address), sizeof(address),
+                std::chrono::milliseconds(500)), 0);
+            std::string request = "GET " + std::string(path) +
+                " HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\ninvalid chunk\r\n";
+            ASSERT_EQ(coop::io::SendKill(client, request.data(), request.size(), MSG_NOSIGNAL,
+                std::chrono::milliseconds(500)), static_cast<int>(request.size()));
+            ASSERT_EQ(::shutdown(client.m_fd, SHUT_WR), 0);
+            std::string response;
+            char buffer[512];
+            int received;
+            while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                        std::chrono::milliseconds(500))) > 0)
+                response.append(buffer, static_cast<size_t>(received));
+            EXPECT_EQ(received, 0);
+            EXPECT_NE(response.find("400 Bad Request\r\n"), std::string::npos);
+            EXPECT_NE(response.find("Connection: close\r\n"), std::string::npos);
+            EXPECT_EQ(response.find("200 OK\r\n"), std::string::npos);
+            EXPECT_FALSE(handlerRan);
+        }
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        serverHandle.Kill();
+    });
+}
+
+TEST(HttpTest, RefusedLargeBodyDeliversResponseBeforeOrderlyClose)
+{
+    coop::http::ServerHandle control;
+    bool handlerRan = false;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(5));
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* server)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.handler = [](coop::http::ConnectionBase& conn, void* value)
+            {
+                if (!conn.RequireNoBody()) return;
+                *static_cast<bool*>(value) = true;
+                conn.Send(200, "text/plain", "unexpected");
+            };
+            config.userData = &handlerRan;
+            EXPECT_TRUE(coop::http::RunServer(server, config));
+        }, &listener));
+        ASSERT_NE(control.Port(), 0);
+
+        for (const char* framing : {"Content-Length: 524288\r\n",
+                                   "Transfer-Encoding: chunked\r\n",
+                                   "Content-Length: invalid\r\n"})
+        {
+            SCOPED_TRACE(framing);
+            coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+            ASSERT_GE(client.m_fd, 0);
+            int size = 16384;
+            ASSERT_EQ(setsockopt(client.m_fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)), 0);
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(control.Port());
+            ASSERT_EQ(coop::io::ConnectKill(client,
+                reinterpret_cast<sockaddr*>(&address), sizeof(address),
+                std::chrono::seconds(1)), 0);
+            std::string upload = "POST /no-body HTTP/1.1\r\n" + std::string(framing) +
+                                 "\r\n" + std::string(524288, 'x');
+            coop::CountdownLatch uploaded(1);
+            bool bodySent = false;
+            ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context*)
+            {
+                size_t at = 0;
+                while (at < upload.size())
+                {
+                    int sent = coop::io::SendFastpathKill(client, upload.data() + at,
+                        upload.size() - at, MSG_NOSIGNAL, std::chrono::seconds(1));
+                    if (sent <= 0) break;
+                    at += static_cast<size_t>(sent);
+                }
+                bodySent = at == upload.size();
+                ::shutdown(client.m_fd, SHUT_WR);
+                uploaded.Arrive();
+            }));
+            std::string response;
+            char buffer[512];
+            int received;
+            while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                                                  std::chrono::seconds(1))) > 0)
+                response.append(buffer, static_cast<size_t>(received));
+            EXPECT_EQ(received, 0);
+            EXPECT_NE(response.find("400 Bad Request\r\n"), std::string::npos);
+            EXPECT_NE(response.find("Connection: close\r\n"), std::string::npos);
+            EXPECT_EQ(uploaded.WaitKill(ctx), coop::CountdownLatch::WaitStatus::Completed);
+            EXPECT_TRUE(bodySent);
+            EXPECT_FALSE(handlerRan);
+        }
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    }, {.stackSize = 65536});
+}
+
+TEST(HttpTest, RefusedBodyOverDrainCapPreservesResponseWithoutReset)
+{
+    coop::http::ServerHandle control;
+    coop::CountdownLatch entered(1);
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(5));
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* server)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.userData = &entered;
+            config.handler = [](coop::http::ConnectionBase& conn, void* data)
+            {
+                static_cast<coop::CountdownLatch*>(data)->Arrive();
+                EXPECT_FALSE(conn.RequireNoBody());
+            };
+            EXPECT_TRUE(coop::http::RunServer(server, config));
+        }, &listener));
+        ASSERT_NE(control.Port(), 0);
+        coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        ASSERT_GE(client.m_fd, 0);
+        ASSERT_EQ(ConnectLoopbackKill(client, control.Port()), 0);
+        const std::string request = "POST / HTTP/1.1\r\nContent-Length: 2097152\r\n\r\n" +
+                                    std::string(2 * 1024 * 1024, 'x');
+        // Queue the whole upload without yielding to the serving context. The body is
+        // twice the refusal drain cap, and remains in flight when that cap is reached.
+        //
+        ASSERT_EQ(::send(client.m_fd, request.data(), request.size(), MSG_NOSIGNAL | MSG_DONTWAIT),
+                  static_cast<ssize_t>(request.size()));
+
+        ASSERT_EQ(entered.WaitKill(ctx), coop::CountdownLatch::WaitStatus::Completed);
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        // POLLERR observes a reset that may follow the already queued FIN.
+        int ready = coop::io::PollKill(client, POLLERR, std::chrono::milliseconds(50));
+        EXPECT_TRUE(ready == -ETIMEDOUT || (ready >= 0 && (ready & POLLERR) == 0));
+        int error = 0;
+        socklen_t length = sizeof(error);
+        ASSERT_EQ(::getsockopt(client.m_fd, SOL_SOCKET, SO_ERROR, &error, &length), 0);
+        EXPECT_EQ(error, 0);
+        std::string response;
+        char buffer[512];
+        int received;
+        while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                                              std::chrono::seconds(1))) > 0)
+            response.append(buffer, static_cast<size_t>(received));
+        EXPECT_EQ(received, 0);
+        EXPECT_NE(response.find("400 Bad Request\r\n"), std::string::npos);
+        listener.Kill();
+    }, {.stackSize = 65536});
+}
+
+TEST(HttpTest, RefusalDrainIsBoundedForAnIdleUploader)
+{
+    coop::http::ServerHandle control;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(5));
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* server)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.handler = [](coop::http::ConnectionBase& conn, void*)
+            {
+                EXPECT_FALSE(conn.RequireNoBody());
+            };
+            EXPECT_TRUE(coop::http::RunServer(server, config));
+        }, &listener));
+        ASSERT_NE(control.Port(), 0);
+        coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        ASSERT_GE(client.m_fd, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(control.Port());
+        ASSERT_EQ(coop::io::ConnectKill(client, reinterpret_cast<sockaddr*>(&address),
+                                      sizeof(address), std::chrono::seconds(1)), 0);
+        const char request[] = "POST / HTTP/1.1\r\nContent-Length: 100000000\r\n\r\n";
+        ASSERT_EQ(coop::io::SendKill(client, request, sizeof(request) - 1, MSG_NOSIGNAL,
+                                    std::chrono::seconds(1)), sizeof(request) - 1);
+        std::string response;
+        char buffer[512];
+        int received;
+        while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                                              std::chrono::seconds(1))) > 0)
+            response.append(buffer, static_cast<size_t>(received));
+        EXPECT_EQ(received, 0);
+        EXPECT_NE(response.find("400 Bad Request\r\n"), std::string::npos);
+        // The peer keeps its write side open. A missing drain cap makes the soft drain
+        // expire and report false, rather than leaving this test blocked indefinitely.
+        //
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    }, {.stackSize = 65536});
+}
+
 TEST(HttpTest, Http10TlsCompletionTruncationErrorsAndFixedKeepAlive)
 {
     coop::http::ServerHandle control;
@@ -3950,6 +4192,49 @@ TEST(HttpTest, TlsClosureAlertDoesNotWaitForPeerAndHonorsWriteBounds)
             EXPECT_EQ(expired->Recv(&byte, 1), 0);
         }, {.stackSize = 65536});
     }
+}
+
+TEST(HttpTest, RefusalDrainPreservesResetForAnUnfinishedHttp10Stream)
+{
+    coop::http::ServerHandle control;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(3));
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* server)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.handler = [](coop::http::ConnectionBase& conn, void*)
+            {
+                conn.SkipHeaders();
+                EXPECT_EQ(conn.Error(), 0);
+                EXPECT_TRUE(conn.BeginChunked(200, "text/plain"));
+                EXPECT_TRUE(conn.SendChunk("unfinished", 10));
+            };
+            EXPECT_TRUE(coop::http::RunServer(server, config));
+        }, &listener));
+        ASSERT_NE(control.Port(), 0);
+        coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        ASSERT_GE(client.m_fd, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(control.Port());
+        ASSERT_EQ(coop::io::ConnectKill(client, reinterpret_cast<sockaddr*>(&address),
+                                      sizeof(address), std::chrono::seconds(1)), 0);
+        const char request[] = "GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\ninvalid\r\n";
+        ASSERT_EQ(coop::io::SendKill(client, request, sizeof(request) - 1, MSG_NOSIGNAL,
+                                    std::chrono::seconds(1)), sizeof(request) - 1);
+        char buffer[512];
+        int received;
+        while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                                              std::chrono::seconds(1))) > 0) {}
+        EXPECT_EQ(received, -ECONNRESET);
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    });
 }
 
 TEST(HttpTest, CompletedHttp10StreamSurvivesKillDuringRequestDrain)

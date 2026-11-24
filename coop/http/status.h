@@ -15,7 +15,9 @@ struct ConnectionBase;
 
 // Handle the built-in status/perf/sampler/epoch JSON API if `path` names one of its endpoints
 // (/api/status, /api/perf[...], /api/sampler[...], /api/cooperators[...], /api/epoch[...]). Returns
-// true if it wrote a response, false if the path is none of them. This is a composable handler, not
+// true if it wrote a response, false if the path is none of them. All endpoints except
+// /api/sampler/symbolize refuse request body framing before invoking their action handlers.
+// Query arguments are consumed before the no-body check. This is a composable handler, not
 // a route table: an application drops it into its own RequestHandler
 // (`if (http::StatusDispatch(conn, path)) return;`) to expose the dashboard API alongside its own
 // endpoints, and coop keeps no matching machinery of its own.

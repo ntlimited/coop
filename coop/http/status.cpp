@@ -239,7 +239,14 @@ std::string GenerateStatusJson(Cooperator* co)
     return out;
 }
 
-void HandleStatus(ConnectionBase& conn)
+struct StatusArguments
+{
+    perf::Family families = perf::Family::All;
+    int hz = 99;
+    bool stacks = false;
+};
+
+void HandleStatus(ConnectionBase& conn, const StatusArguments&)
 {
     std::string body = GenerateStatusJson(conn.GetCooperator());
     conn.Send(200, "application/json", body);
@@ -353,47 +360,27 @@ std::string GeneratePerfJson(Cooperator* co)
     return out;
 }
 
-void HandlePerf(ConnectionBase& conn)
+void HandlePerf(ConnectionBase& conn, const StatusArguments&)
 {
     std::string body = GeneratePerfJson(conn.GetCooperator());
     conn.Send(200, "application/json", body);
 }
 
-void HandlePerfEnable(ConnectionBase& conn)
+void HandlePerfEnable(ConnectionBase& conn, const StatusArguments& args)
 {
-    perf::Family families = perf::Family::All;
-    while (auto* name = conn.NextArgName())
-    {
-        if (name == std::string_view("families"))
-        {
-            if (auto* chunk = conn.ReadArgValue())
-                families = ParseFamilies(
-                    static_cast<const char*>(chunk->data), chunk->size);
-        }
-    }
-    perf::Enable(families);
+    perf::Enable(args.families);
     conn.Send(200, "application/json", "{\"ok\":true}");
 }
 
-void HandlePerfDisable(ConnectionBase& conn)
+void HandlePerfDisable(ConnectionBase& conn, const StatusArguments& args)
 {
-    perf::Family families = perf::Family::All;
-    while (auto* name = conn.NextArgName())
-    {
-        if (name == std::string_view("families"))
-        {
-            if (auto* chunk = conn.ReadArgValue())
-                families = ParseFamilies(
-                    static_cast<const char*>(chunk->data), chunk->size);
-        }
-    }
-    perf::Disable(families);
+    perf::Disable(args.families);
     conn.Send(200, "application/json", "{\"ok\":true}");
 }
 
 // ---- Sampler API ----
 
-void HandleSampler(ConnectionBase& conn)
+void HandleSampler(ConnectionBase& conn, const StatusArguments&)
 {
     std::string out;
     out.reserve(256);
@@ -415,40 +402,14 @@ void HandleSampler(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
-void HandleSamplerStart(ConnectionBase& conn)
+void HandleSamplerStart(ConnectionBase& conn, const StatusArguments& args)
 {
-    // Read hz and stacks from query string
-    //
-    int hz = 99;
-    bool stacks = false;
-    while (auto* name = conn.NextArgName())
-    {
-        if (name == std::string_view("hz"))
-        {
-            if (auto* chunk = conn.ReadArgValue())
-            {
-                char buf[16] = {};
-                size_t len = chunk->size < sizeof(buf) - 1 ? chunk->size : sizeof(buf) - 1;
-                memcpy(buf, chunk->data, len);
-                int val = atoi(buf);
-                if (val > 0) hz = val;
-            }
-        }
-        else if (name == std::string_view("stacks"))
-        {
-            if (auto* chunk = conn.ReadArgValue())
-            {
-                stacks = chunk->size > 0 &&
-                    static_cast<const char*>(chunk->data)[0] == '1';
-            }
-        }
-    }
     perf::ResetSamples();
-    bool ok = perf::StartSampling(hz, stacks);
+    bool ok = perf::StartSampling(args.hz, args.stacks);
     conn.Send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-void HandleSamplerStop(ConnectionBase& conn)
+void HandleSamplerStop(ConnectionBase& conn, const StatusArguments&)
 {
     perf::StopSampling();
     conn.Send(200, "application/json", "{\"ok\":true}");
@@ -527,7 +488,7 @@ static void SerializeStackSamples(JsonWriter& w, std::string& out)
     delete[] samples;
 }
 
-void HandleSamplerSamples(ConnectionBase& conn)
+void HandleSamplerSamples(ConnectionBase& conn, const StatusArguments&)
 {
     bool stackMode = perf::IsStackMode();
 
@@ -552,7 +513,7 @@ void HandleSamplerSamples(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
-void HandleSymbolize(ConnectionBase& conn)
+void HandleSymbolize(ConnectionBase& conn, const StatusArguments&)
 {
     // Read POST body: comma-separated hex PCs like "0x1234,0x5678,..."
     //
@@ -642,7 +603,7 @@ void HandleSymbolize(ConnectionBase& conn)
 // Context trees are gathered via SubmitSync to serialize access on the owning thread.
 //
 
-void HandleCooperators(ConnectionBase& conn)
+void HandleCooperators(ConnectionBase& conn, const StatusArguments&)
 {
     Cooperator* local = conn.GetCooperator();
     std::string out;
@@ -702,7 +663,7 @@ void HandleCooperators(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
-void HandleCooperatorsPerf(ConnectionBase& conn)
+void HandleCooperatorsPerf(ConnectionBase& conn, const StatusArguments&)
 {
     std::string out;
     out.reserve(4096);
@@ -737,7 +698,7 @@ void HandleCooperatorsPerf(ConnectionBase& conn)
 
 // ---- Epoch API ----
 
-void HandleEpoch(ConnectionBase& conn)
+void HandleEpoch(ConnectionBase& conn, const StatusArguments&)
 {
     auto* mgr = epoch::GetManager();
     if (!mgr)
@@ -778,7 +739,7 @@ void HandleEpoch(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
-void HandleEpochAll(ConnectionBase& conn)
+void HandleEpochAll(ConnectionBase& conn, const StatusArguments&)
 {
     auto* localMgr = epoch::GetManager();
 
@@ -826,7 +787,7 @@ void HandleEpochAll(ConnectionBase& conn)
 // currently parked in. For a blocked context that stack names the exact wait it is stuck on — curl
 // this on a wedged server and it explains itself. Two shapes: JSON for tooling, plaintext for eyes.
 
-void HandleContextStacks(ConnectionBase& conn)
+void HandleContextStacks(ConnectionBase& conn, const StatusArguments&)
 {
     Cooperator* co = conn.GetCooperator();
 
@@ -878,7 +839,7 @@ void HandleContextStacks(ConnectionBase& conn)
     conn.Send(200, "application/json", out.data(), out.size());
 }
 
-void HandleContextDump(ConnectionBase& conn)
+void HandleContextDump(ConnectionBase& conn, const StatusArguments&)
 {
     char* buf = nullptr;
     size_t sz = 0;
@@ -902,7 +863,7 @@ void HandleContextDump(ConnectionBase& conn)
 // heartbeat — poll twice and if it moved, the loop is progressing; if it is frozen while `blocked`
 // is high, something is wedging the thread (pair with /api/contexts/dump to see what).
 //
-void HandleHealth(ConnectionBase& conn)
+void HandleHealth(ConnectionBase& conn, const StatusArguments&)
 {
     Cooperator* co = conn.GetCooperator();
     Context* sched = co->Scheduled();
@@ -939,7 +900,7 @@ void HandleHealth(ConnectionBase& conn)
 // tooling: /api/sampler/start?stacks=1, apply load, then curl /api/sampler/folded > out.folded.
 // Symbolizing raw PCs is safe even for since-exited contexts — code addresses do not move.
 //
-void HandleSamplerFolded(ConnectionBase& conn)
+void HandleSamplerFolded(ConnectionBase& conn, const StatusArguments&)
 {
     static constexpr size_t MAX_READ = 2048;
     auto* samples = new perf::StackSample[MAX_READ];
@@ -976,19 +937,63 @@ void HandleSamplerFolded(ConnectionBase& conn)
 // walks it. Keeping it here (rather than in coop's server) is the point of the strip: routing is the
 // application's, and the dashboard is just another application.
 //
-struct StatusRoute { const char* path; void (*handler)(ConnectionBase&); };
+enum class StatusQuery { None, Perf, Sampler };
+
+struct StatusRoute
+{
+    const char* path;
+    void (*handler)(ConnectionBase&, const StatusArguments&);
+    StatusQuery query = StatusQuery::None;
+    bool acceptsBody = false;
+};
+
+// Query parsing precedes header validation because advancing to headers discards unread args.
+// Only the resulting bounded scalar options cross the no-body admission check.
+//
+StatusArguments ReadStatusArguments(ConnectionBase& conn, StatusQuery query)
+{
+    StatusArguments args;
+    if (query == StatusQuery::None) return args;
+    while (auto* name = conn.NextArgName())
+    {
+        if (query == StatusQuery::Perf && name == std::string_view("families"))
+        {
+            if (auto* chunk = conn.ReadArgValue())
+                args.families = ParseFamilies(
+                    static_cast<const char*>(chunk->data), chunk->size);
+        }
+        else if (query == StatusQuery::Sampler && name == std::string_view("hz"))
+        {
+            if (auto* chunk = conn.ReadArgValue())
+            {
+                char buf[16] = {};
+                size_t len = chunk->size < sizeof(buf) - 1 ? chunk->size : sizeof(buf) - 1;
+                memcpy(buf, chunk->data, len);
+                int value = atoi(buf);
+                if (value > 0) args.hz = value;
+            }
+        }
+        else if (query == StatusQuery::Sampler && name == std::string_view("stacks"))
+        {
+            if (auto* chunk = conn.ReadArgValue())
+                args.stacks = chunk->size > 0 &&
+                    static_cast<const char*>(chunk->data)[0] == '1';
+        }
+    }
+    return args;
+}
 
 StatusRoute s_statusRoutes[] = {
     {"/api/status",         HandleStatus},
     {"/api/perf",           HandlePerf},
-    {"/api/perf/enable",    HandlePerfEnable},
-    {"/api/perf/disable",   HandlePerfDisable},
+    {"/api/perf/enable",    HandlePerfEnable, StatusQuery::Perf},
+    {"/api/perf/disable",   HandlePerfDisable, StatusQuery::Perf},
     {"/api/sampler",        HandleSampler},
-    {"/api/sampler/start",  HandleSamplerStart},
+    {"/api/sampler/start",  HandleSamplerStart, StatusQuery::Sampler},
     {"/api/sampler/stop",   HandleSamplerStop},
     {"/api/sampler/samples", HandleSamplerSamples},
     {"/api/sampler/folded",  HandleSamplerFolded},
-    {"/api/sampler/symbolize", HandleSymbolize},
+    {"/api/sampler/symbolize", HandleSymbolize, StatusQuery::None, true},
     {"/api/health",          HandleHealth},
     {"/api/cooperators",       HandleCooperators},
     {"/api/cooperators/perf",  HandleCooperatorsPerf},
@@ -1008,8 +1013,18 @@ void StatusServerHandler(ConnectionBase& conn, void* userData)
 
     if (StatusDispatch(conn, path)) return;
 
+    // Header parsing can invalidate the borrowed path. Static serving already bounds paths
+    // to 511 bytes, so retain only that candidate before consuming the remaining headers.
+    //
+    char filePath[512];
+    size_t pathSize = path.size();
+    bool fileCandidate = pathSize < sizeof(filePath);
+    if (fileCandidate) memcpy(filePath, path.data(), pathSize);
+    if (!conn.RequireNoBody()) return;
+
     auto* searchPaths = static_cast<const char* const*>(userData);
-    if (searchPaths && ServeFile(conn, path, searchPaths)) return;
+    if (fileCandidate && searchPaths &&
+        ServeFile(conn, std::string_view(filePath, pathSize), searchPaths)) return;
 
     conn.Send(404, "text/plain", "Not Found\n");
 }
@@ -1022,7 +1037,9 @@ bool StatusDispatch(ConnectionBase& conn, std::string_view path)
     {
         if (path == route.path)
         {
-            route.handler(conn);
+            StatusArguments args = ReadStatusArguments(conn, route.query);
+            if (!route.acceptsBody && !conn.RequireNoBody()) return true;
+            route.handler(conn, args);
             return true;
         }
     }

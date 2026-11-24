@@ -3,6 +3,7 @@
 #include "transport.h"
 #include "tls_transport.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <optional>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -29,6 +31,8 @@
 #include "coop/io/io.h"
 #include "coop/io/ssl/connection.h"
 #include "coop/io/ssl/context.h"
+#include "coop/self.h"
+#include "coop/time/now.h"
 
 namespace coop
 {
@@ -209,6 +213,61 @@ struct ConnectionChildren
     ~ConnectionChildren() { lifetime.JoinChildren(); }
 };
 
+// A refusal must reach a peer that is still uploading. Half-close the response before
+// discarding a bounded remainder; closing immediately with unread socket data can reset
+// the connection before the peer observes the response. The parser never sees these bytes.
+//
+struct RefusalClose
+{
+    ConnectionBase& connection;
+    io::Descriptor& descriptor;
+
+    ~RefusalClose()
+    {
+        if (!connection.ParseError() || connection.SendError()) return;
+        // A truncated streamed response has already selected an abortive close. A
+        // half-close here could expose a clean FIN before that reset reaches the peer.
+        //
+        linger setting{};
+        socklen_t length = sizeof(setting);
+        if (::getsockopt(descriptor.m_fd, SOL_SOCKET, SO_LINGER, &setting, &length) == 0 &&
+            setting.l_onoff && setting.l_linger == 0) return;
+        if (::shutdown(descriptor.m_fd, SHUT_WR) != 0) return;
+
+        // Giving up with input still queued would reset this socket on close, even
+        // after SHUT_RD. Discard one queue snapshot without copying or waiting; a
+        // continuously uploading peer cannot extend this final cleanup operation.
+        //
+        struct DiscardQueued
+        {
+            int fd;
+            ~DiscardQueued()
+            {
+                ::shutdown(fd, SHUT_RD);
+                int queued = 0;
+                if (::ioctl(fd, FIONREAD, &queued) == 0 && queued > 0)
+                    ::recv(fd, nullptr, static_cast<size_t>(queued), MSG_DONTWAIT | MSG_TRUNC);
+            }
+        } discard{descriptor.m_fd};
+
+        static constexpr size_t MAX_DRAIN = 1024 * 1024;
+        const int64_t end = time::MonotonicMicros() + 200000;
+        auto* ctx = Self();
+        char buffer[4096];
+        size_t remaining = MAX_DRAIN;
+        while (remaining)
+        {
+            if (ctx && (ctx->IsKilled() || ctx->RemainingUs() <= 0)) return;
+            int64_t budget = end - time::MonotonicMicros();
+            if (budget <= 0) return;
+            int received = io::RecvKill(descriptor, buffer,
+                std::min(remaining, sizeof(buffer)), 0, time::Interval(budget));
+            if (received <= 0) return;
+            remaining -= static_cast<size_t>(received);
+        }
+    }
+};
+
 // A missing stream terminator must not masquerade as a successfully delimited EOF.
 // Construct before the child join so attached writers can finish while resources live.
 //
@@ -338,6 +397,7 @@ struct HttpConnection : Launchable
             ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
             m_timeout, m_parserOptions, lifetime.state);
         DrainParser parserRegistration(m_registration, conn.get());
+        RefusalClose refusal{*conn, m_fd};
 
         // Pbuf mode: one armed multishot recv serves the connection's lifetime; the
         // parser windows over kernel-selected chunks. Falls back to classic recv when
@@ -457,6 +517,7 @@ struct HttpTlsConnection : Launchable
             ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
             m_timeout, m_parserOptions, lifetime.state);
         DrainParser parserRegistration(m_registration, conn.get());
+        RefusalClose refusal{*conn, m_fd};
 
         ResponseClosure<Conn> closure{*conn, m_fd, GetContext(), &sslConn, m_timeout};
         ConnectionChildren children{lifetime};

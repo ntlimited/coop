@@ -35,6 +35,47 @@ EOF before a declared body ends is `-ECONNRESET`; a receive timeout remains `-ET
 Errors stay observable and subsequent pulls do not keep receiving. A failure must not be
 interpreted as a smaller successful upload.
 
+## Endpoints without request bodies
+
+A handler or its dispatcher can opt into body-free requests with one call before application
+work or response generation:
+
+```cpp
+if (!conn.RequireNoBody()) return;
+HandleStatusRequest(conn);
+```
+
+`bool ConnectionBase::RequireNoBody()` consumes remaining query arguments and headers,
+without reading body bytes. Consume any needed query arguments first. It accepts absent or
+zero Content-Length. A nonzero Content-Length or any Transfer-Encoding refuses the request
+with 400, disables subsequent sends and reuse, and makes the stock listener close the
+connection. This admission call owns newly encountered protocol-error responses even with Caller
+parser-error policy: malformed framing receives 400, and header-budget errors receive 431.
+The configured parser policy is restored after the call. Errors encountered before admission
+remain unchanged. A response already started cannot be replaced,
+so call the guard before sending anything. False can also indicate an existing parse or IO
+failure; inspect `Error()` and `ParseError()` as usual.
+
+The built-in status, performance, sampler, health, cooperator, epoch and context endpoints
+apply this check before their action handlers run. Their query options are captured first.
+The symbolization endpoint accepts its documented request body. The standalone status
+server also checks static-file and not-found requests. Chunk payload validity is irrelevant
+to admission: even a chunked request containing an invalid first chunk is refused before
+its target handler runs.
+
+The stock server half-closes its write side after a protocol-error response, then discards
+up to 1 MiB of unread socket data for at most 200 ms. Kill and the serving context's deadline
+can end that drain sooner. Provided-buffer receives are stopped before the drain. On giving
+up, the server shuts down reads and discards one snapshot of queued input with a nonwaiting,
+copy-free receive. This prevents the unread queue from aborting the already-sent response
+when the socket closes, without extending the drain for a continuing uploader. Uploads beyond
+either bound are cut short; clients should read the final response even when their upload
+fails. No body bytes reach the rejected handler.
+
+The default `ConnectionBase::RequireNoBody()` implementation refuses without reading and
+forces connection close. Custom connection implementations can override it to provide the
+framing check; the native implementation sends the documented protocol-error response.
+
 ## Borrowed lifetimes
 
 Request method, version, path, query and target are views into receive storage. Copy or consume

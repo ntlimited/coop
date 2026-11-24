@@ -10,6 +10,8 @@
 
 #include "coop/http/connection.h"
 #include "coop/http/detail/server_impl.hpp"
+#include "coop/http/status.h"
+#include "coop/perf/patch.h"
 #include "coop/io/uring.h"
 
 namespace
@@ -511,6 +513,203 @@ TEST(HttpServerParser, FileSendAdvancesByPartialProgress)
     ASSERT_EQ(parser.script.fileSends.size(), 15u);
     EXPECT_EQ(parser.script.fileSends[1].first, 12);
     EXPECT_EQ(parser.script.fileSends.back(), std::make_pair(off_t(103), size_t(2)));
+}
+
+TEST(HttpServerParser, StatusDispatchRejectsBodyBeforeSamplerResponse)
+{
+    Parser parser({"GET /api/sampler HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                   "invalid chunk\r\n"});
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    EXPECT_TRUE(coop::http::StatusDispatch(*parser.conn, "/api/sampler"));
+    EXPECT_NE(parser.script.sent.find("400 Bad Request\r\n"), std::string::npos);
+    EXPECT_EQ(parser.script.sent.find("200 OK\r\n"), std::string::npos);
+    EXPECT_NE(parser.script.sent.find("Connection: close\r\n"), std::string::npos);
+    EXPECT_EQ(parser.script.reads, 1);
+    EXPECT_FALSE(parser.conn->KeepAlive());
+    EXPECT_FALSE(parser.conn->Reset());
+}
+
+TEST(HttpServerParser, NoBodyGuardPrecedesHandlerAndNeverReadsBody)
+{
+    for (const char* framing : {"Content-Length: 1\r\n", "Transfer-Encoding: chunked\r\n",
+                                "Transfer-Encoding: gzip, chunked\r\n"})
+    {
+        for (auto policy : {coop::http::ParserErrorResponse::Automatic,
+                            coop::http::ParserErrorResponse::Caller})
+        {
+            SCOPED_TRACE(framing);
+            coop::http::ServerParserOptions options;
+            options.errorResponse = policy;
+            std::string head = "GET /no-body HTTP/1.1\r\n" + std::string(framing) + "\r\n";
+            Parser parser({head, "invalid chunk\r\n"}, 128, options);
+            bool handlerRan = false;
+            auto dispatch = [&]
+            {
+                if (!parser.conn->RequireNoBody()) return;
+                handlerRan = true;
+                parser.conn->Send(200, "text/plain", "ok");
+            };
+            dispatch();
+            EXPECT_FALSE(handlerRan);
+            EXPECT_EQ(parser.script.reads, 1);
+            EXPECT_EQ(parser.conn->ParseError(), 400);
+            EXPECT_EQ(parser.conn->Error(), -EPROTO);
+            EXPECT_FALSE(parser.conn->KeepAlive());
+            EXPECT_FALSE(parser.conn->SkipBody());
+            EXPECT_FALSE(parser.conn->Reset());
+            EXPECT_NE(parser.script.sent.find("400 Bad Request\r\n"), std::string::npos);
+            EXPECT_NE(parser.script.sent.find("Connection: close\r\n"), std::string::npos);
+            std::string response = parser.script.sent;
+            EXPECT_FALSE(parser.conn->RequireNoBody());
+            EXPECT_FALSE(parser.conn->Send(200, "text/plain", "late"));
+            EXPECT_EQ(parser.script.sent, response);
+        }
+    }
+}
+
+TEST(HttpServerParser, NoBodyGuardAcceptsAbsentAndZeroLengthAndPreservesPipeline)
+{
+    for (const char* framing : {"", "Content-Length: 0\r\n"})
+    {
+        std::string request = "GET /no-body HTTP/1.1\r\n" + std::string(framing) + "\r\n";
+        for (size_t split = 1; split < request.size(); ++split)
+        {
+            SCOPED_TRACE(split);
+            Parser parser({request.substr(0, split), request.substr(split) + next});
+            EXPECT_TRUE(parser.conn->RequireNoBody());
+            EXPECT_TRUE(parser.conn->Complete());
+            EXPECT_TRUE(parser.conn->KeepAlive());
+            EXPECT_TRUE(parser.script.sent.empty());
+            ASSERT_TRUE(parser.conn->Reset());
+            ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+            EXPECT_EQ(parser.conn->GetRequestLine()->path, "/next");
+        }
+    }
+}
+
+TEST(HttpServerParser, AllNoBodyStatusRoutesRejectFramingBeforeTheirHandler)
+{
+    for (const char* path : {"/api/status", "/api/perf", "/api/perf/enable",
+            "/api/perf/disable", "/api/sampler", "/api/sampler/start", "/api/sampler/stop",
+            "/api/sampler/samples", "/api/sampler/folded", "/api/health", "/api/cooperators",
+            "/api/cooperators/perf", "/api/epoch", "/api/epoch/all", "/api/contexts/stacks",
+            "/api/contexts/dump"})
+    {
+        SCOPED_TRACE(path);
+        Parser parser({"GET " + std::string(path) +
+                       "?families=io&hz=17&stacks=1 HTTP/1.1\r\nContent-Length: 1\r\n\r\n",
+                       "x"});
+        ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+        EXPECT_TRUE(coop::http::StatusDispatch(*parser.conn, path));
+        EXPECT_NE(parser.script.sent.find("400 Bad Request\r\n"), std::string::npos);
+        EXPECT_EQ(parser.script.sent.find("200 OK\r\n"), std::string::npos);
+        EXPECT_EQ(parser.script.reads, 1);
+    }
+}
+
+TEST(HttpServerParser, StatusQueryOptionsSurviveNoBodyValidation)
+{
+    auto original = coop::perf::EnabledFamilies();
+    coop::perf::SetFamilies({});
+    Parser enable({"GET /api/perf/enable?families=io HTTP/1.1\r\n\r\n"});
+    ASSERT_NE(enable.conn->GetRequestLine(), nullptr);
+    EXPECT_TRUE(coop::http::StatusDispatch(*enable.conn, "/api/perf/enable"));
+    EXPECT_NE(enable.script.sent.find("200 OK\r\n"), std::string::npos);
+#if COOP_PERF_MODE == 2
+    EXPECT_EQ(coop::perf::EnabledFamilies(), coop::perf::Family::IO);
+#endif
+    Parser disable({"GET /api/perf/disable?families=io HTTP/1.1\r\n\r\n"});
+    ASSERT_NE(disable.conn->GetRequestLine(), nullptr);
+    EXPECT_TRUE(coop::http::StatusDispatch(*disable.conn, "/api/perf/disable"));
+    EXPECT_NE(disable.script.sent.find("200 OK\r\n"), std::string::npos);
+#if COOP_PERF_MODE == 2
+    EXPECT_EQ(coop::perf::EnabledFamilies(), coop::perf::Family{});
+#endif
+    coop::perf::SetFamilies(original);
+}
+
+TEST(HttpServerParser, SymbolizeStatusRouteRetainsItsRequestBody)
+{
+    Parser parser({"POST /api/sampler/symbolize HTTP/1.1\r\nContent-Length: 3\r\n\r\n0x0"});
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    EXPECT_TRUE(coop::http::StatusDispatch(*parser.conn, "/api/sampler/symbolize"));
+    EXPECT_NE(parser.script.sent.find("200 OK\r\n"), std::string::npos);
+    EXPECT_TRUE(parser.conn->Complete());
+}
+
+TEST(HttpServerParser, NoBodyGuardOwnsNewHeaderFailuresAndRestoresCallerPolicy)
+{
+    for (const char* framing : {"Transfer-Encoding:\r\n", "Transfer-Encoding: gzip\r\n",
+            "Transfer-Encoding: chunked;invalid\r\n", "Transfer-Encoding: chunked, gzip\r\n",
+            "Content-Length: invalid\r\n"})
+    {
+        SCOPED_TRACE(framing);
+        coop::http::ServerParserOptions options;
+        options.errorResponse = coop::http::ParserErrorResponse::Caller;
+        Parser parser({"GET /no-body HTTP/1.1\r\n" + std::string(framing) + "\r\n",
+                       "invalid chunk\r\n"}, 128, options);
+        bool handlerRan = false;
+        if (parser.conn->RequireNoBody()) handlerRan = true;
+        EXPECT_FALSE(handlerRan);
+        EXPECT_EQ(parser.script.reads, 1);
+        EXPECT_EQ(parser.conn->ParseError(), 400);
+        EXPECT_EQ(parser.conn->Error(), -EPROTO);
+        EXPECT_EQ(parser.conn->GetParserOptions().errorResponse, options.errorResponse);
+        EXPECT_FALSE(parser.conn->KeepAlive());
+        EXPECT_FALSE(parser.conn->Reset());
+        EXPECT_NE(parser.script.sent.find("400 Bad Request\r\n"), std::string::npos);
+        EXPECT_NE(parser.script.sent.find("Connection: close\r\n"), std::string::npos);
+        std::string response = parser.script.sent;
+        EXPECT_FALSE(parser.conn->RequireNoBody());
+        EXPECT_FALSE(parser.conn->Send(200, "text/plain", "late"));
+        EXPECT_EQ(parser.script.sent, response);
+    }
+
+    coop::http::ServerParserOptions options;
+    options.errorResponse = coop::http::ParserErrorResponse::Caller;
+    options.maxHeaderCount = 0;
+    Parser limited({"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"}, 128, options);
+    EXPECT_FALSE(limited.conn->RequireNoBody());
+    EXPECT_EQ(limited.conn->ParseError(), 431);
+    EXPECT_NE(limited.script.sent.find("431 Request Header Fields Too Large\r\n"),
+              std::string::npos);
+    EXPECT_EQ(limited.conn->GetParserOptions().errorResponse, options.errorResponse);
+}
+
+TEST(HttpServerParser, NoBodyGuardPreservesExistingFailureAndAvoidsSecondResponse)
+{
+    coop::http::ServerParserOptions options;
+    options.errorResponse = coop::http::ParserErrorResponse::Caller;
+    Parser failed({"GET / HTTP/1.1\r\nTransfer-Encoding:\r\n\r\n"}, 128, options);
+    failed.conn->SkipHeaders();
+    ASSERT_EQ(failed.conn->ParseError(), 400);
+    EXPECT_TRUE(failed.script.sent.empty());
+    EXPECT_FALSE(failed.conn->RequireNoBody());
+    EXPECT_TRUE(failed.script.sent.empty());
+    EXPECT_EQ(failed.conn->GetParserOptions().errorResponse, options.errorResponse);
+
+    for (const char* framing : {"Transfer-Encoding: chunked\r\n", "Transfer-Encoding:\r\n"})
+    {
+        SCOPED_TRACE(framing);
+        Parser started({"GET / HTTP/1.1\r\n" + std::string(framing) + "\r\n"}, 128, options);
+        ASSERT_NE(started.conn->GetRequestLine(), nullptr);
+        ASSERT_TRUE(started.conn->Send(200, "text/plain", "started"));
+        std::string response = started.script.sent;
+        EXPECT_FALSE(started.conn->RequireNoBody());
+        EXPECT_EQ(started.conn->ParseError(), 400);
+        EXPECT_FALSE(started.conn->KeepAlive());
+        EXPECT_FALSE(started.conn->Send(200, "text/plain", "late"));
+        EXPECT_EQ(started.script.sent, response);
+    }
+}
+
+TEST(HttpServerParser, LegacyNoBodyAdmissionDefaultsToRefusalWithoutReading)
+{
+    Parser parser({"GET / HTTP/1.1\r\n\r\n"});
+    EXPECT_FALSE(parser.conn->coop::http::ConnectionBase::RequireNoBody());
+    EXPECT_FALSE(parser.conn->KeepAlive());
+    EXPECT_EQ(parser.script.reads, 0);
+    EXPECT_TRUE(parser.script.sent.empty());
 }
 
 TEST(HttpServerParser, Http10FixedLengthKeepAliveRetainsPersistence)

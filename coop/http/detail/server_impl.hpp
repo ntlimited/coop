@@ -88,6 +88,7 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_headerBytes(0)
 , m_haveContentLength(false)
 , m_haveTransferEncoding(false)
+, m_noBodyRejected(false)
 , m_options(options)
 , m_error(0)
 , m_fieldNumber(0)
@@ -136,6 +137,7 @@ bool ConnectionImpl<Derived>::Reset()
     m_headerBytes              = 0;
     m_haveContentLength        = false;
     m_haveTransferEncoding     = false;
+    m_noBodyRejected           = false;
     m_fieldNumber = 0;
     m_fieldState = 0;
     m_tokenLength = 0;
@@ -1037,6 +1039,25 @@ int64_t ConnectionImpl<Derived>::ContentLength()
     //
     if (m_phase < BODY) AdvanceToPhase(BODY);
     return m_error ? -1 : m_contentLength;
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::RequireNoBody()
+{
+    if (m_error) return false;
+
+    // Explicit admission owns the refusal, including malformed framing discovered while
+    // parsing headers. Restore caller policy afterwards; a refusal remains terminal.
+    //
+    auto policy = m_options.errorResponse;
+    m_options.errorResponse = ParserErrorResponse::Automatic;
+    bool accepted = (m_phase >= BODY || AdvanceToPhase(BODY)) && !m_error;
+    if (accepted && (m_contentLength > 0 || m_haveTransferEncoding))
+        accepted = FailRequest(400);
+    m_options.errorResponse = policy;
+
+    if (!accepted) m_noBodyRejected = true;
+    return accepted;
 }
 
 template<typename Derived>

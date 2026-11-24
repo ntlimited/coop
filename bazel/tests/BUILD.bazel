@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 load(":consumer_test.bzl", "consumer_test")
 
 # These headers belong to the fictional consumer, rather than the runtime target.
@@ -22,4 +22,12 @@ consumer_test(
     name = "consumer_settings_test",
     size = "small",
     binary = ":consumer_binary",
+)
+
+# Exercise the fetched libc headers and linked runtime without system development headers.
+cc_test(
+    name = "toolchain_headers_test",
+    size = "small",
+    srcs = ["toolchain_headers.cpp"],
+    linkopts = ["-pthread"],
 )

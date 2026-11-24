@@ -46,7 +46,12 @@ bazelisk test //... --runs_per_test=3
 The pinned Bazel 8 build fetches its dependencies from the public Bazel Central Registry.
 The [hermetic LLVM toolchain](https://registry.bazel.build/modules/llvm/0.6.1) supplies
 LLVM 21, libc++, Linux headers, and glibc ABI stubs, so no system compiler or development
-packages are required. A normal Linux userspace with Bash, coreutils, tar, and network
+packages are required. When this checkout is the root module, its checked-in patch to
+the pinned LLVM release makes the x86_64 glibc build select shared x86 ABI headers
+before generic fallbacks; no local toolchain override is needed. Bazel ignores a
+dependency's `single_version_override`: roots depending on coop must apply the patch
+as described below. The aarch64 include order is unchanged.
+A normal Linux userspace with Bash, coreutils, tar, and network
 access to the public archives is needed. Tests require a kernel and syscall policy that
 permit `io_uring`, loopback networking, and executable-memory patching for perf mode 2.
 No tests are excluded by default. Docker's default seccomp policy may block `io_uring`;
@@ -107,11 +112,47 @@ The helper target supports both `"test_helpers.h"` and `"tests/test_helpers.h"` 
 dispatch object and linker wrapping; link it with a gtest main to embed the suite.
 `@coop//:http_static` exports the dashboard files.
 
-The consumer owns its compilation mode and toolchain registration; dependency rc files
-are not imported by Bazel. Use C++20 for consumer sources, register the fetched toolchain
-with `register_toolchains("@llvm//toolchain:all")` after declaring the same `llvm` dependency,
-or supply a compatible Linux C++20 toolchain yourself. Set layout-affecting options in the
-consumer's rc so coop and all consumers agree:
+Bazel applies `single_version_override` only from the root module, and its patch
+labels must name files in the root module. Coop's own override therefore does not
+repair the fetched LLVM toolchain when coop is a dependency. Copy
+`extern/coop/bazel/patches/llvm-glibc-x86-includes.patch` into the root project's
+`third_party/patches/llvm-glibc-x86-includes.patch` (adjust the source path for a
+non-vendored dependency). In `third_party/patches/BUILD.bazel`, export that file:
+
+```starlark
+exports_files(["llvm-glibc-x86-includes.patch"])
+```
+
+Add the following to the root's `MODULE.bazel`. Keep LLVM at `0.6.1` while using
+this patch; an incompatible version's changed hunk should fail rather than silently
+omit the correction. The extension declarations mirror coop's native Linux targets;
+if the root already declares this extension, merge the tags instead of duplicating them.
+
+```starlark
+bazel_dep(name = "llvm", version = "0.6.1")
+single_version_override(
+    module_name = "llvm",
+    version = "0.6.1",
+    patch_strip = 1,
+    patches = ["//third_party/patches:llvm-glibc-x86-includes.patch"],
+)
+toolchain = use_extension("@llvm//extensions:toolchain.bzl", "toolchain")
+toolchain.exec(arch = "x86_64", os = "linux")
+toolchain.exec(arch = "aarch64", os = "linux")
+toolchain.target(arch = "x86_64", os = "linux")
+toolchain.target(arch = "aarch64", os = "linux")
+use_repo(toolchain, "llvm_toolchains")
+register_toolchains("@llvm_toolchains//:all")
+```
+
+Toolchain registration through coop remains transitive; the root override patches
+the same fetched module used by that registration. A root supplying its own compatible
+Linux C++20 toolchain can register that toolchain instead, without copying the patch;
+verify that its toolchain is selected for coop as well as application targets.
+
+The root owns compilation mode, C++20 options and toolchain selection; dependency rc
+files are not imported by Bazel. Set layout-affecting options in the root's rc so
+coop and all consumers agree:
 
 ```text
 build --platforms=@coop//bazel:linux

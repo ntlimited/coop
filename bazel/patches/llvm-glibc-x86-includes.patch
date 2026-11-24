@@ -1,0 +1,10 @@
+--- a/3rd_party/libc/glibc/helpers.bzl
++++ b/3rd_party/libc/glibc/helpers.bzl
+@@ -19,6 +19,7 @@
+         "sysdeps/unix/{}".format(cpu),
+         "sysdeps/unix",
+         "sysdeps/{}".format(cpu),
++    ] + (["sysdeps/x86"] if cpu == "x86_64" else []) + [
+         "sysdeps/generic",
+         ".",
+     ]

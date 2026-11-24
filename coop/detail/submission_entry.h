@@ -26,6 +26,9 @@ struct SubmissionEntry
     // A countdown notification is a wakeup, not work.
     //
     bool m_inline{false};
+
+    // Caller-owned slots complete through their own lifetime protocol instead of delete.
+    bool m_callerOwned{false};
 };
 
 } // end namespace coop

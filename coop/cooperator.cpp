@@ -19,6 +19,7 @@
 
 #include "cooperator.h"
 #include "cooperate.h"
+#include "cooperate_submission.h"
 #include "context_var.h"
 #include "detail/context_switch.h"
 #include "detail/memory_order.h"
@@ -275,6 +276,12 @@ Cooperator::Cooperator(CooperatorConfiguration const& config)
 
 Cooperator::~Cooperator()
 {
+    // A cooperator may own queued work without ever having entered Launch. Close admission and
+    // return those submissions while its completion and local-storage infrastructure is live.
+    //
+    m_shutdown.store(true, detail::kStoreFlag);
+    DrainRemainingSubmissions();
+
     // Destruct cooperator-vars before cooperator's own members. This ensures var destructors
     // can safely reference cooperator infrastructure (epoch manager, uring, etc.).
     //
@@ -462,8 +469,10 @@ void Cooperator::EndCompletionWait()
 
 void Cooperator::InvokeNotification(SubmissionEntry* entry)
 {
+    auto destroy = entry->m_destroy;
     entry->m_invoke(entry, m_scheduled);
-    entry->m_destroy(entry);
+    // The notification may publish retirement on another cooperator.
+    destroy(entry);
 }
 
 void Cooperator::DrainSubmissions()
@@ -498,6 +507,26 @@ void Cooperator::DrainSubmissions()
 
 void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
 {
+    if (entry->m_callerOwned)
+    {
+        auto* submission = static_cast<CooperateSubmission*>(entry);
+        bool cancelled;
+        {
+            std::lock_guard<std::mutex> lock(submission->m_lock);
+            cancelled = submission->m_cancelled;
+        }
+        if (cancelled || m_shutdown.load(detail::kLoadFlag))
+        {
+            submission->Finish(CooperateSubmission::Status::Refused);
+            return;
+        }
+        bool spawned = Spawn(entry->m_config, [submission](Context* ctx)
+        { submission->Run(ctx); });
+        if (!spawned)
+            submission->Finish(CooperateSubmission::Status::Refused);
+        return;
+    }
+
     bool isCooperate = (reinterpret_cast<uintptr_t>(entry->m_completion) & 1) != 0;
 
     if (isCooperate)
@@ -555,10 +584,13 @@ void Cooperator::SpawnFromSubmission(SubmissionEntry* entry)
 
 void Cooperator::DrainRemainingSubmissions()
 {
-    std::lock_guard<std::mutex> lock(m_submissionLock);
-    auto* head = m_submissionHead;
-    m_submissionHead = nullptr;
-    m_submissionTail = nullptr;
+    SubmissionEntry* head;
+    {
+        std::lock_guard<std::mutex> lock(m_submissionLock);
+        head = m_submissionHead;
+        m_submissionHead = nullptr;
+        m_submissionTail = nullptr;
+    }
     while (head)
     {
         auto* entry = head;
@@ -567,6 +599,12 @@ void Cooperator::DrainRemainingSubmissions()
         if (entry->m_inline)
         {
             InvokeNotification(entry);
+            continue;
+        }
+
+        if (entry->m_callerOwned)
+        {
+            static_cast<CooperateSubmission*>(entry)->Finish(CooperateSubmission::Status::Refused);
             continue;
         }
 
@@ -636,6 +674,10 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
             m_scheduled = nullptr;
             std::atomic_signal_fence(std::memory_order_release);
             m_stackPool.Free(exited, stackSize);
+            auto* submission = m_retiringSubmission;
+            m_retiringSubmission = nullptr;
+            if (submission)
+                submission->Retired();
             break;
         }
         case SchedulerJumpResult::YIELDED:
@@ -659,14 +701,22 @@ void Cooperator::HandleCooperatorResumption(const SchedulerJumpResult res)
 
 void Cooperator::Launch()
 {
+    bool refused;
     {
         std::lock_guard<std::mutex> lock(s_registryMutex);
-        if (s_registryShutdown.load(detail::kLoadFlag))
-        {
+        refused = s_registryShutdown.load(detail::kLoadFlag);
+        if (refused)
             Shutdown();
-            return;
-        }
-        s_registry.Push(this);
+        else
+            s_registry.Push(this);
+    }
+    if (refused)
+    {
+        // Work can be admitted before the run thread registers. Refusal still owes completion
+        // and destruction, outside the registry lock so callable cleanup can inspect the registry.
+        //
+        DrainRemainingSubmissions();
+        return;
     }
 
     // The thread-cooperator binding is valid only for Launch's dynamic extent and is cleared on
@@ -1530,10 +1580,16 @@ extern "C" void CoopContextEntry(coop::Context* ctx)
     //
     coop::detail::ContextVarRegistry::Instance().DestructAll(ctx->m_segment.Bottom());
 
+    // Cache the completion owner while Context is alive. Its storage is released only after
+    // callable cleanup, context variables, child joining and the final switch all finish.
+    //
+    auto* submission = ctx->m_ownedSubmission;
+
     // Context destructor must run while we're still on this context's stack so that kill signals
     // can context-switch to waiters safely.
     //
     ctx->~Context();
+    coop::Cooperator::thread_cooperator->m_retiringSubmission = submission;
 
     // The last switch this stack ever makes. It is not bracketed, because there is no return to
     // bracket: the cooperator reclaims the segment on the far side.

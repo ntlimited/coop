@@ -156,6 +156,25 @@ cooperator.SubmitSync([&](Context* ctx) { ... });
 cooperator.Submit(&MyFunc, argPtr);
 cooperator.Submit(&MyFunc, argPtr, config);
 ```
+`Cooperate(CooperateSubmission&)` queues a caller-owned one-shot slot from any thread. Include
+`coop/cooperate_submission.h` and provide a body function and borrowed state; no submission,
+cancellation or completion allocation is needed. The target still allocates its execution stack.
+The slot's optional nonblocking completion callback runs once on the thread retiring the work;
+executed work completes on the target owner after worker retirement. The callback must not yield
+or block and cannot assume an active context. `Wait(ctx)` joins the body, attached child subtrees,
+callable/context-variable cleanup, context retirement, callback and queued cancellation
+notifications. A killed waiter requests cancellation and still joins; `CancelAndWait(ctx)` requests
+it explicitly. `Cancel()` alone is only a request and may run on any thread. Queued cancellation
+prevents body invocation. `Cancelled` and `Refused` guarantee no body invocation; `Killed` means
+an invoked body returned with its context killed, so effects may have occurred. `Completed` is
+frozen when the body returns normally, including when cancellation arrives during later cleanup.
+Retain the slot and borrowed state until `Wait` returns or a plain-thread successor observes
+`IsRetired()`. The callback itself cannot free either: final latch publication follows it.
+`IsRetired()` stays false during an active Wait. Join concurrent API calls before freeing, and keep
+the target until retirement; destroying an unlaunched target retires its queue. Detached work must
+not borrow caller storage. A slot is not reusable: repeated submission returns false unchanged.
+Idle Wait returns Idle; concurrent waiters and destruction before retirement terminate in all builds.
+
 `Submit` returns false if the cooperator is shutting down. `SubmitSync` returns false without
 blocking on shutdown. Submissions are drained on every scheduler iteration (after each Poll
 and resume batch), giving tighter pickup guarantees than the previous semaphore-based system.

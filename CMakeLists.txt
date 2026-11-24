@@ -331,6 +331,17 @@ target_link_options(coop_tests PRIVATE -rdynamic
     -Wl,--wrap=io_uring_register
     -Wl,--wrap=io_uring_register_probe
     -Wl,--wrap=_ZN4coop2io6HandleD1Ev
+    -Wl,--wrap=_Znwm
+    -Wl,--wrap=_ZnwmRKSt9nothrow_t
+    -Wl,--wrap=malloc
+    -Wl,--wrap=aligned_alloc
+    -Wl,--wrap=posix_memalign
+    -Wl,--wrap=_Znam
+    -Wl,--wrap=_ZnamRKSt9nothrow_t
+    -Wl,--wrap=_ZnwmSt11align_val_t
+    -Wl,--wrap=_ZnamSt11align_val_t
+    -Wl,--wrap=_ZnwmSt11align_val_tRKSt9nothrow_t
+    -Wl,--wrap=_ZnamSt11align_val_tRKSt9nothrow_t
     -Wl,--wrap=uname
     -Wl,--wrap=mmap
     -Wl,--wrap=munmap)

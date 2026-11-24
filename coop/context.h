@@ -10,6 +10,9 @@
 #include "detail/scheduler_state.h"
 #include "spawn_configuration.h"
 
+namespace coop { struct Context; }
+extern "C" void CoopContextEntry(coop::Context*);
+
 namespace coop
 {
 
@@ -54,6 +57,7 @@ struct Segment
 struct Coordinator;
 struct CoordinatorExtension;
 struct Cooperator;
+class CooperateSubmission;
 
 // Three different groups of mutually exclusive lists are kept for contexts:
 // - the list of all contexts for a given cooperator
@@ -333,6 +337,13 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     //
     void (*m_cleanup)(Context*);
 
+  private:
+    friend class CooperateSubmission;
+    friend void ::CoopContextEntry(::coop::Context*);
+    // Submission storage remains borrowed until the scheduler retires this context.
+    CooperateSubmission* m_ownedSubmission{nullptr};
+
+  public:
     // Must be last member
     //
     Segment m_segment;

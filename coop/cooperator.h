@@ -45,6 +45,7 @@ enum class SchedulerJumpResult
 struct Launchable;
 struct CooperateHandle;
 class CountdownLatch;
+class CooperateSubmission;
 
 namespace work { struct Participation; }
 
@@ -142,6 +143,11 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     template<typename Fn>
     bool Cooperate(Fn&& fn, CooperateHandle* handle = nullptr,
                    SpawnConfiguration const& config = s_defaultConfiguration);
+
+    // Caller-owned one-shot storage, queued from any thread. Wait or IsRetired joins
+    // completion/cancellation. Refusal completes the slot; accepted work may finish before
+    // return. A non-Idle slot is refused with false and left unchanged (it is not reusable).
+    bool Cooperate(CooperateSubmission& submission);
 
     // Submit queues work from an external thread onto this cooperator. The cooperator wakes via
     // eventfd and spawns a context to execute the lambda. Fire-and-forget — the lambda is
@@ -587,6 +593,8 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // Cooperate calls and must still be queued while their caller is shutting down.
     //
     friend class CountdownLatch;
+    friend class CooperateSubmission;
+    friend struct CooperateSubmissionTestAccess;
     void BeginCompletionWait();
     void EndCompletionWait();
     size_t m_completionWaits{0};
@@ -653,6 +661,9 @@ struct Cooperator : EmbeddedListHookups<Cooperator, int, COOPERATOR_LIST_REGISTR
     // CooperatorVarRegistry; access is thread-local cooperator + constant offset.
     //
     alignas(kCooperatorVarAlignment) char m_localStorage[LOCAL_STORAGE_SIZE];
+
+    // Published only immediately before EXITED; no context can yield with this set.
+    CooperateSubmission* m_retiringSubmission{nullptr};
 
     static std::atomic<bool> s_registryShutdown;
     static std::mutex        s_registryMutex;

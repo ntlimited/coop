@@ -72,6 +72,10 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_chunkedStatus(0)
 , m_chunkedContentType(nullptr)
 , m_keepAlive(true)
+, m_http10(false)
+, m_closeDelimitedResponse(false)
+, m_closeDelimitedComplete(false)
+, m_responseContentLength(false)
 , m_clientClose(false)
 , m_sendError(false)
 , m_parseError(0)
@@ -136,6 +140,10 @@ bool ConnectionImpl<Derived>::Reset()
     m_valueStarted = false;
     m_needChunkCrlf = false;
     m_keepAlive = true;
+    m_http10 = false;
+    m_closeDelimitedResponse = false;
+    m_closeDelimitedComplete = false;
+    m_responseContentLength = false;
     return true;
 }
 
@@ -596,6 +604,7 @@ bool ConnectionImpl<Derived>::ParseRequestLine()
     std::string_view version(targetEnd + 1, lineEnd - targetEnd - 1);
     if (version != "HTTP/1.1" && version != "HTTP/1.0") return Fail(-EPROTO);
     m_requestLine.version = version;
+    m_http10 = version == "HTTP/1.0";
     m_keepAlive = version == "HTTP/1.1";
     for (char* q = base + pathStart; q != targetEnd; ++q)
         if (static_cast<unsigned char>(*q) <= 0x20 || *q == 0x7f) return Fail(-EPROTO);
@@ -1391,6 +1400,8 @@ bool ConnectionImpl<Derived>::AppendLiteral(const char (&s)[N])
 template<typename Derived>
 bool ConnectionImpl<Derived>::AppendConnectionTrailer()
 {
+    // An early HTTP/1.0 response cannot promise persistence before request headers opt in.
+    if (m_http10 && !m_keepAlive) m_clientClose = true;
     if (m_keepAlive && !m_clientClose)
     {
         return AppendLiteral(response::CONN_KEEP_ALIVE);
@@ -1405,6 +1416,11 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::AppendStatusLine(int status, std::string_view reason)
 {
     assert(status >= 100 && status <= 999);
+    if (m_http10 && status < 200)
+    {
+        m_sendError = true;
+        return false;
+    }
 
     // Every response path emits its status line here, so this is where a response starts
     // existing as far as a later framing failure is concerned.
@@ -1414,11 +1430,21 @@ bool ConnectionImpl<Derived>::AppendStatusLine(int status, std::string_view reas
     if (reason.empty())
     {
         auto sl = response::StatusLine(status);
-        if (sl.data) return Append(sl.data, sl.size);
+        if (sl.data)
+        {
+            if (!m_http10) return Append(sl.data, sl.size);
+            constexpr size_t prefix = sizeof(response::HTTP11_PREFIX) - 1;
+            return AppendLiteral(response::HTTP10_PREFIX) &&
+                   Append(sl.data + prefix, sl.size - prefix);
+        }
         reason = response::DefaultReason(status);
     }
 
-    if (!AppendLiteral("HTTP/1.1 ")) return false;
+    if (m_http10)
+    {
+        if (!AppendLiteral(response::HTTP10_PREFIX)) return false;
+    }
+    else if (!AppendLiteral(response::HTTP11_PREFIX)) return false;
     if (!AppendUInt(static_cast<size_t>(status))) return false;
     if (!AppendLiteral(" ")) return false;
     if (!Append(reason.data(), reason.size())) return false;
@@ -1514,6 +1540,13 @@ bool ConnectionImpl<Derived>::BeginChunked(int status, const char* contentType)
 {
     if (m_sendError || ResponseClosed()) return false;
 
+    if (m_http10)
+    {
+        if (status < 200) { m_sendError = true; return false; }
+        m_clientClose = true;
+        m_closeDelimitedResponse = true;
+        m_closeDelimitedComplete = false;
+    }
     m_chunkedHeadersPending = true;
     m_chunkedStatus = status;
     m_chunkedContentType = contentType;
@@ -1532,7 +1565,7 @@ bool ConnectionImpl<Derived>::AppendChunkedHeaders()
     if (!AppendLiteral(response::CONTENT_TYPE)) return false;
     if (!Append(m_chunkedContentType, strlen(m_chunkedContentType))) return false;
     if (!AppendLiteral(response::CRLF)) return false;
-    if (!AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
+    if (!m_http10 && !AppendLiteral(response::TRANSFER_ENCODING_CHUNKED)) return false;
     return AppendConnectionTrailer();
 }
 
@@ -1546,6 +1579,8 @@ bool ConnectionImpl<Derived>::SendChunk(const void* data, size_t size)
     {
         return false;
     }
+
+    if (m_http10) return Append(data, size) && Flush();
 
     if (!AppendHex(size)) return false;
     if (!AppendLiteral(response::CRLF)) return false;
@@ -1564,8 +1599,10 @@ bool ConnectionImpl<Derived>::EndChunked()
         return false;
     }
 
-    if (!AppendLiteral(response::CHUNKED_TERMINATOR)) return false;
-    return Flush();
+    if (!m_http10 && !AppendLiteral(response::CHUNKED_TERMINATOR)) return false;
+    bool sent = Flush();
+    if (m_http10 && sent) m_closeDelimitedComplete = true;
+    return sent;
 }
 
 template<typename Derived>
@@ -1577,6 +1614,13 @@ bool ConnectionImpl<Derived>::EndChunked(const void* lastChunkData, size_t lastC
     if (m_chunkedHeadersPending && !AppendChunkedHeaders())
     {
         return false;
+    }
+
+    if (m_http10)
+    {
+        bool sent = Append(lastChunkData, lastChunkSize) && Flush();
+        if (sent) m_closeDelimitedComplete = true;
+        return sent;
     }
 
     if (!AppendHex(lastChunkSize)) return false;
@@ -1619,12 +1663,19 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::BeginResponse(int status, std::string_view reason)
 {
     if (m_sendError || ResponseClosed()) return false;
+    m_responseContentLength = false;
     return AppendStatusLine(status, reason);
 }
 
 template<typename Derived>
 bool ConnectionImpl<Derived>::AppendHeader(const char* name, std::string_view value)
 {
+    if (m_http10 && (!strcasecmp(name, "Transfer-Encoding") || !strcasecmp(name, "Trailer")))
+    {
+        m_sendError = true;
+        return false;
+    }
+    if (m_http10 && !strcasecmp(name, "Content-Length")) m_responseContentLength = true;
     if (!Append(name, strlen(name))) return false;
     if (!AppendLiteral(": ")) return false;
     if (!Append(value.data(), value.size())) return false;
@@ -1634,6 +1685,12 @@ bool ConnectionImpl<Derived>::AppendHeader(const char* name, std::string_view va
 template<typename Derived>
 bool ConnectionImpl<Derived>::AppendHeader(const char* name, size_t value)
 {
+    if (m_http10 && (!strcasecmp(name, "Transfer-Encoding") || !strcasecmp(name, "Trailer")))
+    {
+        m_sendError = true;
+        return false;
+    }
+    if (m_http10 && !strcasecmp(name, "Content-Length")) m_responseContentLength = true;
     if (!Append(name, strlen(name))) return false;
     if (!AppendLiteral(": ")) return false;
     if (!AppendUInt(value)) return false;
@@ -1643,6 +1700,7 @@ bool ConnectionImpl<Derived>::AppendHeader(const char* name, size_t value)
 template<typename Derived>
 bool ConnectionImpl<Derived>::EndHeaders()
 {
+    if (m_http10 && !m_responseContentLength) m_clientClose = true;
     if (!AppendConnectionTrailer()) return false;
     return Flush();
 }

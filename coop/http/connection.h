@@ -112,6 +112,9 @@ struct ConnectionBase
     virtual bool Send(int status, const char* contentType, const void* body, size_t size) = 0;
     virtual bool Send(int status, const char* contentType, const std::string& body) = 0;
     virtual bool SendHeaders(int status, const char* contentType, size_t contentLength) = 0;
+    // HTTP/1.0 streams are close-delimited: chunk markers and the terminator are omitted.
+    // HTTP/1.1 retains chunked framing and persistence.
+    //
     virtual bool BeginChunked(int status, const char* contentType) = 0;
     virtual bool SendChunk(const void* data, size_t size) = 0;
     virtual bool EndChunked() = 0;
@@ -160,6 +163,11 @@ struct ConnectionBase
     virtual const char* LeftoverData() = 0;
     virtual size_t LeftoverSize() = 0;
     virtual bool SendRawBytes(const void* data, size_t size) = 0;
+
+    // Stable protocol literal after request-line parsing, independent of borrowed buffer views.
+    // Native connections return empty before parsing; the default preserves HTTP/1.1 adapters.
+    //
+    virtual std::string_view GetRequestVersion() const { return "HTTP/1.1"; }
 };
 
 // ConnectionImpl<Derived> is the CRTP parser implementation. All parser state lives here; buffer
@@ -178,6 +186,19 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     // ConnectionBase overrides — implemented in detail/server_impl.hpp
     //
     RequestLine* GetRequestLine() override;
+    std::string_view GetRequestVersion() const override
+    {
+        return !m_requestLineParsed ? std::string_view{} :
+               m_http10 ? std::string_view("HTTP/1.0") : std::string_view("HTTP/1.1");
+    }
+
+    // Server teardown distinguishes a finished close-delimited stream from abandonment.
+    bool CloseDelimitedResponse() const { return m_closeDelimitedResponse; }
+    bool CloseDelimitedResponseComplete() const
+    {
+        // A later request receive/parser error cannot retract a successfully sent body.
+        return m_closeDelimitedComplete && !m_sendError;
+    }
     const char* NextArgName() override;
     Chunk* ReadArgValue() override;
     void SkipArgValue() override;
@@ -351,6 +372,10 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     const char*     m_chunkedContentType;
 
     bool            m_keepAlive;
+    bool            m_http10; // retained independently of borrowed request-line storage
+    bool            m_closeDelimitedResponse;
+    bool            m_closeDelimitedComplete;
+    bool            m_responseContentLength;
     bool            m_clientClose;
     bool            m_sendError;
 
@@ -432,4 +457,3 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
 
 } // end namespace coop::http
 } // end namespace coop
-

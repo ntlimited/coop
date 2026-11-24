@@ -81,6 +81,13 @@ struct Connection
     int Handshake();
     int HandshakeKill();
 
+    // Send the local close_notify alert without waiting for the peer's reply. The caller
+    // then closes its descriptor. A positive timeout bounds the entire flush; cancellation
+    // and context deadlines are observed. An already cancelled caller gets one
+    // nonwaiting alert attempt. Failure prohibits retrying the alert.
+    //
+    int ShutdownWriteKill(time::Interval timeout);
+
     SSL*         m_ssl;
     Descriptor&  m_desc;
 
@@ -130,6 +137,7 @@ struct Connection
 
     char* m_buffer;
     size_t m_bufferSize;
+    bool m_shutdownWriteFailed = false;
 };
 
 } // end namespace coop::io::ssl

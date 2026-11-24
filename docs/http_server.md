@@ -93,7 +93,31 @@ Content-Length together with any Transfer-Encoding field is rejected, including 
 Transfer codings remain opaque; the combined request transfer-coding list must be nonempty and
 end in exactly one `chunked`. Empty list members are ignored. The parser removes chunk
 framing without decompressing preceding codings. Connection tokens are case-insensitive and
-may span arbitrarily many receives. HTTP/1.0 defaults to close; HTTP/1.1 defaults to persistence.
+may span arbitrarily many receives. HTTP/1.0 defaults to closure; an explicit
+`Connection: keep-alive` permits persistence for Content-Length responses. Consume needed query
+arguments and call `SkipHeaders()` before sending to honor that request: response methods do
+not parse unread headers. An early HTTP/1.0 response selects closure rather than promising
+persistence it has not learned from the request. HTTP/1.1 defaults to persistence. `std::string_view ConnectionBase::GetRequestVersion() const` returns a stable
+protocol literal after parsing, independent of receive-buffer movement, so handlers can choose
+fixed-length framing for HTTP/1.0. Native connections return an empty view before parsing;
+custom adapters inherit an HTTP/1.1 default.
+
+The retained version selects every response status line. Fixed responses retain Content-Length.
+`BeginChunked`/`SendChunk`/`EndChunked` on HTTP/1.0 force closure and stream the body without
+chunk markers or a terminator. A successful `EndChunked` marks the stream complete. The stock
+TLS server then flushes its close_notify alert within the connection timeout, capped at one
+second, without waiting for a peer alert. Completion remains valid if the context is killed
+or its deadline expires afterward: plaintext retains a clean FIN, and TLS gets one nonwaiting
+closure-alert attempt. An alert that cannot be sent still lets TLS detect truncation, but
+does not turn the completed body into an abortive TCP reset. Incomplete streams receive no TLS
+closure alert and use an abortive TCP reset so a truncated close-delimited body cannot look
+complete. Component responses that attempt Transfer-Encoding or Trailer, and all 1xx
+responses on HTTP/1.0, fail permanently before sending further bytes.
+
+`int io::ssl::Connection::ShutdownWriteKill(time::Interval timeout)` sends only the local TLS
+closure alert, observes cancellation and deadlines, and returns zero on success or negative
+errno. A nonpositive timeout uses a one-second bound. It does not close the descriptor or wait
+for the peer's closure alert. The caller must close the transport after success or failure.
 
 `ReadBodyToFile()` retains the plaintext fixed-length socket-to-pipe-to-file splice path.
 TLS, chunked and provided-buffer receive paths consume borrowed parser spans. It returns bytes

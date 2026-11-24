@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #include "coop/coordinator.h"
 #include "coop/detail/embedded_list.h"
@@ -73,6 +74,11 @@ struct ServerHandle
         if (m_listener == listener) m_listener = nullptr;
     }
     bool HasListener() const { return m_listener != nullptr; }
+
+    // Assigned IPv4 listen port, including an ephemeral port selected from configuration 0.
+    // Returns zero while no listener is active or its address cannot be queried.
+    //
+    uint16_t Port() const;
 
     // Connection lifecycle (called from the connection handler).
     //

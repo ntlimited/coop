@@ -2,6 +2,7 @@
 #include "connection.h"
 
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 #include "coop/context.h"
 #include "coop/coordinate_with.h"
@@ -12,6 +13,16 @@ namespace coop
 
 namespace http
 {
+
+uint16_t ServerHandle::Port() const
+{
+    if (!m_listener) return 0;
+    sockaddr_in address{};
+    socklen_t size = sizeof(address);
+    if (::getsockname(m_listener->m_fd, reinterpret_cast<sockaddr*>(&address), &size) != 0 ||
+        address.sin_family != AF_INET) return 0;
+    return ntohs(address.sin_port);
+}
 
 void ServerHandle::ShutdownAllConns(int how)
 {

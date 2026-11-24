@@ -13,10 +13,12 @@
 #include "coop/self.h"
 #include "coop/io/descriptor.h"
 #include "coop/io/recv.h"
+#include "coop/io/connect.h"
 #include "coop/io/send.h"
 #include "coop/http/connection.h"
 #include "coop/http/client.h"
 #include "coop/http/server.h"
+#include "coop/http/server_handle.h"
 #include "coop/io/recv_source.h"
 #include "coop/io/buffer_ring.h"
 #include "coop/io/uring.h"
@@ -30,9 +32,20 @@ using HttpClient = coop::http::ClientConnection<coop::http::PlaintextTransport>;
 static constexpr size_t HTTP_EXTRA = HttpConn::ExtraBytes();
 
 #include "test_helpers.h"
+#include "tls_pair_helpers.h"
 
 namespace
 {
+
+int ConnectLoopbackKill(coop::io::Descriptor& client, uint16_t port)
+{
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    return coop::io::ConnectKill(client, reinterpret_cast<sockaddr*>(&address),
+                                  sizeof(address), std::chrono::seconds(1));
+}
 
 // Helper that creates an AF_UNIX socketpair.
 //
@@ -458,6 +471,103 @@ TEST(HttpTest, ChunkedResponse)
         EXPECT_NE(resp.find("5\r\nHello\r\n"), std::string::npos);
         EXPECT_NE(resp.find("7\r\n, World\r\n"), std::string::npos);
         EXPECT_NE(resp.find("0\r\n\r\n"), std::string::npos);
+    });
+}
+
+TEST(HttpTest, Http10ResponsesCloseWithoutChunkFraming)
+{
+    coop::http::ServerHandle control;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        coop::Context::Handle listener;
+        coop::Spawn({.stackSize = 65536}, [&](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.handler = [](coop::http::ConnectionBase& conn, void*)
+            {
+                const bool fixed = conn.GetRequestLine()->path == "/fixed";
+                conn.SkipHeaders();
+                if (fixed)
+                {
+                    EXPECT_TRUE(conn.Send(200, "text/plain", "hello"));
+                }
+                else
+                {
+                    EXPECT_TRUE(conn.BeginChunked(200, "text/plain"));
+                    EXPECT_TRUE(conn.SendChunk("hel", 3));
+                    EXPECT_TRUE(conn.EndChunked("lo", 2));
+                }
+            };
+            EXPECT_TRUE(coop::http::RunServer(serverCtx, config));
+        }, &listener);
+
+        const int port = control.Port();
+        ASSERT_GT(port, 0);
+        for (const char* path : {"/stream", "/fixed"})
+        {
+            for (bool keepAlive : {false, true})
+            {
+                coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+                ASSERT_GE(client.m_fd, 0);
+                ASSERT_EQ(ConnectLoopbackKill(client, port), 0);
+                const bool fixedKeepAlive = std::string_view(path) == "/fixed" && keepAlive;
+                const std::string request = std::string("GET ") + path + " HTTP/1.0\r\n" +
+                    (keepAlive ? "Connection: keep-alive\r\n" : "") + "\r\n" +
+                    (fixedKeepAlive ? "GET /fixed HTTP/1.0\r\nConnection: close\r\n\r\n" : "");
+                ASSERT_EQ(coop::io::SendKill(client, request.data(), request.size(), MSG_NOSIGNAL,
+                          std::chrono::seconds(1)), static_cast<int>(request.size()));
+                std::string wire;
+                char bytes[1024];
+                int result;
+                while ((result = coop::io::RecvKill(client, bytes, sizeof(bytes), 0,
+                                                std::chrono::seconds(1))) > 0)
+                    wire.append(bytes, result);
+                EXPECT_EQ(result, 0) << "response must end with orderly EOF";
+                EXPECT_EQ(wire.find("HTTP/1.0 200 OK\r\n"), 0);
+                EXPECT_NE(wire.find("Connection: close\r\n"), std::string::npos);
+                if (fixedKeepAlive)
+                {
+                    EXPECT_NE(wire.find("Connection: keep-alive\r\n"), std::string::npos);
+                    EXPECT_NE(wire.find("HTTP/1.0 200 OK\r\n", 1), std::string::npos);
+                    continue;
+                }
+                EXPECT_EQ(wire.find("Transfer-Encoding:"), std::string::npos);
+                EXPECT_EQ(wire.find("Trailer:"), std::string::npos);
+                const auto end = wire.find("\r\n\r\n");
+                ASSERT_NE(end, std::string::npos);
+                EXPECT_EQ(wire.substr(end + 4), "hello");
+                if (std::string_view(path) == "/fixed")
+                    EXPECT_NE(wire.find("Content-Length: 5\r\n"), std::string::npos);
+            }
+        }
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    });
+}
+
+TEST(HttpTest, Http11ChunkedResponseCompletesAndReuses)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        coop::io::Descriptor client(sp.fds[0]);
+        coop::io::Descriptor server(sp.fds[1]);
+        SendString(client, "GET / HTTP/1.1\r\n\r\nGET /next HTTP/1.1\r\n\r\n");
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
+        ASSERT_NE(conn->GetRequestLine(), nullptr);
+        ASSERT_TRUE(conn->BeginChunked(200, "text/plain"));
+        ASSERT_TRUE(conn->EndChunked("hello", 5));
+        ASSERT_TRUE(conn->SkipBody());
+        ASSERT_TRUE(conn->Reset());
+        ASSERT_NE(conn->GetRequestLine(), nullptr);
+        EXPECT_EQ(conn->GetRequestLine()->path, "/next");
+        const auto wire = RecvAll(client);
+        EXPECT_EQ(wire.find("HTTP/1.1 200 OK\r\n"), 0);
+        EXPECT_NE(wire.find("Transfer-Encoding: chunked\r\n"), std::string::npos);
+        EXPECT_NE(wire.find("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"), std::string::npos);
     });
 }
 
@@ -2589,4 +2699,265 @@ TEST(HttpFramingTest, CumulativeHeaderBytesOverLimitRejected)
             EXPECT_EQ(conn.ParseError(), 431);
         });
     });
+}
+
+TEST(HttpTest, Http10TlsCompletionTruncationErrorsAndFixedKeepAlive)
+{
+    coop::http::ServerHandle control;
+    coop::io::ssl::Context serverContext{coop::io::ssl::Mode::Server};
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(10));
+        auto certificates = std::make_unique<test::TlsPair>();
+        ASSERT_EQ(SSL_CTX_use_certificate(serverContext.m_ctx,
+            SSL_CTX_get0_certificate(certificates->serverContext.m_ctx)), 1);
+        ASSERT_EQ(SSL_CTX_use_PrivateKey(serverContext.m_ctx,
+            SSL_CTX_get0_privatekey(certificates->serverContext.m_ctx)), 1);
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.timeout = std::chrono::milliseconds(500);
+            config.handler = [](coop::http::ConnectionBase& conn, void*)
+            {
+                auto path = conn.GetRequestLine()->path;
+                const bool fixed = path == "/fixed";
+                const bool bad = path == "/bad";
+                const bool abandoned = path == "/abandoned";
+                const bool failed = path == "/failed";
+                const bool killed = path == "/killed";
+                const bool completeKilled = path == "/complete-killed";
+                const bool completeExpired = path == "/complete-expired";
+                conn.SkipHeaders();
+                if (bad) return;
+                if (fixed) { EXPECT_TRUE(conn.Send(200, "text/plain", "hello")); return; }
+                EXPECT_TRUE(conn.BeginChunked(200, "text/plain"));
+                EXPECT_TRUE(conn.SendChunk("hel", 3));
+                if (abandoned) return;
+                if (failed) { EXPECT_FALSE(conn.AppendHeader("Trailer", "X")); return; }
+                if (killed) { coop::Self()->KillSelf(coop::KillCause::Kill); return; }
+                EXPECT_TRUE(conn.EndChunked("lo", 2));
+                if (completeKilled) coop::Self()->KillSelf(coop::KillCause::Kill);
+                if (completeExpired) coop::Self()->SetDeadlineIn(std::chrono::microseconds(0));
+            };
+            EXPECT_TRUE(coop::http::RunTlsServer(serverCtx, config, serverContext));
+        }, &listener));
+        ASSERT_GT(control.Port(), 0);
+        for (const char* path : {"/complete", "/complete-killed", "/complete-expired",
+                                 "/abandoned", "/failed", "/killed", "/bad", "/fixed"})
+        {
+            SCOPED_TRACE(path);
+            coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+            ASSERT_GE(client.m_fd, 0);
+            ASSERT_EQ(ConnectLoopbackKill(client, control.Port()), 0);
+            char staging[16384];
+            coop::io::ssl::Connection tls(certificates->clientContext, client, staging, sizeof(staging));
+            ASSERT_EQ(tls.HandshakeKill(), 0);
+            std::string request = std::string("GET ") + path + " HTTP/1.0\r\n";
+            if (std::string_view(path) == "/fixed")
+                request += "Connection: keep-alive\r\n\r\n"
+                           "GET /fixed HTTP/1.0\r\nConnection: close\r\n\r\n";
+            else if (std::string_view(path) == "/bad")
+                request += "Content-Length: invalid\r\n\r\n";
+            else request += "Connection: keep-alive\r\n\r\n";
+            ASSERT_EQ(coop::io::ssl::SendAllKill(tls, request.data(), request.size()),
+                      static_cast<int>(request.size()));
+            std::string response;
+            char buffer[1024];
+            int received;
+            while ((received = coop::io::ssl::RecvKill(tls, buffer, sizeof(buffer),
+                        std::chrono::seconds(1))) > 0)
+                response.append(buffer, static_cast<size_t>(received));
+            if (std::string_view(path).starts_with("/complete"))
+            {
+                EXPECT_EQ(received, 0);
+                EXPECT_NE(SSL_get_shutdown(tls.m_ssl) & SSL_RECEIVED_SHUTDOWN, 0);
+                EXPECT_NE(response.find("\r\n\r\nhello"), std::string::npos);
+            }
+            else
+            {
+                EXPECT_LT(received, 0);
+                EXPECT_EQ(SSL_get_shutdown(tls.m_ssl) & SSL_RECEIVED_SHUTDOWN, 0);
+            }
+            if (std::string_view(path) == "/bad")
+                EXPECT_EQ(response.find("HTTP/1.0 400 Bad Request\r\n"), 0);
+            else EXPECT_EQ(response.find("HTTP/1.0 200 OK\r\n"), 0);
+            if (std::string_view(path) == "/fixed")
+            {
+                EXPECT_NE(response.find("Content-Length: 5\r\n"), std::string::npos);
+                EXPECT_NE(response.find("Connection: keep-alive\r\n"), std::string::npos);
+                EXPECT_NE(response.find("HTTP/1.0 200 OK\r\n", 1), std::string::npos);
+            }
+        }
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    }, {.stackSize = 65536});
+}
+
+TEST(HttpTest, Http10CompletedPlaintextStreamSurvivesCancellation)
+{
+    coop::http::ServerHandle control;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.handler = [](coop::http::ConnectionBase& conn, void*)
+            {
+                const auto path = conn.GetRequestLine()->path;
+                const bool expired = path.ends_with("expired");
+                if (!path.starts_with("/unparsed-")) conn.SkipHeaders();
+                ASSERT_EQ(conn.ParseError(), 0);
+                ASSERT_TRUE(conn.BeginChunked(200, "text/plain"));
+                ASSERT_TRUE(conn.EndChunked("complete", 8));
+                if (expired) coop::Self()->SetDeadlineIn(std::chrono::microseconds(0));
+                else coop::Self()->KillSelf(coop::KillCause::Kill);
+            };
+            EXPECT_TRUE(coop::http::RunServer(serverCtx, config));
+        }, &listener));
+        ASSERT_GT(control.Port(), 0);
+        for (const char* path : {"/killed", "/expired", "/unparsed-killed", "/unparsed-expired"})
+        {
+            SCOPED_TRACE(path);
+            coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+            ASSERT_EQ(ConnectLoopbackKill(client, control.Port()), 0);
+            const std::string request = std::string("GET ") + path + " HTTP/1.0\r\n\r\n";
+            ASSERT_EQ(coop::io::SendKill(client, request.data(), request.size(), MSG_NOSIGNAL,
+                      std::chrono::seconds(1)), request.size());
+            std::string response;
+            char buffer[1024];
+            int received;
+            while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                        std::chrono::seconds(1))) > 0)
+                response.append(buffer, static_cast<size_t>(received));
+            EXPECT_EQ(received, 0);
+            EXPECT_NE(response.find("\r\n\r\ncomplete"), std::string::npos);
+        }
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    });
+}
+
+TEST(HttpTest, Http10AbandonedPlaintextStreamResetsInsteadOfEndingNormally)
+{
+    coop::http::ServerHandle control;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* serverCtx)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.handler = [](coop::http::ConnectionBase& conn, void*)
+            {
+                conn.SkipHeaders();
+                EXPECT_TRUE(conn.BeginChunked(200, "text/plain"));
+                EXPECT_TRUE(conn.SendChunk("partial", 7));
+            };
+            EXPECT_TRUE(coop::http::RunServer(serverCtx, config));
+        }, &listener));
+        ASSERT_GT(control.Port(), 0);
+        coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        ASSERT_EQ(ConnectLoopbackKill(client, control.Port()), 0);
+        constexpr char request[] = "GET / HTTP/1.0\r\n\r\n";
+        ASSERT_EQ(coop::io::SendKill(client, request, sizeof(request) - 1, MSG_NOSIGNAL,
+                  std::chrono::seconds(1)), sizeof(request) - 1);
+        char buffer[1024];
+        int received;
+        while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                    std::chrono::seconds(1))) > 0) {}
+        EXPECT_EQ(received, -ECONNRESET);
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    });
+}
+
+TEST(HttpTest, TlsClosureAlertDoesNotWaitForPeerAndHonorsWriteBounds)
+{
+    for (bool socketBio : {false, true})
+    {
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            ctx->SetDeadlineIn(std::chrono::seconds(3));
+            auto pair = std::make_unique<test::TlsPair>(socketBio);
+            EXPECT_EQ(pair->serverTls->ShutdownWriteKill(std::chrono::milliseconds(500)), 0);
+            char byte;
+            EXPECT_EQ(pair->Recv(&byte, 1), 0);
+            EXPECT_NE(SSL_get_shutdown(pair->clientTls->m_ssl) & SSL_RECEIVED_SHUTDOWN, 0);
+
+            auto stalled = std::make_unique<test::TlsPair>(socketBio);
+            stalled->FillSocket();
+            EXPECT_EQ(stalled->serverTls->ShutdownWriteKill(std::chrono::milliseconds(30)),
+                      -ETIMEDOUT);
+            EXPECT_EQ(stalled->serverTls->ShutdownWriteKill(std::chrono::milliseconds(30)),
+                      -EPIPE);
+
+            auto expired = std::make_unique<test::TlsPair>(socketBio);
+            ctx->SetDeadlineIn(std::chrono::microseconds(0));
+            EXPECT_EQ(expired->serverTls->ShutdownWriteKill(std::chrono::milliseconds(30)), 0);
+            EXPECT_EQ(ctx->WhyKilled(), coop::KillCause::Deadline);
+            EXPECT_NE(SSL_get_shutdown(expired->serverTls->m_ssl) & SSL_SENT_SHUTDOWN, 0);
+            EXPECT_EQ(expired->Recv(&byte, 1), 0);
+        }, {.stackSize = 65536});
+    }
+}
+
+TEST(HttpTest, CompletedHttp10StreamSurvivesKillDuringRequestDrain)
+{
+    coop::http::ServerHandle control;
+    struct State
+    {
+        coop::CountdownLatch complete{1};
+        coop::Context* serving = nullptr;
+    } state;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(3));
+        coop::Context::Handle listener;
+        ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* server)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.userData = &state;
+            config.handler = [](coop::http::ConnectionBase& conn, void* data)
+            {
+                auto& state = *static_cast<State*>(data);
+                state.serving = coop::Self();
+                ASSERT_TRUE(conn.BeginChunked(200, "text/plain"));
+                ASSERT_TRUE(conn.EndChunked("complete", 8));
+                state.complete.Arrive();
+            };
+            EXPECT_TRUE(coop::http::RunServer(server, config));
+        }, &listener));
+        coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        ASSERT_GE(client.m_fd, 0);
+        ASSERT_EQ(ConnectLoopbackKill(client, control.Port()), 0);
+        constexpr char request[] = "GET / HTTP/1.0\r\n";
+        ASSERT_EQ(coop::io::SendKill(client, request, sizeof(request) - 1, MSG_NOSIGNAL,
+                  std::chrono::seconds(1)), sizeof(request) - 1);
+        ASSERT_EQ(state.complete.WaitKill(ctx), coop::CountdownLatch::WaitStatus::Completed);
+        // Arrival does not yield: the serving context has returned from its handler and
+        // blocked in the request-header drain before this context resumes.
+        //
+        ASSERT_NE(state.serving, nullptr);
+        EXPECT_FALSE(state.serving->IsKilled());
+        state.serving->KillSelf(coop::KillCause::Kill);
+        std::string response;
+        char buffer[512];
+        int received;
+        while ((received = coop::io::RecvKill(client, buffer, sizeof(buffer), 0,
+                                              std::chrono::seconds(1))) > 0)
+            response.append(buffer, static_cast<size_t>(received));
+        EXPECT_EQ(received, 0);
+        EXPECT_NE(response.find("\r\n\r\ncomplete"), std::string::npos);
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+        listener.Kill();
+    }, {.stackSize = 65536});
 }

@@ -1,10 +1,13 @@
 #include "connection.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <spdlog/spdlog.h>
@@ -14,6 +17,8 @@
 #include "coop/io/poll.h"
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
+#include "coop/time/now.h"
+#include "coop/context.h"
 
 namespace coop
 {
@@ -207,6 +212,90 @@ int Connection::HandshakeKill()
         return HandshakeSocketBio(true);
     }
     return HandshakeMemoryBio(true);
+}
+
+int Connection::ShutdownWriteKill(time::Interval timeout)
+{
+    if (m_shutdownWriteFailed) return -EPIPE;
+    auto* ctx = Self();
+    // An orderly closure is a bounded final operation even when normal IO is unbounded.
+    // The server passes its timeout, with a one-second cap for this alert alone.
+    //
+    if (timeout.count() <= 0) timeout = std::chrono::seconds(1);
+    int64_t budget = std::chrono::duration_cast<std::chrono::microseconds>(timeout).count();
+    int64_t started = time::MonotonicMicros();
+    auto remaining = [&]() -> time::Interval
+    {
+        int64_t now = time::MonotonicMicros();
+        if (ctx && !ctx->IsKilled() && ctx->DeadlineUs() != 0 && now >= ctx->DeadlineUs())
+            ctx->KillSelf(KillCause::Deadline);
+        if (ctx && ctx->IsKilled()) return {};
+        int64_t left = budget - (now - started);
+        if (ctx && ctx->DeadlineUs() != 0)
+            left = std::min(left, ctx->DeadlineUs() - now);
+        return left > 0 ? std::chrono::microseconds(left) : time::Interval{};
+    };
+    auto fail = [&](int error)
+    {
+        m_shutdownWriteFailed = true;
+        return error;
+    };
+    bool first = true;
+    for (;;)
+    {
+        auto left = remaining();
+        const bool terminal = left.count() <= 0;
+        if (terminal && !first)
+            return fail(ctx && ctx->IsKilled() ? -ECANCELED : -ETIMEDOUT);
+        first = false;
+        ERR_clear_error();
+        errno = 0;
+        int result = SSL_shutdown(m_ssl);
+        int savedErrno = errno;
+        int error = result < 0 ? SSL_get_error(m_ssl, result) : SSL_ERROR_NONE;
+        if (m_buffer)
+        {
+            while (BIO_ctrl_pending(m_wbio))
+            {
+                int count = BIO_read(m_wbio, m_buffer, m_bufferSize);
+                if (count <= 0) return fail(-EIO);
+                int offset = 0;
+                while (offset < count)
+                {
+                    left = remaining();
+                    if (left.count() <= 0 && !terminal)
+                        return fail(ctx && ctx->IsKilled()
+                                    ? -ECANCELED : -ETIMEDOUT);
+                    int sent;
+                    if (terminal)
+                    {
+                        sent = ::send(m_desc.m_fd, m_buffer + offset, count - offset,
+                                      MSG_DONTWAIT | MSG_NOSIGNAL);
+                        if (sent != count - offset)
+                            return fail(sent < 0 ? -errno : -EAGAIN);
+                    }
+                    else
+                        sent = io::SendKill(m_desc, m_buffer + offset, count - offset,
+                                            MSG_NOSIGNAL, left);
+                    if (sent <= 0) return fail(sent < 0 ? sent : -EPIPE);
+                    offset += sent;
+                }
+            }
+        }
+        // SSL_shutdown returns zero once our alert was sent: the other half of its
+        // two-phase handshake would wait for the peer and is deliberately omitted.
+        //
+        if (result >= 0) return 0;
+        if (terminal)
+            return fail(error == SSL_ERROR_SYSCALL && savedErrno ? -savedErrno : -ECANCELED);
+        if (error != SSL_ERROR_WANT_WRITE)
+            return fail(error == SSL_ERROR_SYSCALL && savedErrno ? -savedErrno : -EIO);
+        if (m_buffer) return fail(-EPROTO);
+        left = remaining();
+        if (left.count() <= 0) continue;
+        int ready = io::PollKill(m_desc, POLLOUT, left);
+        if (ready < 0) return fail(ready);
+    }
 }
 
 // Drive the socket BIO handshake cooperatively using readiness waits. OpenSSL operates on the real

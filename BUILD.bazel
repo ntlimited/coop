@@ -58,7 +58,11 @@ genrule(
 cc_library(
     name = "test_helpers",
     testonly = True,
-    hdrs = ["tests/test_helpers.h", "tests/completion_observer.h"],
+    hdrs = [
+        "tests/test_helpers.h",
+        "tests/tls_pair_helpers.h",
+        "tests/completion_observer.h",
+    ],
     strip_include_prefix = "/",
     includes = ["tests"],
     deps = [":coop", "@googletest//:gtest"],

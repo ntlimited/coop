@@ -155,6 +155,40 @@ struct DrainParser
     ~DrainParser() { if (node) { node->connection = nullptr; node->idle = false; } }
 };
 
+// A missing stream terminator must not masquerade as a successfully delimited EOF.
+// Construct before the child join so attached writers can finish while resources live.
+//
+template<typename Conn>
+struct ResponseClosure
+{
+    Conn& conn;
+    io::Descriptor& descriptor;
+    Context* ctx;
+    io::ssl::Connection* tls = nullptr;
+    time::Interval timeout{};
+
+    ~ResponseClosure()
+    {
+        if (!conn.CloseDelimitedResponse()) return;
+        bool complete = conn.CloseDelimitedResponseComplete();
+        if (complete && tls)
+        {
+            auto bound = timeout.count() > 0 && timeout < std::chrono::seconds(1)
+                       ? timeout : std::chrono::seconds(1);
+            // Completion is irrevocable: cancellation after EndChunked cannot turn
+            // a completed body into an abortive TCP reset. TLS still gets
+            // one nonwaiting alert attempt when its context can no longer wait.
+            //
+            tls->ShutdownWriteKill(bound);
+        }
+        if (!complete)
+        {
+            linger abort{1, 0};
+            ::setsockopt(descriptor.m_fd, SOL_SOCKET, SO_LINGER, &abort, sizeof(abort));
+        }
+    }
+};
+
 struct ListenerRegistration
 {
     ServerHandle* control;
@@ -220,7 +254,7 @@ struct HttpConnection : Launchable
     , m_registration(control)
     , m_parserOptions(parserOptions)
     , m_fd(fd)
-    , m_shutdownGuard(ctx, m_fd)
+    , m_shutdownGuard(ctx, m_fd, SHUT_RD)
     , m_co(co)
     , m_handler(handler)
     , m_userData(userData)
@@ -256,6 +290,7 @@ struct HttpConnection : Launchable
             conn->AttachRecvSource(&*source);
         }
 
+        ResponseClosure<Conn> closure{*conn, m_fd, GetContext()};
         while (!GetContext()->IsKilled())
         {
             // Draining: force this response to close the connection, then exit after it.
@@ -268,6 +303,11 @@ struct HttpConnection : Launchable
                                m_control ? &m_registration.node : nullptr)) return;
 
             if (conn->SendError()) return;
+            // A completed close-delimited response cannot be reused. Do not turn
+            // later cancellation into a receive failure while draining the request.
+            //
+            if (conn->CloseDelimitedResponseComplete() &&
+                (GetContext()->IsKilled() || GetContext()->RemainingUs() <= 0)) return;
 
             // Drain the request before judging keep-alive: a handler that never touched
             // the headers hasn't parsed Connection yet, and checking first would let
@@ -309,7 +349,7 @@ struct HttpTlsConnection : Launchable
     , m_registration(control)
     , m_parserOptions(parserOptions)
     , m_fd(fd)
-    , m_shutdownGuard(ctx, m_fd)
+    , m_shutdownGuard(ctx, m_fd, SHUT_RD)
     , m_co(co)
     , m_handler(handler)
     , m_userData(userData)
@@ -347,6 +387,7 @@ struct HttpTlsConnection : Launchable
             m_timeout, m_parserOptions);
         DrainParser parserRegistration(m_registration, conn.get());
 
+        ResponseClosure<Conn> closure{*conn, m_fd, GetContext(), &sslConn, m_timeout};
         while (!GetContext()->IsKilled())
         {
             if (m_control && m_control->IsDraining()) conn->ForceClose();
@@ -354,6 +395,11 @@ struct HttpTlsConnection : Launchable
                                m_control ? &m_registration.node : nullptr)) return;
 
             if (conn->SendError()) return;
+            // A completed close-delimited response cannot be reused. Do not turn
+            // later cancellation into a receive failure while draining the request.
+            //
+            if (conn->CloseDelimitedResponseComplete() &&
+                (GetContext()->IsKilled() || GetContext()->RemainingUs() <= 0)) return;
 
             // Drain the request before judging keep-alive: a handler that never touched
             // the headers hasn't parsed Connection yet, and checking first would let

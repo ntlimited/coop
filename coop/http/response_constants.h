@@ -20,6 +20,9 @@ struct Fragment
 //
 Fragment StatusLine(int code);
 
+inline constexpr char HTTP10_PREFIX[] = "HTTP/1.0 ";
+inline constexpr char HTTP11_PREFIX[] = "HTTP/1.1 ";
+
 // Reason phrase for codes outside the pre-compiled table, by status class. Never null.
 //
 const char* DefaultReason(int code);

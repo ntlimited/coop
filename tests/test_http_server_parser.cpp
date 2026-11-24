@@ -216,6 +216,18 @@ TEST(HttpServerParser, ConnectionTokensStreamWithoutFixedScratchLimit)
     EXPECT_TRUE(tenClose.conn->SkipBody());
     EXPECT_FALSE(tenClose.conn->Reusable());
 }
+TEST(HttpServerParser, Http10ResponseVersionSurvivesBufferMovement)
+{
+    Parser parser(Bytes("GET / HTTP/1.0\r\nConnection: keep-alive\r\nX: " +
+                        std::string(100, 'x') + "\r\n\r\n"), 32);
+    ASSERT_TRUE(parser.conn->SkipBody());
+    EXPECT_EQ(parser.conn->GetRequestVersion(), "HTTP/1.0");
+    ASSERT_TRUE(parser.conn->BeginResponse(299, "Custom"));
+    ASSERT_TRUE(parser.conn->AppendHeader("Content-Length", size_t(0)));
+    ASSERT_TRUE(parser.conn->EndHeaders());
+    EXPECT_EQ(parser.script.sent,
+              "HTTP/1.0 299 Custom\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+}
 TEST(HttpServerParser, TransferCodingListsAreOpaqueUntilFinalChunked)
 {
     Parser parser(Bytes("POST / HTTP/1.1\r\nTransfer-Encoding: gzip; p=\"opaque\", chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n"));
@@ -477,4 +489,75 @@ TEST(HttpServerParser, ContentLengthQueryValidatesAllHeadersAfterPartialIteratio
     }
 }
 
+}
+
+TEST(HttpServerParser, Http10FixedLengthKeepAliveRetainsPersistence)
+{
+    Parser parser({"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" + next});
+    EXPECT_TRUE(parser.conn->GetRequestVersion().empty());
+    ASSERT_TRUE(parser.conn->SkipBody());
+    EXPECT_EQ(parser.conn->GetRequestVersion(), "HTTP/1.0");
+    ASSERT_TRUE(parser.conn->Send(200, "text/plain", "hello"));
+    EXPECT_NE(parser.script.sent.find("HTTP/1.0 200 OK\r\n"), std::string::npos);
+    EXPECT_NE(parser.script.sent.find("Content-Length: 5\r\n"), std::string::npos);
+    EXPECT_NE(parser.script.sent.find("Connection: keep-alive\r\n"), std::string::npos);
+    EXPECT_TRUE(parser.conn->Reusable());
+    ASSERT_TRUE(parser.conn->Reset());
+    EXPECT_TRUE(parser.conn->GetRequestVersion().empty());
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    EXPECT_EQ(parser.conn->GetRequestLine()->path, "/next");
+    EXPECT_EQ(parser.conn->GetRequestVersion(), "HTTP/1.1");
+}
+
+TEST(HttpServerParser, Http10DisallowedHeadersAndInformationalResponsesAreSticky)
+{
+    for (const char* name : {"Transfer-Encoding", "Trailer"})
+    {
+        for (bool numeric : {false, true})
+        {
+            Parser parser({"GET / HTTP/1.0\r\n\r\n"});
+            ASSERT_TRUE(parser.conn->SkipBody());
+            ASSERT_TRUE(parser.conn->BeginResponse(200));
+            EXPECT_FALSE(numeric ? parser.conn->AppendHeader(name, size_t(1))
+                                 : parser.conn->AppendHeader(name, "chunked"));
+            EXPECT_TRUE(parser.conn->SendError());
+            EXPECT_FALSE(parser.conn->SendRawBytes("corrupt", 7));
+            EXPECT_FALSE(parser.conn->EndHeaders());
+            EXPECT_TRUE(parser.script.sent.empty());
+        }
+    }
+    for (int status : {100, 101, 103, 199})
+    {
+        Parser parser({"GET / HTTP/1.0\r\n\r\n"});
+        ASSERT_TRUE(parser.conn->SkipBody());
+        EXPECT_FALSE(parser.conn->BeginResponse(status));
+        EXPECT_TRUE(parser.conn->SendError());
+        EXPECT_FALSE(parser.conn->Send(200, "text/plain", "late"));
+        EXPECT_TRUE(parser.script.sent.empty());
+    }
+}
+
+TEST(HttpServerParser, Http10ComponentResponseWithoutLengthCloses)
+{
+    Parser parser({"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"});
+    ASSERT_TRUE(parser.conn->SkipBody());
+    ASSERT_TRUE(parser.conn->BeginResponse(200));
+    ASSERT_TRUE(parser.conn->EndHeaders());
+    EXPECT_NE(parser.script.sent.find("Connection: close\r\n"), std::string::npos);
+    EXPECT_FALSE(parser.conn->Reusable());
+}
+
+TEST(HttpServerParser, Http10EarlyFixedResponseChoosesClosureWithoutConsumingHeaders)
+{
+    Parser parser({"GET /?needed=value HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"});
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    ASSERT_TRUE(parser.conn->Send(200, "text/plain", "hello"));
+    EXPECT_NE(parser.script.sent.find("Connection: close\r\n"), std::string::npos);
+    ASSERT_STREQ(parser.conn->NextArgName(), "needed");
+    auto value = parser.conn->ReadArgValue();
+    ASSERT_NE(value, nullptr);
+    EXPECT_EQ(std::string_view(static_cast<const char*>(value->data), value->size), "value");
+    EXPECT_TRUE(parser.conn->SkipBody());
+    EXPECT_FALSE(parser.conn->KeepAlive());
+    EXPECT_FALSE(parser.conn->Reset());
 }

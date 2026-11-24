@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string_view>
+#include <sys/socket.h>
 
 #include "coop/time/interval.h"
 #include "coop/http/connection.h"
@@ -27,6 +28,18 @@ struct ServerHandle;
 // through verbatim from ServerConfiguration for handlers that need per-server state.
 //
 using RequestHandler = void (*)(ConnectionBase& conn, void* userData);
+
+// Connection hooks run on the serving context, including TLS handshake failures. Open may
+// allocate application-owned state and refuse the connection by returning false. Close runs
+// once even after refusal, after handlers and attached descendant contexts finish. Detached
+// contexts require their own lifetime contract. The library never frees application state.
+//
+// peer points to a socket address borrowed only for the duration of the open callback.
+// Copy it to retain it. A failed address query supplies nullptr with a zero length.
+//
+using ConnectionOpenHandler = bool (*)(Context* ctx, const sockaddr* peer, socklen_t peerLength,
+                                       void* userData, void*& state);
+using ConnectionCloseHandler = void (*)(Context* ctx, void* userData, void* state);
 
 // Declared server topology and accept policy. reusePort is the sharding contract: N
 // RunServer calls with the same port — one per cooperator — each get their own listen
@@ -67,6 +80,14 @@ struct ServerConfiguration
     //
     RequestHandler handler = nullptr;
     void* userData = nullptr;
+
+    // Optional connection-lifetime state, separate from the per-server userData. Open runs
+    // before TLS handshake/request parsing; close receives its output even when open refuses.
+    // Both hooks may yield. State remains borrowed by ConnectionBase::GetConnectionState().
+    // Hook functions and userData must outlive active connections, including detached drain.
+    //
+    ConnectionOpenHandler connectionOpen = nullptr;
+    ConnectionCloseHandler connectionClose = nullptr;
 
     const char* name = "HttpServer";
     time::Interval timeout = std::chrono::seconds(30);

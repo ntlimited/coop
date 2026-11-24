@@ -171,6 +171,12 @@ their cleanup runs before `~Context()`. Drain children explicitly before destroy
 they borrow. A cleared Handle, `SubmitSync` return, or `Group::Wait()` return is also not a
 transitive Context join; these report their respective earlier task-completion boundaries.
 
+`Context::JoinChildren(KillCause cancel = KillCause::None)` exposes this retirement boundary
+before borrowed state unwinds. By default it only joins; an explicit cause first cancels attached
+child trees without killing a healthy caller. Its initial wait observes caller kill/deadline,
+then drains retirement even if cancellation wins. It releases its gate acquisition so the caller
+can spawn and join again. Call it from the owning running context; detached trees are excluded.
+
 After `~Context()`, `CoopContextEntry` does `ContextSwitch(EXITED)` back to the cooperator,
 which returns the allocation to the `StackPool` for reuse (or frees it if the pool bucket is
 full).

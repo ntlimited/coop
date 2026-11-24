@@ -21,6 +21,8 @@
 #include "coop/http/client.h"
 #include "coop/http/server.h"
 #include "coop/http/server_handle.h"
+#include "coop/coordinate_with.h"
+#include "coop/ws/upgrade.h"
 #include "coop/io/recv_source.h"
 #include "coop/io/buffer_ring.h"
 #include "coop/io/uring.h"
@@ -3311,6 +3313,436 @@ TEST(HttpTest, AmbiguousCancelledSendIsNeverReplayed)
         EXPECT_EQ(script.tryCalls, 0u);
         EXPECT_EQ(script.output, payload.substr(0, 11));
     });
+}
+
+namespace
+{
+
+struct ConnectionLifetimeStats
+{
+    int opened = 0;
+    int closed = 0;
+    int handled = 0;
+    int borrowers = 0;
+    bool refuse = false;
+    bool upgrade = false;
+    bool spawnChild = false;
+    bool upgraded = false;
+    bool hooks = true;
+    bool childCompleted = false;
+    bool childFinishesData = false;
+    coop::KillCause closeCause = coop::KillCause::None;
+    sockaddr_storage peer{};
+    socklen_t peerLength = 0;
+    coop::Context* serving = nullptr;
+    coop::Coordinator releaseChild;
+    coop::Signal closedSignal{coop::Self()};
+};
+
+struct ApplicationConnectionState
+{
+    ConnectionLifetimeStats* stats;
+    coop::Context* owner;
+};
+
+bool OpenApplicationConnection(coop::Context* ctx, const sockaddr* peer, socklen_t peerLength,
+                               void* userData, void*& state)
+{
+    auto* stats = static_cast<ConnectionLifetimeStats*>(userData);
+    ++stats->opened;
+    stats->serving = ctx;
+    EXPECT_NE(peer, nullptr);
+    EXPECT_EQ(peerLength, sizeof(sockaddr_in));
+    if (peer && peerLength == sizeof(sockaddr_in))
+    {
+        memcpy(&stats->peer, peer, peerLength);
+        stats->peerLength = peerLength;
+        EXPECT_EQ(peer->sa_family, AF_INET);
+        const auto* address = reinterpret_cast<const sockaddr_in*>(peer);
+        EXPECT_EQ(address->sin_addr.s_addr, htonl(INADDR_LOOPBACK));
+        EXPECT_NE(address->sin_port, 0);
+    }
+    state = new ApplicationConnectionState{stats, ctx};
+    return !stats->refuse;
+}
+
+void CloseApplicationConnection(coop::Context* ctx, void* userData, void* state)
+{
+    auto* application = static_cast<ApplicationConnectionState*>(state);
+    auto* stats = static_cast<ConnectionLifetimeStats*>(userData);
+    EXPECT_EQ(application->owner, ctx);
+    EXPECT_EQ(coop::Self(), ctx);
+    EXPECT_EQ(application->stats, stats);
+    EXPECT_EQ(stats->borrowers, 0);
+    stats->closeCause = ctx->WhyKilled();
+    ++stats->closed;
+    stats->closedSignal.Notify(ctx, false);
+    delete application;
+}
+
+void ApplicationStateHandler(coop::http::ConnectionBase& conn, void* userData)
+{
+    auto* application = static_cast<ApplicationConnectionState*>(conn.GetConnectionState());
+    ASSERT_NE(application, nullptr);
+    auto* stats = static_cast<ConnectionLifetimeStats*>(userData);
+    EXPECT_EQ(application->stats, stats);
+    EXPECT_EQ(application->owner, coop::Self());
+    ++stats->handled;
+    if (stats->spawnChild)
+    {
+        ASSERT_TRUE(coop::GetCooperator()->Spawn([application](coop::Context* child)
+        {
+            auto* stats = application->stats;
+            ASSERT_TRUE(child->GetCooperator()->Spawn([application](coop::Context* grandchild)
+            {
+                auto* stats = application->stats;
+                ++stats->borrowers;
+                // Cleanup deliberately ignores cancellation: close must join its retirement.
+                auto result = coop::CoordinateWith(grandchild, &stats->releaseChild,
+                                                   std::chrono::seconds(2));
+                EXPECT_FALSE(result.Error());
+                EXPECT_FALSE(result.TimedOut());
+                EXPECT_EQ(application->stats, stats);
+                --stats->borrowers;
+                if (!result.Error() && !result.TimedOut())
+                    stats->releaseChild.Release(grandchild, false);
+            }));
+        }));
+    }
+    if (stats->upgrade)
+    {
+        ASSERT_TRUE(coop::ws::Upgrade(conn));
+        stats->upgraded = true;
+        auto result = coop::CoordinateWithKill(coop::Self(), &stats->releaseChild,
+                                               std::chrono::seconds(2));
+        EXPECT_EQ(result, &stats->releaseChild);
+        EXPECT_EQ(stats->closed, 0);
+        if (result == &stats->releaseChild)
+            stats->releaseChild.Release(coop::Self(), false);
+        return;
+    }
+    conn.Send(200, "text/plain", "OK");
+}
+
+void AttachedResponseHandler(coop::http::ConnectionBase& conn, void* userData)
+{
+    auto* stats = static_cast<ConnectionLifetimeStats*>(userData);
+    EXPECT_EQ(conn.GetConnectionState(), nullptr);
+    ASSERT_TRUE(conn.BeginChunked(200, "text/plain"));
+    if (!stats->childFinishesData) ASSERT_TRUE(conn.SendChunk("joined", 6));
+    int descriptor = conn.GetDescriptor().m_fd;
+    ASSERT_TRUE(coop::Spawn([&conn, stats, descriptor](coop::Context* child)
+    {
+        coop::Coordinator idle(child);
+        auto result = coop::CoordinateWithKill(child, &idle, std::chrono::seconds(1));
+        EXPECT_TRUE(result.Killed());
+        EXPECT_EQ(conn.GetDescriptor().m_fd, descriptor);
+        stats->childCompleted = stats->childFinishesData
+            ? conn.EndChunked("joined", 6) : conn.EndChunked();
+    }));
+}
+
+struct ApplicationStateServer
+{
+    coop::Context* owner;
+    ConnectionLifetimeStats& stats;
+    coop::Context::Handle handle;
+    coop::http::ServerHandle control;
+    coop::io::ssl::Context* tls;
+    int port = 0;
+    bool returned = false;
+
+    ApplicationStateServer(coop::Context* ctx, ConnectionLifetimeStats& value,
+                           coop::io::ssl::Context* tlsContext = nullptr)
+        : owner(ctx), stats(value), tls(tlsContext)
+    {
+        EXPECT_TRUE(ctx->GetCooperator()->Spawn(
+            {.priority = 0, .stackSize = 65536}, [this](coop::Context* server)
+        {
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            config.control = &control;
+            config.timeout = std::chrono::milliseconds(500);
+            config.handler = stats.hooks ? ApplicationStateHandler : AttachedResponseHandler;
+            config.userData = &stats;
+            if (stats.hooks)
+            {
+                config.connectionOpen = OpenApplicationConnection;
+                config.connectionClose = CloseApplicationConnection;
+            }
+            if (tls) coop::http::RunTlsServer(server, config, *tls);
+            else coop::http::RunServer(server, config);
+            returned = true;
+        }, &handle));
+        port = control.Port();
+        EXPECT_NE(port, 0);
+    }
+
+    ~ApplicationStateServer()
+    {
+        if (control.HasListener())
+            EXPECT_TRUE(control.Drain(owner, std::chrono::milliseconds(500)));
+        handle.Kill();
+        owner->JoinChildren();
+        EXPECT_TRUE(returned);
+        EXPECT_EQ(stats.closed, stats.opened);
+    }
+
+    int Connect()
+    {
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        EXPECT_GE(fd, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        coop::io::Descriptor descriptor(coop::io::borrowed, fd);
+        EXPECT_EQ(coop::io::ConnectKill(descriptor, reinterpret_cast<sockaddr*>(&address),
+                                       sizeof(address), std::chrono::seconds(1)), 0);
+        return fd;
+    }
+};
+
+} // namespace
+
+TEST(HttpTest, ConnectionStateSpansKeepAliveAndClosesOnEof)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ConnectionLifetimeStats stats;
+        ApplicationStateServer server(ctx, stats);
+        {
+            coop::io::Descriptor client(server.Connect());
+            for (int request = 0; request != 2; ++request)
+            {
+                SendString(client, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+                EXPECT_NE(RecvAll(client).find("200 OK"), std::string::npos);
+                EXPECT_EQ(stats.opened, 1);
+                EXPECT_EQ(stats.closed, 0);
+            }
+            EXPECT_EQ(stats.handled, 2);
+            sockaddr_in local{};
+            socklen_t size = sizeof(local);
+            ASSERT_EQ(getsockname(client.m_fd, reinterpret_cast<sockaddr*>(&local), &size), 0);
+            EXPECT_EQ(reinterpret_cast<const sockaddr_in*>(&stats.peer)->sin_port, local.sin_port);
+        }
+        auto closed = coop::CoordinateWithKill(ctx, &stats.closedSignal, std::chrono::seconds(2));
+        EXPECT_FALSE(closed.TimedOut());
+        EXPECT_FALSE(closed.Killed());
+        EXPECT_EQ(stats.closed, 1);
+        EXPECT_EQ(stats.closeCause, coop::KillCause::None);
+    });
+}
+
+TEST(HttpTest, ConnectionStateRefusalClosesOnlyNewConnection)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ConnectionLifetimeStats stats;
+        stats.refuse = true;
+        ApplicationStateServer server(ctx, stats);
+        {
+            coop::io::Descriptor client(server.Connect());
+            char byte;
+            EXPECT_EQ(coop::io::Recv(client, &byte, 1, 0, std::chrono::seconds(1)), 0);
+        }
+        EXPECT_EQ(stats.opened, 1);
+        EXPECT_EQ(stats.closed, 1);
+        EXPECT_EQ(stats.handled, 0);
+        stats.refuse = false;
+        {
+            coop::io::Descriptor client(server.Connect());
+            SendString(client, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            EXPECT_NE(RecvAll(client).find("200 OK"), std::string::npos);
+        }
+        EXPECT_EQ(stats.opened, 2);
+        EXPECT_EQ(stats.closed, 2);
+        EXPECT_EQ(stats.handled, 1);
+        EXPECT_EQ(stats.closeCause, coop::KillCause::None);
+    });
+}
+
+TEST(HttpTest, ConnectionStateKillJoinsAttachedDescendantsBeforeClose)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ConnectionLifetimeStats stats;
+        stats.spawnChild = true;
+        ASSERT_TRUE(stats.releaseChild.TryAcquire(ctx));
+        ApplicationStateServer server(ctx, stats);
+        coop::io::Descriptor client(server.Connect());
+        SendString(client, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        EXPECT_NE(RecvAll(client).find("200 OK"), std::string::npos);
+        EXPECT_EQ(stats.borrowers, 1);
+        // Drain-mode connections are detached from the listener; kill the serving context.
+        ASSERT_NE(stats.serving, nullptr);
+        stats.serving->KillSelf(coop::KillCause::Kill);
+        for (int i = 0; i < 30; ++i) ctx->Yield(true);
+        EXPECT_EQ(stats.closed, 0);
+        stats.releaseChild.Release(ctx, false);
+        auto closed = coop::CoordinateWithKill(ctx, &stats.closedSignal, std::chrono::seconds(2));
+        EXPECT_FALSE(closed.TimedOut());
+        EXPECT_FALSE(closed.Killed());
+        EXPECT_EQ(stats.borrowers, 0);
+        EXPECT_EQ(stats.closed, 1);
+        EXPECT_EQ(stats.closeCause, coop::KillCause::Kill);
+    });
+}
+
+TEST(HttpTest, ConnectionStateRemainsOpenDuringUpgrade)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ConnectionLifetimeStats stats;
+        stats.upgrade = true;
+        ASSERT_TRUE(stats.releaseChild.TryAcquire(ctx));
+        ApplicationStateServer server(ctx, stats);
+        coop::io::Descriptor client(server.Connect());
+        SendString(client,
+            "GET / HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n");
+        EXPECT_NE(RecvAll(client).find("101 Switching Protocols"), std::string::npos);
+        EXPECT_TRUE(stats.upgraded);
+        EXPECT_EQ(stats.closed, 0);
+        stats.releaseChild.Release(ctx, false);
+        auto closed = coop::CoordinateWithKill(ctx, &stats.closedSignal, std::chrono::seconds(2));
+        EXPECT_FALSE(closed.TimedOut());
+        EXPECT_FALSE(closed.Killed());
+        EXPECT_EQ(stats.closed, 1);
+        EXPECT_EQ(stats.closeCause, coop::KillCause::None);
+    });
+}
+
+
+TEST(HttpTest, AttachedResponseChildFinishesBeforeUnhookedConnectionTeardown)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ConnectionLifetimeStats stats;
+        stats.hooks = false;
+        ApplicationStateServer server(ctx, stats);
+        coop::io::Descriptor client(server.Connect());
+        SendString(client, "GET / HTTP/1.0\r\nHost: t\r\n\r\n");
+        std::string response = RecvAll(client);
+        EXPECT_NE(response.find("HTTP/1.0 200 OK\r\n"), std::string::npos);
+        EXPECT_NE(response.find("joined"), std::string::npos);
+        EXPECT_TRUE(stats.childCompleted);
+        EXPECT_EQ(stats.opened, 0);
+        EXPECT_EQ(stats.closed, 0);
+    });
+}
+
+TEST(HttpTest, AttachedTlsResponseChildFinishesBeforeOrderlyConnectionTeardown)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(3));
+        auto certificates = std::make_unique<test::TlsPair>();
+        ConnectionLifetimeStats stats;
+        stats.hooks = false;
+        stats.childFinishesData = true;
+        ApplicationStateServer server(ctx, stats, &certificates->serverContext);
+        coop::io::Descriptor client(server.Connect());
+        char staging[16384];
+        coop::io::ssl::Connection tls(certificates->clientContext, client,
+                                       staging, sizeof(staging));
+        ASSERT_EQ(tls.HandshakeKill(), 0);
+        constexpr char request[] = "GET / HTTP/1.0\r\nHost: t\r\n\r\n";
+        ASSERT_EQ(coop::io::ssl::SendAllKill(tls, request, sizeof(request) - 1),
+                  sizeof(request) - 1);
+        std::string response;
+        char buffer[512];
+        int received;
+        while ((received = coop::io::ssl::RecvKill(tls, buffer, sizeof(buffer),
+                                                   std::chrono::seconds(1))) > 0)
+            response.append(buffer, static_cast<size_t>(received));
+        EXPECT_EQ(received, 0);
+        EXPECT_NE(SSL_get_shutdown(tls.m_ssl) & SSL_RECEIVED_SHUTDOWN, 0);
+        EXPECT_NE(response.find("HTTP/1.0 200 OK\r\n"), std::string::npos);
+        EXPECT_NE(response.find("\r\n\r\njoined"), std::string::npos);
+        EXPECT_TRUE(stats.childCompleted);
+        EXPECT_EQ(stats.opened, 0);
+        EXPECT_EQ(stats.closed, 0);
+    }, {.stackSize = 65536});
+}
+
+TEST(HttpTest, ConnectionStateAccessorHasNullDefault)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        coop::http::PlaintextTransport transport(descriptor);
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA, transport, ctx, ctx->GetCooperator());
+        EXPECT_EQ(conn->GetConnectionState(), nullptr);
+        EXPECT_EQ(conn->coop::http::ConnectionBase::GetConnectionState(), nullptr);
+    });
+}
+
+TEST(HttpTest, TlsConnectionStateSpansRequestsAndClosesHealthy)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(3));
+        auto certificate = std::make_unique<test::SendPair>(test::SendTransport::MemoryTls);
+        ConnectionLifetimeStats stats;
+        ApplicationStateServer server(ctx, stats, &certificate->serverContext);
+        {
+            coop::io::Descriptor client(server.Connect());
+            coop::io::ssl::Connection tls(certificate->clientContext, client,
+                                           coop::io::ssl::SocketBio{});
+            ASSERT_EQ(tls.HandshakeKill(), 0);
+            for (int request = 0; request != 2; ++request)
+            {
+                const char* text = request == 0
+                    ? "GET / HTTP/1.1\r\nHost: t\r\n\r\n"
+                    : "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+                ASSERT_EQ(coop::io::ssl::SendAllKill(tls, text, strlen(text)),
+                          static_cast<int>(strlen(text)));
+                std::string response;
+                char buffer[512];
+                int n;
+                while ((n = coop::io::ssl::RecvKill(tls, buffer, sizeof(buffer),
+                                                    std::chrono::milliseconds(100))) > 0)
+                    response.append(buffer, static_cast<size_t>(n));
+                EXPECT_NE(response.find("200 OK\r\n"), std::string::npos);
+                EXPECT_EQ(stats.opened, 1);
+                EXPECT_EQ(stats.handled, request + 1);
+                if (request == 0) EXPECT_EQ(stats.closed, 0);
+            }
+            sockaddr_in local{};
+            socklen_t size = sizeof(local);
+            ASSERT_EQ(getsockname(client.m_fd, reinterpret_cast<sockaddr*>(&local), &size), 0);
+            EXPECT_EQ(reinterpret_cast<const sockaddr_in*>(&stats.peer)->sin_port, local.sin_port);
+        }
+        auto closed = coop::CoordinateWithKill(ctx, &stats.closedSignal, std::chrono::seconds(2));
+        EXPECT_EQ(closed.Killed(), false);
+        EXPECT_EQ(closed.TimedOut(), false);
+        EXPECT_EQ(stats.closed, 1);
+        EXPECT_EQ(stats.closeCause, coop::KillCause::None);
+    }, {.stackSize = 65536});
+}
+
+TEST(HttpTest, TlsConnectionStateClosesAfterHandshakeFailureWithoutHandler)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        auto certificate = std::make_unique<test::SendPair>(test::SendTransport::MemoryTls);
+        ConnectionLifetimeStats stats;
+        ApplicationStateServer server(ctx, stats, &certificate->serverContext);
+        coop::io::Descriptor client(server.Connect());
+        constexpr char invalid[] = "invalid TLS handshake\n";
+        ASSERT_EQ(coop::io::SendKill(client, invalid, sizeof(invalid) - 1, MSG_NOSIGNAL,
+                                    std::chrono::seconds(1)), sizeof(invalid) - 1);
+        ASSERT_EQ(coop::io::Shutdown(client, SHUT_WR), 0);
+        auto closed = coop::CoordinateWithKill(ctx, &stats.closedSignal, std::chrono::seconds(2));
+        EXPECT_FALSE(closed.Killed());
+        EXPECT_FALSE(closed.TimedOut());
+        EXPECT_EQ(stats.opened, 1);
+        EXPECT_EQ(stats.closed, 1);
+        EXPECT_EQ(stats.handled, 0);
+        EXPECT_EQ(stats.closeCause, coop::KillCause::None);
+    }, {.stackSize = 65536});
 }
 
 TEST(HttpTest, Http10TlsCompletionTruncationErrorsAndFixedKeepAlive)

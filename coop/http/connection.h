@@ -164,6 +164,12 @@ struct ConnectionBase
     virtual size_t LeftoverSize() = 0;
     virtual bool SendRawBytes(const void* data, size_t size) = 0;
 
+    // Borrowed application state for this connection, preserved across keep-alive requests.
+    // The server's connection hooks own its allocation and lifetime; directly constructed
+    // connections default to nullptr. Attached children finish before the close hook runs.
+    //
+    virtual void* GetConnectionState() const { return nullptr; }
+
     // Stable protocol literal after request-line parsing, independent of borrowed buffer views.
     // Native connections return empty before parsing; the default preserves HTTP/1.1 adapters.
     //
@@ -181,7 +187,8 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     friend struct detail::ParserBuffer<Derived>;
 
     ConnectionImpl(io::Descriptor& desc, Context* ctx, Cooperator* co,
-                   time::Interval timeout, ServerParserOptions options);
+                   time::Interval timeout, ServerParserOptions options,
+                   void* connectionState = nullptr);
 
     // ConnectionBase overrides — implemented in detail/server_impl.hpp
     //
@@ -241,6 +248,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool KeepAlive() const override { return m_keepAlive && !m_clientClose && !m_error; }
     io::Descriptor& GetDescriptor() override { return m_desc; }
     Cooperator* GetCooperator() override { return m_co; }
+    void* GetConnectionState() const override { return m_connectionState; }
 
     const char* LeftoverData() override
     {
@@ -350,6 +358,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     }
 
     io::Descriptor& m_desc;
+    void*          m_connectionState;
     Context*        m_ctx;
     Cooperator*     m_co;
     time::Interval  m_timeout;
@@ -429,8 +438,9 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
                size_t recvBufSize = ConnectionBase::DEFAULT_BUFFER_SIZE,
                size_t sendBufSize = ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
                time::Interval timeout = std::chrono::seconds(30),
-               ServerParserOptions options = {})
-    : ConnectionImpl<Connection<Transport>>(transport.Descriptor(), ctx, co, timeout, options)
+               ServerParserOptions options = {}, void* connectionState = nullptr)
+    : ConnectionImpl<Connection<Transport>>(transport.Descriptor(), ctx, co, timeout, options,
+                                            connectionState)
     , m_transport(transport)
     , m_recvBufSize(recvBufSize)
     , m_sendBufSize(sendBufSize)

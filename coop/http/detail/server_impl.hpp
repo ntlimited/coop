@@ -50,8 +50,10 @@ inline unsigned char ServerLower(unsigned char c)
 
 template<typename Derived>
 ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Cooperator* co,
-                                        time::Interval timeout, ServerParserOptions options)
+                                        time::Interval timeout, ServerParserOptions options,
+                                        void* connectionState)
 : m_desc(desc)
+, m_connectionState(connectionState)
 , m_ctx(ctx)
 , m_co(co)
 , m_timeout(timeout)

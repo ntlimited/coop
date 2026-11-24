@@ -3,6 +3,7 @@
 #include "thunk.h"
 #include "cooperator.h"
 #include "debug_borrow.h"
+#include "coordinate_with.h"
 
 namespace coop
 {
@@ -110,6 +111,28 @@ bool Context::SchedulingCheckpoint()
     m_cooperator->m_schedLastRan = this;
     Yield(true /* force */);
     return true;
+}
+
+void Context::JoinChildren(KillCause cancel)
+{
+    assert(m_cooperator->Scheduled() == this);
+    if (!IsKilled() && DeadlineUs() != 0 && RemainingUs() == 0)
+        KillSelf(KillCause::Deadline);
+    if (IsKilled()) cancel = WhyKilled();
+
+    if (cancel != KillCause::None)
+    {
+        for (auto* child : m_children) Kill(child, false, cancel);
+    }
+
+    // Cancellation requests termination but does not prove borrowed state is no longer used.
+    // Once cancelled, retain the existing retirement gate until every attached subtree exits.
+    //
+    auto result = CoordinateWithKill(this, &m_lastChild);
+    if (!(result == &m_lastChild)) m_lastChild.Acquire(this);
+    m_lastChild.Release(this, false);
+    if (!IsKilled() && DeadlineUs() != 0 && RemainingUs() == 0)
+        KillSelf(KillCause::Deadline);
 }
 
 void Context::Detach()

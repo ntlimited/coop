@@ -51,7 +51,7 @@ transport resource lifetime covering the connection. Connections are not copyabl
 
 ## Resource and response policy
 
-Pass `ServerParserOptions` as the final connection constructor argument, or set it before
+Pass `ServerParserOptions` after the connection timeout constructor argument, or set it before
 request-line parsing through `SetParserOptions()`. Stock listeners carry the same options in
 `ServerConfiguration::parserOptions`. Options persist across requests.
 
@@ -184,3 +184,42 @@ borrowed-span lifetime at chunk boundaries, numeric overflow, persistence tokens
 limits, custom error responses, malformed grammar and large file-send counts. It does not
 initialize io_uring. Native socket, splice, TLS and provided-buffer behavior remains covered
 by the integration suite on a host that supports io_uring.
+
+## Application connection state
+
+`ServerConfiguration::connectionOpen` and `connectionClose` are optional callbacks:
+
+```cpp
+using ConnectionOpenHandler = bool (*)(Context*, const sockaddr* peer, socklen_t peerLength,
+                                       void* userData, void*& state);
+using ConnectionCloseHandler = void (*)(Context*, void* userData, void* state);
+```
+
+Open runs on the serving context before request parsing or a TLS handshake. The peer socket
+address is borrowed only during the callback; copy it to retain it. Address-query failure
+supplies nullptr and a zero length. The output state is
+borrowed through `void* ConnectionBase::GetConnectionState() const` for every request on
+that connection. The existing handler `userData` remains per-server state. Directly constructed
+connections can pass an optional state pointer as the last constructor argument.
+`ConnectionBase::GetConnectionState()` supplies a null default for custom connection interfaces.
+The open hook can call `ctx->SetDeadlineIn(...)` to cap the connection's overall lifetime,
+including sends that continue making progress. Separate writer contexts need their own bound.
+
+Returning false refuses only that connection. Close runs exactly once when configured,
+including refusal, EOF, kill, and TLS handshake failure; it receives the state output even
+when open returned false. With no open callback, state is null. Both hooks may cooperate.
+The application allocates, accounts for, and frees its state; the library owns no application
+allocator.
+
+Close follows the last handler or upgraded protocol handler and retirement of all attached
+child context trees, including their cleanup. Connection resources remain live through that
+join. `Context::JoinChildren(KillCause cancel = KillCause::None)` provides that lifetime
+boundary: the default joins, while an explicit cause cancels attached descendants first.
+The server cancels children on exit while preserving a healthy serving context's live state;
+its close hook can still cooperate. Existing cancellation and deadlines propagate normally.
+Like Context retirement, the join cooperatively waits for cleanup to finish even when that
+cleanup ignores cancellation; abandoning it would free borrowed state early. The server uses
+this boundary before parser and transport teardown even when connection hooks are unset.
+A detached child must arrange its own state lifetime. Hooks and per-server state must
+outlive active connections; when graceful draining detaches connections from the listener,
+wait for drain completion before destroying them.

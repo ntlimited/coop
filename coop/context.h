@@ -238,6 +238,14 @@ struct Context : EmbeddedListHookups<Context, int, CONTEXT_LIST_ALL>
     //
     AllocBuffer AllocateBuffer(size_t size);
 
+    // Join all attached child trees while this context and its borrowed resources remain alive.
+    // An explicit cause cancels the children first without cancelling this context. A kill or
+    // deadline during the cooperative wait still propagates normally, then cleanup is drained
+    // to retirement rather than abandoned. Detached children require an independent lifetime.
+    // Call only from this context on its owning cooperator. Safe to repeat after new children.
+    //
+    void JoinChildren(KillCause cancel = KillCause::None);
+
     // Detach disassociates the context from its parent, excluding it from the parent's join
     // and kill propagation. Callers must ensure no other code is going to detach it or has
     // already done so.

@@ -875,3 +875,52 @@ TEST(SpawnTest, OverAlignedObjectsRefusedOnTightStack)
         }
     }, {.stackSize = 65536});
 }
+
+
+TEST(SpawnTest, JoinChildrenCancelsDescendantsWithoutKillingParent)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        bool childFinished = false;
+        coop::KillCause childCause = coop::KillCause::None;
+        ASSERT_TRUE(ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::Coordinator idle(child);
+            auto result = coop::CoordinateWithKill(child, &idle, std::chrono::seconds(1));
+            EXPECT_TRUE(result.Killed());
+            childCause = child->WhyKilled();
+            childFinished = true;
+        }));
+        ctx->JoinChildren(coop::KillCause::Kill);
+        EXPECT_TRUE(childFinished);
+        EXPECT_EQ(childCause, coop::KillCause::Kill);
+        EXPECT_FALSE(ctx->IsKilled());
+        EXPECT_EQ(ctx->WhyKilled(), coop::KillCause::None);
+        bool nextFinished = false;
+        ASSERT_TRUE(ctx->GetCooperator()->Spawn([&](coop::Context*) { nextFinished = true; }));
+        ctx->JoinChildren();
+        EXPECT_TRUE(nextFinished);
+        EXPECT_FALSE(ctx->IsKilled());
+    });
+}
+
+TEST(SpawnTest, JoinChildrenObservesParentDeadlineThenDrains)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        bool childFinished = false;
+        ctx->SetDeadlineIn(std::chrono::milliseconds(10));
+        ASSERT_TRUE(ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            coop::Coordinator idle(child);
+            auto result = coop::CoordinateWithKill(child, &idle);
+            EXPECT_TRUE(result.Killed());
+            EXPECT_EQ(child->WhyKilled(), coop::KillCause::Deadline);
+            childFinished = true;
+        }));
+        ctx->JoinChildren();
+        EXPECT_TRUE(childFinished);
+        EXPECT_TRUE(ctx->IsKilled());
+        EXPECT_EQ(ctx->WhyKilled(), coop::KillCause::Deadline);
+    });
+}

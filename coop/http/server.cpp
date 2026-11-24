@@ -155,6 +155,60 @@ struct DrainParser
     ~DrainParser() { if (node) { node->connection = nullptr; node->idle = false; } }
 };
 
+// Application state outlives every attached context that may borrow it. Context's normal
+// descendant join follows task-local destruction, so serving connections perform that
+// same retirement join explicitly while the parser and transport resources are still alive.
+//
+struct ConnectionLifetime
+{
+    Context* ctx;
+    io::Descriptor& descriptor;
+    ConnectionOpenHandler open;
+    ConnectionCloseHandler close;
+    void* userData;
+    void* state = nullptr;
+    bool joined = false;
+
+    bool Open()
+    {
+        if (!open) return true;
+        sockaddr_storage peer{};
+        socklen_t length = sizeof(peer);
+        const sockaddr* address = nullptr;
+        if (::getpeername(descriptor.m_fd, reinterpret_cast<sockaddr*>(&peer), &length) == 0 &&
+            length <= sizeof(peer))
+            address = reinterpret_cast<const sockaddr*>(&peer);
+        else
+            length = 0;
+        return open(ctx, address, length, userData, state);
+    }
+
+    void JoinChildren()
+    {
+        if (joined) return;
+        // Children may borrow application state through cleanup. Cancel and join them
+        // without marking a healthy serving context killed or shutting down its socket.
+        //
+        KillCause cause = ctx->IsKilled() ? ctx->WhyKilled() : KillCause::Kill;
+        ctx->JoinChildren(cause);
+        joined = true;
+    }
+
+    ~ConnectionLifetime()
+    {
+        JoinChildren();
+        if (close) close(ctx, userData, state);
+    }
+};
+
+// Declared after the connection's borrowed resources, so their teardown follows the join.
+//
+struct ConnectionChildren
+{
+    ConnectionLifetime& lifetime;
+    ~ConnectionChildren() { lifetime.JoinChildren(); }
+};
+
 // A missing stream terminator must not masquerade as a successfully delimited EOF.
 // Construct before the child join so attached writers can finish while resources live.
 //
@@ -249,10 +303,14 @@ struct HttpConnection : Launchable
                    time::Interval timeout,
                    bool pbufRecv = false,
                    ServerHandle* control = nullptr,
-                   ServerParserOptions parserOptions = {})
+                   ServerParserOptions parserOptions = {},
+                   ConnectionOpenHandler connectionOpen = nullptr,
+                   ConnectionCloseHandler connectionClose = nullptr)
     : Launchable(ctx)
     , m_registration(control)
     , m_parserOptions(parserOptions)
+    , m_connectionOpen(connectionOpen)
+    , m_connectionClose(connectionClose)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd, SHUT_RD)
     , m_co(co)
@@ -269,13 +327,16 @@ struct HttpConnection : Launchable
     virtual void Launch() final
     {
         m_registration.Begin(GetContext(), &m_fd);
+        ConnectionLifetime lifetime{
+            GetContext(), m_fd, m_connectionOpen, m_connectionClose, m_userData};
+        if (!lifetime.Open()) return;
 
         using Conn = Connection<PlaintextTransport>;
         PlaintextTransport transport(m_fd);
         auto conn = GetContext()->Allocate<Conn>(
             Conn::ExtraBytes(), transport, GetContext(), m_co,
             ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
-            m_timeout, m_parserOptions);
+            m_timeout, m_parserOptions, lifetime.state);
         DrainParser parserRegistration(m_registration, conn.get());
 
         // Pbuf mode: one armed multishot recv serves the connection's lifetime; the
@@ -291,6 +352,7 @@ struct HttpConnection : Launchable
         }
 
         ResponseClosure<Conn> closure{*conn, m_fd, GetContext()};
+        ConnectionChildren children{lifetime};
         while (!GetContext()->IsKilled())
         {
             // Draining: force this response to close the connection, then exit after it.
@@ -323,6 +385,8 @@ struct HttpConnection : Launchable
 
     DrainRegistration   m_registration;
     ServerParserOptions m_parserOptions;
+    ConnectionOpenHandler m_connectionOpen;
+    ConnectionCloseHandler m_connectionClose;
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
@@ -344,10 +408,14 @@ struct HttpTlsConnection : Launchable
                       io::ssl::Context& sslCtx,
                       time::Interval timeout,
                       ServerHandle* control = nullptr,
-                   ServerParserOptions parserOptions = {})
+                      ServerParserOptions parserOptions = {},
+                      ConnectionOpenHandler connectionOpen = nullptr,
+                      ConnectionCloseHandler connectionClose = nullptr)
     : Launchable(ctx)
     , m_registration(control)
     , m_parserOptions(parserOptions)
+    , m_connectionOpen(connectionOpen)
+    , m_connectionClose(connectionClose)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd, SHUT_RD)
     , m_co(co)
@@ -374,6 +442,9 @@ struct HttpTlsConnection : Launchable
     {
         // Register before handshake: a peer that never sends ClientHello is still live.
         m_registration.Begin(GetContext(), &m_fd);
+        ConnectionLifetime lifetime{
+            GetContext(), m_fd, m_connectionOpen, m_connectionClose, m_userData};
+        if (!lifetime.Open()) return;
         char sslBuf[io::ssl::Connection::BUFFER_SIZE];
         io::ssl::Connection sslConn(m_sslCtx, m_fd, sslBuf, sizeof(sslBuf));
         if (sslConn.HandshakeKill() != 0) return;
@@ -384,10 +455,11 @@ struct HttpTlsConnection : Launchable
         auto conn = GetContext()->Allocate<Conn>(
             Conn::ExtraBytes(), transport, GetContext(), m_co,
             ConnectionBase::DEFAULT_BUFFER_SIZE, ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
-            m_timeout, m_parserOptions);
+            m_timeout, m_parserOptions, lifetime.state);
         DrainParser parserRegistration(m_registration, conn.get());
 
         ResponseClosure<Conn> closure{*conn, m_fd, GetContext(), &sslConn, m_timeout};
+        ConnectionChildren children{lifetime};
         while (!GetContext()->IsKilled())
         {
             if (m_control && m_control->IsDraining()) conn->ForceClose();
@@ -415,6 +487,8 @@ struct HttpTlsConnection : Launchable
 
     DrainRegistration   m_registration;
     ServerParserOptions m_parserOptions;
+    ConnectionOpenHandler m_connectionOpen;
+    ConnectionCloseHandler m_connectionClose;
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
@@ -548,7 +622,8 @@ bool RunServer(Context* ctx, ServerConfiguration const& config)
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 32768};
         if (!co->Launch<HttpConnection>(spawn, fd, co, config.handler, config.userData,
                                        config.timeout, config.pbufRecv, config.control,
-                                       config.parserOptions))
+                                       config.parserOptions, config.connectionOpen,
+                                       config.connectionClose))
         {
             ::close(fd);
         }
@@ -583,7 +658,8 @@ bool RunTlsServer(Context* ctx, ServerConfiguration const& config, io::ssl::Cont
         static constexpr SpawnConfiguration spawn = {.priority = 0, .stackSize = 65536};
         if (!co->Launch<HttpTlsConnection>(spawn, fd, co, config.handler, config.userData,
                                           sslCtx, config.timeout, config.control,
-                                          config.parserOptions))
+                                          config.parserOptions, config.connectionOpen,
+                                          config.connectionClose))
         {
             ::close(fd);
         }

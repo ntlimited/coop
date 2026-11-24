@@ -122,12 +122,59 @@ for the peer's closure alert. The caller must close the transport after success 
 `ReadBodyToFile()` retains the plaintext fixed-length socket-to-pipe-to-file splice path.
 TLS, chunked and provided-buffer receive paths consume borrowed parser spans. It returns bytes
 written or negative errno; a failed call may have written a prefix. Invalid offsets are
-rejected; sink failures are terminal and do not masquerade as complete uploads.
+rejected; sink failures are terminal and do not masquerade as complete uploads. Body reads,
+file writes, splice waits and fairness yields use the context running the read, including
+a separate child reader. Kill or an expired deadline stops that reader even when its
+construction context remains healthy.
 
 `Sendfile()` validates ranges before flushing buffered headers and splits large counts into
-transport-representable operations without copying file contents. A zero count performs no
-file operation. Response components are literal caller-authored wire syntax: no escaping,
+writes of at most 16 KiB. Plaintext and kTLS use pooled pipes and forced-async io_uring
+splice, preserving zero-copy while source page faults run outside the scheduler thread.
+Other TLS file sends stage at most 16 KiB through cooperative file reads and TLS writes.
+Untimed IO sendfile APIs retain their existing paths. A zero count performs no file operation. Response components are literal caller-authored wire syntax: no escaping,
 framing inference, compression, or hidden body buffering is installed.
+
+## Send progress and cancellation
+
+The connection timeout bounds socket-write inactivity as well as receives. Each positive
+write refreshes the inactivity budget, so a steady transfer may last longer than the timeout.
+The sending context's absolute deadline remains a cap on the whole operation.
+There is no absolute cap by default: a reader accepting even a few bytes per interval can
+keep a transfer alive indefinitely. Applications needing a total lifetime bound should call
+`ctx->SetDeadlineIn(...)` on the serving context before sending, and set a deadline on any
+separate writer context they spawn. Kill and expired deadlines also stop continuously writable sends. After cancellation, one immediate,
+nonwaiting write may deliver a small final response; it succeeds only if every byte in that
+write is accepted. A partial or blocked final write terminates the stream. The allowance is
+once per connection, including when a different context subsequently uses it. Buffered header/final chunk flushes,
+raw writes and upgrades use the same policy. An oversized canceled buffer is refused before
+any new bytes are written. File sends cannot use the final attempt; cancellation before
+flushing buffered response bytes or entering the first file transport call returns false without marking the connection failed, leaving
+the allowance available for a later small raw write. This refusal leaves `Error()` unchanged.
+A send that has entered the transport and fails is terminal;
+HTTP exposes its negative errno through `Error()` and returns false from subsequent sends.
+Timeouts report `-ETIMEDOUT`; cancellation reports `-ECANCELED` unless the one immediate final
+write succeeds. A timed TLS write or closure-alert failure also poisons the public TLS write
+API: later `Send` and `Sendfile` variants return `-EPIPE`. After a successful immediate final
+data write completes a close-delimited stream, its owner may still send the TLS closure
+alert. An already canceled or expired owner gets one nonwaiting alert attempt; a healthy
+owner uses the bounded alert operation. Neither resumes application writes nor recovers
+a failed TLS record.
+
+Custom server transports provide these synchronous cooperative progress operations:
+
+```cpp
+int Send(const void* data, size_t size, coop::time::Interval timeout);
+int TrySend(const void* data, size_t size); // optional, one nonwaiting final attempt
+int Sendfile(int fileFd, off_t offset, size_t count, coop::time::Interval timeout);
+```
+
+A positive result is the actual byte count transferred, which may be shorter than requested;
+zero means the stream or file ended, and negative values are errno-style failures. The parser
+requests at most 16 KiB per call. A positive timeout bounds inactivity, while zero imposes no
+inactivity limit. Every nested wait must observe kill and the context deadline. `TrySend` must never wait or yield; transports omitting it refuse final writes after
+cancellation. Native transports retain `SendAll`/`SendfileAll` for the HTTP client API. Repeated successful server
+sends yield after each 2 MiB of progress, including progress spread over many response calls.
+No payload allocation or retained caller buffer is introduced.
 
 ## Deterministic validation
 

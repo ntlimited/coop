@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -15,6 +16,7 @@
 #include "coop/io/recv.h"
 #include "coop/io/connect.h"
 #include "coop/io/send.h"
+#include "coop/io/write.h"
 #include "coop/http/connection.h"
 #include "coop/http/client.h"
 #include "coop/http/server.h"
@@ -32,6 +34,8 @@ using HttpClient = coop::http::ClientConnection<coop::http::PlaintextTransport>;
 static constexpr size_t HTTP_EXTRA = HttpConn::ExtraBytes();
 
 #include "test_helpers.h"
+#include "send_test_helpers.h"
+#include "coop/http/detail/server_impl.hpp"
 #include "tls_pair_helpers.h"
 
 namespace
@@ -1605,6 +1609,180 @@ TEST(HttpTest, ReadBodyToFileSplicesAndPreservesPipelining)
     });
 }
 
+TEST(HttpTest, KilledChildBodyToFileStopsItsOwnSpliceWait)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int fds[2];
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+        coop::io::Descriptor client(fds[0]);
+        coop::io::Descriptor server(fds[1]);
+        const std::string headers =
+            "PUT /body HTTP/1.1\r\nContent-Length: 4194304\r\n\r\n";
+        ASSERT_EQ(coop::io::SendAll(client, headers.data(), headers.size()), headers.size());
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
+        ASSERT_NE(conn->GetRequestLine(), nullptr);
+        conn->SkipHeaders();
+        coop::io::Descriptor file(MakeTmpFile());
+        ASSERT_GE(file.m_fd, 0);
+        coop::CountdownLatch joined(1);
+        coop::Context::Handle reader;
+        ASSERT_TRUE(coop::Spawn([&](coop::Context* child)
+        {
+            EXPECT_EQ(conn->ReadBodyToFile(file.m_fd, 0), -ECANCELED);
+            EXPECT_TRUE(child->IsKilled());
+            joined.Arrive();
+        }, &reader));
+        reader.Kill();
+        // Wake the old non-cancelable splice as well, so its wrong result is a
+        // deterministic failure rather than a test that needs a rescue timer.
+        //
+        std::string tail(8192, 'x');
+        EXPECT_EQ(coop::io::SendAll(client, tail.data(), tail.size()), tail.size());
+        EXPECT_EQ(shutdown(client.m_fd, SHUT_WR), 0);
+        joined.Wait(ctx);
+        EXPECT_FALSE(ctx->IsKilled());
+        struct stat status{};
+        ASSERT_EQ(fstat(file.m_fd, &status), 0);
+        EXPECT_EQ(status.st_size, 0);
+    });
+}
+
+TEST(HttpTest, ChildBodyToFileYieldsItsOwnContext)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        int fds[2];
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+        coop::io::Descriptor client(fds[0]);
+        coop::io::Descriptor server(fds[1]);
+        std::string body = PatternBody(4 * 1024 * 1024);
+        std::string headers = "PUT /body HTTP/1.1\r\nContent-Length: "
+            + std::to_string(body.size()) + "\r\n\r\n";
+        ASSERT_EQ(coop::io::SendAll(client, headers.data(), headers.size()), headers.size());
+        auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
+            coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
+        ASSERT_NE(conn->GetRequestLine(), nullptr);
+        conn->SkipHeaders();
+        coop::io::Descriptor file(MakeTmpFile());
+        ASSERT_GE(file.m_fd, 0);
+        coop::CountdownLatch joined(2);
+        ASSERT_TRUE(coop::Spawn([&](coop::Context*)
+        {
+            EXPECT_EQ(coop::io::SendAll(client, body.data(), body.size()), body.size());
+            joined.Arrive();
+        }));
+        ASSERT_TRUE(coop::Spawn([&](coop::Context* child)
+        {
+            EXPECT_EQ(conn->ReadBodyToFile(file.m_fd, 0), body.size());
+            EXPECT_EQ(coop::Self(), child);
+            EXPECT_FALSE(child->IsKilled());
+            joined.Arrive();
+        }));
+        joined.Wait(ctx);
+        EXPECT_FALSE(ctx->IsKilled());
+        EXPECT_EQ(ReadFileAt(file.m_fd, 0, body.size()), body);
+    });
+}
+
+namespace
+{
+struct CancelingBodyTransport : test::ShortWriteTransport
+{
+    std::string* input;
+    bool* cancel;
+    int Recv(void* data, size_t size, int, coop::time::Interval)
+    {
+        if (*cancel) coop::Self()->KillSelf(coop::KillCause::Kill);
+        size_t n = std::min(size, input->size());
+        memcpy(data, input->data(), n);
+        input->erase(0, n);
+        return static_cast<int>(n);
+    }
+};
+}
+
+TEST(HttpTest, ChildBodyToFileObservesItsOwnCancellation)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        std::string input = "PUT /body HTTP/1.1\r\nContent-Length: 4194304\r\n\r\n";
+        bool cancel = false;
+        CancelingBodyTransport transport{{&script, &descriptor}, &input, &cancel};
+        using Connection = coop::http::Connection<CancelingBodyTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            transport, ctx, ctx->GetCooperator());
+        ASSERT_NE(conn->GetRequestLine(), nullptr);
+        conn->SkipHeaders();
+        input.assign(4 * 1024 * 1024, 'x');
+        cancel = true;
+        coop::io::Descriptor file(MakeTmpFile());
+        ASSERT_GE(file.m_fd, 0);
+        coop::CountdownLatch joined(1);
+        ASSERT_TRUE(coop::Spawn([&](coop::Context* child)
+        {
+            EXPECT_EQ(conn->ReadBodyToFile(file.m_fd, 0), -ECANCELED);
+            EXPECT_TRUE(child->IsKilled());
+            joined.Arrive();
+        }));
+        joined.Wait(ctx);
+        EXPECT_FALSE(ctx->IsKilled());
+        struct stat status{};
+        ASSERT_EQ(fstat(file.m_fd, &status), 0);
+        EXPECT_EQ(status.st_size, 0);
+    });
+}
+
+TEST(HttpTest, CompletedBodyReadsRemainNoOpsAfterCancellation)
+{
+    for (bool consumed : {false, true})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            test::SendScript script;
+            coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+            std::string input = consumed
+                ? "POST /body HTTP/1.0\r\nContent-Length: 3\r\n\r\nabc"
+                : "GET /body HTTP/1.0\r\n\r\n";
+            bool cancel = false;
+            CancelingBodyTransport transport{{&script, &descriptor}, &input, &cancel};
+            using Connection = coop::http::Connection<CancelingBodyTransport>;
+            auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+                transport, ctx, ctx->GetCooperator());
+            ASSERT_NE(conn->GetRequestLine(), nullptr);
+            conn->SkipHeaders();
+            if (consumed) ASSERT_TRUE(conn->SkipBody());
+            ASSERT_TRUE(conn->BeginChunked(200, "text/plain"));
+            ASSERT_TRUE(conn->EndChunked("complete", 8));
+            ctx->KillSelf(coop::KillCause::Kill);
+            EXPECT_TRUE(conn->SkipBody());
+            EXPECT_EQ(conn->ReadBodyToFile(-1, 0), 0);
+            EXPECT_EQ(conn->Error(), 0);
+            EXPECT_TRUE(conn->CloseDelimitedResponseComplete());
+        });
+}
+
+TEST(HttpTest, PlaintextSendFastpathOutsideCooperator)
+{
+    coop::io::Uring ring;
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    coop::io::Descriptor descriptor(coop::io::borrowed, fds[0], &ring);
+    coop::http::PlaintextTransport transport(descriptor);
+    EXPECT_EQ(transport.Send("x", 1, {}), 1);
+    char byte = 0;
+    EXPECT_EQ(recv(fds[1], &byte, 1, 0), 1);
+    EXPECT_EQ(byte, 'x');
+    std::string fill(4096, 'x');
+    while (send(fds[0], fill.data(), fill.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+    EXPECT_EQ(errno, EAGAIN);
+    EXPECT_EQ(transport.Send("x", 1, std::chrono::seconds(1)), -EAGAIN);
+    close(fds[0]);
+    close(fds[1]);
+}
+
 TEST(HttpTest, ReadBodyToFileChunked)
 {
     test::RunInCooperator([](coop::Context* ctx)
@@ -1808,20 +1986,18 @@ void OkHandler(coop::http::ConnectionBase& conn, void*)
 
 TEST(HttpTest, RunServerMultishotAcceptRoundtrip)
 {
-    test::RunInCooperator([](coop::Context* ctx)
+    coop::http::ServerHandle control;
+    bool serverReturned = false;
+    test::RunInCooperator([&](coop::Context* ctx)
     {
-        // Fixed port with pid salt — the test host is shared
-        //
-        int port = 40000 + (getpid() % 20000);
-
         coop::Context::Handle serverHandle;
-        bool serverReturned = false;
         ctx->GetCooperator()->Spawn(
             {.priority = 0, .stackSize = 65536},
-            [&, port](coop::Context* serverCtx)
+            [&](coop::Context* serverCtx)
         {
             coop::http::ServerConfiguration config;
-            config.port = port;
+            config.port = 0;
+            config.control = &control;
             config.multishotAccept = true;
             config.maxPendingAccepts = 8;
             config.name = "TestMultishotServer";
@@ -1830,12 +2006,8 @@ TEST(HttpTest, RunServerMultishotAcceptRoundtrip)
             serverReturned = true;
         }, &serverHandle);
 
-        // Let the server bind and arm
-        //
-        for (int i = 0; i < 10; i++)
-        {
-            ctx->Yield(true);
-        }
+        const auto port = control.Port();
+        ASSERT_NE(port, 0);
 
         for (int round = 0; round < 2; round++)
         {
@@ -1865,6 +2037,7 @@ TEST(HttpTest, RunServerMultishotAcceptRoundtrip)
             ctx->Yield(true);
         }
         EXPECT_TRUE(serverReturned);
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
     });
 }
 
@@ -2108,20 +2281,20 @@ TEST(HttpPbufTest, BodyStreamsAndKeepAliveReuses)
 
 TEST(HttpPbufTest, RunServerFullModernPath)
 {
+    coop::http::ServerHandle control;
+    bool serverReturned = false;
     // Multishot accept + pbuf-chunk parsing together — the modern server data path
     //
-    RunWithBufferRing(64, 2048, [](coop::Context* ctx)
+    RunWithBufferRing(64, 2048, [&](coop::Context* ctx)
     {
-        int port = 41000 + (getpid() % 20000);
-
         coop::Context::Handle serverHandle;
-        bool serverReturned = false;
         ctx->GetCooperator()->Spawn(
             {.priority = 0, .stackSize = 65536},
-            [&, port](coop::Context* serverCtx)
+            [&](coop::Context* serverCtx)
         {
             coop::http::ServerConfiguration config;
-            config.port = port;
+            config.port = 0;
+            config.control = &control;
             config.multishotAccept = true;
             config.pbufRecv = true;
             config.name = "TestModernServer";
@@ -2130,10 +2303,8 @@ TEST(HttpPbufTest, RunServerFullModernPath)
             serverReturned = true;
         }, &serverHandle);
 
-        for (int i = 0; i < 10; i++)
-        {
-            ctx->Yield(true);
-        }
+        const auto port = control.Port();
+        ASSERT_NE(port, 0);
 
         for (int round = 0; round < 3; round++)
         {
@@ -2160,6 +2331,7 @@ TEST(HttpPbufTest, RunServerFullModernPath)
             ctx->Yield(true);
         }
         EXPECT_TRUE(serverReturned);
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
     });
 }
 
@@ -2170,23 +2342,24 @@ TEST(HttpPbufTest, RunServerFullModernPath)
 //
 TEST(HttpTest, KeepAliveClientDisconnectDoesNotSpin)
 {
-    test::RunInCooperator([](coop::Context* ctx)
+    coop::http::ServerHandle control;
+    test::RunInCooperator([&](coop::Context* ctx)
     {
-        int port = 43000 + (getpid() % 20000);
-
         coop::Context::Handle serverHandle;
         ctx->GetCooperator()->Spawn(
             {.priority = 0, .stackSize = 65536},
-            [&, port](coop::Context* serverCtx)
+            [&](coop::Context* serverCtx)
         {
             coop::http::ServerConfiguration config;
-            config.port = port;
+            config.port = 0;
+            config.control = &control;
             config.name = "EofSpinServer";
             config.handler = &OkHandler;
             coop::http::RunServer(serverCtx, config);
         }, &serverHandle);
 
-        for (int i = 0; i < 10; i++) ctx->Yield(true);
+        const auto port = control.Port();
+        ASSERT_NE(port, 0);
 
         auto roundtrip = [&](bool close) -> bool
         {
@@ -2224,6 +2397,7 @@ TEST(HttpTest, KeepAliveClientDisconnectDoesNotSpin)
 
         serverHandle.Kill();
         for (int i = 0; i < 100; i++) ctx->Yield(true);
+        EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
     });
 }
 
@@ -2698,6 +2872,444 @@ TEST(HttpFramingTest, CumulativeHeaderBytesOverLimitRejected)
             conn.SkipHeaders();
             EXPECT_EQ(conn.ParseError(), 431);
         });
+    });
+}
+
+namespace
+{
+void RunHttpSendScenario(test::SendScenario scenario, bool sendfile = false)
+{
+    for (auto kind : {test::SendTransport::Plaintext, test::SendTransport::MemoryTls,
+                      test::SendTransport::SocketTls})
+    {
+        SCOPED_TRACE(static_cast<int>(kind));
+        test::RunSendScenario(kind, scenario,
+            [sendfile](auto transport, coop::Context* ctx, const std::string& payload,
+               coop::time::Interval timeout, bool flush, coop::CountdownLatch& staged)
+            {
+                using Connection = coop::http::Connection<decltype(transport)>;
+                auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+                    transport, ctx, ctx->GetCooperator(),
+                    Connection::DEFAULT_BUFFER_SIZE,
+                    Connection::DEFAULT_SEND_BUFFER_SIZE, timeout);
+                if (sendfile)
+                {
+                    coop::io::Descriptor file(memfd_create("http-send", MFD_CLOEXEC));
+                    EXPECT_GE(file.m_fd, 0);
+                    if (file.m_fd < 0) return false;
+                    int written = coop::io::WriteKill(file, payload.data(), payload.size(),
+                        0, 0, std::chrono::seconds(1));
+                    EXPECT_EQ(written, static_cast<int>(payload.size()));
+                    staged.Arrive();
+                    if (written != static_cast<int>(payload.size())) return false;
+                    return conn->SendHeaders(200, "text/plain", payload.size())
+                        && conn->Sendfile(file.m_fd, 0, payload.size());
+                }
+                staged.Arrive();
+                if (flush)
+                    return conn->BeginChunked(200, "text/plain")
+                        && conn->EndChunked(payload.data(), payload.size());
+                return conn->Send(200, "text/plain", payload);
+            });
+    }
+}
+} // namespace
+
+TEST(HttpTest, StalledSendTimesOut)
+{
+    RunHttpSendScenario(test::SendScenario::Stalled);
+}
+
+TEST(HttpTest, SteadySendRefreshesInactivityBudget)
+{
+    RunHttpSendScenario(test::SendScenario::Steady);
+}
+
+TEST(HttpTest, KillWakesFinalFlushAndSiblingRuns)
+{
+    RunHttpSendScenario(test::SendScenario::KilledFlush);
+}
+
+TEST(HttpTest, SendObservesContextDeadline)
+{
+    RunHttpSendScenario(test::SendScenario::Deadline);
+}
+
+TEST(HttpTest, ShortWritesAdvanceByActualProgress)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        test::ShortWriteTransport transport{&script, &descriptor};
+        using Connection = coop::http::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            transport, ctx, ctx->GetCooperator());
+        std::string payload(40000, 'x');
+        ASSERT_TRUE(conn->SendRawBytes(payload.data(), payload.size()));
+        EXPECT_EQ(script.output, payload);
+        EXPECT_GT(script.calls, 1u);
+        EXPECT_LE(script.largest, 16384u);
+    });
+}
+
+TEST(HttpTest, RepeatedSendsYieldToSibling)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        script.limit = SIZE_MAX;
+        script.output.reserve(3 * 1024 * 1024);
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        test::ShortWriteTransport transport{&script, &descriptor};
+        using Connection = coop::http::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            transport, ctx, ctx->GetCooperator());
+        bool siblingRan = false;
+        coop::CountdownLatch joined(2);
+        ASSERT_TRUE(coop::Spawn([&](coop::Context* child)
+        {
+            child->Yield();
+            siblingRan = true;
+            joined.Arrive();
+        }));
+        std::string payload(4096, 'x');
+        ASSERT_TRUE(coop::Spawn([&](coop::Context*)
+        {
+            for (size_t i = 0; i < 600; ++i)
+                EXPECT_TRUE(conn->SendRawBytes(payload.data(), payload.size()));
+            EXPECT_TRUE(siblingRan);
+            joined.Arrive();
+        }));
+        joined.Wait(ctx);
+        EXPECT_TRUE(siblingRan);
+    });
+}
+
+TEST(HttpTest, FinalChunkFlushTimesOut)
+{
+    RunHttpSendScenario(test::SendScenario::FinalFlush);
+}
+
+TEST(HttpTest, StalledFileSendTimesOut)
+{
+    RunHttpSendScenario(test::SendScenario::Stalled, true);
+}
+
+TEST(HttpTest, KillWakesFileSendAndSiblingRuns)
+{
+    RunHttpSendScenario(test::SendScenario::KilledFile, true);
+}
+
+TEST(HttpTest, WritableSendObservesExpiredContextDeadline)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        script.limit = SIZE_MAX;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        test::ShortWriteTransport transport{&script, &descriptor};
+        using Connection = coop::http::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            transport, ctx, ctx->GetCooperator());
+        ctx->SetDeadline(coop::time::MonotonicMicros() - 1);
+        EXPECT_TRUE(conn->SendRawBytes("x", 1));
+        EXPECT_EQ(ctx->WhyKilled(), coop::KillCause::Deadline);
+        EXPECT_EQ(script.calls, 0u);
+        EXPECT_EQ(script.tryCalls, 1u);
+    });
+}
+
+TEST(HttpTest, ChildWriterObservesItsOwnCancellation)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        script.limit = SIZE_MAX;
+        script.killOnWrite = true;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        using Connection = coop::http::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            test::ShortWriteTransport{&script, &descriptor}, ctx, ctx->GetCooperator());
+        coop::CountdownLatch joined(1);
+        ASSERT_TRUE(coop::Spawn([&](coop::Context*)
+        {
+            std::string payload(49152, 'x');
+            EXPECT_FALSE(conn->SendRawBytes(payload.data(), payload.size()));
+            EXPECT_TRUE(conn->SendError());
+            joined.Arrive();
+        }));
+        joined.Wait(ctx);
+        EXPECT_FALSE(ctx->IsKilled());
+        EXPECT_EQ(script.calls, 1u);
+        EXPECT_EQ(script.tryCalls, 0u);
+        EXPECT_EQ(script.output.size(), 16384u);
+    });
+}
+
+TEST(HttpTest, CanceledOversizedWriteDoesNotSendAPrefix)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        using Connection = coop::http::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            test::ShortWriteTransport{&script, &descriptor}, ctx, ctx->GetCooperator());
+        std::string payload(32768, 'x');
+        ctx->KillSelf(coop::KillCause::Kill);
+        EXPECT_FALSE(conn->SendRawBytes(payload.data(), payload.size()));
+        EXPECT_TRUE(script.output.empty());
+        EXPECT_EQ(script.calls, 0u);
+        EXPECT_EQ(script.tryCalls, 0u);
+    });
+}
+
+TEST(HttpTest, CanceledUnstartedFileSendPreservesFinalWrite)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        using Connection = coop::http::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            test::ShortWriteTransport{&script, &descriptor}, ctx, ctx->GetCooperator());
+        ctx->KillSelf(coop::KillCause::Kill);
+        EXPECT_FALSE(conn->Sendfile(-1, 0, 32768));
+        EXPECT_FALSE(conn->SendError());
+        EXPECT_TRUE(conn->SendRawBytes("goodbye", 7));
+        EXPECT_FALSE(conn->SendRawBytes("again", 5));
+        EXPECT_EQ(script.output, "goodbye");
+        EXPECT_EQ(script.calls, 0u);
+        EXPECT_EQ(script.tryCalls, 1u);
+    });
+}
+
+TEST(HttpTest, CanceledUnstartedFileSendDoesNotFlushBufferedResponse)
+{
+    for (bool deadline : {false, true})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            test::SendScript script;
+            coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+            using Connection = coop::http::Connection<test::ShortWriteTransport>;
+            auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+                test::ShortWriteTransport{&script, &descriptor}, ctx, ctx->GetCooperator());
+            ASSERT_TRUE(conn->BeginResponse(503, "Service Unavailable"));
+            ASSERT_TRUE(conn->AppendHeader("Content-Length", size_t(0)));
+            if (deadline) ctx->SetDeadline(coop::time::MonotonicMicros() - 1);
+            else ctx->KillSelf(coop::KillCause::Kill);
+            EXPECT_FALSE(conn->Sendfile(-1, 0, 32768));
+            EXPECT_FALSE(conn->SendError());
+            EXPECT_TRUE(script.output.empty());
+            EXPECT_EQ(script.tryCalls, 0u);
+            EXPECT_TRUE(conn->EndHeaders());
+            EXPECT_EQ(script.calls, 0u);
+            EXPECT_EQ(script.tryCalls, 1u);
+            EXPECT_EQ(script.output.find("HTTP/1.1 503 Service Unavailable\r\n"), 0u);
+            EXPECT_NE(script.output.find("Content-Length: 0\r\n"), std::string::npos);
+            EXPECT_EQ(script.output.substr(script.output.size() - 4), "\r\n\r\n");
+        });
+}
+
+TEST(HttpTest, CancellationAllowsExactlyOneTruthfulImmediateWrite)
+{
+    for (size_t limit : {size_t(3), SIZE_MAX})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            test::SendScript script;
+            script.tryLimit = limit;
+            coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+            using Connection = coop::http::Connection<test::ShortWriteTransport>;
+            auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+                test::ShortWriteTransport{&script, &descriptor}, nullptr, ctx->GetCooperator());
+            ctx->KillSelf(coop::KillCause::Kill);
+            EXPECT_EQ(conn->SendRawBytes("goodbye", 7), limit >= 7);
+            EXPECT_FALSE(conn->SendRawBytes("again", 5));
+            EXPECT_EQ(script.calls, 0u);
+            EXPECT_EQ(script.tryCalls, 1u);
+            EXPECT_EQ(script.output, limit >= 7 ? "goodbye" : "goo");
+        });
+}
+
+TEST(HttpTest, TrickleReaderCannotExtendAbsoluteDeadline)
+{
+    RunHttpSendScenario(test::SendScenario::TrickleDeadline);
+}
+
+TEST(HttpTest, TimedFileSendPreservesRecordSizedProgress)
+{
+    for (auto kind : {test::SendTransport::Plaintext, test::SendTransport::MemoryTls,
+                      test::SendTransport::SocketTls})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            ctx->SetDeadlineIn(std::chrono::seconds(2));
+            auto pair = std::make_unique<test::SendPair>(kind);
+            int capacity = 65536;
+            ASSERT_EQ(setsockopt(pair->server.m_fd, SOL_SOCKET, SO_SNDBUF,
+                                &capacity, sizeof(capacity)), 0);
+            coop::io::Descriptor file(memfd_create("sendfile-record", MFD_CLOEXEC));
+            ASSERT_GE(file.m_fd, 0);
+            std::string payload(16384, 'f');
+            ASSERT_EQ(coop::io::WriteKill(file, payload.data(), payload.size(), 0), 16384);
+            int n = kind == test::SendTransport::Plaintext
+                ? coop::io::SendfileKill(pair->server, file.m_fd, 0, payload.size(),
+                                        std::chrono::milliseconds(150))
+                : coop::io::ssl::SendfileKill(*pair->serverTls, file.m_fd, 0, payload.size(),
+                                             std::chrono::milliseconds(150));
+            ASSERT_GT(n, 4096);
+            EXPECT_LE(n, 16384);
+            if (kind != test::SendTransport::Plaintext) EXPECT_EQ(n, 16384);
+            std::string actual;
+            char buffer[16384];
+            while (actual.size() < static_cast<size_t>(n))
+            {
+                int got = pair->Recv(buffer, sizeof(buffer));
+                ASSERT_GT(got, 0);
+                actual.append(buffer, got);
+            }
+            EXPECT_EQ(actual, payload.substr(0, n));
+        }, {.stackSize = 65536});
+}
+
+namespace
+{
+
+void CheckTimedFileWithDefaultSigpipe(test::SendTransport kind, bool resetPeer = false,
+                                     int signalState = 0)
+{
+    struct sigaction action{};
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    ASSERT_EQ(sigaction(SIGPIPE, &action, nullptr), 0);
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGPIPE);
+    ASSERT_EQ(pthread_sigmask(SIG_UNBLOCK, &signals, nullptr), 0);
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(2));
+        auto pair = std::make_unique<test::SendPair>(kind);
+        if (kind == test::SendTransport::Ktls) ASSERT_TRUE(pair->serverTls->m_ktlsTx);
+        if (signalState)
+        {
+            ASSERT_EQ(pthread_sigmask(SIG_BLOCK, &signals, nullptr), 0);
+            if (signalState == 2) ASSERT_EQ(raise(SIGPIPE), 0);
+        }
+        if (resetPeer)
+        {
+            linger reset{1, 0};
+            ASSERT_EQ(setsockopt(pair->client.m_fd, SOL_SOCKET, SO_LINGER,
+                                &reset, sizeof(reset)), 0);
+        }
+        ASSERT_EQ(pair->client.Close(), 0);
+        if (resetPeer)
+        {
+            char byte;
+            ASSERT_EQ(coop::io::RecvKill(pair->server, &byte, 1, 0,
+                                         std::chrono::milliseconds(150)), -ECONNRESET);
+        }
+        else
+        {
+            // Also cover an output half closed before the file send begins.
+            ASSERT_EQ(shutdown(pair->server.m_fd, SHUT_WR), 0);
+        }
+        coop::io::Descriptor file(memfd_create("sendfile-closed-output", MFD_CLOEXEC));
+        ASSERT_GE(file.m_fd, 0);
+        constexpr char payload[] = "file response";
+        ASSERT_EQ(coop::io::WriteKill(file, payload, sizeof(payload), 0), sizeof(payload));
+        int result = kind == test::SendTransport::Plaintext
+            ? coop::io::SendfileKill(pair->server, file.m_fd, 0, sizeof(payload),
+                                     std::chrono::milliseconds(150))
+            : coop::io::ssl::SendfileKill(*pair->serverTls, file.m_fd, 0, sizeof(payload),
+                                          std::chrono::milliseconds(150));
+        EXPECT_EQ(result, -EPIPE);
+        sigset_t current, pending;
+        EXPECT_EQ(pthread_sigmask(SIG_SETMASK, nullptr, &current), 0);
+        EXPECT_EQ(sigismember(&current, SIGPIPE), signalState != 0);
+        EXPECT_EQ(sigpending(&pending), 0);
+        EXPECT_EQ(sigismember(&pending, SIGPIPE), signalState == 2);
+    }, {.stackSize = 65536});
+}
+
+} // namespace
+
+TEST(HttpFileSendDeathTest, PlaintextClosedOutputReturnsEpipeWithDefaultSigpipe)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT({
+        CheckTimedFileWithDefaultSigpipe(test::SendTransport::Plaintext);
+        CheckTimedFileWithDefaultSigpipe(test::SendTransport::Plaintext, false, 1);
+        CheckTimedFileWithDefaultSigpipe(test::SendTransport::Plaintext, false, 2);
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(HttpFileSendDeathTest, KtlsClosedOutputReturnsEpipeWithDefaultSigpipe)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    bool activated = false;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(2));
+        auto pair = std::make_unique<test::SendPair>(test::SendTransport::Ktls);
+        activated = pair->serverTls->m_ktlsTx;
+    }, {.stackSize = 65536});
+    if (!activated) GTEST_SKIP() << "kernel/OpenSSL did not activate kTLS";
+    ASSERT_EXIT({
+        CheckTimedFileWithDefaultSigpipe(test::SendTransport::Ktls);
+        CheckTimedFileWithDefaultSigpipe(test::SendTransport::Ktls, true);
+        CheckTimedFileWithDefaultSigpipe(test::SendTransport::Ktls, true, 1);
+        CheckTimedFileWithDefaultSigpipe(test::SendTransport::Ktls, true, 2);
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(HttpTest, KtlsTimedFileAndCancellationPaths)
+{
+    bool activated = false;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(2));
+        auto pair = std::make_unique<test::SendPair>(test::SendTransport::Ktls);
+        activated = pair->serverTls->m_ktlsTx && pair->clientTls->m_ktlsRx;
+    }, {.stackSize = 65536});
+    if (!activated) GTEST_SKIP() << "kernel/OpenSSL did not activate kTLS";
+    for (auto scenario : {test::SendScenario::Stalled, test::SendScenario::KilledFile,
+                          test::SendScenario::Steady, test::SendScenario::TrickleDeadline})
+        test::RunSendScenario(test::SendTransport::Ktls, scenario,
+            [](auto transport, coop::Context* child, const std::string& payload,
+               coop::time::Interval timeout, bool, coop::CountdownLatch& staged)
+            {
+                coop::io::Descriptor file(memfd_create("ktls-sendfile", MFD_CLOEXEC));
+                EXPECT_GE(file.m_fd, 0);
+                EXPECT_EQ(coop::io::WriteKill(file, payload.data(), payload.size(), 0),
+                          static_cast<int>(payload.size()));
+                staged.Arrive();
+                using Connection = coop::http::Connection<decltype(transport)>;
+                auto conn = child->Allocate<Connection>(Connection::ExtraBytes(),
+                    transport, child, child->GetCooperator(), Connection::DEFAULT_BUFFER_SIZE,
+                    Connection::DEFAULT_SEND_BUFFER_SIZE, timeout);
+                return conn->Sendfile(file.m_fd, 0, payload.size());
+            });
+}
+
+TEST(HttpTest, AmbiguousCancelledSendIsNeverReplayed)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        script.killOnWrite = true;
+        script.cancelAfterWrite = true;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        using Connection = coop::http::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            test::ShortWriteTransport{&script, &descriptor}, ctx, ctx->GetCooperator());
+        std::string payload(1000, 'x');
+        EXPECT_FALSE(conn->SendRawBytes(payload.data(), payload.size()));
+        EXPECT_EQ(script.calls, 1u);
+        EXPECT_EQ(script.tryCalls, 0u);
+        EXPECT_EQ(script.output, payload.substr(0, 11));
     });
 }
 

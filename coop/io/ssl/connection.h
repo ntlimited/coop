@@ -12,6 +12,7 @@ namespace io
 {
 
 struct Descriptor;
+namespace detail { struct SendProgress; }
 
 namespace ssl
 {
@@ -97,12 +98,18 @@ struct Connection
     bool m_ktlsTx = false;
     bool m_ktlsRx = false;
 
+    // A failed encrypted write cannot be retried without corrupting record order.
+    bool m_writeFailed = false;
+    bool m_finalSendAttempted = false;
+
   private:
+    friend int TrySend(Connection&, const void*, size_t);
     friend int Send(Connection&, const void*, size_t);
     friend int SendKill(Connection&, const void*, size_t);
     friend int SendAll(Connection&, const void*, size_t);
     friend int SendAllKill(Connection&, const void*, size_t);
-    friend int SendImpl(Connection&, const void*, size_t, bool);
+    friend int SendImpl(Connection&, const void*, size_t, bool, time::Interval,
+                        io::detail::SendProgress*);
     friend int Recv(Connection&, void*, size_t);
     friend int Recv(Connection&, void*, size_t, time::Interval);
     friend int RecvKill(Connection&, void*, size_t);
@@ -123,7 +130,8 @@ struct Connection
     // after any SSL operation that may produce output (handshake steps, SSL_write, shutdown).
     // Memory BIO mode only.
     //
-    int FlushWrite(bool killAware = false, time::Interval timeout = {});
+    int FlushWrite(bool killAware = false, time::Interval timeout = {},
+                   io::detail::SendProgress* progress = nullptr);
 
     // Pull encrypted data from the descriptor into OpenSSL's read BIO. Called when an SSL operation
     // returns SSL_ERROR_WANT_READ, meaning it needs more ciphertext to proceed.
@@ -139,6 +147,12 @@ struct Connection
     size_t m_bufferSize;
     bool m_shutdownWriteFailed = false;
 };
+
+// Shared by the encrypted buffer and cooperative file-send implementations so
+// file reads cannot restart a partially spent write-inactivity budget.
+//
+int SendImpl(Connection&, const void*, size_t, bool, time::Interval,
+             io::detail::SendProgress*);
 
 } // end namespace coop::io::ssl
 } // end namespace coop::io

@@ -9,6 +9,8 @@
 #include <climits>
 #include <limits>
 
+#include "coop/io/detail/send_progress.h"
+
 namespace coop
 {
 namespace ws
@@ -19,8 +21,9 @@ namespace ws
 // ---------------------------------------------------------------------------
 
 template<typename Derived>
-ConnectionImpl<Derived>::ConnectionImpl(time::Interval timeout)
+ConnectionImpl<Derived>::ConnectionImpl(time::Interval timeout, Context* ctx)
 : m_timeout(timeout)
+, m_sendSinceYield(0)
 , m_bufLen(0)
 , m_parsePos(0)
 , m_sendLen(0)
@@ -42,6 +45,7 @@ ConnectionImpl<Derived>::ConnectionImpl(time::Interval timeout)
 , m_sendMessageOpen(false)
 , m_autoCloseOnError(true)
 {
+    (void)ctx;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,16 +126,7 @@ bool ConnectionImpl<Derived>::Append(const void* data, size_t size)
         //
         if (m_sendLen == 0 && size > space)
         {
-            // The transport reports progress through int; keep every operation representable.
-            size_t part = std::min(size, static_cast<size_t>(INT_MAX));
-            if (TransportSendAll(p, part) != static_cast<int>(part))
-            {
-                m_sendError = true;
-                return false;
-            }
-            p += part;
-            size -= part;
-            continue;
+            return SendRaw(p, size);
         }
 
         size_t n = std::min(size, space);
@@ -149,12 +144,47 @@ bool ConnectionImpl<Derived>::Flush()
     if (m_sendError) return false;
     if (m_sendLen == 0) return true;
 
-    if (TransportSendAll(SendBuf(), m_sendLen) != static_cast<int>(m_sendLen))
-    {
-        m_sendError = true;
-        return false;
-    }
+    bool result = SendRaw(SendBuf(), m_sendLen);
     m_sendLen = 0;
+    return result;
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::SendRaw(const void* data, size_t size)
+{
+    if (m_finalSendAttempted) { m_sendError = true; return false; }
+    if (m_sendError) return false;
+    const char* p = static_cast<const char*>(data);
+    io::detail::SendProgress progress(coop::GetCooperator() ? Self() : nullptr,
+                                       m_timeout, &m_sendSinceYield);
+    while (size)
+    {
+        time::Interval timeout;
+        int n = progress.Prepare(timeout);
+        size_t part = std::min(size, io::detail::SendProgress::MAX_WRITE);
+        bool finalAttempt = n == -ECANCELED && !m_finalSendAttempted;
+        if (finalAttempt)
+        {
+            m_finalSendAttempted = true;
+            if (part != size) { m_sendError = true; return false; }
+            n = TransportTrySend(p, part);
+        }
+        else if (n == 0) n = TransportSend(p, part, timeout);
+
+        if (finalAttempt && (n <= 0 || static_cast<size_t>(n) != part))
+        {
+            m_sendError = true;
+            return false;
+        }
+        if (n <= 0 || static_cast<size_t>(n) > part)
+        {
+            m_sendError = true;
+            return false;
+        }
+        p += n;
+        size -= n;
+        if (!finalAttempt) progress.Progress(static_cast<size_t>(n));
+    }
     return true;
 }
 
@@ -497,6 +527,22 @@ bool ConnectionImpl<Derived>::SendFrame(Opcode opcode, bool fin,
         headerLen = 10;
     }
 
+    // A canceled frame must stay in the existing buffer until its sole immediate
+    // write. Otherwise Append could flush a header before refusing the payload.
+    //
+    auto* ctx = coop::GetCooperator() ? Self() : nullptr;
+    if (ctx && !ctx->IsKilled() && ctx->DeadlineUs() != 0 && ctx->RemainingUs() <= 0)
+        ctx->KillSelf(KillCause::Deadline);
+    if (ctx && ctx->IsKilled())
+    {
+        size_t capacity = std::min(SendBufSize(), io::detail::SendProgress::MAX_WRITE);
+        if (m_sendLen > capacity || headerLen > capacity - m_sendLen
+            || size > capacity - m_sendLen - headerLen)
+        {
+            m_sendError = true;
+            return false;
+        }
+    }
     if (!Append(header, headerLen)) return false;
     if (size > 0 && !Append(payload, size)) return false;
     return Flush();

@@ -78,6 +78,13 @@ park/pull totals to confirm balancing.
 ### HTTP
 Filter: `--filter='BM_HTTP_'`
 
+`bench_http_file` is a directional hot-loopback interleaved comparison of 32 MiB
+fixed-length HTTP responses over plaintext, memory-BIO TLS and active kTLS. Missing kTLS
+activation is a nonzero exit. It alternates a reconstructed former 4 KiB cooperative copy
+model with the current `Connection::Sendfile` path in one process.
+Build the `bench_http_file` CMake/Bazel target, then run it from the certificate directory;
+its optional argument selects repetitions (default 7). Numbered reports record exact commands.
+
 ## Coding Standards
 
 ### Naming Convention

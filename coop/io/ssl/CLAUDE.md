@@ -56,6 +56,19 @@ for the common case where the syscall succeeds immediately. This is critical for
 routing every send through `io::Send` (uring SQE/CQE) adds ~20us per-op overhead that
 dominates the crypto savings kTLS provides.
 
+Timed `ssl::SendKill` accepts at most 16 KiB of plaintext per call. Memory BIO
+sends report success only after the encrypted output reaches the socket. Socket BIO sends
+track actual BIO socket-write progress, including prefixes written before WANT_WRITE.
+Positive writes refresh the inactivity budget; readiness and encryption alone do not.
+The same budget covers nested output flushes and WANT_READ/WANT_WRITE waits, and kill-aware
+variants retain the context's absolute deadline. A failed send terminates the write stream;
+staging bytes removed from the write BIO must not be retried. Timed TLS file sends use
+16 KiB cooperative file reads and retain that budget through the subsequent TLS write.
+kTLS timed file sends retain zero-copy through the runtime pipe pool and async splice.
+Failed writes set `Connection::m_writeFailed`; every later public Send/Sendfile returns
+`-EPIPE`. `TrySend` performs one nonwaiting terminal write for cancellation cleanup; a
+partial encrypted record is a sticky failure. `SSL_ERROR_SYSCALL` preserves its errno.
+
 ## Client authentication policy
 
 Client contexts preserve OpenSSL's `SSL_VERIFY_NONE` default. Opt-in helpers keep trust,

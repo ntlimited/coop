@@ -1,4 +1,5 @@
 #include "connection.h"
+#include "coop/io/detail/send_progress.h"
 
 #include <algorithm>
 #include <cassert>
@@ -124,8 +125,13 @@ bool Connection::SetVerifyIp(const char* address)
 //
 // Returns 0 on success, negative on I/O error.
 //
-int Connection::FlushWrite(bool killAware, time::Interval timeout)
+int Connection::FlushWrite(bool killAware, time::Interval timeout,
+                           io::detail::SendProgress* suppliedProgress)
 {
+    if (m_writeFailed) return -EPIPE;
+    auto fail = [&](int error) { m_writeFailed = true; return error; };
+    io::detail::SendProgress localProgress(killAware ? Self() : nullptr, timeout);
+    auto& progress = suppliedProgress ? *suppliedProgress : localProgress;
     while (BIO_ctrl_pending(m_wbio) > 0)
     {
         int n = BIO_read(m_wbio, m_buffer, m_bufferSize);
@@ -138,12 +144,14 @@ int Connection::FlushWrite(bool killAware, time::Interval timeout)
         int at = 0;
         while (at < n)
         {
+            time::Interval remaining;
+            if (int error = progress.Prepare(remaining); error < 0) return fail(error);
             int sent;
-            if (timeout.count() > 0)
+            if (remaining.count() > 0)
             {
                 sent = killAware
-                    ? io::SendKill(m_desc, &m_buffer[at], n - at, 0, timeout)
-                    : io::Send(m_desc, &m_buffer[at], n - at, 0, timeout);
+                    ? io::SendKill(m_desc, &m_buffer[at], n - at, 0, remaining)
+                    : io::Send(m_desc, &m_buffer[at], n - at, 0, remaining);
             }
             else
             {
@@ -154,9 +162,10 @@ int Connection::FlushWrite(bool killAware, time::Interval timeout)
             if (sent <= 0)
             {
                 spdlog::warn("ssl flush_write fd={} send failed={}", m_desc.m_fd, sent);
-                return sent < 0 ? sent : -1;
+                return fail(sent < 0 ? sent : -EIO);
             }
             at += sent;
+            progress.Progress(static_cast<size_t>(sent));
         }
     }
     return 0;
@@ -216,7 +225,7 @@ int Connection::HandshakeKill()
 
 int Connection::ShutdownWriteKill(time::Interval timeout)
 {
-    if (m_shutdownWriteFailed) return -EPIPE;
+    if (m_shutdownWriteFailed || m_writeFailed) return -EPIPE;
     auto* ctx = Self();
     // An orderly closure is a bounded final operation even when normal IO is unbounded.
     // The server passes its timeout, with a one-second cap for this alert alone.
@@ -238,6 +247,7 @@ int Connection::ShutdownWriteKill(time::Interval timeout)
     auto fail = [&](int error)
     {
         m_shutdownWriteFailed = true;
+        m_writeFailed = true;
         return error;
     };
     bool first = true;

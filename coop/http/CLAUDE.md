@@ -62,8 +62,9 @@ trailers are pre-built `Fragment`s — memcpy'd via `Append`/`AppendLiteral`. Nu
 write buffer flushes automatically on overflow or explicitly via `Flush()`.
 
 Status lines outside the pre-compiled table are formatted at runtime by `AppendStatusLine`:
-`HTTP/1.1 <code> <reason>` where the reason is the caller's (proxy passthrough of the
-upstream phrase) or `response::DefaultReason(code)`'s status-class fallback. All response
+`HTTP/1.x <code> <reason>` using the retained request version, where the reason is the
+caller's phrase or `response::DefaultReason(code)`'s status-class fallback. HTTP/1.0
+responses close after the body and never emit chunked framing or trailers. All response
 methods route through it, so any 3-digit code is sendable.
 
 ## Component Response API (proxying)
@@ -93,15 +94,26 @@ visit userspace); TLS and chunked bodies bounce through the parser buffer instea
 contract, just copied. On success the parser lands in DONE, positioned for keep-alive Reset.
 Client side treats HEAD/204/304 as framing-only (returns 0).
 
-Serve-from-disk was already first-class: `Sendfile` on the server (kTLS-aware via the
-transport), and now `SendBodyFromFile` on the client (PUT of a cached object — flush headers,
-then sendfile through the transport). Splice and sendfile need non-blocking sockets; accepted
-server sockets and anything from `io::Connect` should already be `O_NONBLOCK`.
+`Sendfile` on the server uses timed partial-progress transport operations. Plaintext and kTLS use pooled pipes: source pages enter through forced-async io_uring
+splice, then resident pipe pages move to the nonblocking socket without a userspace copy.
+Other TLS sends use cooperative 16 KiB reads, matching the TLS record size. The client's `SendBodyFromFile` retains the untimed sendfile transport
+path. Splice and direct sendfile need non-blocking sockets; accepted server sockets and
+anything from `io::Connect` should already be `O_NONBLOCK`.
 
 For small responses (headers + body fit in 512B), the entire response coalesces in the send
-buffer and goes out in one `SendAll` syscall. Large bodies flush headers first, then send the
-body directly via `SendRaw`. Chunked encoding accumulates hex size + data + CRLF in the buffer,
-coalescing multiple small chunks before flush.
+buffer and normally goes out in one partial-progress `Send`. Large bodies flush headers
+first, then send the body directly via `SendRaw` in operations of at most 16 KiB. Chunked
+encoding accumulates hex size + data + CRLF in the buffer, coalescing multiple small chunks
+before flush.
+
+Server and WebSocket sends observe kill and context deadlines before every progress attempt
+and in every nested wait. The connection timeout limits inactivity; no absolute lifetime cap is set by default, so
+applications needing one should set a context deadline in `connectionOpen`. Positive socket writes
+refresh the inactivity budget, while the absolute context deadline cannot be extended. Final flushes and control
+frames use the same loop. A persistent per-connection byte budget yields after each 2 MiB,
+even across many small sends. Custom server transports supply timed `Send` and `Sendfile`
+partial-progress operations and may provide `TrySend(buf, size)` for the one nonwaiting
+post-cancellation final write. Omission refuses that final write. HTTP clients retain `SendAll` and `SendfileAll`.
 
 The `WritevAll` / iovec pattern is eliminated — both `PlaintextTransport` and `TlsTransport`
 no longer provide `WritevAll`. TLS benefits especially: the buffer replaces the deferred-send

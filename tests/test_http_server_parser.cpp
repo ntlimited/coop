@@ -21,6 +21,7 @@ struct Script
     int terminal = 0;
     int sendError = 0;
     int fileError = 0;
+    size_t fileLimit = SIZE_MAX;
     std::vector<std::pair<off_t, size_t>> fileSends;
     std::string sent;
 };
@@ -54,7 +55,15 @@ struct Transport
         script->fileSends.emplace_back(offset, count);
         if (script->fileError) return script->fileError;
         EXPECT_LE(count, static_cast<size_t>(INT_MAX));
-        return static_cast<int>(count);
+        return static_cast<int>(std::min(count, script->fileLimit));
+    }
+    int Send(const void* data, size_t size, coop::time::Interval)
+    {
+        return SendAll(data, size);
+    }
+    int Sendfile(int fd, off_t offset, size_t count, coop::time::Interval)
+    {
+        return SendfileAll(fd, offset, count);
     }
 };
 using Connection = coop::http::Connection<Transport>;
@@ -327,9 +336,12 @@ TEST(HttpServerParser, FileSendSplitsCountsAndRejectsInvalidRangesBeforeFlush)
     EXPECT_TRUE(parser.script.fileSends.empty());
     const size_t count = static_cast<size_t>(INT_MAX) + 4;
     ASSERT_TRUE(parser.conn->Sendfile(123, 5, count));
-    ASSERT_EQ(parser.script.fileSends.size(), 2);
-    EXPECT_EQ(parser.script.fileSends[0], std::make_pair(off_t(5), size_t(INT_MAX)));
-    EXPECT_EQ(parser.script.fileSends[1], std::make_pair(off_t(5) + INT_MAX, size_t(4)));
+    constexpr size_t maxWrite = 16384;
+    const size_t calls = (count + maxWrite - 1) / maxWrite;
+    ASSERT_EQ(parser.script.fileSends.size(), calls);
+    EXPECT_EQ(parser.script.fileSends.front(), std::make_pair(off_t(5), maxWrite));
+    EXPECT_EQ(parser.script.fileSends.back(),
+              std::make_pair(off_t(5 + (calls - 1) * maxWrite), count % maxWrite));
     Parser bad({next});
     ASSERT_TRUE(bad.conn->BeginResponse(200));
     EXPECT_FALSE(bad.conn->Sendfile(123, std::numeric_limits<off_t>::max(), 1));
@@ -489,6 +501,16 @@ TEST(HttpServerParser, ContentLengthQueryValidatesAllHeadersAfterPartialIteratio
     }
 }
 
+}
+
+TEST(HttpServerParser, FileSendAdvancesByPartialProgress)
+{
+    Parser parser({next});
+    parser.script.fileLimit = 7;
+    ASSERT_TRUE(parser.conn->Sendfile(123, 5, 100));
+    ASSERT_EQ(parser.script.fileSends.size(), 15u);
+    EXPECT_EQ(parser.script.fileSends[1].first, 12);
+    EXPECT_EQ(parser.script.fileSends.back(), std::make_pair(off_t(103), size_t(2)));
 }
 
 TEST(HttpServerParser, Http10FixedLengthKeepAliveRetainsPersistence)

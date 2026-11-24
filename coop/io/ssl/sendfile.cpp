@@ -6,6 +6,10 @@
 #include "connection.h"
 #include "send.h"
 #include "coop/io/sendfile.h"
+#include "coop/io/read.h"
+#include "coop/io/descriptor.h"
+#include "coop/io/detail/send_progress.h"
+#include "coop/self.h"
 
 namespace coop
 {
@@ -18,6 +22,7 @@ namespace ssl
 
 static int SendfileImpl(Connection& conn, int in_fd, off_t offset, size_t count, bool killAware)
 {
+    if (conn.m_writeFailed || conn.m_finalSendAttempted) return -EPIPE;
     // kTLS TX: kernel handles encryption, sendfile() directly — zero copies
     //
     if (conn.m_ktlsTx)
@@ -52,8 +57,35 @@ int SendfileKill(Connection& conn, int in_fd, off_t offset, size_t count)
     return SendfileImpl(conn, in_fd, offset, count, true);
 }
 
+int SendfileKill(Connection& conn, int in_fd, off_t offset, size_t count,
+                 time::Interval timeout)
+{
+    if (conn.m_writeFailed || conn.m_finalSendAttempted) return -EPIPE;
+    if (conn.m_ktlsTx)
+    {
+        int result = io::SendfileKill(conn.m_desc, in_fd, offset, count, timeout);
+        if (result < 0) conn.m_writeFailed = true;
+        return result;
+    }
+
+    auto fail = [&](int error) { conn.m_writeFailed = true; return error; };
+    io::detail::SendProgress progress(Self(), timeout);
+    time::Interval remaining;
+    if (int error = progress.Prepare(remaining); error < 0) return fail(error);
+    char buf[16384];
+    size_t size = std::min(count, sizeof(buf));
+    io::Descriptor file(io::borrowed, in_fd, conn.m_desc.m_ring);
+    int n = remaining.count() > 0
+        ? io::ReadKill(file, buf, size, offset, 0, remaining)
+        : io::ReadKill(file, buf, size, offset);
+    if (n <= 0) return n < 0 ? fail(n) : n;
+    if (int error = progress.Prepare(remaining); error < 0) return fail(error);
+    return SendImpl(conn, buf, static_cast<size_t>(n), true, timeout, &progress);
+}
+
 static int SendfileAllImpl(Connection& conn, int in_fd, off_t offset, size_t count, bool killAware)
 {
+    if (conn.m_writeFailed || conn.m_finalSendAttempted) return -EPIPE;
     // kTLS TX: kernel handles encryption, sendfile() directly — zero copies
     //
     if (conn.m_ktlsTx)

@@ -444,6 +444,10 @@ add_executable(bench_client benchmarks/bench_client.cpp)
 target_link_libraries(bench_client PRIVATE coop)
 target_link_options(bench_client PRIVATE -rdynamic)
 
+add_executable(bench_http_file benchmarks/bench_http_file.cpp)
+target_link_libraries(bench_http_file PRIVATE coop)
+add_dependencies(bench_http_file test-certs)
+
 add_executable(diag_ktls benchmarks/diag_ktls.cpp)
 target_link_libraries(diag_ktls PRIVATE coop)
 add_dependencies(diag_ktls test-certs)

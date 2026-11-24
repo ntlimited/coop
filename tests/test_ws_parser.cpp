@@ -32,7 +32,7 @@ struct Script
     size_t sends{0};
     int terminal{0};
     bool failSend{false};
-    bool shortSend{false};
+    bool zeroSend{false};
     coop::io::Descriptor* descriptor{nullptr};
 };
 
@@ -54,11 +54,16 @@ struct Transport
     {
         ++script->sends;
         if (script->failSend) return -EPIPE;
-        if (script->shortSend) return static_cast<int>(size - 1);
+        if (script->zeroSend) return 0;
         script->sent.append(static_cast<const char*>(data), size);
         return static_cast<int>(size);
     }
     int SendfileAll(int, off_t, size_t) { return -ENOTSUP; }
+    int Send(const void* data, size_t size, coop::time::Interval)
+    {
+        return SendAll(data, size);
+    }
+    int Sendfile(int, off_t, size_t, coop::time::Interval) { return -ENOTSUP; }
 };
 
 using Ws = coop::ws::Connection<Transport>;
@@ -267,11 +272,11 @@ TEST(WsParserTest, ExplicitOutboundFragmentsAndControlInterleaving)
 
 TEST(WsParserTest, SendFailuresAreStickyIncludingRepeatedClose)
 {
-    for (bool shortSend : {false, true})
+    for (bool zeroSend : {false, true})
     {
         Script script;
-        script.failSend = !shortSend;
-        script.shortSend = shortSend;
+        script.failSend = !zeroSend;
+        script.zeroSend = zeroSend;
         Owned<Ws> ws(script);
         EXPECT_FALSE(ws->Close(1000));
         EXPECT_TRUE(ws->SendError());

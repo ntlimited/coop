@@ -62,6 +62,7 @@ cc_library(
         "tests/test_helpers.h",
         "tests/tls_pair_helpers.h",
         "tests/completion_observer.h",
+        "tests/send_test_helpers.h",
     ],
     strip_include_prefix = "/",
     includes = ["tests"],
@@ -399,6 +400,15 @@ cc_binary(
 cc_binary(
     name = "bench_client",
     srcs = ["benchmarks/bench_client.cpp"],
+    copts = COOP_COPTS,
+    linkopts = ["-rdynamic"],
+    deps = [":coop"],
+)
+
+cc_binary(
+    name = "bench_http_file",
+    srcs = ["benchmarks/bench_http_file.cpp"],
+    data = [":test_certs"],
     copts = COOP_COPTS,
     linkopts = ["-rdynamic"],
     deps = [":coop"],

@@ -211,12 +211,21 @@ int Sendfile(Descriptor& desc, int in_fd, off_t offset, size_t count);
 int SendfileAll(Descriptor& desc, int in_fd, off_t offset, size_t count);
 int SendfileKill(Descriptor& desc, int in_fd, off_t offset, size_t count);
 int SendfileAllKill(Descriptor& desc, int in_fd, off_t offset, size_t count);
+int SendfileKill(Descriptor& desc, int in_fd, off_t offset, size_t count,
+                 time::Interval timeout);
 ```
 The SSL layer provides `ssl::Sendfile` / `ssl::SendfileAll` which dispatch to `io::Sendfile` for
 kTLS connections (kernel encrypts file data in-flight, zero copies) and fall back to pread+Send for
-non-kTLS connections. Both layers now also expose explicit `*Kill` variants. The HTTP server keeps
-the cheap default send paths and relies on `ShutdownOnKillGuard` in its connection handlers to wake
-promptly during shutdown.
+non-kTLS connections. Both layers expose explicit `*Kill` variants. The timed
+`SendfileKill(..., time::Interval)` overload uses forced-async io_uring file-to-pipe
+splice and nonblocking pipe-to-socket splice, including kTLS. Source page faults run on an
+io_uring worker, preserving zero-copy without blocking the scheduler. Non-kTLS TLS uses
+16 KiB cooperative `ReadKill` staging. Untimed overloads retain their zero-copy behavior.
+
+HTTP server and WebSocket sends use timed partial-progress operations and observe kill and
+context deadlines in every wait. Positive socket progress refreshes inactivity timeouts;
+a persistent byte budget yields even when repeated writes remain immediately writable.
+The connection shutdown guard remains available for receive-side and other socket cleanup.
 
 ## Splice (`splice.h`)
 
@@ -320,3 +329,11 @@ first hostname lookup. A coordinator serializes setup across cooperative file re
 successful snapshot is published. No mutable process-global configuration, DNS answer cache, or new
 thread-local exists. See `docs/dns_resolver.md` for lifetime, retry and error contracts.
 `coop_dns_parser_tests` needs no io_uring; native first-use concurrency is `DnsRuntimeTest.*`.
+
+Timed file sends preserve zero-copy for plaintext and kTLS while suppressing SIGPIPE
+locally around the immediate nonblocking socket splice. The original thread signal mask
+is restored before any cooperative wait, and an already pending SIGPIPE is preserved.
+kTLS stages less than one full record, appends with SPLICE_F_MORE, and explicitly flushes
+with MSG_NOSIGNAL so kernel retries during socket close retain safe signal behavior.
+After a positive partial splice, the helper returns that actual count and discards unused
+staged pages; a terminal result still requires the caller to end the stream.

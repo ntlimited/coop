@@ -25,6 +25,8 @@ static constexpr size_t HTTP_EXTRA = HttpConn::ExtraBytes();
 static constexpr size_t WS_EXTRA   = WsConn::ExtraBytes();
 
 #include "test_helpers.h"
+#include "send_test_helpers.h"
+#include "coop/ws/detail/connection_impl.hpp"
 
 namespace
 {
@@ -1000,3 +1002,300 @@ TEST(WsFramingTest, FragmentedTextMessageDelivered)
     });
 }
 
+namespace
+{
+void RunWsSendScenario(test::SendScenario scenario)
+{
+    for (auto kind : {test::SendTransport::Plaintext, test::SendTransport::MemoryTls,
+                      test::SendTransport::SocketTls})
+    {
+        SCOPED_TRACE(static_cast<int>(kind));
+        test::RunSendScenario(kind, scenario,
+            [scenario](auto transport, coop::Context* ctx, const std::string& payload,
+               coop::time::Interval timeout, bool flush, coop::CountdownLatch& staged)
+            {
+                staged.Arrive();
+                using Connection = coop::ws::Connection<decltype(transport)>;
+                auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+                    transport, ctx,
+                    Connection::DEFAULT_RECV_BUFFER_SIZE,
+                    Connection::DEFAULT_SEND_BUFFER_SIZE, timeout);
+                if (scenario == test::SendScenario::CloseFlush) return conn->Close(1000);
+                if (flush) return conn->SendPing(payload.data(), payload.size());
+                return conn->SendBinary(payload.data(), payload.size());
+            });
+    }
+}
+} // namespace
+
+TEST(WsTest, StalledSendTimesOut)
+{
+    RunWsSendScenario(test::SendScenario::Stalled);
+}
+
+TEST(WsTest, SteadySendRefreshesInactivityBudget)
+{
+    RunWsSendScenario(test::SendScenario::Steady);
+}
+
+TEST(WsTest, KillWakesFinalFlushAndSiblingRuns)
+{
+    RunWsSendScenario(test::SendScenario::KilledFlush);
+}
+
+TEST(WsTest, SendObservesContextDeadline)
+{
+    RunWsSendScenario(test::SendScenario::Deadline);
+}
+
+TEST(WsTest, ShortWritesAdvanceByActualProgress)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        test::ShortWriteTransport transport{&script, &descriptor};
+        using Connection = coop::ws::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            transport, ctx);
+        std::string payload(40000, 'x');
+        ASSERT_TRUE(conn->SendBinary(payload.data(), payload.size()));
+        auto frame = ParseServerFrame(script.output);
+        ASSERT_TRUE(frame.valid);
+        EXPECT_EQ(frame.payload, payload);
+        EXPECT_GT(script.calls, 1u);
+        EXPECT_LE(script.largest, 16384u);
+    });
+}
+
+TEST(WsTest, RepeatedSendsYieldToSibling)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        script.limit = SIZE_MAX;
+        script.output.reserve(3 * 1024 * 1024);
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        test::ShortWriteTransport transport{&script, &descriptor};
+        using Connection = coop::ws::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            transport, ctx);
+        bool siblingRan = false;
+        coop::CountdownLatch joined(2);
+        ASSERT_TRUE(coop::Spawn([&](coop::Context* child)
+        {
+            child->Yield();
+            siblingRan = true;
+            joined.Arrive();
+        }));
+        std::string payload(4096, 'x');
+        ASSERT_TRUE(coop::Spawn([&](coop::Context*)
+        {
+            for (size_t i = 0; i < 600; ++i)
+                EXPECT_TRUE(conn->SendBinary(payload.data(), payload.size()));
+            EXPECT_TRUE(siblingRan);
+            joined.Arrive();
+        }));
+        joined.Wait(ctx);
+        EXPECT_TRUE(siblingRan);
+    });
+}
+
+TEST(WsTest, ControlFlushTimesOut)
+{
+    RunWsSendScenario(test::SendScenario::FinalFlush);
+}
+
+TEST(WsTest, CloseFlushTimesOut)
+{
+    RunWsSendScenario(test::SendScenario::CloseFlush);
+}
+
+TEST(WsTest, WritableSendObservesExpiredContextDeadline)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        script.limit = SIZE_MAX;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        test::ShortWriteTransport transport{&script, &descriptor};
+        using Connection = coop::ws::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            transport, ctx);
+        ctx->SetDeadline(coop::time::MonotonicMicros() - 1);
+        EXPECT_TRUE(conn->SendBinary("x", 1));
+        EXPECT_EQ(ctx->WhyKilled(), coop::KillCause::Deadline);
+        EXPECT_EQ(script.calls, 0u);
+        EXPECT_EQ(script.tryCalls, 1u);
+    });
+}
+
+TEST(WsTest, CanceledOversizedFrameDoesNotSendAHeaderOrPrefix)
+{
+    for (size_t size : {size_t(1024), size_t(32768)})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            test::SendScript script;
+            coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+            using Connection = coop::ws::Connection<test::ShortWriteTransport>;
+            auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+                test::ShortWriteTransport{&script, &descriptor}, ctx);
+            std::string payload(size, 'x');
+            ctx->KillSelf(coop::KillCause::Kill);
+            EXPECT_FALSE(conn->SendBinary(payload.data(), payload.size()));
+            EXPECT_TRUE(script.output.empty());
+            EXPECT_EQ(script.calls, 0u);
+            EXPECT_EQ(script.tryCalls, 0u);
+        });
+}
+
+TEST(WsTest, KilledContextMaySendOneImmediateClose)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        test::SendScript script;
+        coop::io::Descriptor descriptor(coop::io::borrowed, -1);
+        using Connection = coop::ws::Connection<test::ShortWriteTransport>;
+        auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+            test::ShortWriteTransport{&script, &descriptor}, ctx);
+        ctx->KillSelf(coop::KillCause::Kill);
+        EXPECT_TRUE(conn->Close(1001));
+        EXPECT_EQ(script.tryCalls, 1u);
+        EXPECT_EQ(script.calls, 0u);
+        EXPECT_EQ(ParseServerFrame(script.output).payload,
+                  std::string("\x03\xe9", 2));
+    });
+}
+
+TEST(WsTest, FailedTlsWritesRejectEveryLaterPublicSend)
+{
+    for (auto kind : {test::SendTransport::MemoryTls, test::SendTransport::SocketTls})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            ctx->SetDeadlineIn(std::chrono::seconds(2));
+            auto pair = std::make_unique<test::SendPair>(kind);
+            pair->FillSocket();
+            EXPECT_LT(coop::io::ssl::SendKill(*pair->serverTls, "record", 6,
+                std::chrono::milliseconds(20)), 0);
+            EXPECT_EQ(coop::io::ssl::SendKill(*pair->serverTls, "next", 4,
+                std::chrono::milliseconds(20)), -EPIPE);
+            EXPECT_EQ(pair->serverTls->ShutdownWriteKill(std::chrono::milliseconds(20)),
+                      -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendfileKill(*pair->serverTls, -1, 0, 4,
+                std::chrono::milliseconds(20)), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::Send(*pair->serverTls, "next", 4), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendKill(*pair->serverTls, "next", 4), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendAll(*pair->serverTls, "next", 4), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendAllKill(*pair->serverTls, "next", 4), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::Sendfile(*pair->serverTls, -1, 0, 4), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendfileKill(*pair->serverTls, -1, 0, 4), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendfileAll(*pair->serverTls, -1, 0, 4), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendfileAllKill(*pair->serverTls, -1, 0, 4), -EPIPE);
+        }, {.stackSize = 65536});
+}
+
+TEST(WsTest, TrickleReaderCannotExtendAbsoluteDeadline)
+{
+    RunWsSendScenario(test::SendScenario::TrickleDeadline);
+}
+
+TEST(WsTest, KilledTlsWriterCanSendOneCompleteClose)
+{
+    for (auto kind : {test::SendTransport::MemoryTls, test::SendTransport::SocketTls})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            ctx->SetDeadlineIn(std::chrono::seconds(2));
+            auto pair = std::make_unique<test::SendPair>(kind);
+            using Connection = coop::ws::Connection<coop::http::TlsTransport>;
+            auto conn = ctx->Allocate<Connection>(Connection::ExtraBytes(),
+                coop::http::TlsTransport(*pair->serverTls, pair->server), nullptr);
+            coop::CountdownLatch joined(1);
+            ASSERT_TRUE(coop::Spawn([&](coop::Context* child)
+            {
+                child->KillSelf(coop::KillCause::Kill);
+                EXPECT_TRUE(conn->Close(1001));
+                joined.Arrive();
+            }));
+            joined.Wait(ctx);
+            char frame[128];
+            int n = pair->Recv(frame, sizeof(frame));
+            ASSERT_GT(n, 0);
+            EXPECT_EQ(ParseServerFrame(std::string(frame, n)).payload,
+                      std::string("\x03\xe9", 2));
+            EXPECT_EQ(coop::io::ssl::SendKill(*pair->serverTls, "next", 4,
+                std::chrono::milliseconds(20)), -EPIPE);
+        }, {.stackSize = 65536});
+}
+
+TEST(WsTest, SocketTlsSyscallFailurePreservesErrno)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(2));
+        test::ScopedSigpipeBlock blockedSigpipe;
+        auto pair = std::make_unique<test::SendPair>(test::SendTransport::SocketTls);
+        ASSERT_EQ(shutdown(pair->server.m_fd, SHUT_WR), 0);
+        EXPECT_EQ(coop::io::ssl::SendKill(*pair->serverTls, "next", 4,
+            std::chrono::milliseconds(150)), -EPIPE);
+    }, {.stackSize = 65536});
+}
+
+TEST(WsTest, ImmediateTlsWriteNeverReportsQueuedCiphertext)
+{
+    for (auto kind : {test::SendTransport::MemoryTls, test::SendTransport::SocketTls})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            ctx->SetDeadlineIn(std::chrono::seconds(2));
+            test::ScopedSigpipeBlock blockedSigpipe;
+            auto pair = std::make_unique<test::SendPair>(kind);
+            pair->FillSocket();
+            EXPECT_EQ(coop::io::ssl::TrySend(*pair->serverTls, "final", 5), -EAGAIN);
+            EXPECT_EQ(coop::io::ssl::SendKill(*pair->serverTls, "later", 5,
+                std::chrono::milliseconds(20)), -EPIPE);
+        }, {.stackSize = 65536});
+}
+
+TEST(WsTest, KtlsTimedSendAndCancellationPaths)
+{
+    bool activated = false;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        ctx->SetDeadlineIn(std::chrono::seconds(2));
+        auto pair = std::make_unique<test::SendPair>(test::SendTransport::Ktls);
+        activated = pair->serverTls->m_ktlsTx && pair->clientTls->m_ktlsRx;
+    }, {.stackSize = 65536});
+    if (!activated) GTEST_SKIP() << "kernel/OpenSSL did not activate kTLS";
+    for (auto scenario : {test::SendScenario::Stalled, test::SendScenario::KilledSend,
+                          test::SendScenario::Deadline, test::SendScenario::Steady,
+                          test::SendScenario::TrickleDeadline})
+        test::RunSendScenario(test::SendTransport::Ktls, scenario,
+            [scenario](auto transport, coop::Context* child, const std::string& payload,
+               coop::time::Interval timeout, bool flush, coop::CountdownLatch& staged)
+            {
+                staged.Arrive();
+                using Connection = coop::ws::Connection<decltype(transport)>;
+                auto conn = child->Allocate<Connection>(Connection::ExtraBytes(), transport,
+                    nullptr, Connection::DEFAULT_RECV_BUFFER_SIZE,
+                    Connection::DEFAULT_SEND_BUFFER_SIZE, timeout);
+                if (scenario == test::SendScenario::CloseFlush) return conn->Close(1000);
+                if (flush) return conn->SendPing(payload.data(), payload.size());
+                return conn->SendBinary(payload.data(), payload.size());
+            });
+}
+
+TEST(WsTest, FailedTlsClosureRefusesLaterPublicSends)
+{
+    for (auto kind : {test::SendTransport::MemoryTls, test::SendTransport::SocketTls})
+        test::RunInCooperator([&](coop::Context* ctx)
+        {
+            ctx->SetDeadlineIn(std::chrono::seconds(2));
+            auto pair = std::make_unique<test::SendPair>(kind);
+            pair->FillSocket();
+            EXPECT_EQ(pair->serverTls->ShutdownWriteKill(std::chrono::milliseconds(20)),
+                      -ETIMEDOUT);
+            EXPECT_EQ(coop::io::ssl::SendKill(*pair->serverTls, "next", 4,
+                std::chrono::milliseconds(20)), -EPIPE);
+            EXPECT_EQ(coop::io::ssl::SendfileKill(*pair->serverTls, -1, 0, 4,
+                std::chrono::milliseconds(20)), -EPIPE);
+        }, {.stackSize = 65536});
+}

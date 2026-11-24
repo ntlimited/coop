@@ -88,10 +88,26 @@ ws.SendFragment(ws::Opcode::Continuation, true, last.data(), last.size());
 Check every return value. Each successful call flushes that frame synchronously and
 retains no payload pointers. A second data-message start while a fragmented message is
 open, or a stray continuation, returns false before sending. Large direct payload sends
-are split only at the transport's representable operation size; no extra body copy is
-introduced. A write failure is sticky, because retrying a partially written frame would
-corrupt the wire stream. `Close()` remains false after a failed Close send, and no new
+are split into writes of at most 16 KiB; no extra body copy is introduced. A write failure is
+sticky, because retrying a partially written frame would corrupt the wire stream. `Close()` remains false after a failed Close send, and no new
 data or Ping/Pong frames are sent after Close.
 
-The transport's existing receive timeout behavior applies, including TLS's existing
-timeout limitations. This API does not introduce an operation-wide deadline policy.
+The connection timeout bounds socket-write inactivity, including final frame flushes,
+Ping/Pong and Close. Positive wire progress refreshes the budget, allowing steady sends to
+last longer than the timeout. There is no absolute lifetime cap by default: a reader accepting a few bytes per interval
+can keep a transfer alive indefinitely. Set `ctx->SetDeadlineIn(...)` on the serving context
+when an overall bound is needed, and set a deadline on any separate writer context.
+The sending context's absolute deadline caps the operation;
+kill and deadlines also stop continuously writable loops. Plaintext and TLS use the same
+policy, including TLS encrypted-output flushes and readiness waits. Repeated sends yield
+after each 2 MiB of progress. Custom transports provide the timed partial-progress `Send`
+operation described in [HTTP server sends](http_server.md#send-progress-and-cancellation).
+After cancellation, a final frame must fit completely in the existing send buffer and
+one nonwaiting write; oversized frames are refused before their headers are sent.
+A short immediate write still fails terminally, and cancellation after an ordinary send
+has accepted bytes cannot retract that prefix. No new payload allocation or background
+sender is introduced.
+
+After cancellation, one immediate, nonwaiting write per connection may send a final Close.
+It succeeds only when the complete buffered frame is accepted; a partial or blocked write
+terminates the send stream. Subsequent writes cannot acquire another final attempt.

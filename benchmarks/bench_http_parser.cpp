@@ -34,6 +34,8 @@ struct BufferedTransport
     }
     int SendAll(const void*, size_t size) { return static_cast<int>(size); }
     int SendfileAll(int, off_t, size_t) { return -ENOTSUP; }
+    int Send(const void*, size_t size, coop::time::Interval) { return static_cast<int>(size); }
+    int Sendfile(int, off_t, size_t, coop::time::Interval) { return -ENOTSUP; }
 };
 
 void ParseResponse(benchmark::State& state)

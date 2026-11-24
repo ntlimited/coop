@@ -33,9 +33,24 @@ struct TlsTransport
     {
         if (timeout.count() > 0)
         {
-            return io::ssl::Recv(m_conn, buf, size, timeout);
+            return io::ssl::RecvKill(m_conn, buf, size, timeout);
         }
-        return io::ssl::Recv(m_conn, buf, size);
+        return io::ssl::RecvKill(m_conn, buf, size);
+    }
+
+    int Send(const void* buf, size_t size, time::Interval timeout)
+    {
+        return io::ssl::SendKill(m_conn, buf, size, timeout);
+    }
+
+    int TrySend(const void* buf, size_t size)
+    {
+        return io::ssl::TrySend(m_conn, buf, size);
+    }
+
+    int Sendfile(int in_fd, off_t offset, size_t count, time::Interval timeout)
+    {
+        return io::ssl::SendfileKill(m_conn, in_fd, offset, count, timeout);
     }
 
     int SendAll(const void* buf, size_t size)

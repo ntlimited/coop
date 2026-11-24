@@ -268,14 +268,19 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
         return static_cast<Derived*>(this)->DoRecv(buf, size, flags, timeout);
     }
 
-    int TransportSendAll(const void* buf, size_t size)
+    int TransportTrySend(const void* buf, size_t size)
     {
-        return static_cast<Derived*>(this)->DoSendAll(buf, size);
+        return static_cast<Derived*>(this)->DoTrySend(buf, size);
     }
 
-    int TransportSendfileAll(int in_fd, off_t offset, size_t count)
+    int TransportSend(const void* buf, size_t size, time::Interval timeout)
     {
-        return static_cast<Derived*>(this)->DoSendfileAll(in_fd, offset, count);
+        return static_cast<Derived*>(this)->DoSend(buf, size, timeout);
+    }
+
+    int TransportSendfile(int in_fd, off_t offset, size_t count, time::Interval timeout)
+    {
+        return static_cast<Derived*>(this)->DoSendfile(in_fd, offset, count, timeout);
     }
 
     // Write buffer management
@@ -350,6 +355,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     time::Interval  m_timeout;
 
     size_t          m_sendLen;
+    size_t          m_sendSinceYield;
 
     Phase           m_phase;
     int64_t         m_contentLength;
@@ -377,6 +383,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool            m_closeDelimitedComplete;
     bool            m_responseContentLength;
     bool            m_clientClose;
+    bool            m_finalSendAttempted = false;
     bool            m_sendError;
 
     int             m_parseError;
@@ -439,14 +446,21 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
         return m_transport.Recv(buf, size, flags, timeout);
     }
 
-    int DoSendAll(const void* buf, size_t size)
+    int DoTrySend(const void* buf, size_t size)
     {
-        return m_transport.SendAll(buf, size);
+        if constexpr (requires { m_transport.TrySend(buf, size); })
+            return m_transport.TrySend(buf, size);
+        return -EAGAIN;
     }
 
-    int DoSendfileAll(int in_fd, off_t offset, size_t count)
+    int DoSend(const void* buf, size_t size, time::Interval timeout)
     {
-        return m_transport.SendfileAll(in_fd, offset, count);
+        return m_transport.Send(buf, size, timeout);
+    }
+
+    int DoSendfile(int in_fd, off_t offset, size_t count, time::Interval timeout)
+    {
+        return m_transport.Sendfile(in_fd, offset, count, timeout);
     }
 
     Transport       m_transport;

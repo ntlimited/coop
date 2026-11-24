@@ -1,6 +1,9 @@
 #pragma once
 
+#include <sys/socket.h>
+
 #include "coop/io/descriptor.h"
+#include "coop/io/detail/send_progress.h"
 #include "coop/io/recv.h"
 #include "coop/io/send.h"
 #include "coop/io/sendfile.h"
@@ -57,25 +60,53 @@ struct PlaintextTransport
             case RecvPolicy::Fastpath:
                 if (timeout.count() > 0)
                 {
-                    return io::RecvFastpath(m_desc, buf, size, flags, timeout);
+                    return io::RecvFastpathKill(m_desc, buf, size, flags, timeout);
                 }
-                return io::RecvFastpath(m_desc, buf, size, flags);
+                return io::RecvFastpathKill(m_desc, buf, size, flags);
 
             case RecvPolicy::PollFirst:
                 if (timeout.count() > 0)
                 {
-                    return io::RecvPollFirst(m_desc, buf, size, flags, timeout);
+                    return io::RecvPollFirstKill(m_desc, buf, size, flags, timeout);
                 }
-                return io::RecvPollFirst(m_desc, buf, size, flags);
+                return io::RecvPollFirstKill(m_desc, buf, size, flags);
 
             case RecvPolicy::Plain:
                 break;
         }
         if (timeout.count() > 0)
         {
-            return io::Recv(m_desc, buf, size, flags, timeout);
+            return io::RecvKill(m_desc, buf, size, flags, timeout);
         }
-        return io::Recv(m_desc, buf, size, flags);
+        return io::RecvKill(m_desc, buf, size, flags);
+    }
+
+    // Return one bounded write's progress. A positive timeout limits inactivity;
+    // every kernel wait also observes the running context's kill and deadline.
+    //
+    int Send(const void* buf, size_t size, time::Interval timeout)
+    {
+        if (!coop::GetCooperator()) return TrySend(buf, size);
+        io::detail::SendProgress progress(coop::GetCooperator() ? Self() : nullptr, timeout);
+        time::Interval remaining;
+        if (int error = progress.Prepare(remaining); error < 0) return error;
+        size = std::min(size, io::detail::SendProgress::MAX_WRITE);
+        if (remaining.count() > 0)
+            return io::SendFastpathKill(m_desc, buf, size, 0, remaining);
+        return io::SendFastpathKill(m_desc, buf, size);
+    }
+
+    // One immediate syscall; never waits, including after cancellation.
+    int TrySend(const void* buf, size_t size)
+    {
+        ssize_t n = ::send(m_desc.m_fd, buf,
+            std::min(size, io::detail::SendProgress::MAX_WRITE), MSG_DONTWAIT | MSG_NOSIGNAL);
+        return n < 0 ? -errno : static_cast<int>(n);
+    }
+
+    int Sendfile(int in_fd, off_t offset, size_t count, time::Interval timeout)
+    {
+        return io::SendfileKill(m_desc, in_fd, offset, count, timeout);
     }
 
     int SendAll(const void* buf, size_t size)

@@ -105,7 +105,7 @@ struct ConnectionBase
 template<typename Derived>
 struct ConnectionImpl : ConnectionBase
 {
-    explicit ConnectionImpl(time::Interval timeout);
+    explicit ConnectionImpl(time::Interval timeout, Context* ctx = nullptr);
 
     Frame* NextFrame() override;
     void SkipPayload() override;
@@ -148,9 +148,14 @@ struct ConnectionImpl : ConnectionBase
     {
         return static_cast<Derived*>(this)->DoRecv(buf, size, flags, timeout);
     }
-    int TransportSendAll(const void* buf, size_t size)
+    int TransportTrySend(const void* buf, size_t size)
     {
-        return static_cast<Derived*>(this)->DoSendAll(buf, size);
+        return static_cast<Derived*>(this)->DoTrySend(buf, size);
+    }
+
+    int TransportSend(const void* buf, size_t size, time::Interval timeout)
+    {
+        return static_cast<Derived*>(this)->DoSend(buf, size, timeout);
     }
 
     // Buffer management
@@ -163,6 +168,7 @@ struct ConnectionImpl : ConnectionBase
     //
     bool Append(const void* data, size_t size);
     bool Flush();
+    bool SendRaw(const void* data, size_t size);
 
     // Frame parser
     //
@@ -175,6 +181,7 @@ struct ConnectionImpl : ConnectionBase
     bool Fail(uint16_t code);
 
     time::Interval  m_timeout;
+    size_t          m_sendSinceYield;
 
     size_t          m_bufLen;
     size_t          m_parsePos;
@@ -198,6 +205,7 @@ struct ConnectionImpl : ConnectionBase
     Opcode          m_continuationOpcode;
     bool            m_gotClose;
     bool            m_sentClose;
+    bool            m_finalSendAttempted = false;
     bool            m_sendError;
 
     size_t          m_maxMessageSize;
@@ -230,7 +238,7 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
                size_t sendBufSize = ConnectionBase::DEFAULT_SEND_BUFFER_SIZE,
                time::Interval timeout = std::chrono::seconds(30),
                const char* initialData = nullptr, size_t initialDataSize = 0)
-    : ConnectionImpl<Connection<Transport>>(timeout)
+    : ConnectionImpl<Connection<Transport>>(timeout, ctx)
     , m_transport(transport)
     , m_recvBufSize(recvBufSize)
     , m_sendBufSize(sendBufSize)
@@ -238,7 +246,6 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
         // At most 12 bytes after the leading two frame-header bytes must fit together.
         assert(recvBufSize >= 12 && sendBufSize > 0 && sendBufSize <= INT_MAX);
         assert(initialDataSize <= recvBufSize && (initialData || initialDataSize == 0));
-        (void)ctx;
         if (initialDataSize > 0)
         {
             memcpy(m_buf, initialData, initialDataSize);
@@ -254,9 +261,16 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
         return m_transport.Recv(buf, size, flags, timeout);
     }
 
-    int DoSendAll(const void* buf, size_t size)
+    int DoTrySend(const void* buf, size_t size)
     {
-        return m_transport.SendAll(buf, size);
+        if constexpr (requires { m_transport.TrySend(buf, size); })
+            return m_transport.TrySend(buf, size);
+        return -EAGAIN;
+    }
+
+    int DoSend(const void* buf, size_t size, time::Interval timeout)
+    {
+        return m_transport.Send(buf, size, timeout);
     }
 
     Transport       m_transport;

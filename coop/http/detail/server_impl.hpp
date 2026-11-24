@@ -16,6 +16,7 @@
 #include "coop/cooperator.h"
 #include "coop/self.h"
 #include "coop/io/detail/yield_budget.h"
+#include "coop/io/detail/send_progress.h"
 #include "coop/io/splice.h"
 #include "coop/io/uring.h"
 #include "coop/io/write.h"
@@ -55,6 +56,7 @@ ConnectionImpl<Derived>::ConnectionImpl(io::Descriptor& desc, Context* ctx, Coop
 , m_co(co)
 , m_timeout(timeout)
 , m_sendLen(0)
+, m_sendSinceYield(0)
 , m_phase(REQUEST_LINE)
 , m_contentLength(-1)
 , m_chunkedBody(false)
@@ -208,7 +210,11 @@ bool ConnectionImpl<Derived>::ConsumeCrlf()
 template<typename Derived>
 bool ConnectionImpl<Derived>::RecvAborted() const
 {
-    return m_ctx && m_ctx->IsKilled();
+    auto* ctx = coop::GetCooperator() ? Self() : nullptr;
+    if (!ctx) return false;
+    if (!ctx->IsKilled() && ctx->DeadlineUs() != 0 && ctx->RemainingUs() <= 0)
+        ctx->KillSelf(KillCause::Deadline);
+    return ctx->IsKilled();
 }
 
 // -------------------------------------------------------------------------------------
@@ -1042,6 +1048,13 @@ template<typename Derived>
 Chunk* ConnectionImpl<Derived>::ReadBody()
 {
     if (m_error) return nullptr;
+    if (m_phase == DONE) return nullptr;
+    if (m_phase == BODY && !m_chunkedBody && !m_bodyRemaining)
+    {
+        m_phase = DONE;
+        return nullptr;
+    }
+    if (RecvAborted()) { FailIo(-ECANCELED); return nullptr; }
     if (m_phase < BODY && !AdvanceToPhase(BODY)) return nullptr;
     if (m_phase != BODY) return nullptr;
     if (m_chunkedBody) return ReadChunkedBody();
@@ -1063,7 +1076,7 @@ inline int ServerWriteAllToFile(io::Descriptor& file, const void* data, size_t s
     auto* p = static_cast<const char*>(data);
     while (size)
     {
-        int n = io::Write(file, p, size, static_cast<uint64_t>(offset));
+        int n = io::WriteKill(file, p, size, static_cast<uint64_t>(offset));
         if (n <= 0) return n < 0 ? n : -EIO;
         p += n;
         offset += n;
@@ -1077,6 +1090,13 @@ int64_t ConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
 {
     if (m_error) return m_error;
     if (offset < 0) return -EINVAL;
+    if (m_phase == DONE) return 0;
+    if (m_phase == BODY && !m_chunkedBody && !m_bodyRemaining)
+    {
+        m_phase = DONE;
+        return 0;
+    }
+    if (RecvAborted()) { FailIo(-ECANCELED); return m_error; }
     if (m_phase < BODY && !AdvanceToPhase(BODY)) return m_error;
     if (m_phase != BODY) return 0;
     auto& desc = m_desc;
@@ -1105,10 +1125,12 @@ int64_t ConnectionImpl<Derived>::ReadBodyToFile(int fileFd, off_t offset)
             {
                 io::PipeLease pipe(desc.m_ring->GetPipePool());
                 if (!pipe) { FailIo(-EMFILE); return m_error; }
-                io::detail::YieldBudget budget(m_ctx);
+                io::detail::YieldBudget budget(coop::GetCooperator() ? Self() : nullptr);
                 while (m_bodyRemaining)
                 {
-                    int n = io::SpliceToFile(desc, fileFd, offset + total, pipe.Fds(), m_bodyRemaining);
+                    if (RecvAborted()) { FailIo(-ECANCELED); return m_error; }
+                    int n = io::SpliceToFileKill(desc, fileFd, offset + total,
+                                                pipe.Fds(), m_bodyRemaining);
                     if (n <= 0)
                     {
                         pipe.MarkDirty();
@@ -1458,21 +1480,44 @@ bool ConnectionImpl<Derived>::AppendStatusLine(int status, std::string_view reas
 template<typename Derived>
 bool ConnectionImpl<Derived>::SendRaw(const void* data, size_t size)
 {
+    if (m_finalSendAttempted) { m_sendError = true; FailIo(-EPIPE); return false; }
     if (m_sendError || ResponseClosed()) return false;
 
     auto* p = static_cast<const char*>(data);
+    io::detail::SendProgress progress(coop::GetCooperator() ? Self() : nullptr,
+                                       m_timeout, &m_sendSinceYield);
     while (size)
     {
-        size_t part = std::min(size, static_cast<size_t>(INT_MAX));
-        int result = TransportSendAll(p, part);
-        if (result <= 0 || static_cast<size_t>(result) != part)
+        time::Interval timeout;
+        int result = progress.Prepare(timeout);
+        size_t part = std::min(size, io::detail::SendProgress::MAX_WRITE);
+        bool finalAttempt = result == -ECANCELED && !m_finalSendAttempted;
+        if (finalAttempt)
+        {
+            // A bounded final attempt must cover the whole remaining buffer. Refuse
+            // an oversized remainder before any new prefix reaches the transport.
+            //
+            m_finalSendAttempted = true;
+            if (part != size) { m_sendError = true; FailIo(-ECANCELED); return false; }
+            result = TransportTrySend(p, part);
+        }
+        else if (result == 0) result = TransportSend(p, part, timeout);
+
+        if (finalAttempt && (result <= 0 || static_cast<size_t>(result) != part))
+        {
+            m_sendError = true;
+            FailIo(-ECANCELED);
+            return false;
+        }
+        if (result <= 0 || static_cast<size_t>(result) > part)
         {
             m_sendError = true;
             FailIo(result < 0 ? result : -EIO);
             return false;
         }
-        p += part;
-        size -= part;
+        p += result;
+        size -= result;
+        if (!finalAttempt) progress.Progress(static_cast<size_t>(result));
     }
     return true;
 }
@@ -1634,22 +1679,44 @@ bool ConnectionImpl<Derived>::EndChunked(const void* lastChunkData, size_t lastC
 template<typename Derived>
 bool ConnectionImpl<Derived>::Sendfile(int fileFd, off_t offset, size_t count)
 {
+    if (m_finalSendAttempted) { m_sendError = true; FailIo(-EPIPE); return false; }
     if (m_sendError || ResponseClosed()) return false;
     if (offset < 0) return FailIo(-EINVAL);
     if (count > static_cast<uint64_t>(std::numeric_limits<off_t>::max() - offset))
         return FailIo(-EOVERFLOW);
+    if (count)
+    {
+        auto* ctx = coop::GetCooperator() ? Self() : nullptr;
+        if (ctx && !ctx->IsKilled() && ctx->DeadlineUs() != 0 && ctx->RemainingUs() <= 0)
+            ctx->KillSelf(KillCause::Deadline);
+        if (ctx && ctx->IsKilled()) return false;
+    }
     if (!Flush()) return false;
+    io::detail::SendProgress progress(coop::GetCooperator() ? Self() : nullptr,
+                                       m_timeout, &m_sendSinceYield);
+    bool enteredTransport = false;
     while (count)
     {
-        size_t take = std::min(count, static_cast<size_t>(INT_MAX));
-        int result = TransportSendfileAll(fileFd, offset, take);
-        if (result <= 0 || static_cast<size_t>(result) != take)
+        time::Interval timeout;
+        int result = progress.Prepare(timeout);
+        size_t take = std::min(count, io::detail::SendProgress::MAX_WRITE);
+        // Files cannot use the immediate final-buffer attempt. Before any file bytes
+        // enter the transport, leave that allowance available for a small raw write.
+        //
+        if (result == -ECANCELED && !enteredTransport) return false;
+        if (result == 0)
+        {
+            enteredTransport = true;
+            result = TransportSendfile(fileFd, offset, take, timeout);
+        }
+        if (result <= 0 || static_cast<size_t>(result) > take)
         {
             m_sendError = true;
             return FailIo(result < 0 ? result : -EIO);
         }
-        count -= take;
-        offset += take;
+        count -= result;
+        offset += result;
+        progress.Progress(static_cast<size_t>(result));
     }
     return true;
 }

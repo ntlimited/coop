@@ -16,6 +16,54 @@ namespace coop
 namespace ws
 {
 
+namespace detail
+{
+// Reject noncanonical encodings, surrogate code points and incomplete sequences before
+// any control bytes are written. The caller has already bounded the reason to 123 bytes.
+//
+inline bool ValidCloseReason(std::string_view reason)
+{
+    size_t pos = 0;
+    while (pos < reason.size())
+    {
+        uint8_t first = static_cast<uint8_t>(reason[pos++]);
+        if (first < 0x80) continue;
+        uint32_t value;
+        uint32_t minimum;
+        size_t continuation;
+        if (first >= 0xc2 && first <= 0xdf)
+        {
+            value = first & 0x1f;
+            minimum = 0x80;
+            continuation = 1;
+        }
+        else if (first >= 0xe0 && first <= 0xef)
+        {
+            value = first & 0x0f;
+            minimum = 0x800;
+            continuation = 2;
+        }
+        else if (first >= 0xf0 && first <= 0xf4)
+        {
+            value = first & 0x07;
+            minimum = 0x10000;
+            continuation = 3;
+        }
+        else return false;
+        if (continuation > reason.size() - pos) return false;
+        while (continuation--)
+        {
+            uint8_t next = static_cast<uint8_t>(reason[pos++]);
+            if ((next & 0xc0) != 0x80) return false;
+            value = (value << 6) | (next & 0x3f);
+        }
+        if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
+            return false;
+    }
+    return true;
+}
+} // namespace detail
+
 // ---------------------------------------------------------------------------
 // ConnectionImpl — constructor
 // ---------------------------------------------------------------------------
@@ -601,13 +649,22 @@ bool ConnectionImpl<Derived>::SendPong(const void* data, size_t size)
 template<typename Derived>
 bool ConnectionImpl<Derived>::Close(uint16_t code)
 {
+    return Close(code, {});
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::Close(uint16_t code, std::string_view reason)
+{
+    if (!detail::ValidCloseCode(code) || reason.size() > MAX_CONTROL_PAYLOAD - 2 ||
+        !detail::ValidCloseReason(reason))
+        return false;
     if (m_sentClose) return !m_sendError;
     m_sentClose = true;
-    uint8_t payload[2] = {
-        static_cast<uint8_t>(code >> 8),
-        static_cast<uint8_t>(code),
-    };
-    return SendFrame(Opcode::Close, true, payload, 2);
+    uint8_t payload[MAX_CONTROL_PAYLOAD];
+    payload[0] = static_cast<uint8_t>(code >> 8);
+    payload[1] = static_cast<uint8_t>(code);
+    if (!reason.empty()) memcpy(payload + 2, reason.data(), reason.size());
+    return SendFrame(Opcode::Close, true, payload, reason.size() + 2);
 }
 
 } // namespace coop::ws

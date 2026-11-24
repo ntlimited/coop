@@ -416,3 +416,55 @@ TEST_F(WsUpgradeParserTest, TruncatedHeaderBlockNeverSendsSwitchingProtocols)
     EXPECT_NE(http->Error(), 0);
 }
 } // namespace
+
+TEST(WsParser, InvalidCloseCodesDoNotWriteOrChangeState)
+{
+    for (uint16_t code : {0, 999, 1004, 1005, 1006, 1015, 5000, 65535})
+    {
+        SCOPED_TRACE(code);
+        Script script;
+        Owned<Ws> conn(script);
+        EXPECT_FALSE(conn->Close(code, "reason"));
+        EXPECT_TRUE(script.sent.empty());
+        EXPECT_FALSE(conn->SendError());
+        EXPECT_TRUE(conn->SendText("still open", 10));
+        EXPECT_TRUE(conn->Close(1000, "valid"));
+    }
+}
+
+namespace
+{
+struct CodeOnlyConnection final : coop::ws::ConnectionBase
+{
+    coop::io::Uring ring;
+    coop::io::Descriptor descriptor{coop::io::borrowed, -1, &ring};
+    uint16_t lastCode = 0;
+    coop::ws::Frame* NextFrame() override { return nullptr; }
+    void SkipPayload() override {}
+    bool PeerClosed() const override { return false; }
+    int Error() const override { return 0; }
+    bool SendText(const void*, size_t) override { return false; }
+    bool SendBinary(const void*, size_t) override { return false; }
+    bool SendFragment(Opcode, bool, const void*, size_t) override { return false; }
+    bool SendPing(const void*, size_t) override { return false; }
+    bool SendPong(const void*, size_t) override { return false; }
+    bool Close(uint16_t code) override { lastCode = code; return true; }
+    bool SendError() const override { return false; }
+    uint16_t ProtocolError() const override { return 0; }
+    void SetMaxMessageSize(size_t) override {}
+    void SetAutoCloseOnError(bool) override {}
+    coop::io::Descriptor& GetDescriptor() override { return descriptor; }
+};
+}
+
+TEST(WsParser, ReasonOverloadDefaultsPreserveCodeOnlyAdapters)
+{
+    CodeOnlyConnection adapter;
+    coop::ws::ConnectionBase& conn = adapter;
+    EXPECT_FALSE(conn.Close(1000, "reason"));
+    EXPECT_EQ(adapter.lastCode, 0);
+    EXPECT_FALSE(conn.Close(1005, {}));
+    EXPECT_EQ(adapter.lastCode, 0);
+    EXPECT_TRUE(conn.Close(1001, {}));
+    EXPECT_EQ(adapter.lastCode, 1001);
+}

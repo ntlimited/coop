@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cassert>
 #include <climits>
+#include <string_view>
 
 #include "types.h"
 #include "coop/io/descriptor.h"
@@ -18,6 +19,15 @@ struct Cooperator;
 
 namespace ws
 {
+
+namespace detail
+{
+inline bool ValidCloseCode(uint16_t code)
+{
+    return code >= 1000 && code < 5000 && code != 1004 && code != 1005 &&
+           code != 1006 && code != 1015;
+}
+} // namespace detail
 
 // ConnectionBase is the handler-facing interface for WebSocket connections. Handlers receive
 // ConnectionBase& (or ConnectionBase*) for transport-agnostic frame processing. Virtual
@@ -77,6 +87,16 @@ struct ConnectionBase
     virtual bool SendPing(const void* data = nullptr, size_t size = 0) = 0;
     virtual bool SendPong(const void* data, size_t size) = 0;
     virtual bool Close(uint16_t code = 1000) = 0;
+    // A reason is valid UTF-8 of at most 123 bytes (125 including the status code).
+    // Invalid reasons or codes return false before writing or changing the Close state.
+    // Codes must be 1000..4999, excluding reserved 1004, 1005, 1006 and 1015.
+    // The default supports adapters implementing only Close(code): empty reasons delegate,
+    // nonempty reasons fail without silently dropping text. Call through ConnectionBase&.
+    //
+    virtual bool Close(uint16_t code, std::string_view reason)
+    {
+        return detail::ValidCloseCode(code) && reason.empty() && Close(code);
+    }
 
     virtual bool SendError() const = 0;
 
@@ -117,6 +137,7 @@ struct ConnectionImpl : ConnectionBase
     bool SendPing(const void* data, size_t size) override;
     bool SendPong(const void* data, size_t size) override;
     bool Close(uint16_t code) override;
+    bool Close(uint16_t code, std::string_view reason) override;
     bool SendError() const override { return m_sendError; }
     uint16_t ProtocolError() const override { return m_protocolError; }
     void SetMaxMessageSize(size_t bytes) override { m_maxMessageSize = bytes; }
@@ -281,4 +302,3 @@ struct Connection final : ConnectionImpl<Connection<Transport>>
 
 } // namespace coop::ws
 } // namespace coop
-

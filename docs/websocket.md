@@ -4,7 +4,8 @@ The WebSocket layer exposes borrowed frame payloads and explicit sends over the 
 transports. It does not assemble messages, answer Ping frames, select subprotocols, or
 schedule a Close handshake for the handler. Callers decide when to receive, retain,
 reply, and stop. The parser validates the frame envelope and fragmentation sequence;
-applications remain responsible for text/reason UTF-8 and Close status-code semantics.
+applications remain responsible for received text/reason UTF-8 and Close status-code
+semantics. Outgoing Close reasons are validated before sending.
 
 ## Upgrade and receive ownership
 
@@ -107,6 +108,17 @@ one nonwaiting write; oversized frames are refused before their headers are sent
 A short immediate write still fails terminally, and cancellation after an ordinary send
 has accepted bytes cannot retract that prefix. No new payload allocation or background
 sender is introduced.
+
+`bool Close(uint16_t code, std::string_view reason)` sends the two-byte status code in
+network order followed by the exact reason bytes. Reasons must be valid UTF-8 and at most
+123 bytes, keeping the control payload within 125 bytes. Invalid or oversized reasons return
+false without sending or changing Close state. Codes must be between 1000 and 4999,
+excluding reserved codes 1004, 1005, 1006 and 1015; invalid codes also leave the stream open.
+The existing `Close(code)` sends an empty reason. Adapters overriding only `Close(code)`
+inherit a default reason overload: through `ConnectionBase&`, an empty reason delegates and
+a nonempty reason returns false without sending. A successful repeated Close sends no additional frame. Closing during a fragmented
+data message sends only the Close frame; it adds no continuation or data FIN. The bounded
+send and deadline policy above applies to the complete Close flush.
 
 After cancellation, one immediate, nonwaiting write per connection may send a final Close.
 It succeeds only when the complete buffered frame is accepted; a partial or blocked write

@@ -1283,6 +1283,99 @@ TEST(WsTest, KtlsTimedSendAndCancellationPaths)
             });
 }
 
+TEST(WsTest, CloseReasonHasExactCodeAndUtf8Payload)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        for (const std::string reason : {std::string("done \xf0\x9f\x8c\x8d"), std::string("a\0b", 3),
+                                         std::string(119, 'x') + "\xf0\x9f\x8c\x8d"})
+        {
+            SocketPair sp;
+            coop::io::Descriptor client(sp.fds[0]);
+            coop::io::Descriptor server(sp.fds[1]);
+            auto conn = ctx->Allocate<WsConn>(WS_EXTRA,
+                coop::http::PlaintextTransport(server), ctx);
+            ASSERT_TRUE(conn->Close(1001, reason));
+            const auto raw = RecvAll(client);
+            const auto frame = ParseServerFrame(raw);
+            ASSERT_TRUE(frame.valid);
+            EXPECT_EQ(frame.opcode, coop::ws::Opcode::Close);
+            EXPECT_TRUE(frame.fin);
+            EXPECT_EQ(frame.payload, std::string("\x03\xe9", 2) + reason);
+            EXPECT_EQ(raw.size(), reason.size() + 4);
+        }
+    });
+}
+
+TEST(WsTest, CloseReasonRejectsOversizeAndInvalidUtf8BeforeSending)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        for (const std::string reason : {std::string(124, 'x'), std::string("\xc0\xaf"),
+             std::string("\xed\xa0\x80"), std::string("\xf4\x90\x80\x80"),
+             std::string("\xe2\x82"), std::string("\x80"), std::string("\xf5\x80\x80\x80")})
+        {
+            SocketPair sp;
+            coop::io::Descriptor client(sp.fds[0]);
+            coop::io::Descriptor server(sp.fds[1]);
+            auto conn = ctx->Allocate<WsConn>(WS_EXTRA,
+                coop::http::PlaintextTransport(server), ctx);
+            EXPECT_FALSE(conn->Close(1000, reason));
+            EXPECT_FALSE(conn->SendError());
+            char byte;
+            EXPECT_EQ(::recv(client.m_fd, &byte, 1, MSG_DONTWAIT), -1);
+            EXPECT_EQ(errno, EAGAIN);
+            ASSERT_TRUE(conn->Close(1000, "valid"));
+            EXPECT_EQ(ParseServerFrame(RecvAll(client)).payload,
+                      std::string("\x03\xe8valid", 7));
+        }
+    });
+}
+
+TEST(WsTest, CloseDuringFragmentedSendAddsNoContinuationOrExtraFin)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        coop::io::Descriptor client(sp.fds[0]);
+        coop::io::Descriptor server(sp.fds[1]);
+        auto conn = ctx->Allocate<WsConn>(WS_EXTRA,
+            coop::http::PlaintextTransport(server), ctx);
+        ASSERT_TRUE(conn->SendFragment(coop::ws::Opcode::Text, false, "abc", 3));
+        ASSERT_TRUE(conn->Close(1000, "done"));
+        ASSERT_TRUE(conn->Close(1000, "done"));
+        EXPECT_FALSE(conn->SendFragment(coop::ws::Opcode::Continuation, true, nullptr, 0));
+        std::string expected("\x01\x03" "abc", 5);
+        expected.append("\x88\x06\x03\xe8" "done", 8);
+        EXPECT_EQ(RecvAll(client), expected);
+    });
+}
+
+TEST(WsTest, UndeliverableCloseReasonHonorsDeadline)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        SocketPair sp;
+        coop::io::Descriptor client(sp.fds[0]);
+        coop::io::Descriptor server(sp.fds[1]);
+        int capacity = 4096;
+        ASSERT_EQ(setsockopt(server.m_fd, SOL_SOCKET, SO_SNDBUF,
+                            &capacity, sizeof(capacity)), 0);
+        char fill[4096]{};
+        while (::send(server.m_fd, fill, sizeof(fill), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+        ASSERT_EQ(errno, EAGAIN);
+        auto conn = ctx->Allocate<WsConn>(WS_EXTRA,
+            coop::http::PlaintextTransport(server), ctx);
+        ctx->SetDeadlineIn(std::chrono::milliseconds(30));
+        const auto before = std::chrono::steady_clock::now();
+        EXPECT_FALSE(conn->Close(1001, "timeout"));
+        EXPECT_LT(std::chrono::steady_clock::now() - before, std::chrono::seconds(1));
+        EXPECT_EQ(ctx->WhyKilled(), coop::KillCause::Deadline);
+        EXPECT_TRUE(conn->SendError());
+        EXPECT_FALSE(conn->Close(1001, "timeout"));
+    });
+}
+
 TEST(WsTest, FailedTlsClosureRefusesLaterPublicSends)
 {
     for (auto kind : {test::SendTransport::MemoryTls, test::SendTransport::SocketTls})

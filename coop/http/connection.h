@@ -3,8 +3,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "detail/parser_buffer.hpp"
 #include "types.h"
@@ -119,8 +121,25 @@ struct ConnectionBase
     // Response methods return false on failure. Failures are sticky; later sends do
     // no IO. Caller-mode parser errors allow the handler to send its own response.
     //
-    virtual bool Send(int status, const char* contentType, const void* body, size_t size) = 0;
-    virtual bool Send(int status, const char* contentType, const std::string& body) = 0;
+    virtual bool Send(int status, const char* contentType, std::span<const std::byte> body) = 0;
+    // Deduction keeps {} as the empty byte span and refuses a nullptr body literal.
+    // Borrowed C strings, string_views and owning strings need no allocating adapter.
+    //
+    template<typename Text>
+        requires (std::is_convertible_v<Text, std::string_view> &&
+                  !std::is_null_pointer_v<std::remove_cvref_t<Text>>)
+    bool Send(int status, const char* contentType, Text&& body)
+    {
+        if constexpr (std::is_pointer_v<std::remove_cvref_t<Text>>)
+            if (body == nullptr) return false;
+        const std::string_view view(static_cast<Text&&>(body));
+        return Send(status, contentType, std::as_bytes(std::span(view.data(), view.size())));
+    }
+    bool Send(int status, const char* contentType, const void* body, size_t size)
+    {
+        return Send(status, contentType,
+                    std::span(static_cast<const std::byte*>(body), size));
+    }
     virtual bool SendHeaders(int status, const char* contentType, size_t contentLength) = 0;
     // HTTP/1.0 streams are close-delimited: chunk markers and the terminator are omitted.
     // HTTP/1.1 retains chunked framing and persistence.
@@ -240,8 +259,8 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     int64_t ContentLength() override;
     bool RequireNoBody() override;
     int64_t ReadBodyToFile(int fileFd, off_t offset) override;
-    bool Send(int status, const char* contentType, const void* body, size_t size) override;
-    bool Send(int status, const char* contentType, const std::string& body) override;
+    using ConnectionBase::Send;
+    bool Send(int status, const char* contentType, std::span<const std::byte> body) override;
     bool SendHeaders(int status, const char* contentType, size_t contentLength) override;
     bool BeginChunked(int status, const char* contentType) override;
     bool SendChunk(const void* data, size_t size) override;

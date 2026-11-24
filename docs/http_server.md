@@ -264,3 +264,14 @@ this boundary before parser and transport teardown even when connection hooks ar
 A detached child must arrange its own state lifetime. Hooks and per-server state must
 outlive active connections; when graceful draining detaches connections from the listener,
 wait for drain completion before destroying them.
+
+Response bodies are borrowed for the duration of `Send`. The virtual operation is
+`bool Send(int status, const char* contentType, std::span<const std::byte> body)`.
+Text callers use a constrained nonvirtual adapter for values convertible to
+`std::string_view`; the pointer/size overload remains a non-owning adapter.
+A `nullptr` body literal is refused at compile time, a null C-string pointer
+returns false without sending, and `{}` selects an empty byte span. Neither adapter allocates or retains the
+body. Custom connection implementations override only the byte-span operation
+and expose the base overloads with `using ConnectionBase::Send` when calling them
+through the concrete type. Existing owning strings can be passed as text views;
+embedded NUL bytes are preserved by their explicit length.

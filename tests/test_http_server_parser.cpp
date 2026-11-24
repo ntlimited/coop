@@ -5,6 +5,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@ struct Script
     size_t fileLimit = SIZE_MAX;
     std::vector<std::pair<off_t, size_t>> fileSends;
     std::string sent;
+    const void* lastSendData = nullptr;
 };
 struct Transport
 {
@@ -49,6 +51,7 @@ struct Transport
     int SendAll(const void* data, size_t size)
     {
         if (script->sendError) return script->sendError;
+        script->lastSendData = data;
         script->sent.append(static_cast<const char*>(data), size);
         return static_cast<int>(size);
     }
@@ -781,4 +784,61 @@ TEST(HttpServerParser, Http10EarlyFixedResponseChoosesClosureWithoutConsumingHea
     EXPECT_TRUE(parser.conn->SkipBody());
     EXPECT_FALSE(parser.conn->KeepAlive());
     EXPECT_FALSE(parser.conn->Reset());
+}
+
+TEST(HttpServerParser, SendBorrowsAnExactTextView)
+{
+    Parser parser({"GET / HTTP/1.1\r\n\r\n"});
+    const char text[] = {'x', 'a', '\0', 'b', 'z'};
+    coop::http::ConnectionBase& conn = *parser.conn;
+    ASSERT_TRUE(conn.Send(200, "text/plain", std::string_view(text + 1, 3)));
+    EXPECT_NE(parser.script.sent.find("Content-Length: 3\r\n"), std::string::npos);
+    EXPECT_EQ(parser.script.sent.substr(parser.script.sent.find("\r\n\r\n") + 4),
+              std::string(text + 1, 3));
+}
+
+TEST(HttpServerParser, SendBorrowsBinaryStorageWithoutAnOwningAdapter)
+{
+    Parser parser({"GET / HTTP/1.1\r\n\r\n"});
+    std::byte body[128]{};
+    body[0] = std::byte{0xff};
+    body[127] = std::byte{0x7f};
+    ASSERT_TRUE(parser.conn->Send(200, "application/octet-stream",
+                                 std::span<const std::byte>(body)));
+    EXPECT_EQ(parser.script.lastSendData, body);
+    EXPECT_NE(parser.script.sent.find("Content-Length: 128\r\n"), std::string::npos);
+    EXPECT_EQ(parser.script.sent.substr(parser.script.sent.find("\r\n\r\n") + 4),
+              std::string(reinterpret_cast<const char*>(body), sizeof(body)));
+}
+
+namespace
+{
+template<typename Body>
+concept CanSendBorrowedBody = requires(coop::http::ConnectionBase& conn, Body&& body)
+{
+    conn.Send(200, "text/plain", static_cast<Body&&>(body));
+};
+static_assert(!CanSendBorrowedBody<std::nullptr_t>);
+static_assert(CanSendBorrowedBody<std::string_view>);
+static_assert(CanSendBorrowedBody<std::string&>);
+}
+
+TEST(HttpServerParser, EmptyBracesSendAnEmptyBody)
+{
+    Parser parser({"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    ASSERT_TRUE(parser.conn->Send(200, "text/plain", {}));
+    EXPECT_NE(parser.script.sent.find("Content-Length: 0\r\n"), std::string::npos);
+    EXPECT_TRUE(parser.script.sent.ends_with("\r\n\r\n"));
+}
+
+TEST(HttpServerParser, NullTextPointerIsRefusedWithoutReadingOrSending)
+{
+    Parser parser({"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    const char* text = nullptr;
+    EXPECT_FALSE(parser.conn->Send(200, "text/plain", text));
+    EXPECT_TRUE(parser.script.sent.empty());
+    EXPECT_FALSE(parser.conn->SendError());
+    EXPECT_TRUE(parser.conn->Send(200, "text/plain", "ok"));
 }

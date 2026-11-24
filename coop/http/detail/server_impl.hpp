@@ -1565,8 +1565,10 @@ bool ConnectionImpl<Derived>::SendHeaders(int status, const char* contentType,
 
 template<typename Derived>
 bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
-                                    const void* body, size_t size)
+                                    std::span<const std::byte> bytes)
 {
+    const void* body = bytes.data();
+    size_t size = bytes.size();
     if (m_sendError || ResponseClosed()) return false;
 
     if (!AppendStatusLine(status, {})) return false;
@@ -1594,13 +1596,6 @@ bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
     //
     if (!Flush()) return false;
     return SendRaw(body, size);
-}
-
-template<typename Derived>
-bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
-                                    const std::string& body)
-{
-    return Send(status, contentType, body.data(), body.size());
 }
 
 template<typename Derived>

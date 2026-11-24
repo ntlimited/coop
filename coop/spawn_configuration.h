@@ -2,6 +2,10 @@
 
 #include <cstddef>
 
+// CMake and Bazel propagate one build-level value to the library and its consumers.
+// An unmanaged build defaults to 16 KiB; define this macro consistently in every
+// translation unit (65536 is the sanitizer default supplied by both build systems).
+//
 #ifndef COOP_DEFAULT_STACK_SIZE
 #define COOP_DEFAULT_STACK_SIZE 16384
 #endif

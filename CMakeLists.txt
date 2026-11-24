@@ -56,6 +56,23 @@ if(COOP_ASAN)
     add_link_options(-fsanitize=address)
 endif()
 
+# Choose the public stack budget once per build, including uninstrumented consumers.
+# Zero selects the normal or sanitizer default; positive values are explicit overrides.
+#
+set(COOP_DEFAULT_STACK_SIZE 0 CACHE STRING "Default context stack bytes (0 = automatic)")
+if(NOT COOP_DEFAULT_STACK_SIZE MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "COOP_DEFAULT_STACK_SIZE must be a nonnegative integer")
+endif()
+set(COOP_CONFIGURED_STACK_SIZE "${COOP_DEFAULT_STACK_SIZE}")
+if(COOP_CONFIGURED_STACK_SIZE EQUAL 0)
+    if(COOP_ASAN)
+        set(COOP_CONFIGURED_STACK_SIZE 65536)
+    else()
+        set(COOP_CONFIGURED_STACK_SIZE 16384)
+    endif()
+endif()
+add_compile_definitions(COOP_DEFAULT_STACK_SIZE=${COOP_CONFIGURED_STACK_SIZE})
+
 # Link-time optimization, default-on for standalone release builds. Whole-program codegen is a
 # measured win on the hottest dispatch paths (continuation fire ~-25%, text ~-6%) and is safe
 # because the context switch is an ordinary out-of-line call the optimizer can model (see
@@ -130,6 +147,8 @@ list(FILTER COOP_SOURCES EXCLUDE REGEX ".*/coop/chan/.*")
 
 add_library(coop STATIC ${COOP_SOURCES} $<TARGET_OBJECTS:coop_chan>)
 target_include_directories(coop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(coop PUBLIC
+    COOP_DEFAULT_STACK_SIZE=${COOP_CONFIGURED_STACK_SIZE})
 if(COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK)
     target_compile_definitions(coop PRIVATE COOP_WORKAROUND_UBUNTU_PBUF_RESERVED_CHECK=1)
 endif()

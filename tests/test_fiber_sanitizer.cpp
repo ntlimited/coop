@@ -8,7 +8,9 @@
 #include "coop/cooperator.h"
 #include "coop/coordinator.h"
 #include "coop/detail/asan_fiber.h"
+#include "coop/group.h"
 #include "coop/self.h"
+#include "coop/stack_pool.h"
 #include "test_helpers.h"
 
 // These tests exist for what AddressSanitizer says about them, not for what they assert.
@@ -63,6 +65,43 @@ void ChurnStack(coop::Context* ctx, uint64_t seed, int rounds)
 }
 
 } // end anonymous namespace
+
+// An unconfigured root and Group::Go use the build default. Spawn(fn) inside a context
+// inherits its parent's stack instead; explicit configurations remain caller-controlled.
+//
+TEST(FiberSanitizerTest, DefaultContextsUseConfiguredStackBudget)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        EXPECT_EQ(ctx->m_segment.Size(),
+                  coop::StackPool::RoundUpStackSize(coop::s_defaultConfiguration.stackSize));
+    });
+
+    const size_t parentSize = coop::StackPool::RoundUpStackSize(
+        coop::s_defaultConfiguration.stackSize) * 2;
+    test::RunInCooperator([&](coop::Context* ctx)
+    {
+        EXPECT_EQ(ctx->m_segment.Size(), parentSize);
+        size_t inheritedSize = 0;
+        ASSERT_TRUE(ctx->GetCooperator()->Spawn([&](coop::Context* child)
+        {
+            inheritedSize = child->m_segment.Size();
+        }));
+        ctx->JoinChildren();
+        EXPECT_EQ(inheritedSize, parentSize);
+
+        coop::Group group(ctx);
+        size_t groupSize = 0;
+        ASSERT_TRUE(group.Go([&](coop::Context* child)
+        {
+            groupSize = child->m_segment.Size();
+        }));
+        EXPECT_TRUE(group.Wait());
+        EXPECT_EQ(groupSize,
+                  coop::StackPool::RoundUpStackSize(coop::s_defaultConfiguration.stackSize));
+        EXPECT_NE(groupSize, parentSize);
+    }, {.priority = 0, .stackSize = parentSize});
+}
 
 // Many fibers, deeply interleaved. This drives every switch flavour the scheduler has: direct
 // fiber-to-fiber yields, trips back out through the loop, first entries, and final exits.

@@ -123,7 +123,10 @@ Launch<MyHandler>(args...);
 ### StackPool (`coop/stack_pool.h`)
 Size-class allocator for context stack segments, owned by `Cooperator`. 6 power-of-2 buckets
 (4KB-128KB), eliminates mmap/malloc syscalls on the spawn/exit hot path. Stack sizes in
-`SpawnConfiguration` are transparently rounded up. See `coop/CLAUDE.md` for internals.
+`SpawnConfiguration` are transparently rounded up. The default is 16KB, or 64KB when compiled with
+AddressSanitizer to allow for instrumented frames and intercepted library calls. Explicit stack
+sizes and the `COOP_DEFAULT_STACK_SIZE` build override take precedence. See `coop/CLAUDE.md` for
+internals.
 
 ### Spawn vs Launch (`coop/cooperator.h`)
 Two ways to create contexts:
@@ -225,6 +228,9 @@ Structured-concurrency scope (errgroup / JoinSet / gate). `Go(fn)` spawns a chil
 the group; the destructor (or `Wait()`) joins all children so none outlive the scope.
 Fail-fast: the first child returning `false` cancels its siblings via `Handle::Kill`
 (which they observe through kill-aware waits) and makes `Wait()` return false.
+The implicit `Go(fn)` configuration uses `s_defaultConfiguration` (16 KiB normally,
+64 KiB in sanitizer builds). It does not inherit its parent's stack size or priority;
+`Spawn(fn)` inside a context does inherit both. Use `Go(config, fn)` to choose explicitly.
 `SetLimit(n)` bounds in-flight children through a Semaphore — `Go` blocks the owner at the
 limit. Child fns return `bool` (true = ok) or `void` (always ok) and must be kill-aware
 for cancellation to reach them (`CoordinateWithKill`, `io::*Kill`, `chan::RecvKill` /

@@ -10,6 +10,13 @@ build:debug --compilation_mode=dbg
 build:debug --//bazel:perf_mode=1
 build:debug --//bazel:spdlog_active_level=2
 
+# Keep instrumentation and the public default stack budget in the same build config.
+build:asan --config=debug
+# The toolchain setting also declares/builds the matching compiler-rt runtimes.
+# Raw compiler flags alone leave clang's resource directory without ASan archives.
+build:asan --@llvm//config:asan=true
+build:asan --//bazel:address_sanitizer=true
+
 # Release is -O3 without LTO; add --config=lto for the shipping CMake Release lane.
 build:release --compilation_mode=opt
 build:release --copt=-O3

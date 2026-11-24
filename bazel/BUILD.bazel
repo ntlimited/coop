@@ -11,7 +11,9 @@ platform(
     constraint_values = ["@llvm//constraints/libc:gnu.2.31"],
 )
 
-int_flag(name = "default_stack_size", build_setting_default = 16384)
+# Zero selects the build default: 16 KiB normally, 64 KiB with address_sanitizer.
+int_flag(name = "default_stack_size", build_setting_default = 0)
+bool_flag(name = "address_sanitizer", build_setting_default = False)
 int_flag(name = "perf_mode", build_setting_default = 1)
 int_flag(name = "spdlog_active_level", build_setting_default = 2)
 string_flag(name = "perf_user_counters", build_setting_default = "")

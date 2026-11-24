@@ -8,8 +8,10 @@ def _configuration_impl(ctx):
     stack = ctx.attr.stack[BuildSettingInfo].value
     mode = ctx.attr.mode[BuildSettingInfo].value
     level = ctx.attr.level[BuildSettingInfo].value
-    if stack <= 0:
-        fail("default_stack_size must be positive")
+    if stack < 0:
+        fail("default_stack_size must be nonnegative (0 selects the build default)")
+    if stack == 0:
+        stack = 65536 if ctx.attr.asan[BuildSettingInfo].value else 16384
     if mode not in [0, 1, 2]:
         fail("perf_mode must be 0, 1, or 2")
     if level not in range(7):
@@ -39,6 +41,7 @@ coop_configuration = rule(
     implementation = _configuration_impl,
     attrs = {
         "stack": attr.label(default = "//bazel:default_stack_size"),
+        "asan": attr.label(default = "//bazel:address_sanitizer"),
         "mode": attr.label(default = "//bazel:perf_mode"),
         "level": attr.label(default = "//bazel:spdlog_active_level"),
         "counters": attr.label(default = "//bazel:perf_user_counters"),

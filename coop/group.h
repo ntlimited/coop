@@ -65,12 +65,14 @@ struct Group
 
     // Spawn a child running fn. With a limit set, blocks the owner until a slot frees
     // (kill-aware — returns false if the owner is killed while waiting). Returns false
-    // without spawning if the group is already failing or the spawn fails.
+    // without spawning if the group is already failing or the spawn fails. This overload
+    // uses s_defaultConfiguration, rather than inheriting the owner's stack or priority.
+    // Use Go(config, fn) to choose either explicitly.
     //
     template<typename Fn>
     bool Go(Fn&& fn)
     {
-        return Go(SpawnConfiguration{}, std::forward<Fn>(fn));
+        return Go(s_defaultConfiguration, std::forward<Fn>(fn));
     }
 
     template<typename Fn>

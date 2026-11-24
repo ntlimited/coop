@@ -64,6 +64,7 @@ for errors, cleanup and live-fix limits.
 | CMake CI lane | Bazel options |
 | --- | --- |
 | Debug (x86_64 / aarch64) | `--config=debug` (also the default) |
+| AddressSanitizer | `--config=asan` (CMake: `-DCOOP_ASAN=ON`) |
 | Release with LTO (x86_64 / aarch64) | `--config=lto` |
 | Release without LTO | `--config=release` |
 | Plain `-O2` without LTO | `--config=o2` |
@@ -130,7 +131,22 @@ Alternatively, put the `COOP_PERF_USER_COUNTERS` / `COOP_PERF_USER_FAMILIES` def
 on that library's `defines` and leave the string flags empty. See
 [perf extensions](coop/perf/CLAUDE.md#extension-mechanism-for-coop-consumers) for file syntax.
 
-Defaults are stack size 16384, perf mode 1 (always on), logging level 2 (info), empty
+The default-stack flag is 0 (automatic): 16384 bytes normally, or 65536 with
+`--config=asan`. The config selects the fetched LLVM toolchain's
+`--@llvm//config:asan=true` setting (instrumentation and declared compiler-rt
+runtime inputs) together with `--//bazel:address_sanitizer=true` for the larger
+stack budget. Raw `-fsanitize=address` flags alone do not declare those runtime
+inputs in this toolchain. Dependency rc files are not imported: a root module
+using the fetched toolchain must set both `--@llvm//config:asan=true` and
+`--@coop//bazel:address_sanitizer=true`, or choose a positive explicit stack
+default in place of the latter. A different toolchain must supply its own
+instrumentation/runtime configuration as well as the matching stack setting.
+The effective numeric value propagates to every C++ consumer, independent of
+whether a particular translation unit is instrumented. CMake likewise computes
+one public definition; `-DCOOP_DEFAULT_STACK_SIZE=0` selects its automatic default.
+Explicit `SpawnConfiguration::stackSize` values remain unchanged.
+
+Other defaults are perf mode 1 (always on), logging level 2 (info), empty
 perf paths, and an empty perf-defs library. The standalone release configs select mode 2
 (patched counters, zero when off) and logging level 3 (warn). Mode 0 disables counters.
 These definitions propagate through `CcInfo`, including to consumer translation units.

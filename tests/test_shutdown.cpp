@@ -372,6 +372,54 @@ TEST(ShutdownTest, ShutdownAllNoCooperators)
     coop::Cooperator::ResetGlobalShutdown();
 }
 
+namespace
+{
+
+struct SubmissionLifetime
+{
+    std::atomic<int>& destroyed;
+    explicit SubmissionLifetime(std::atomic<int>& count) : destroyed(count) {}
+    ~SubmissionLifetime() { destroyed.fetch_add(1); }
+};
+
+} // namespace
+
+TEST(ShutdownTest, GlobalShutdownBeforeLaunchRetiresQueuedSubmission)
+{
+    std::atomic<int> destroyed{0};
+    bool ran = false;
+    {
+        coop::Cooperator target;
+        ASSERT_TRUE(target.Submit(
+            [lifetime = std::make_unique<SubmissionLifetime>(destroyed), &ran](coop::Context*)
+            {
+                ran = true;
+            }));
+        coop::Cooperator::ShutdownAll();
+        target.Launch();
+        EXPECT_FALSE(ran);
+        EXPECT_EQ(destroyed.load(), 1);
+    }
+    coop::Cooperator::ResetGlobalShutdown();
+    EXPECT_EQ(destroyed.load(), 1);
+}
+
+TEST(ShutdownTest, UnlaunchedCooperatorRetiresQueuedSubmission)
+{
+    std::atomic<int> destroyed{0};
+    bool ran = false;
+    {
+        coop::Cooperator target;
+        ASSERT_TRUE(target.Submit(
+            [lifetime = std::make_unique<SubmissionLifetime>(destroyed), &ran](coop::Context*)
+            {
+                ran = true;
+            }));
+    }
+    EXPECT_FALSE(ran);
+    EXPECT_EQ(destroyed.load(), 1);
+}
+
 // After ResetGlobalShutdown(), new cooperators should register and run normally.
 //
 TEST(ShutdownTest, ShutdownAllThenReset)

@@ -42,7 +42,13 @@ ready.Release(ctx, false);
 ```
 
 ### Stack budget
-Default context stack is 16KB (`s_defaultConfiguration.stackSize`). Operations running on a
+Default context stack is 16KB, or 64KB in AddressSanitizer builds
+(`s_defaultConfiguration.stackSize`). CMake and Bazel propagate the same build-level
+`COOP_DEFAULT_STACK_SIZE` definition to the runtime and consumers, even if an individual
+translation unit is not instrumented. Select Bazel instrumentation with `--config=asan`;
+CMake uses `-DCOOP_ASAN=ON`. Both accept a positive explicit default-stack override;
+zero selects the automatic default. Explicit `SpawnConfiguration::stackSize` remains
+authoritative. Operations running on a
 context stack — including framework internals invoked from that context — must fit within this.
 Use `SpawnConfiguration` with a larger `stackSize` when a context needs more, or prefer
 iterative algorithms over recursive ones for depth-variable work.

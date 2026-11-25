@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <netinet/in.h>
 #include <span>
 #include <string_view>

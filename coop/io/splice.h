@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <stddef.h>
 #include <sys/types.h>
 

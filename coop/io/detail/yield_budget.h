@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 
 #include "coop/context.h"

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <sys/types.h>
 
 #include "coop/time/interval.h"

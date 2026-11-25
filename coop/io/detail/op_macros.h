@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coop/io/detail/handle_extension.h"
+#include <cerrno>
 #include "coop/time/interval.h"
 
 // Visitor projections for operation argument lists.

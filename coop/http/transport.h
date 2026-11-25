@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <sys/socket.h>
 
 #include "coop/io/descriptor.h"

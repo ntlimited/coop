@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.h"
+#include <cerrno>
 #include "connection.h"
 #include "recv.h"
 #include "send.h"

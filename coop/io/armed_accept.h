@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
 
 #include "armed_handle.h"

@@ -367,3 +367,19 @@ body. Custom connection implementations override only the byte-span operation
 and expose the base overloads with `using ConnectionBase::Send` when calling them
 through the concrete type. Existing owning strings can be passed as text views;
 embedded NUL bytes are preserved by their explicit length.
+
+The built-in API table dispatched by `StatusDispatch` requires POST for
+`/api/perf/enable`, `/api/perf/disable`, `/api/sampler/start`, `/api/sampler/stop`
+and body-based `/api/sampler/symbolize`. Its read-only API routes accept GET and HEAD.
+Native HEAD responses retain representation headers, including the GET Content-Length, but
+send no response content; fixed, chunked and file sends all honor this rule. Chunked HEAD
+responses emit neither data chunks nor a terminating chunk. Raw `SendRawBytes` bypasses HTTP
+formatting and leaves protocol correctness to its caller. See
+[RFC 9110 section 9.3.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.2).
+OPTIONS on every built-in API route responds 204 with Allow and no Content-Length or body,
+and performs no control action. Read-only routes advertise GET, HEAD, OPTIONS; mutating and
+body-based routes advertise POST, OPTIONS. OPTIONS requests must pass RequireNoBody before
+being answered. See [RFC 9110 section 9.3.7](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.7).
+A method mismatch sends 405 with `Allow`, closes the connection and performs no
+control action or query-option parsing. Call `StatusDispatch` before consuming
+query arguments or headers. Static-file helpers retain their independent policy.

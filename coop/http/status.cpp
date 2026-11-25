@@ -897,7 +897,8 @@ void HandleHealth(ConnectionBase& conn, const StatusArguments&)
 //
 // Emit the sampler's stack ring as Brendan-Gregg collapsed/folded stacks (root;...;leaf<space>count),
 // the input format for flamegraph.pl and speedscope. Turns the built-in profiler into standard
-// tooling: /api/sampler/start?stacks=1, apply load, then curl /api/sampler/folded > out.folded.
+// tooling: curl -X POST 'http://127.0.0.1:8080/api/sampler/start?stacks=1', apply load,
+// then curl http://127.0.0.1:8080/api/sampler/folded > out.folded.
 // Symbolizing raw PCs is safe even for since-exited contexts — code addresses do not move.
 //
 void HandleSamplerFolded(ConnectionBase& conn, const StatusArguments&)
@@ -945,6 +946,7 @@ struct StatusRoute
     void (*handler)(ConnectionBase&, const StatusArguments&);
     StatusQuery query = StatusQuery::None;
     bool acceptsBody = false;
+    std::string_view method = "GET";
 };
 
 // Query parsing precedes header validation because advancing to headers discards unread args.
@@ -986,14 +988,14 @@ StatusArguments ReadStatusArguments(ConnectionBase& conn, StatusQuery query)
 StatusRoute s_statusRoutes[] = {
     {"/api/status",         HandleStatus},
     {"/api/perf",           HandlePerf},
-    {"/api/perf/enable",    HandlePerfEnable, StatusQuery::Perf},
-    {"/api/perf/disable",   HandlePerfDisable, StatusQuery::Perf},
+    {"/api/perf/enable",    HandlePerfEnable, StatusQuery::Perf, false, "POST"},
+    {"/api/perf/disable",   HandlePerfDisable, StatusQuery::Perf, false, "POST"},
     {"/api/sampler",        HandleSampler},
-    {"/api/sampler/start",  HandleSamplerStart, StatusQuery::Sampler},
-    {"/api/sampler/stop",   HandleSamplerStop},
+    {"/api/sampler/start",  HandleSamplerStart, StatusQuery::Sampler, false, "POST"},
+    {"/api/sampler/stop",   HandleSamplerStop, StatusQuery::None, false, "POST"},
     {"/api/sampler/samples", HandleSamplerSamples},
     {"/api/sampler/folded",  HandleSamplerFolded},
-    {"/api/sampler/symbolize", HandleSymbolize, StatusQuery::None, true},
+    {"/api/sampler/symbolize", HandleSymbolize, StatusQuery::None, true, "POST"},
     {"/api/health",          HandleHealth},
     {"/api/cooperators",       HandleCooperators},
     {"/api/cooperators/perf",  HandleCooperatorsPerf},
@@ -1037,6 +1039,27 @@ bool StatusDispatch(ConnectionBase& conn, std::string_view path)
     {
         if (path == route.path)
         {
+            const auto* request = conn.GetRequestLine();
+            if (!request) return true;
+            const bool readOnly = route.method == "GET";
+            const std::string_view allow = readOnly ? "GET, HEAD, OPTIONS" : "POST, OPTIONS";
+            if (request->method == "OPTIONS")
+            {
+                if (!conn.RequireNoBody()) return true;
+                if (conn.BeginResponse(204, "No Content") && conn.AppendHeader("Allow", allow))
+                    conn.EndHeaders();
+                return true;
+            }
+            if (request->method != route.method && !(readOnly && request->method == "HEAD"))
+            {
+                conn.ForceClose();
+                if (conn.BeginResponse(405, "Method Not Allowed") &&
+                    conn.AppendHeader("Allow", allow) &&
+                    conn.AppendHeader("Content-Length", size_t(0)))
+                    conn.EndHeaders();
+                conn.RejectRequest(405, true);
+                return true;
+            }
             StatusArguments args = ReadStatusArguments(conn, route.query);
             if (!route.acceptsBody && !conn.RequireNoBody()) return true;
             route.handler(conn, args);

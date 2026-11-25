@@ -13,6 +13,7 @@
 #include "coop/http/detail/server_impl.hpp"
 #include "coop/http/status.h"
 #include "coop/perf/patch.h"
+#include "coop/perf/sampler.h"
 #include "coop/io/uring.h"
 
 namespace
@@ -81,10 +82,10 @@ struct Parser
     Script script;
     Connection* conn;
     explicit Parser(std::vector<std::string> packets, size_t receive = 128,
-                    coop::http::ServerParserOptions options = {})
+                    coop::http::ServerParserOptions options = {}, coop::Cooperator* co = nullptr)
     : script{std::move(packets)}
     , conn(new (::operator new(sizeof(Connection) + Connection::ExtraBytes(receive, 64)))
-        Connection(Transport{&script, &descriptor}, nullptr, nullptr, receive, 64,
+        Connection(Transport{&script, &descriptor}, nullptr, co, receive, 64,
                    std::chrono::seconds(30), options))
     {}
     ~Parser() { conn->~Connection(); ::operator delete(conn); }
@@ -930,7 +931,11 @@ TEST(HttpServerParser, AllNoBodyStatusRoutesRejectFramingBeforeTheirHandler)
             "/api/contexts/dump"})
     {
         SCOPED_TRACE(path);
-        Parser parser({"GET " + std::string(path) +
+        const bool mutates = std::string_view(path) == "/api/perf/enable" ||
+            std::string_view(path) == "/api/perf/disable" ||
+            std::string_view(path) == "/api/sampler/start" ||
+            std::string_view(path) == "/api/sampler/stop";
+        Parser parser({std::string(mutates ? "POST " : "GET ") + path +
                        "?families=io&hz=17&stacks=1 HTTP/1.1\r\nContent-Length: 1\r\n\r\n",
                        "x"});
         ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
@@ -945,14 +950,14 @@ TEST(HttpServerParser, StatusQueryOptionsSurviveNoBodyValidation)
 {
     auto original = coop::perf::EnabledFamilies();
     coop::perf::SetFamilies({});
-    Parser enable({"GET /api/perf/enable?families=io HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    Parser enable({"POST /api/perf/enable?families=io HTTP/1.1\r\nHost: example.test\r\n\r\n"});
     ASSERT_NE(enable.conn->GetRequestLine(), nullptr);
     EXPECT_TRUE(coop::http::StatusDispatch(*enable.conn, "/api/perf/enable"));
     EXPECT_NE(enable.script.sent.find("200 OK\r\n"), std::string::npos);
 #if COOP_PERF_MODE == 2
     EXPECT_EQ(coop::perf::EnabledFamilies(), coop::perf::Family::IO);
 #endif
-    Parser disable({"GET /api/perf/disable?families=io HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    Parser disable({"POST /api/perf/disable?families=io HTTP/1.1\r\nHost: example.test\r\n\r\n"});
     ASSERT_NE(disable.conn->GetRequestLine(), nullptr);
     EXPECT_TRUE(coop::http::StatusDispatch(*disable.conn, "/api/perf/disable"));
     EXPECT_NE(disable.script.sent.find("200 OK\r\n"), std::string::npos);
@@ -1140,6 +1145,178 @@ TEST(HttpServerParser, SendBorrowsBinaryStorageWithoutAnOwningAdapter)
     EXPECT_NE(parser.script.sent.find("Content-Length: 128\r\n"), std::string::npos);
     EXPECT_EQ(parser.script.sent.substr(parser.script.sent.find("\r\n\r\n") + 4),
               std::string(reinterpret_cast<const char*>(body), sizeof(body)));
+}
+
+namespace
+{
+struct RestoreProcessControls
+{
+    coop::perf::Family families = coop::perf::EnabledFamilies();
+    bool sampling = coop::perf::IsSampling();
+    int hz = coop::perf::SamplingHz();
+    bool stacks = coop::perf::IsStackMode();
+    ~RestoreProcessControls()
+    {
+        coop::perf::SetFamilies(families);
+        coop::perf::StopSampling();
+        if (sampling) coop::perf::StartSampling(hz, stacks);
+    }
+};
+}
+
+TEST(HttpServerParser, MutatingStatusRoutesRequirePostBeforeActing)
+{
+    RestoreProcessControls restore;
+    for (const char* path : {"/api/perf/enable", "/api/perf/disable",
+                            "/api/sampler/start", "/api/sampler/stop"})
+    {
+        for (const char* method : {"GET", "HEAD", "PUT"})
+        for (bool framed : {false, true})
+        {
+            SCOPED_TRACE(path);
+            SCOPED_TRACE(method);
+            SCOPED_TRACE(framed);
+            coop::perf::SetFamilies(std::string_view(path) == "/api/perf/enable"
+                ? coop::perf::Family{} : coop::perf::Family::IO);
+            coop::perf::StopSampling();
+            if (std::string_view(path) == "/api/sampler/stop")
+                ASSERT_TRUE(coop::perf::StartSampling(2));
+            const bool sampling = coop::perf::IsSampling();
+            const auto families = coop::perf::EnabledFamilies();
+            Parser parser({std::string(method) + " " + path +
+                "?hz=2&families=io HTTP/1.1\r\n" +
+                (framed ? "Transfer-Encoding: chunked\r\n" : "") + "\r\n", "invalid"});
+            ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+            EXPECT_TRUE(coop::http::StatusDispatch(*parser.conn, path));
+            EXPECT_NE(parser.script.sent.find("405 Method Not Allowed\r\n"), std::string::npos);
+            EXPECT_NE(parser.script.sent.find("Allow: POST, OPTIONS\r\n"), std::string::npos);
+            EXPECT_FALSE(parser.conn->KeepAlive());
+            EXPECT_EQ(coop::perf::IsSampling(), sampling);
+            EXPECT_EQ(coop::perf::EnabledFamilies(), families);
+            EXPECT_EQ(parser.script.reads, 1);
+        }
+    }
+}
+
+TEST(HttpServerParser, PostSamplerControlsRetainTheirQueryAndAction)
+{
+    RestoreProcessControls restore;
+    coop::perf::StopSampling();
+    Parser start({"POST /api/sampler/start?hz=2 HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    ASSERT_NE(start.conn->GetRequestLine(), nullptr);
+    ASSERT_TRUE(coop::http::StatusDispatch(*start.conn, "/api/sampler/start"));
+    EXPECT_NE(start.script.sent.find("200 OK\r\n"), std::string::npos);
+    EXPECT_TRUE(coop::perf::IsSampling());
+    EXPECT_EQ(coop::perf::SamplingHz(), 2);
+    Parser stop({"POST /api/sampler/stop HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    ASSERT_NE(stop.conn->GetRequestLine(), nullptr);
+    ASSERT_TRUE(coop::http::StatusDispatch(*stop.conn, "/api/sampler/stop"));
+    EXPECT_NE(stop.script.sent.find("200 OK\r\n"), std::string::npos);
+    EXPECT_FALSE(coop::perf::IsSampling());
+}
+
+TEST(HttpServerParser, ReadOnlyStatusRouteRequiresGet)
+{
+    Parser read({"GET /api/sampler HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    ASSERT_NE(read.conn->GetRequestLine(), nullptr);
+    EXPECT_TRUE(coop::http::StatusDispatch(*read.conn, "/api/sampler"));
+    EXPECT_NE(read.script.sent.find("200 OK\r\n"), std::string::npos);
+    Parser post({"POST /api/sampler HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    ASSERT_NE(post.conn->GetRequestLine(), nullptr);
+    EXPECT_TRUE(coop::http::StatusDispatch(*post.conn, "/api/sampler"));
+    EXPECT_NE(post.script.sent.find("405 Method Not Allowed\r\n"), std::string::npos);
+    EXPECT_NE(post.script.sent.find("Allow: GET, HEAD, OPTIONS\r\n"), std::string::npos);
+}
+
+TEST(HttpServerParser, HeadReadOnlyRoutesPreserveGetHeadersWithoutContent)
+{
+    coop::Cooperator co;
+    for (const char* path : {"/api/health", "/api/sampler"})
+    {
+        Parser get({std::string("GET ") + path + " HTTP/1.1\r\nHost: example.test\r\n\r\n"},
+                   128, {}, &co);
+        ASSERT_NE(get.conn->GetRequestLine(), nullptr);
+        ASSERT_TRUE(coop::http::StatusDispatch(*get.conn, path));
+        const auto split = get.script.sent.find("\r\n\r\n");
+        ASSERT_NE(split, std::string::npos);
+        ASSERT_GT(get.script.sent.size(), split + 4);
+        Parser head({std::string("HEAD ") + path + " HTTP/1.1\r\nHost: example.test\r\n\r\n"},
+                    128, {}, &co);
+        ASSERT_NE(head.conn->GetRequestLine(), nullptr);
+        ASSERT_TRUE(coop::http::StatusDispatch(*head.conn, path));
+        EXPECT_EQ(head.script.sent, get.script.sent.substr(0, split + 4));
+        EXPECT_TRUE(head.conn->KeepAlive());
+    }
+}
+
+TEST(HttpServerParser, HeadSuppressesFixedStreamAndFileContentAndPreservesPipeline)
+{
+    for (const char* version : {"HTTP/1.0", "HTTP/1.1"})
+    for (int form = 0; form != 4; ++form)
+    {
+        SCOPED_TRACE(version);
+        SCOPED_TRACE(form);
+        Parser parser({std::string("HEAD / ") + version +
+            "\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n" + next});
+        ASSERT_TRUE(parser.conn->SkipBody());
+        switch (form)
+        {
+            case 0: ASSERT_TRUE(parser.conn->Send(200, "text/plain", "content")); break;
+            case 1:
+                ASSERT_TRUE(parser.conn->BeginChunked(200, "text/plain"));
+                ASSERT_TRUE(parser.conn->SendChunk("first", 5));
+                ASSERT_TRUE(parser.conn->EndChunked("last", 4));
+                break;
+            case 2:
+                ASSERT_TRUE(parser.conn->BeginChunked(200, "text/plain"));
+                ASSERT_TRUE(parser.conn->EndChunked());
+                break;
+            case 3:
+                ASSERT_TRUE(parser.conn->SendHeaders(200, "text/plain", 999));
+                ASSERT_TRUE(parser.conn->Sendfile(123, 0, 999));
+                EXPECT_TRUE(parser.script.fileSends.empty());
+                break;
+        }
+        const auto split = parser.script.sent.find("\r\n\r\n");
+        ASSERT_NE(split, std::string::npos);
+        EXPECT_EQ(parser.script.sent.size(), split + 4);
+        EXPECT_TRUE(parser.conn->KeepAlive());
+        ASSERT_TRUE(parser.conn->Reset());
+        ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+        EXPECT_EQ(parser.conn->GetRequestLine()->path, "/next");
+        const auto prior = parser.script.sent.size();
+        ASSERT_TRUE(parser.conn->Send(200, "text/plain", "get-content"));
+        EXPECT_EQ(parser.script.sent.substr(parser.script.sent.find("\r\n\r\n", prior) + 4),
+                  "get-content");
+    }
+}
+
+TEST(HttpServerParser, OptionsDescribesEveryBuiltinRouteWithoutActing)
+{
+    RestoreProcessControls restore;
+    coop::perf::StopSampling();
+    coop::perf::SetFamilies(coop::perf::Family::IO);
+    const auto families = coop::perf::EnabledFamilies();
+    for (const char* path : {"/api/status", "/api/perf", "/api/perf/enable", "/api/perf/disable",
+            "/api/sampler", "/api/sampler/start", "/api/sampler/stop", "/api/sampler/samples",
+            "/api/sampler/folded", "/api/sampler/symbolize", "/api/health", "/api/cooperators",
+            "/api/cooperators/perf", "/api/epoch", "/api/epoch/all", "/api/contexts/stacks",
+            "/api/contexts/dump"})
+    {
+        SCOPED_TRACE(path);
+        Parser parser({std::string("OPTIONS ") + path +
+            "?families=scheduler&hz=2 HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+        ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+        ASSERT_TRUE(coop::http::StatusDispatch(*parser.conn, path));
+        EXPECT_NE(parser.script.sent.find("204 No Content\r\n"), std::string::npos);
+        EXPECT_NE(parser.script.sent.find("Allow: "), std::string::npos);
+        EXPECT_NE(parser.script.sent.find("OPTIONS\r\n"), std::string::npos);
+        EXPECT_EQ(parser.script.sent.find("Content-Length:"), std::string::npos);
+        EXPECT_EQ(parser.script.sent.size(), parser.script.sent.find("\r\n\r\n") + 4);
+        EXPECT_FALSE(coop::perf::IsSampling());
+        EXPECT_EQ(coop::perf::EnabledFamilies(), families);
+        EXPECT_TRUE(parser.conn->KeepAlive());
+    }
 }
 
 namespace

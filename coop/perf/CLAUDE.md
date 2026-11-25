@@ -109,8 +109,8 @@ is coherent with the dcache (syncs on next taken branch).
 }
 ```
 
-`/api/perf/enable?families=scheduler,epoch` — selective enable.
-`/api/perf/disable?families=io` — selective disable.
+`curl -X POST 'http://127.0.0.1:8080/api/perf/enable?families=scheduler,epoch'` — selective enable.
+`curl -X POST 'http://127.0.0.1:8080/api/perf/disable?families=io'` — selective disable.
 
 ## Testing Considerations
 

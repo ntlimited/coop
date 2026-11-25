@@ -168,6 +168,7 @@ void ConnectionImpl<Derived>::ResetRequestParser()
     m_needChunkCrlf = false;
     m_keepAlive = true;
     m_http10 = false;
+    m_headRequest = false;
 }
 
 template<typename Derived>
@@ -311,7 +312,7 @@ bool ConnectionImpl<Derived>::FailRequest(int status)
             && AppendHeader("Content-Length", bodyLen)
             && EndHeaders())
         {
-            SendRawBytes(text.body, bodyLen);
+            if (!m_headRequest) SendRawBytes(text.body, bodyLen);
         }
     }
 
@@ -778,6 +779,7 @@ bool ConnectionImpl<Derived>::ParseRequestLine()
     for (char* q = p; q != sp; ++q)
         if (!detail::ServerToken(static_cast<unsigned char>(*q))) return Fail(-EPROTO);
     m_requestLine.method = std::string_view(p, sp - p);
+    m_headRequest = m_requestLine.method == "HEAD";
     p = sp + 1;
     size_t pathStart = p - base;
 
@@ -1815,7 +1817,7 @@ bool ConnectionImpl<Derived>::Send(int status, const char* contentType,
     if (!AppendLiteral(response::CRLF)) return false;
     if (!AppendConnectionTrailer()) return false;
 
-    if (size == 0)
+    if (size == 0 || m_headRequest)
     {
         return Flush();
     }
@@ -1838,10 +1840,10 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::BeginChunked(int status, const char* contentType)
 {
     if (m_sendError || ResponseClosed()) return false;
+    if (m_http10 && status < 200) { m_sendError = true; return false; }
 
-    if (m_http10)
+    if (m_http10 && !m_headRequest)
     {
-        if (status < 200) { m_sendError = true; return false; }
         m_clientClose = true;
         m_closeDelimitedResponse = true;
         m_closeDelimitedComplete = false;
@@ -1879,6 +1881,7 @@ bool ConnectionImpl<Derived>::SendChunk(const void* data, size_t size)
         return false;
     }
 
+    if (m_headRequest) return Flush();
     if (m_http10) return Append(data, size) && Flush();
 
     if (!AppendHex(size)) return false;
@@ -1898,7 +1901,8 @@ bool ConnectionImpl<Derived>::EndChunked()
         return false;
     }
 
-    if (!m_http10 && !AppendLiteral(response::CHUNKED_TERMINATOR)) return false;
+    if (!m_http10 && !m_headRequest && !AppendLiteral(response::CHUNKED_TERMINATOR))
+        return false;
     bool sent = Flush();
     if (m_http10 && sent) m_closeDelimitedComplete = true;
     return sent;
@@ -1908,7 +1912,7 @@ template<typename Derived>
 bool ConnectionImpl<Derived>::EndChunked(const void* lastChunkData, size_t lastChunkSize)
 {
     if (m_sendError || ResponseClosed()) return false;
-    if (lastChunkSize == 0) return EndChunked();
+    if (lastChunkSize == 0 || m_headRequest) return EndChunked();
 
     if (m_chunkedHeadersPending && !AppendChunkedHeaders())
     {
@@ -1933,6 +1937,7 @@ bool ConnectionImpl<Derived>::EndChunked(const void* lastChunkData, size_t lastC
 template<typename Derived>
 bool ConnectionImpl<Derived>::Sendfile(int fileFd, off_t offset, size_t count)
 {
+    if (m_headRequest) return !m_sendError && !ResponseClosed() && Flush();
     if (m_finalSendAttempted) { m_sendError = true; FailIo(-EPIPE); return false; }
     if (m_sendError || ResponseClosed()) return false;
     if (offset < 0) return FailIo(-EINVAL);
@@ -2021,7 +2026,7 @@ bool ConnectionImpl<Derived>::AppendHeader(const char* name, size_t value)
 template<typename Derived>
 bool ConnectionImpl<Derived>::EndHeaders()
 {
-    if (m_http10 && !m_responseContentLength) m_clientClose = true;
+    if (m_http10 && !m_responseContentLength && !m_headRequest) m_clientClose = true;
     if (!AppendConnectionTrailer()) return false;
     return Flush();
 }

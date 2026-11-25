@@ -455,7 +455,9 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     const char*     m_chunkedContentType;
 
     bool            m_keepAlive;
-    bool            m_http10; // retained independently of borrowed request-line storage
+    // Retained independently of borrowed request-line storage.
+    bool            m_http10;
+    bool            m_headRequest = false;
     bool            m_closeDelimitedResponse;
     bool            m_closeDelimitedComplete;
     bool            m_responseContentLength;

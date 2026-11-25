@@ -8,6 +8,24 @@ Dispatch note: coop does no routing. `RunServer` parses each request and calls t
 `ServerConfiguration::handler` (a `RequestHandler = void(*)(ConnectionBase&, void*)`); the handler
 owns all matching, static serving (via the `ServeFile` helper), and 404s. There is no `Route` table
 in coop — the status dashboard (`StatusDispatch`) and benchmarks each carry their own.
+An optional `ServerConfiguration::requestAdmission` runs before that dispatch for every request.
+`InspectRequestHead` captures a bounded immutable head and validates through the same parser,
+including missing HTTP/1.1 Host and duplicate Host rejection. `FindHeader` is first-only;
+use `FindUniqueHeader`/`CountHeaders` for admission fields without duplicate semantics.
+The server calls `ReleaseRequestHead` immediately after admission; snapshot/index allocations
+are freed then, and the remaining parser replay allocation is freed at header completion.
+Explicit handler inspection owns the snapshot until ReleaseRequestHead/Reset/destruction.
+Re-fetch request-line views after inspection because capture can recycle the receive window.
+Inspection
+then supplies a mutable replay window so ordinary query/header iteration is unchanged. The
+original body/pipeline window is restored at `FinishHeaders`; pbuf chunks remain borrowed
+through replay. No capture or eager header parsing occurs without an inspection request.
+`ReadHeaderValue` alone strips leading/trailing SP/HTAB, so inspection and ordinary parsing
+agree. It withholds ambiguous OWS suffixes across refills in temporary storage bounded by
+`maxHeaderBytes` (unless explicitly disabled with SIZE_MAX), preserving interior bytes exactly.
+All raw bytes still feed framing checks and the wire budget once; scratch storage is released
+once discarded or once its returned view expires. No scratch allocation occurs for a complete
+value already in the receive window.
 
 ## Connection Buffer Management (`connection.cpp`)
 

@@ -7,6 +7,8 @@
 #include <array>
 #include <climits>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <cassert>
 #include <cerrno>
 #include <cstring>
@@ -38,6 +40,7 @@ inline constexpr auto kServerTokens = []
     return tokens;
 }();
 inline bool ServerToken(unsigned char c) { return kServerTokens[c]; }
+inline bool ServerOws(unsigned char c) { return c == ' ' || c == '\t'; }
 inline bool ServerValueChar(unsigned char c)
 {
     return c == '\t' || (c >= 0x20 && c != 0x7f);
@@ -113,44 +116,58 @@ bool ConnectionImpl<Derived>::Reset()
 
     Compact();
 
-    m_parsePos          = 0;
-    m_sendLen           = 0;
-    m_phase             = REQUEST_LINE;
-    m_contentLength     = -1;
-    m_chunkedBody       = false;
-    m_bodyRemaining     = 0;
-    m_requestLine       = {};
-    m_chunk             = {};
+    ResetRequestParser();
+    m_sendLen = 0;
+    m_chunkedHeadersPending = false;
+    m_chunkedStatus = 0;
+    m_chunkedContentType = nullptr;
+    m_clientClose = false;
+    m_sendError = false;
+    m_responseBegun = false;
+    m_noBodyRejected = false;
+    m_closeDelimitedResponse = false;
+    m_closeDelimitedComplete = false;
+    m_responseContentLength = false;
+    m_headReady = false;
+    m_headReleased = false;
+    m_head = {};
+    std::vector<char>().swap(m_headBytes);
+    std::vector<char>().swap(m_headReplay);
+    std::vector<RequestHeader>().swap(m_headHeaders);
+    return true;
+}
+
+template<typename Derived>
+void ConnectionImpl<Derived>::ResetRequestParser()
+{
+    m_phase = REQUEST_LINE;
+    m_contentLength = -1;
+    m_chunkedBody = false;
+    m_bodyRemaining = 0;
+    m_requestLine = {};
+    m_chunk = {};
     m_requestLineParsed = false;
-    m_chunkedDone       = false;
-    m_valueConsumed     = true;
-    m_pendingContentLength     = false;
-    m_pendingTransferEncoding  = false;
-    m_pendingConnection        = false;
-    m_chunkedHeadersPending    = false;
-    m_chunkedStatus            = 0;
-    m_chunkedContentType       = nullptr;
-    m_clientClose              = false;
-    m_sendError                = false;
-    m_responseBegun            = false;
-    m_headerCount              = 0;
-    m_headerBytes              = 0;
-    m_haveContentLength        = false;
-    m_haveTransferEncoding     = false;
-    m_noBodyRejected           = false;
+    m_chunkedDone = false;
+    m_valueConsumed = true;
+    m_pendingContentLength = false;
+    m_pendingTransferEncoding = false;
+    m_pendingConnection = false;
+    m_hostSeen = false;
+    m_headerCount = 0;
+    m_headerBytes = 0;
+    m_haveContentLength = false;
+    m_haveTransferEncoding = false;
     m_fieldNumber = 0;
     m_fieldState = 0;
     m_tokenLength = 0;
     m_tokenMatches = 7;
     m_lastTokenChunked = false;
     m_valueStarted = false;
+    m_headerOwsReturned = false;
+    std::vector<char>().swap(m_headerOws);
     m_needChunkCrlf = false;
     m_keepAlive = true;
     m_http10 = false;
-    m_closeDelimitedResponse = false;
-    m_closeDelimitedComplete = false;
-    m_responseContentLength = false;
-    return true;
 }
 
 template<typename Derived>
@@ -175,8 +192,16 @@ bool ConnectionImpl<Derived>::FailIo(int error)
 }
 
 template<typename Derived>
+void ConnectionImpl<Derived>::Compact()
+{
+    assert(!m_headReplayActive && "validated request heads cannot require a refill");
+    detail::ParserBuffer<Derived>::Compact();
+}
+
+template<typename Derived>
 int ConnectionImpl<Derived>::RecvMore()
 {
+    assert(!m_headReplayActive && "validated request heads cannot require a refill");
     if (m_error) return m_error;
     int n = detail::ParserBuffer<Derived>::RecvMore();
     if (n == -EMSGSIZE) Fail(n);
@@ -513,6 +538,7 @@ bool ConnectionImpl<Derived>::FinishHeaders()
     // message boundary, and the trailing bytes then become a request nobody sent
     // (RFC 9112 6.3). There is no reading that is safe to guess at.
     //
+    if (!m_http10 && !m_hostSeen) return FailRequest(400);
     if (m_contentLength >= 0 && m_haveTransferEncoding)
     {
         return FailRequest(400);
@@ -525,7 +551,160 @@ bool ConnectionImpl<Derived>::FinishHeaders()
         m_bodyRemaining = m_contentLength > 0 ? static_cast<size_t>(m_contentLength) : 0;
         if (!m_bodyRemaining) m_phase = DONE;
     }
+    if (m_headReplayActive && !m_headValidating) RestoreHeadTail();
     return true;
+}
+
+template<typename Derived>
+void ConnectionImpl<Derived>::RestoreHeadTail()
+{
+    this->m_winBase = m_headTailBase;
+    m_bufLen = m_headTailLength;
+    m_parsePos = m_headTailPosition;
+    ++m_bufEpoch;
+    m_headReplayActive = false;
+    std::vector<char>().swap(m_headReplay);
+}
+
+template<typename Derived>
+const RequestHead* ConnectionImpl<Derived>::InspectRequestHead(size_t maxBytes)
+{
+    if (m_headReady) return m_headReleased ? nullptr : &m_head;
+    if (m_error || m_noBodyRejected) return nullptr;
+    const bool parsedLine = m_requestLineParsed;
+    if (m_phase != REQUEST_LINE &&
+        (m_phase != ARGS || m_requestLineEpoch != m_bufEpoch)) return nullptr;
+    if (parsedLine)
+    {
+        const char* cursor = m_requestLine.query.data() ? m_requestLine.query.data()
+                            : m_requestLine.path.data() + m_requestLine.path.size();
+        if (m_parsePos != static_cast<size_t>(cursor - Win())) return nullptr;
+    }
+    if (RecvAborted()) { FailIo(-ECANCELED); return nullptr; }
+    const bool priorClose = m_clientClose;
+
+    struct PolicyGuard
+    {
+        ParserErrorResponse& policy;
+        ParserErrorResponse saved;
+        ~PolicyGuard() { policy = saved; }
+    } guard{m_options.errorResponse, m_options.errorResponse};
+    m_options.errorResponse = ParserErrorResponse::Automatic;
+
+    // Capture only the head. Recv may already have buffered body/pipelined bytes;
+    // retain that original parse window rather than copying or interpreting its tail.
+    //
+    if (parsedLine) m_parsePos = m_requestLine.method.data() - Win();
+    if (maxBytes > m_headBytes.max_size()) { FailRequest(431); return nullptr; }
+    try
+    {
+        // Geometric growth follows actual bytes, rather than charging every short
+        // request for the entire configured cap.
+        m_headBytes.reserve(std::min(maxBytes, size_t(256)));
+        unsigned ending = 0;
+        static constexpr char delimiter[] = "\r\n\r\n";
+        auto* running = coop::GetCooperator() ? Self() : nullptr;
+        io::detail::YieldBudget budget(running);
+        while (ending != 4)
+        {
+            if (m_headBytes.size() == maxBytes) { FailRequest(431); return nullptr; }
+            if (m_parsePos == m_bufLen && !Receive()) return nullptr;
+            char c = Win()[m_parsePos++];
+            if (m_headBytes.size() == m_headBytes.capacity())
+                m_headBytes.reserve(std::min(maxBytes, m_headBytes.capacity() +
+                                                        m_headBytes.capacity() / 2 + 1));
+            m_headBytes.push_back(c);
+            ending = c == delimiter[ending] ? ending + 1 : c == '\r' ? 1 : 0;
+            if (running) budget.Charge(1);
+            if ((m_headBytes.size() & 4095) == 0 && RecvAborted())
+            {
+                FailIo(-ECANCELED);
+                return nullptr;
+            }
+        }
+
+        m_headTailBase = this->m_winBase;
+        m_headTailLength = m_bufLen;
+        m_headTailPosition = m_parsePos;
+        m_headReplay = m_headBytes;
+        m_headHeaders.reserve(std::min(m_options.maxHeaderCount, m_headBytes.size() / 4));
+        this->m_winBase = m_headReplay.data();
+        m_bufLen = m_headReplay.size();
+        m_parsePos = 0;
+        ++m_bufEpoch;
+        m_headReplayActive = true;
+        m_headValidating = true;
+        ResetRequestParser();
+
+        // The normal parser validates grammar, budgets and ambiguous framing before
+        // admission. Map its views to the untouched snapshot before tokenization.
+        //
+        auto raw = [&](std::string_view view)
+        {
+            if (!view.data()) return std::string_view{};
+            return std::string_view(m_headBytes.data() + (view.data() - m_headReplay.data()),
+                                    view.size());
+        };
+        auto* line = GetRequestLine();
+        if (!line) { RestoreHeadTail(); return nullptr; }
+        m_head = {raw(line->method), raw(line->version), raw(line->path),
+                  raw(line->query), raw(line->target), {}};
+        while (auto* name = NextHeaderName())
+        {
+            auto* value = ReadHeaderValue();
+            if (!value || !value->complete) { RestoreHeadTail(); return nullptr; }
+            std::string_view text(static_cast<const char*>(value->data), value->size);
+            m_headHeaders.push_back({raw(name), raw(text)});
+        }
+        if (m_error || m_phase < BODY) { RestoreHeadTail(); return nullptr; }
+        m_head.headers = m_headHeaders;
+
+        // Replay is ordinary parser input: callers still see every query argument and
+        // header, and FinishHeaders restores exactly the saved body/pipeline window.
+        //
+        std::copy(m_headBytes.begin(), m_headBytes.end(), m_headReplay.begin());
+        m_parsePos = 0;
+        ++m_bufEpoch;
+        ResetRequestParser();
+        m_headValidating = false;
+        m_clientClose = priorClose;
+        m_headReady = true;
+        if (parsedLine) GetRequestLine();
+        return &m_head;
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (m_headReplayActive) RestoreHeadTail();
+        RejectRequest(503);
+        return nullptr;
+    }
+}
+
+template<typename Derived>
+void ConnectionImpl<Derived>::ReleaseRequestHead()
+{
+    if (!m_headReady) return;
+    m_headReleased = true;
+    m_head = {};
+    std::vector<char>().swap(m_headBytes);
+    std::vector<RequestHeader>().swap(m_headHeaders);
+}
+
+template<typename Derived>
+bool ConnectionImpl<Derived>::RejectRequest(int status, bool responseStarted)
+{
+    if (m_noBodyRejected) return m_responseBegun && !m_sendError;
+    ForceClose();
+    if (status < 400 || status > 599) status = 500;
+    if (responseStarted) m_responseBegun = true;
+    bool sent = !m_sendError;
+    if (!m_responseBegun)
+        sent = Send(status, "text/plain", std::string_view(response::DefaultReason(status)));
+    if (!sent) m_sendError = true;
+    m_noBodyRejected = true;
+    if (!m_error) m_error = -ECONNABORTED;
+    m_phase = DONE;
+    return sent;
 }
 
 // -------------------------------------------------------------------------------------
@@ -890,6 +1069,11 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
             m_pendingContentLength = length == 14 && !strncasecmp(start, "content-length", 14);
             m_pendingTransferEncoding = length == 17 && !strncasecmp(start, "transfer-encoding", 17);
             m_pendingConnection = length == 10 && !strncasecmp(start, "connection", 10);
+            if (length == 4 && !strncasecmp(start, "host", 4))
+            {
+                if (m_hostSeen) { FailRequest(400); return nullptr; }
+                m_hostSeen = true;
+            }
             // An empty coding list is still Transfer-Encoding framing metadata.
             // Record field presence independently of successful token recognition.
             //
@@ -944,20 +1128,66 @@ const char* ConnectionImpl<Derived>::NextHeaderName()
 template<typename Derived>
 Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
 {
+    if (m_headerOwsReturned)
+    {
+        // The previously returned view expires at this pull.
+        std::vector<char>().swap(m_headerOws);
+        m_headerOwsReturned = false;
+    }
     if (m_valueConsumed || m_error) return nullptr;
+    auto holdOws = [&](const char* data, size_t size)
+    {
+        if (!size) return true;
+        try
+        {
+            // These bytes have already been charged to the cumulative wire budget.
+            // Grow geometrically without reserving beyond that configured budget.
+            const size_t limit = std::min(m_options.maxHeaderBytes, m_headerOws.max_size());
+            if (size > limit - m_headerOws.size()) throw std::length_error("header OWS");
+            const size_t required = m_headerOws.size() + size;
+            if (required > m_headerOws.capacity())
+            {
+                const size_t capacity = m_headerOws.capacity();
+                const size_t growth = std::min(limit - capacity, capacity / 2 + 1);
+                m_headerOws.reserve(std::max(required, capacity + growth));
+            }
+            m_headerOws.insert(m_headerOws.end(), data, data + size);
+            return true;
+        }
+        catch (const std::bad_alloc&) { RejectRequest(503); return false; }
+        catch (const std::length_error&) { RejectRequest(503); return false; }
+    };
     while (true)
     {
         if (m_parsePos == m_bufLen && !Receive()) return nullptr;
         if (!m_valueStarted)
         {
-            while (m_parsePos < m_bufLen &&
-                   (Win()[m_parsePos] == ' ' || Win()[m_parsePos] == '\t'))
+            while (m_parsePos < m_bufLen && detail::ServerOws(Win()[m_parsePos]))
             {
                 if (!ChargeHeaderBytes(1)) return nullptr;
                 ++m_parsePos;
             }
             if (m_parsePos == m_bufLen) continue;
             m_valueStarted = true;
+        }
+        if (!m_headerOws.empty())
+        {
+            size_t end = m_parsePos;
+            while (end < m_bufLen && detail::ServerOws(Win()[end])) ++end;
+            const size_t size = end - m_parsePos;
+            if (!ChargeHeaderBytes(size) ||
+                !FeedHeaderValue(Win() + m_parsePos, size, false) ||
+                !holdOws(Win() + m_parsePos, size)) return nullptr;
+            m_parsePos = end;
+            if (end == m_bufLen) continue;
+            if (Win()[end] != '\r')
+            {
+                // A following value byte proves this is interior whitespace. Return
+                // it separately without consuming that byte or feeding the wire twice.
+                m_chunk = {m_headerOws.data(), m_headerOws.size(), false};
+                m_headerOwsReturned = true;
+                return &m_chunk;
+            }
         }
         size_t start = m_parsePos;
         size_t end = start;
@@ -981,18 +1211,24 @@ Chunk* ConnectionImpl<Derived>::ReadHeaderValue()
             if (!Receive()) return nullptr;
             continue;
         }
+        // Framing validation and budgets always use the original wire value. Only the
+        // borrowed application view omits leading/trailing OWS (RFC 9110 section 5.5).
         if (!ChargeHeaderBytes(end - start)) return nullptr;
         if (!FeedHeaderValue(Win() + start, end - start, haveCrlf)) return nullptr;
-        m_chunk = {Win() + start, end - start, haveCrlf};
+        size_t valueEnd = end;
+        while (valueEnd > start && detail::ServerOws(Win()[valueEnd - 1])) --valueEnd;
         m_parsePos = end;
         if (haveCrlf)
         {
+            std::vector<char>().swap(m_headerOws);
             m_parsePos += 2;
             m_valueConsumed = true;
         }
-        // Never refill after forming a view, even to finish a split CRLF. The next
-        // pull validates/consumes that delimiter and may return an empty final span.
-        //
+        else if (!holdOws(Win() + valueEnd, end - valueEnd)) return nullptr;
+        if (!haveCrlf && valueEnd == start) continue;
+        // Never refill after forming a view, including when CRLF is split. A suffix
+        // that might be trailing OWS is withheld until the next bytes settle it.
+        m_chunk = {Win() + start, valueEnd - start, haveCrlf};
         return &m_chunk;
     }
 }

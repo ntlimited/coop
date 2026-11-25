@@ -85,10 +85,10 @@ void ParseRequest(benchmark::State& state)
     constexpr std::string_view fixed =
         "POST /upload HTTP/1.1\r\nContent-Type: application/octet-stream\r\n"
         "Content-Length: 13\r\nConnection: keep-alive\r\n"
-        "X-Origin: test-origin.example.net\r\n\r\nHello, World!";
+        "X-Origin: test-origin.example.net\r\nHost: example.test\r\n\r\nHello, World!";
     constexpr std::string_view chunked =
         "POST /upload HTTP/1.1\r\nContent-Type: application/octet-stream\r\n"
-        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\nHost: example.test\r\n\r\n"
         "d\r\nHello, World!\r\n0\r\n\r\n";
     std::string_view request = state.range(0) ? chunked : fixed;
     // The server exposes its descriptor to handlers; parsing itself needs no kernel

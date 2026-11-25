@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 #include <sys/socket.h>
@@ -28,6 +29,14 @@ struct ServerHandle;
 // through verbatim from ServerConfiguration for handlers that need per-server state.
 //
 using RequestHandler = void (*)(ConnectionBase& conn, void* userData);
+
+// Optional per-request admission before any dispatch. Return 0 to accept, or 400..599
+// to send a refusal and close. Other statuses refuse with 500. The validated head is
+// borrowed only through the callback; inspection preserves normal query/header/body iteration.
+// The callback runs on the serving context and may yield. userData is the server's.
+//
+using RequestAdmissionHandler = int (*)(ConnectionBase& conn, const RequestHead& head,
+                                       void* userData);
 
 // Connection hooks run on the serving context, including TLS handshake failures. Open may
 // allocate application-owned state and refuse the connection by returning false. Close runs
@@ -80,6 +89,14 @@ struct ServerConfiguration
     //
     RequestHandler handler = nullptr;
     void* userData = nullptr;
+
+    // The head snapshot expires immediately after the callback; routing uses ordinary
+    // parsing. Snapshot/replay allocations are freed by header completion.
+    // Head capture/validation is entirely opt-in. The cap counts request-line plus
+    // header wire bytes; oversized heads receive 431 before admission or dispatch.
+    //
+    RequestAdmissionHandler requestAdmission = nullptr;
+    size_t maxRequestHeadBytes = 16384;
 
     // Optional connection-lifetime state, separate from the per-server userData. Open runs
     // before TLS handshake/request parsing; close receives its output even when open refuses.

@@ -3,8 +3,93 @@
 `Connection<Transport>` parses requests incrementally over contiguous caller-sized buffers.
 Its transport is a compile-time parameter; native plaintext and TLS instantiations are
 provided. Include `coop/http/detail/server_impl.hpp` to instantiate a custom transport.
-`ConnectionBase&` remains the handler boundary. The parser owns no request string, header map,
-body accumulator, decoder, router, or retry mechanism.
+`ConnectionBase&` remains the handler boundary. Ordinary parsing owns no request string or
+header map. Request-head inspection explicitly opts into a bounded snapshot; neither path
+owns a body accumulator, decoder, router, or retry mechanism.
+
+## Request-head inspection and admission
+
+`const RequestHead* ConnectionBase::InspectRequestHead(size_t maxBytes = 16384)` gives
+handlers stable borrowed method, version, path, query, target and header views before they
+consume query arguments or headers. `GetRequestLine()` may precede inspection, but copied
+request-line views can be invalidated by capture; re-fetch it afterwards. A first call
+after iteration has begun returns null without rewinding or changing parser state. A successful
+snapshot can be read again throughout the request, including after body parsing. The cap applies
+to the first capture; cached calls do not recapture or change it. Its views
+expire at `ReleaseRequestHead()`, the next successful `Reset()`, or connection destruction.
+`void ConnectionBase::ReleaseRequestHead()` invalidates every snapshot view and releases
+its storage. It defaults to a no-op for adapters. After release, inspection returns null until
+Reset. Explicit handler inspection retains its snapshot until one of those lifetime boundaries.
+
+`RequestHead::headers` is a `std::span<const RequestHeader>` in wire order. Each field has
+`std::string_view name` and `value`; duplicate fields remain separate. Values omit leading
+and trailing optional whitespace. `const RequestHeader* RequestHead::FindHeader(
+std::string_view name) const` performs ASCII case-insensitive lookup of the first field and
+returns null for absence, distinct from an empty value. It is first-only, not a uniqueness check.
+`size_t RequestHead::CountHeaders(std::string_view name) const` counts matching fields;
+`const RequestHeader* RequestHead::FindUniqueHeader(std::string_view name) const` returns
+null for absence or duplicates. Both use ASCII case-insensitive matching. Security policies
+should use unique lookup or explicit duplicate handling through the span.
+
+Stock listeners can perform this check before every dispatch, including a handler's calls
+to the library's status, performance and sampler dispatcher:
+
+```cpp
+config.requestAdmission = [](http::ConnectionBase&, const http::RequestHead& head,
+                             void*) -> int {
+    const auto* host = head.FindUniqueHeader("Host");
+    const auto* origin = head.FindUniqueHeader("Origin");
+    if (!host || host->value != "allowed.test" || !origin ||
+        origin->value != "https://allowed.test") return 403;
+    return 0;
+};
+config.maxRequestHeadBytes = 16384;
+```
+
+The callback type is `int (*RequestAdmissionHandler)(ConnectionBase&, const RequestHead&,
+void*)`. It runs on the serving context and receives the server's `userData`. Zero accepts;
+400 through 599 refuse with that status and close; any other return value refuses with 500.
+The hook applies independently to every keep-alive or pipelined request on plaintext and TLS.
+It can yield and use connection state. The server releases the snapshot immediately after
+this callback returns; route handlers use ordinary request-line/header parsing afterwards.
+No head capture, allocation or additional header
+parsing occurs when neither a hook nor a handler requests inspection.
+
+Inspection validates the complete head through the ordinary request parser before returning
+it. Normal header parsing rejects missing HTTP/1.1 Host fields and duplicate Host fields
+with 400 ([RFC 9112 section 3.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2)). Admission cannot approve one Host while routing sees another.
+The target remains the same verbatim request-target in both interfaces; absolute-form targets
+are not rewritten into a different authority or path. Malformed framing receives 400, and either a parser-header budget or inspection-wire cap
+violation receives 431, before admission or route dispatch. Inspection owns newly encountered
+protocol-error responses even with Caller parser policy. Existing errors remain unchanged.
+Body bytes are never consumed or interpreted. Network receives may have prefetched body or
+pipelined bytes as with ordinary parsing; those bytes remain in their original receive window.
+Normal argument, header and body iteration then replays the validated head without losing or
+duplicating bytes. Provided-buffer windows follow the same contract.
+
+The explicit cap covers request-line and header wire bytes together. Snapshot workspace has
+two byte buffers, each bounded by the selected cap, plus at most `floor(maxBytes / 4)` header
+index entries of `sizeof(RequestHeader)` bytes (also bounded by `maxHeaderCount`). Capture grows
+geometrically with actual input instead of reserving the cap. After admission, snapshot/index
+storage is released immediately and the parser's replay copy is released at header completion.
+Thus an idle keep-alive connection retains no dynamic head-inspection storage: only the fixed
+vector/view bookkeeping remains in the connection object. Explicit handler inspection must call
+ReleaseRequestHead to obtain the same lifetime. The snapshot never stores the body. Set parser policy before inspection; changing it afterwards
+is refused. Allocation failure refuses with 503. The default interface implementation returns
+null for connection adapters that do not support inspection.
+
+`bool ConnectionBase::RejectRequest(int status, bool responseStarted = false)` provides the
+same terminal refusal to a handler. It forces closure and sends a status with a fixed-length text body. If a response
+already began, it adds no bytes and only marks the request refused, allowing a caller to
+format custom headers first. Pass `responseStarted = true` after custom formatting so the
+default connection-adapter implementation also omits an additional response. Invalid status
+codes become 500. Repeated calls add no bytes;
+the return value reports response-send success. `bool ConnectionBase::RequestRejected() const`
+reports the native terminal state. Refusal preserves an existing error; otherwise `Error()`
+becomes `-ECONNABORTED`, and `Complete()`/reuse remain false. The stock server bypasses its
+normal post-handler body drain and uses the bounded refusal cleanup described below. Custom
+adapters inherit a conservative close-and-send fallback and may implement the full terminal
+contract.
 
 ## Body completion is explicit
 
@@ -63,8 +148,8 @@ server also checks static-file and not-found requests. Chunk payload validity is
 to admission: even a chunked request containing an invalid first chunk is refused before
 its target handler runs.
 
-The stock server half-closes its write side after a protocol-error response, then discards
-up to 1 MiB of unread socket data for at most 200 ms. Kill and the serving context's deadline
+The stock server half-closes its write side after a protocol-error or explicit refusal response,
+then discards up to 1 MiB of unread socket data for at most 200 ms. Kill and the serving context's deadline
 can end that drain sooner. Provided-buffer receives are stopped before the drain. On giving
 up, the server shuts down reads and discards one snapshot of queued input with a nonwaiting,
 copy-free receive. This prevents the unread queue from aborting the already-sent response
@@ -85,9 +170,16 @@ rejects reuse after either invalidation (asserting in debug). Returned argument/
 value chunks and body chunks are valid until the next parsing or reset operation. A body pull
 never refills after creating the returned span, including at chunk delimiters.
 
+Header values omit leading and trailing SP/HTAB in both `ReadHeaderValue()` and request-head
+inspection. Interior whitespace is preserved exactly. Framing checks and `maxHeaderBytes`
+charge the original wire bytes, including omitted whitespace. A possible trailing whitespace
+run spanning receive windows is temporarily retained, bounded by `maxHeaderBytes`; setting
+that policy to `SIZE_MAX` explicitly removes the bound. This scratch storage is released when
+the run is discarded or after its returned interior-whitespace view expires. The scratch adds only
+an empty vector and a flag to idle connections, with no additional heap storage.
+
 Request lines and individual names must fit the selected receive buffer. Header values, chunk
-extensions, trailers and bodies stream; enlarging any of these does not require an owning
-representation or a larger receive buffer. Native construction requires a live context and
+extensions, trailers and bodies stream without requiring a larger receive buffer. Native construction requires a live context and
 transport resource lifetime covering the connection. Connections are not copyable.
 
 ## Resource and response policy

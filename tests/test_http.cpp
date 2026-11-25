@@ -32,6 +32,7 @@
 #include "coop/thread.h"
 #include <functional>
 #include "coop/http/transport.h"
+#include "coop/http/tls_transport.h"
 
 using HttpConn = coop::http::Connection<coop::http::PlaintextTransport>;
 using HttpClient = coop::http::ClientConnection<coop::http::PlaintextTransport>;
@@ -271,7 +272,7 @@ TEST(HttpTest, PostWithBody)
 
         SendString(client,
             "POST /data HTTP/1.1\r\n"
-            "Content-Length: 13\r\n"
+            "Content-Length: 13\r\nHost: example.test\r\n"
             "\r\n"
             "Hello, World!");
 
@@ -311,7 +312,7 @@ TEST(HttpTest, ChunkedBody)
 
         SendString(client,
             "POST /upload HTTP/1.1\r\n"
-            "Transfer-Encoding: chunked\r\n"
+            "Transfer-Encoding: chunked\r\nHost: example.test\r\n"
             "\r\n"
             "5\r\n"
             "Hello\r\n"
@@ -360,7 +361,7 @@ TEST(HttpTest, SkipArgsToHeaders)
 
         SendString(client,
             "GET /path?a=1&b=2 HTTP/1.1\r\n"
-            "X-Custom: test\r\n"
+            "X-Custom: test\r\nHost: example.test\r\n"
             "\r\n");
 
         coop::http::PlaintextTransport transport(server);
@@ -392,7 +393,7 @@ TEST(HttpTest, SkipHeadersToBody)
         SendString(client,
             "POST /data HTTP/1.1\r\n"
             "Content-Length: 4\r\n"
-            "X-Extra: ignored\r\n"
+            "X-Extra: ignored\r\nHost: example.test\r\n"
             "\r\n"
             "test");
 
@@ -427,7 +428,7 @@ TEST(HttpTest, SendResponse)
         coop::io::Descriptor client(sp.fds[0], uring);
         coop::io::Descriptor server(sp.fds[1], uring);
 
-        SendString(client, "GET / HTTP/1.1\r\n\r\n");
+        SendString(client, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
         auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
@@ -461,7 +462,7 @@ TEST(HttpTest, ChunkedResponse)
         coop::io::Descriptor client(sp.fds[0], uring);
         coop::io::Descriptor server(sp.fds[1], uring);
 
-        SendString(client, "GET / HTTP/1.1\r\n\r\n");
+        SendString(client, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
 
         coop::http::PlaintextTransport transport(server);
         auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
@@ -563,7 +564,8 @@ TEST(HttpTest, Http11ChunkedResponseCompletesAndReuses)
         SocketPair sp;
         coop::io::Descriptor client(sp.fds[0]);
         coop::io::Descriptor server(sp.fds[1]);
-        SendString(client, "GET / HTTP/1.1\r\n\r\nGET /next HTTP/1.1\r\n\r\n");
+        SendString(client, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                           "GET /next HTTP/1.1\r\nHost: example.test\r\n\r\n");
         auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
             coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
         ASSERT_NE(conn->GetRequestLine(), nullptr);
@@ -1623,7 +1625,7 @@ TEST(HttpTest, KilledChildBodyToFileStopsItsOwnSpliceWait)
         coop::io::Descriptor client(fds[0]);
         coop::io::Descriptor server(fds[1]);
         const std::string headers =
-            "PUT /body HTTP/1.1\r\nContent-Length: 4194304\r\n\r\n";
+            "PUT /body HTTP/1.1\r\nContent-Length: 4194304\r\nHost: example.test\r\n\r\n";
         ASSERT_EQ(coop::io::SendAll(client, headers.data(), headers.size()), headers.size());
         auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
             coop::http::PlaintextTransport(server), ctx, ctx->GetCooperator());
@@ -1663,7 +1665,7 @@ TEST(HttpTest, ChildBodyToFileYieldsItsOwnContext)
         coop::io::Descriptor client(fds[0]);
         coop::io::Descriptor server(fds[1]);
         std::string body = PatternBody(4 * 1024 * 1024);
-        std::string headers = "PUT /body HTTP/1.1\r\nContent-Length: "
+        std::string headers = "PUT /body HTTP/1.1\r\nHost: example.test\r\nContent-Length: "
             + std::to_string(body.size()) + "\r\n\r\n";
         ASSERT_EQ(coop::io::SendAll(client, headers.data(), headers.size()), headers.size());
         auto conn = ctx->Allocate<HttpConn>(HTTP_EXTRA,
@@ -1714,7 +1716,7 @@ TEST(HttpTest, ChildBodyToFileObservesItsOwnCancellation)
     {
         test::SendScript script;
         coop::io::Descriptor descriptor(coop::io::borrowed, -1);
-        std::string input = "PUT /body HTTP/1.1\r\nContent-Length: 4194304\r\n\r\n";
+        std::string input = "PUT /body HTTP/1.1\r\nContent-Length: 4194304\r\nHost: example.test\r\n\r\n";
         bool cancel = false;
         CancelingBodyTransport transport{{&script, &descriptor}, &input, &cancel};
         using Connection = coop::http::Connection<CancelingBodyTransport>;
@@ -2490,7 +2492,7 @@ std::string DrainBody(coop::http::ConnectionBase& conn)
 std::string ChunkedRequest(const std::string& chunks)
 {
     return "POST /upload HTTP/1.1\r\n"
-           "Transfer-Encoding: chunked\r\n"
+           "Transfer-Encoding: chunked\r\nHost: example.test\r\n"
            "\r\n" + chunks;
 }
 
@@ -2668,7 +2670,7 @@ TEST(HttpFramingTest, ContentLengthSplitAcrossRefillDecodesWhole)
     {
         WithRequest(ctx,
             "POST /u HTTP/1.1\r\n"
-            "Content-Length: 1234\r\n"
+            "Content-Length: 1234\r\nHost: example.test\r\n"
             "\r\n", 36,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
         {
@@ -2686,7 +2688,7 @@ TEST(HttpFramingTest, ContentLengthRejectsNonDigits)
     test::RunInCooperator([](coop::Context* ctx)
     {
         WithRequest(ctx,
-            "POST /u HTTP/1.1\r\nContent-Length: 1abc0\r\n\r\n", 2048,
+            "POST /u HTTP/1.1\r\nContent-Length: 1abc0\r\nHost: example.test\r\n\r\n", 2048,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
         {
             ASSERT_NE(conn.GetRequestLine(), nullptr);
@@ -2703,7 +2705,7 @@ TEST(HttpFramingTest, ContentLengthAcceptsLeadingZeros)
     test::RunInCooperator([](coop::Context* ctx)
     {
         WithRequest(ctx,
-            "POST /u HTTP/1.1\r\nContent-Length: 007\r\n\r\nseven!!", 2048,
+            "POST /u HTTP/1.1\r\nContent-Length: 007\r\nHost: example.test\r\n\r\nseven!!", 2048,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
         {
             ASSERT_NE(conn.GetRequestLine(), nullptr);
@@ -2718,7 +2720,7 @@ TEST(HttpFramingTest, ContentLengthRejectsTwentyDigits)
     test::RunInCooperator([](coop::Context* ctx)
     {
         WithRequest(ctx,
-            "POST /u HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n", 2048,
+            "POST /u HTTP/1.1\r\nContent-Length: 99999999999999999999\r\nHost: example.test\r\n\r\n", 2048,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
         {
             ASSERT_NE(conn.GetRequestLine(), nullptr);
@@ -2736,7 +2738,7 @@ TEST(HttpFramingTest, DuplicateContentLengthRejectedWhenValuesDiffer)
     test::RunInCooperator([](coop::Context* ctx)
     {
         WithRequest(ctx,
-            "POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
+            "POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\nHost: example.test\r\n\r\nhello",
             2048,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
         {
@@ -2752,7 +2754,7 @@ TEST(HttpFramingTest, DuplicateContentLengthAcceptedWhenValuesAgree)
     test::RunInCooperator([](coop::Context* ctx)
     {
         WithRequest(ctx,
-            "POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            "POST /u HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\nHost: example.test\r\n\r\nhello",
             2048,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
         {
@@ -2774,7 +2776,7 @@ TEST(HttpFramingTest, ContentLengthWithTransferEncodingRejected)
         WithRequest(ctx,
             "POST /u HTTP/1.1\r\n"
             "Content-Length: 6\r\n"
-            "Transfer-Encoding: chunked\r\n"
+            "Transfer-Encoding: chunked\r\nHost: example.test\r\n"
             "\r\n"
             "0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: t\r\n\r\n", 2048,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
@@ -2805,7 +2807,7 @@ TEST(HttpFramingTest, UnknownTransferEncodingRejected)
     test::RunInCooperator([](coop::Context* ctx)
     {
         WithRequest(ctx,
-            "POST /u HTTP/1.1\r\nTransfer-Encoding: chunkedfoo\r\n\r\n", 2048,
+            "POST /u HTTP/1.1\r\nTransfer-Encoding: chunkedfoo\r\nHost: example.test\r\n\r\n", 2048,
             [](coop::http::ConnectionBase& conn, coop::io::Descriptor&)
         {
             ASSERT_NE(conn.GetRequestLine(), nullptr);
@@ -2820,8 +2822,8 @@ namespace
 
 std::string ManyHeaders(int count)
 {
-    std::string request = "GET /x HTTP/1.1\r\n";
-    for (int i = 0; i < count; i++)
+    std::string request = "GET /x HTTP/1.1\r\nHost: example.test\r\n";
+    for (int i = 1; i < count; i++)
     {
         request += "X-" + std::to_string(i) + ": v\r\n";
     }
@@ -3748,6 +3750,205 @@ TEST(HttpTest, TlsConnectionStateClosesAfterHandshakeFailureWithoutHandler)
     }, {.stackSize = 65536});
 }
 
+namespace
+{
+struct AdmissionStats
+{
+    size_t admissions = 0;
+    size_t dispatches = 0;
+    size_t userRoutes = 0;
+    size_t builtins = 0;
+};
+
+void ExerciseRequestAdmission(coop::Context* ctx, bool encrypted, bool pbuf)
+{
+    ctx->SetDeadlineIn(std::chrono::seconds(10));
+    AdmissionStats stats;
+    coop::http::ServerHandle control;
+    std::unique_ptr<test::TlsPair> certificates;
+    if (encrypted) certificates = std::make_unique<test::TlsPair>();
+    coop::Context::Handle listener;
+    ASSERT_TRUE(coop::Spawn({.stackSize = 65536}, [&](coop::Context* server)
+    {
+        coop::http::ServerConfiguration config;
+        config.port = 0;
+        config.control = &control;
+        config.pbufRecv = pbuf;
+        config.timeout = std::chrono::seconds(1);
+        config.maxRequestHeadBytes = 1024;
+        config.userData = &stats;
+        config.requestAdmission = [](coop::http::ConnectionBase& conn,
+                                     const coop::http::RequestHead& head, void* data)
+        {
+            ++static_cast<AdmissionStats*>(data)->admissions;
+            EXPECT_FALSE(head.method.empty());
+            EXPECT_FALSE(head.target.empty());
+            EXPECT_EQ(conn.InspectRequestHead(), &head);
+            auto* host = head.FindUniqueHeader("Host");
+            auto* origin = head.FindUniqueHeader("Origin");
+            if (host && host->value == "invalid.test") return 200;
+            if (!host || host->value != "allowed.test" || !origin ||
+                origin->value != "https://allowed.test") return 403;
+            return 0;
+        };
+        config.handler = [](coop::http::ConnectionBase& conn, void* data)
+        {
+            auto& stats = *static_cast<AdmissionStats*>(data);
+            ++stats.dispatches;
+            // Admission releases its snapshot before dispatch; ordinary parsing replays
+            // the same request and owns no retained admission buffers after headers.
+            EXPECT_EQ(conn.InspectRequestHead(), nullptr);
+            const auto* request = conn.GetRequestLine();
+            ASSERT_NE(request, nullptr);
+            if (coop::http::StatusDispatch(conn, request->path)) { ++stats.builtins; return; }
+            ++stats.userRoutes;
+            ASSERT_STREQ(conn.NextArgName(), "q");
+            auto* argument = conn.ReadArgValue();
+            ASSERT_NE(argument, nullptr);
+            const std::string value(static_cast<const char*>(argument->data), argument->size);
+            ASSERT_TRUE(argument->complete);
+            ASSERT_STREQ(conn.NextHeaderName(), "Host");
+            auto* host = conn.ReadHeaderValue();
+            ASSERT_NE(host, nullptr);
+            EXPECT_EQ(std::string_view(static_cast<const char*>(host->data), host->size),
+                      "allowed.test");
+            std::string body;
+            while (auto part = conn.NextBody())
+                body.append(static_cast<const char*>(part->data), part->size);
+            EXPECT_TRUE(conn.Complete());
+            EXPECT_EQ(body, value == "one" ? "hello" : "");
+            EXPECT_TRUE(conn.Send(200, "text/plain", std::string_view(value)));
+        };
+        if (encrypted)
+            EXPECT_TRUE(coop::http::RunTlsServer(server, config, certificates->serverContext));
+        else
+            EXPECT_TRUE(coop::http::RunServer(server, config));
+    }, &listener));
+    ASSERT_GT(control.Port(), 0);
+
+    auto exchange = [&](const std::string& request, std::span<const int> statuses,
+                        bool sequential = false)
+    {
+        coop::io::Descriptor socket(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+        ASSERT_GE(socket.m_fd, 0);
+        ASSERT_EQ(ConnectLoopbackKill(socket, control.Port()), 0);
+        std::vector<char> tlsBuffer;
+        std::unique_ptr<coop::io::ssl::Connection> tls;
+        if (encrypted)
+        {
+            tlsBuffer.resize(16384);
+            tls = std::make_unique<coop::io::ssl::Connection>(certificates->clientContext,
+                    socket, tlsBuffer.data(), tlsBuffer.size());
+            ASSERT_EQ(tls->HandshakeKill(), 0);
+        }
+        auto run = [&](auto transport)
+        {
+            using Client = coop::http::ClientConnection<decltype(transport)>;
+            auto response = ctx->Allocate<Client>(Client::ExtraBytes(), transport,
+                                                  "allowed.test", 2048, 512,
+                                                  std::chrono::seconds(1));
+            auto send = [&](std::string_view bytes)
+            {
+                if (tls) return coop::io::ssl::SendAllKill(*tls, bytes.data(), bytes.size());
+                size_t sent = 0;
+                while (sent < bytes.size())
+                {
+                    int n = coop::io::SendKill(socket, bytes.data() + sent, bytes.size() - sent,
+                                               MSG_NOSIGNAL, std::chrono::seconds(1));
+                    if (n <= 0) return n;
+                    sent += static_cast<size_t>(n);
+                }
+                return static_cast<int>(sent);
+            };
+            ASSERT_EQ(send(request), static_cast<int>(request.size()));
+            for (size_t i = 0; i < statuses.size(); ++i)
+            {
+                auto* line = response->GetResponseLine();
+                ASSERT_NE(line, nullptr);
+                EXPECT_EQ(line->status, statuses[i]);
+                std::string body;
+                while (auto part = response->NextBody())
+                    body.append(static_cast<const char*>(part->data), part->size);
+                EXPECT_TRUE(response->Complete());
+                if (sequential && i == 0)
+                {
+                    ASSERT_TRUE(response->Reset());
+                    const std::string second =
+                        "GET /echo?q=two HTTP/1.1\r\nHost: \tallowed.test \t\r\n"
+                        "Origin: \thttps://allowed.test\t \r\nConnection: close\r\n\r\n";
+                    ASSERT_EQ(send(second), static_cast<int>(second.size()));
+                }
+                else if (i + 1 < statuses.size()) ASSERT_TRUE(response->Reset());
+            }
+        };
+        if (tls) run(coop::http::TlsTransport(*tls, socket));
+        else run(coop::http::PlaintextTransport(socket));
+    };
+
+    const int refused[] = {403};
+    exchange("POST /api/perf/enable HTTP/1.1\r\nHost: refused.test\r\n"
+             "Origin: \thttps://allowed.test\t \r\nContent-Length: 4\r\n\r\nbody", refused);
+    exchange("GET /echo?q=two HTTP/1.1\r\nHost: \tallowed.test \t\r\n"
+             "Origin: https://refused.test\r\n\r\n", refused);
+    const int malformedHost[] = {400};
+    exchange("GET /echo HTTP/1.1\r\nOrigin: \thttps://allowed.test\t \r\n\r\n", malformedHost);
+    exchange("GET /echo HTTP/1.1\r\nHost: \tallowed.test \t\r\nHost: refused.test\r\n"
+             "Origin: \thttps://allowed.test\t \r\n\r\n", malformedHost);
+    const int invalidStatus[] = {500};
+    exchange("GET /echo?q=two HTTP/1.1\r\nHost: invalid.test\r\n\r\n", invalidStatus);
+    EXPECT_EQ(stats.admissions, 3);
+    EXPECT_EQ(stats.dispatches, 0);
+    const int oversized[] = {431};
+    exchange("GET /echo HTTP/1.1\r\nX-Large: " + std::string(1500, 'v') + "\r\n\r\n", oversized);
+    EXPECT_EQ(stats.admissions, 3);
+    EXPECT_EQ(stats.dispatches, 0);
+
+    const std::string first =
+        "POST /echo?q=one HTTP/1.1\r\nHost: \tallowed.test \t\r\n"
+        "Origin: \thttps://allowed.test\t \r\nContent-Length: 5\r\n\r\nhello";
+    const std::string second =
+        "GET /echo?q=two HTTP/1.1\r\nHost: \tallowed.test \t\r\n"
+        "Origin: \thttps://allowed.test\t \r\nConnection: close\r\n\r\n";
+    const int accepted[] = {200, 200};
+    exchange(first + second, accepted);
+    exchange(first, accepted, true);
+    const int builtin[] = {200};
+    exchange("GET /api/sampler HTTP/1.1\r\nHost: \tallowed.test \t\r\n"
+             "Origin: \thttps://allowed.test\t \r\nConnection: close\r\n\r\n", builtin);
+    EXPECT_EQ(stats.admissions, 8);
+    EXPECT_EQ(stats.dispatches, 5);
+    EXPECT_EQ(stats.userRoutes, 4);
+    EXPECT_EQ(stats.builtins, 1);
+    EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+    listener.Kill();
+    ctx->JoinChildren();
+}
+} // namespace
+
+TEST(HttpTest, RequestAdmissionPrecedesRoutesAndPreservesKeepAliveAndPipeline)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ExerciseRequestAdmission(ctx, false, false);
+    }, {.stackSize = 131072});
+}
+
+TEST(HttpTest, TlsRequestAdmissionPrecedesRoutesAndPreservesKeepAliveAndPipeline)
+{
+    test::RunInCooperator([](coop::Context* ctx)
+    {
+        ExerciseRequestAdmission(ctx, true, false);
+    }, {.stackSize = 131072});
+}
+
+TEST(HttpPbufTest, RequestAdmissionPreservesBodyAndPipelineAcrossWindows)
+{
+    RunWithBufferRing(64, 128, [](coop::Context* ctx)
+    {
+        ExerciseRequestAdmission(ctx, false, true);
+    });
+}
+
 TEST(HttpTest, NoBodyEndpointsRejectMalformedChunkBeforeHandlerAndClose)
 {
     coop::http::ServerHandle control;
@@ -3790,7 +3991,7 @@ TEST(HttpTest, NoBodyEndpointsRejectMalformedChunkBeforeHandlerAndClose)
                 reinterpret_cast<sockaddr*>(&address), sizeof(address),
                 std::chrono::milliseconds(500)), 0);
             std::string request = "GET " + std::string(path) +
-                " HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\ninvalid chunk\r\n";
+                " HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\ninvalid chunk\r\n";
             ASSERT_EQ(coop::io::SendKill(client, request.data(), request.size(), MSG_NOSIGNAL,
                 std::chrono::milliseconds(500)), static_cast<int>(request.size()));
             ASSERT_EQ(::shutdown(client.m_fd, SHUT_WR), 0);
@@ -3851,7 +4052,7 @@ TEST(HttpTest, RefusedLargeBodyDeliversResponseBeforeOrderlyClose)
             ASSERT_EQ(coop::io::ConnectKill(client,
                 reinterpret_cast<sockaddr*>(&address), sizeof(address),
                 std::chrono::seconds(1)), 0);
-            std::string upload = "POST /no-body HTTP/1.1\r\n" + std::string(framing) +
+            std::string upload = "POST /no-body HTTP/1.1\r\nHost: example.test\r\n" + std::string(framing) +
                                  "\r\n" + std::string(524288, 'x');
             coop::CountdownLatch uploaded(1);
             bool bodySent = false;
@@ -3912,7 +4113,7 @@ TEST(HttpTest, RefusedBodyOverDrainCapPreservesResponseWithoutReset)
         coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
         ASSERT_GE(client.m_fd, 0);
         ASSERT_EQ(ConnectLoopbackKill(client, control.Port()), 0);
-        const std::string request = "POST / HTTP/1.1\r\nContent-Length: 2097152\r\n\r\n" +
+        const std::string request = "POST / HTTP/1.1\r\nContent-Length: 2097152\r\nHost: example.test\r\n\r\n" +
                                     std::string(2 * 1024 * 1024, 'x');
         // Queue the whole upload without yielding to the serving context. The body is
         // twice the refusal drain cap, and remains in flight when that cap is reached.
@@ -3968,7 +4169,7 @@ TEST(HttpTest, RefusalDrainIsBoundedForAnIdleUploader)
         address.sin_port = htons(control.Port());
         ASSERT_EQ(coop::io::ConnectKill(client, reinterpret_cast<sockaddr*>(&address),
                                       sizeof(address), std::chrono::seconds(1)), 0);
-        const char request[] = "POST / HTTP/1.1\r\nContent-Length: 100000000\r\n\r\n";
+        const char request[] = "POST / HTTP/1.1\r\nContent-Length: 100000000\r\nHost: example.test\r\n\r\n";
         ASSERT_EQ(coop::io::SendKill(client, request, sizeof(request) - 1, MSG_NOSIGNAL,
                                     std::chrono::seconds(1)), sizeof(request) - 1);
         std::string response;

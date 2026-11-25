@@ -105,11 +105,342 @@ std::vector<std::string> Bytes(const std::string& input)
     for (char c : input) packets.emplace_back(1, c);
     return packets;
 }
-const std::string next = "GET /next HTTP/1.1\r\n\r\n";
+const std::string next = "GET /next HTTP/1.1\r\nHost: example.test\r\n\r\n";
+
+TEST(HttpServerParser, RejectsMissingAndDuplicateHostAtHeaderCompletion)
+{
+    for (const char* fields : {"", "Host: first.test\r\nHost: second.test\r\n"})
+    {
+        Parser parser({std::string("GET / HTTP/1.1\r\n") + fields + "\r\n"});
+        EXPECT_FALSE(parser.conn->SkipBody());
+        EXPECT_EQ(parser.conn->ParseError(), 400);
+        EXPECT_FALSE(parser.conn->KeepAlive());
+        Parser inspected({std::string("GET / HTTP/1.1\r\n") + fields + "\r\n"});
+        EXPECT_EQ(inspected.conn->InspectRequestHead(), nullptr);
+        EXPECT_EQ(inspected.conn->ParseError(), 400);
+    }
+}
+
+TEST(HttpServerParser, HeaderOwsMatchesInspectionAcrossEverySplit)
+{
+    std::string spaces;
+    for (size_t i = 0; i < 100; ++i) spaces += " \t";
+    const std::vector<std::pair<std::string, std::string>> fields = {
+        {"Host", "allowed.test"}, {"Origin", "https://allowed.test"},
+        {"Empty", ""}, {"Interior", "one" + spaces + "two"},
+        {"Content-Length", "5"}};
+    std::string head = "POST /upload HTTP/1.1\r\n";
+    for (const auto& [name, value] : fields)
+        head += name + ": \t" + value + spaces + "\r\n";
+    head += "Skipped: one" + spaces + "two" + spaces + "\r\n\r\n";
+    for (bool inspect : {false, true})
+    for (size_t split = 0; split < head.size(); ++split)
+    {
+        SCOPED_TRACE(inspect);
+        SCOPED_TRACE(split);
+        auto packets = split ? std::vector<std::string>{head.substr(0, split),
+                                                        head.substr(split) + "hello" + next}
+                             : Bytes(head + "hello" + next);
+        Parser parser(std::move(packets), 32);
+        if (inspect)
+        {
+            auto* snapshot = parser.conn->InspectRequestHead();
+            ASSERT_NE(snapshot, nullptr);
+            for (const auto& [name, value] : fields)
+            {
+                auto* field = snapshot->FindUniqueHeader(name);
+                ASSERT_NE(field, nullptr);
+                EXPECT_EQ(field->value, value);
+            }
+        }
+        ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+        for (const auto& [name, value] : fields)
+        {
+            ASSERT_STREQ(parser.conn->NextHeaderName(), name.c_str());
+            std::string actual;
+            bool complete = false;
+            while (auto* part = parser.conn->ReadHeaderValue())
+            {
+                actual.append(static_cast<const char*>(part->data), part->size);
+                if (part->complete) { complete = true; break; }
+            }
+            ASSERT_TRUE(complete);
+            EXPECT_EQ(actual, value);
+        }
+        EXPECT_EQ(parser.Body(), "hello");
+        ASSERT_TRUE(parser.conn->Reset());
+        ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+        EXPECT_EQ(parser.conn->GetRequestLine()->target, "/next");
+        EXPECT_TRUE(parser.conn->SkipBody());
+    }
+}
+
+TEST(HttpServerParser, HeaderOwsStillChargesWireBytesAndValidatesFraming)
+{
+    Parser invalid(Bytes("POST / HTTP/1.1\r\nHost: example.test\r\n"
+                         "Content-Length: 1 \t2 \t\r\n\r\n"), 32);
+    EXPECT_FALSE(invalid.conn->SkipBody());
+    EXPECT_EQ(invalid.conn->ParseError(), 400);
+
+    coop::http::ServerParserOptions options;
+    options.maxHeaderBytes = 80;
+    Parser oversized(Bytes("GET / HTTP/1.1\r\nHost: example.test" +
+                            std::string(100, ' ') + "\r\n\r\n"), 32, options);
+    EXPECT_FALSE(oversized.conn->SkipBody());
+    EXPECT_EQ(oversized.conn->ParseError(), 431);
+
+    for (const char* ending : {"", "\r", "\rX"})
+    {
+        Parser broken(Bytes("GET / HTTP/1.1\r\nHost: example.test" +
+                             std::string(100, ' ') + ending), 32);
+        ASSERT_STREQ(broken.conn->NextHeaderName(), "Host");
+        bool complete = false;
+        while (auto* part = broken.conn->ReadHeaderValue()) complete |= part->complete;
+        EXPECT_FALSE(complete);
+        EXPECT_NE(broken.conn->Error(), 0);
+    }
+}
+
+TEST(HttpServerParser, InspectRequestHeadPreservesArgumentsHeadersBodyAndPipeline)
+{
+    const std::string head = "POST /upload?q=one&other=two HTTP/1.1\r\n"
+                             "Host: allowed.test\r\nOrigin: https://allowed.test\r\n"
+                             "X-Duplicate: first\r\nx-duplicate: second\r\n"
+                             "Empty: \t \r\n"
+                             "Content-Length: 5\r\n\r\n";
+    for (size_t split = 1; split < head.size(); ++split)
+    {
+        SCOPED_TRACE(split);
+        Parser parser({head.substr(0, split), head.substr(split) + "hello" + next}, 64);
+        auto* inspected = parser.conn->InspectRequestHead();
+        ASSERT_NE(inspected, nullptr);
+        EXPECT_EQ(inspected->method, "POST");
+        EXPECT_EQ(inspected->target, "/upload?q=one&other=two");
+        ASSERT_NE(inspected->FindHeader("hOsT"), nullptr);
+        EXPECT_EQ(inspected->FindHeader("HOST")->value, "allowed.test");
+        ASSERT_NE(inspected->FindHeader("Origin"), nullptr);
+        EXPECT_EQ(inspected->FindHeader("Origin")->value, "https://allowed.test");
+        EXPECT_EQ(inspected->headers.size(), 6);
+        EXPECT_EQ(inspected->headers[2].value, "first");
+        EXPECT_EQ(inspected->headers[3].value, "second");
+        ASSERT_NE(inspected->FindHeader("empty"), nullptr);
+        EXPECT_TRUE(inspected->FindHeader("Empty")->value.empty());
+        EXPECT_EQ(inspected->FindHeader("Absent"), nullptr);
+        EXPECT_EQ(parser.conn->InspectRequestHead(), inspected);
+        EXPECT_FALSE(parser.conn->SetParserOptions({}));
+        ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+        EXPECT_EQ(parser.conn->GetRequestLine()->target, inspected->target);
+        ASSERT_STREQ(parser.conn->NextArgName(), "q");
+        auto* argument = parser.conn->ReadArgValue();
+        ASSERT_NE(argument, nullptr);
+        EXPECT_EQ(std::string_view(static_cast<const char*>(argument->data), argument->size), "one");
+        ASSERT_STREQ(parser.conn->NextArgName(), "other");
+        parser.conn->SkipArgValue();
+        ASSERT_STREQ(parser.conn->NextHeaderName(), "Host");
+        auto* header = parser.conn->ReadHeaderValue();
+        ASSERT_NE(header, nullptr);
+        EXPECT_EQ(std::string_view(static_cast<const char*>(header->data), header->size), "allowed.test");
+        EXPECT_EQ(parser.Body(), "hello");
+        EXPECT_EQ(inspected->target, "/upload?q=one&other=two");
+        EXPECT_EQ(inspected->FindHeader("origin")->value, "https://allowed.test");
+        ASSERT_TRUE(parser.conn->Reset());
+        auto* second = parser.conn->InspectRequestHead();
+        ASSERT_NE(second, nullptr);
+        EXPECT_EQ(second->target, "/next");
+        EXPECT_TRUE(parser.conn->SkipBody());
+    }
+}
+
+TEST(HttpServerParser, RequestHeadLookupDistinguishesDuplicatesAndReleasePreservesReplay)
+{
+    Parser parser({"POST /?q=one HTTP/1.1\r\nHost: allowed.test\r\n"
+                   "Origin: first\r\nORIGIN: second\r\nContent-Length: 5\r\n\r\nhello" + next});
+    auto* head = parser.conn->InspectRequestHead(1024 * 1024);
+    ASSERT_NE(head, nullptr);
+    EXPECT_EQ(head->CountHeaders("oRiGiN"), 2);
+    EXPECT_EQ(head->FindHeader("origin")->value, "first");
+    EXPECT_EQ(head->FindUniqueHeader("origin"), nullptr);
+    EXPECT_EQ(head->CountHeaders("Absent"), 0);
+    EXPECT_EQ(head->FindUniqueHeader("Absent"), nullptr);
+    EXPECT_EQ(head->FindUniqueHeader("Host")->value, "allowed.test");
+    parser.conn->ReleaseRequestHead();
+    EXPECT_EQ(parser.conn->InspectRequestHead(), nullptr);
+    EXPECT_EQ(parser.conn->GetRequestLine()->target, "/?q=one");
+    EXPECT_STREQ(parser.conn->NextArgName(), "q");
+    EXPECT_NE(parser.conn->ReadArgValue(), nullptr);
+    EXPECT_EQ(parser.Body(), "hello");
+    ASSERT_TRUE(parser.conn->Reset());
+    ASSERT_NE(parser.conn->InspectRequestHead(), nullptr);
+    EXPECT_EQ(parser.conn->GetRequestLine()->path, "/next");
+}
+
+TEST(HttpServerParser, InspectRequestHeadAfterRequestLineAndBeforeIteration)
+{
+    Parser parser(Bytes("GET /search?q=value HTTP/1.1\r\nHost: example.test\r\n\r\n"), 64);
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    ASSERT_NE(parser.conn->InspectRequestHead(), nullptr);
+    EXPECT_EQ(parser.conn->GetRequestLine()->path, "/search");
+    EXPECT_STREQ(parser.conn->NextArgName(), "q");
+    EXPECT_NE(parser.conn->ReadArgValue(), nullptr);
+    EXPECT_TRUE(parser.conn->SkipBody());
+}
+
+TEST(HttpServerParser, LateHeadInspectionDoesNotRewindConsumedArguments)
+{
+    Parser parser({"GET /search?q=value&other=two HTTP/1.1\r\nHost: example.test\r\n\r\n"});
+    ASSERT_STREQ(parser.conn->NextArgName(), "q");
+    EXPECT_EQ(parser.conn->InspectRequestHead(), nullptr);
+    EXPECT_EQ(parser.conn->Error(), 0);
+    auto* value = parser.conn->ReadArgValue();
+    ASSERT_NE(value, nullptr);
+    EXPECT_EQ(std::string_view(static_cast<const char*>(value->data), value->size), "value");
+    EXPECT_STREQ(parser.conn->NextArgName(), "other");
+    EXPECT_TRUE(parser.conn->SkipBody());
+}
+
+TEST(HttpServerParser, InspectionPreservesClosePolicyUntilNormalHeaderConsumption)
+{
+    Parser parser({"GET / HTTP/1.1\r\nConnection: close\r\nHost: example.test\r\n\r\n"});
+    ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
+    EXPECT_TRUE(parser.conn->KeepAlive());
+    ASSERT_NE(parser.conn->InspectRequestHead(), nullptr);
+    EXPECT_TRUE(parser.conn->KeepAlive());
+    parser.conn->SkipHeaders();
+    EXPECT_FALSE(parser.conn->KeepAlive());
+    Parser forced({next});
+    forced.conn->ForceClose();
+    ASSERT_NE(forced.conn->InspectRequestHead(), nullptr);
+    EXPECT_FALSE(forced.conn->KeepAlive());
+}
+
+TEST(HttpServerParser, InspectRequestHeadStreamsLargeFieldsAndEnforcesItsOwnCap)
+{
+    const std::string head = "GET / HTTP/1.1\r\nX-Large: " + std::string(4000, 'v') +
+                             "\r\nHost: allowed.test\r\n\r\n";
+    Parser parser(Bytes(head + next), 32);
+    auto* inspected = parser.conn->InspectRequestHead(head.size());
+    ASSERT_NE(inspected, nullptr);
+    ASSERT_NE(inspected->FindHeader("x-large"), nullptr);
+    EXPECT_EQ(inspected->FindHeader("x-large")->value.size(), 4000);
+    EXPECT_TRUE(parser.conn->SkipBody());
+    ASSERT_TRUE(parser.conn->Reset());
+    EXPECT_EQ(parser.conn->GetRequestLine()->path, "/next");
+    Parser limited(Bytes(head), 32);
+    EXPECT_EQ(limited.conn->InspectRequestHead(head.size() - 1), nullptr);
+    EXPECT_EQ(limited.conn->ParseError(), 431);
+    EXPECT_NE(limited.script.sent.find("431"), std::string::npos);
+}
+
+TEST(HttpServerParser, InspectRequestHeadRejectsMalformedFramingBeforeBodyRead)
+{
+    for (const std::string fields : {"Content-Length: 1\r\nTransfer-Encoding: chunked\r\n",
+                                    "Bad Name: value\r\n", "Content-Length: invalid\r\n"})
+    {
+        Parser parser({"POST / HTTP/1.1\r\nHost: example.test\r\n" + fields + "\r\n", "body-not-read"}, 128);
+        EXPECT_EQ(parser.conn->InspectRequestHead(), nullptr);
+        EXPECT_EQ(parser.conn->ParseError(), 400);
+        EXPECT_EQ(parser.script.packet, 1);
+        EXPECT_NE(parser.script.sent.find("400"), std::string::npos);
+    }
+}
+
+TEST(HttpServerParser, RejectRequestClosesWithoutConsumingAndDoesNotAppendAnotherResponse)
+{
+    Parser parser({"POST / HTTP/1.1\r\nContent-Length: 100\r\nHost: example.test\r\n\r\n", "body-not-read"});
+    ASSERT_NE(parser.conn->InspectRequestHead(), nullptr);
+    ASSERT_TRUE(parser.conn->RejectRequest(403));
+    EXPECT_TRUE(parser.conn->RequestRejected());
+    EXPECT_FALSE(parser.conn->KeepAlive());
+    EXPECT_FALSE(parser.conn->Complete());
+    EXPECT_FALSE(parser.conn->Reset());
+    EXPECT_EQ(parser.script.packet, 1);
+    EXPECT_NE(parser.script.sent.find("403"), std::string::npos);
+    const std::string sent = parser.script.sent;
+    EXPECT_TRUE(parser.conn->RejectRequest(403));
+    EXPECT_EQ(parser.script.sent, sent);
+    Parser formatted({next});
+    ASSERT_NE(formatted.conn->GetRequestLine(), nullptr);
+    formatted.conn->ForceClose();
+    ASSERT_TRUE(formatted.conn->BeginResponse(405));
+    ASSERT_TRUE(formatted.conn->AppendHeader("Allow", "POST"));
+    ASSERT_TRUE(formatted.conn->AppendHeader("Content-Length", size_t(0)));
+    ASSERT_TRUE(formatted.conn->EndHeaders());
+    const std::string response = formatted.script.sent;
+    EXPECT_TRUE(formatted.conn->coop::http::ConnectionBase::RejectRequest(405, true));
+    EXPECT_EQ(formatted.script.sent, response);
+    EXPECT_TRUE(formatted.conn->RejectRequest(405, true));
+    EXPECT_EQ(formatted.script.sent, response);
+    Parser failed({next});
+    ASSERT_NE(failed.conn->GetRequestLine(), nullptr);
+    failed.script.sendError = -ETIMEDOUT;
+    EXPECT_FALSE(failed.conn->RejectRequest(403));
+    EXPECT_FALSE(failed.conn->RejectRequest(403));
+    EXPECT_TRUE(failed.conn->SendError());
+    EXPECT_TRUE(failed.script.sent.empty());
+}
+
+TEST(HttpServerParser, EmptyQueryAndChunkedBodyKeepImmutableHeadAndPipeline)
+{
+    const std::string head = "POST /target? HTTP/1.1\r\nHost: allowed.test\r\n"
+                             "Transfer-Encoding: chunked\r\n\r\n";
+    const std::string tail = "3\r\none\r\n2\r\n!!\r\n0\r\nX-Final: value\r\n\r\n" + next;
+    for (size_t split = 1; split != head.size() + tail.size(); ++split)
+    {
+        SCOPED_TRACE(split);
+        const std::string wire = head + tail;
+        Parser parser({wire.substr(0, split), wire.substr(split)}, 32);
+        const auto* inspected = parser.conn->InspectRequestHead();
+        ASSERT_NE(inspected, nullptr);
+        EXPECT_EQ(inspected->target, "/target?");
+        EXPECT_TRUE(inspected->query.empty());
+        EXPECT_EQ(parser.Body(), "one!!");
+        EXPECT_TRUE(parser.conn->Complete());
+        EXPECT_EQ(inspected->FindHeader("HOST")->value, "allowed.test");
+        ASSERT_TRUE(parser.conn->Reset());
+        const auto* second = parser.conn->InspectRequestHead();
+        ASSERT_NE(second, nullptr);
+        EXPECT_EQ(second->target, "/next");
+        EXPECT_TRUE(parser.conn->SkipBody());
+    }
+}
+
+TEST(HttpServerParser, CapExtremesAndCallerErrorPolicyStayTerminal)
+{
+    for (size_t cap : {size_t(0), std::numeric_limits<size_t>::max()})
+    {
+        Parser parser({next});
+        EXPECT_EQ(parser.conn->InspectRequestHead(cap), nullptr);
+        EXPECT_EQ(parser.conn->ParseError(), 431);
+        EXPECT_FALSE(parser.conn->Reset());
+        EXPECT_NE(parser.script.sent.find("431"), std::string::npos);
+    }
+    coop::http::ServerParserOptions options;
+    options.errorResponse = coop::http::ParserErrorResponse::Caller;
+    Parser parser({"POST / HTTP/1.1\r\nContent-Length: bad\r\nHost: example.test\r\n\r\n", "body"}, 64, options);
+    EXPECT_EQ(parser.conn->InspectRequestHead(), nullptr);
+    EXPECT_EQ(parser.conn->ParseError(), 400);
+    EXPECT_NE(parser.script.sent.find("400"), std::string::npos);
+    EXPECT_EQ(parser.script.packet, 1);
+    EXPECT_EQ(parser.conn->GetParserOptions().errorResponse,
+              coop::http::ParserErrorResponse::Caller);
+}
+
+TEST(HttpServerParser, FirstInspectionAfterHeaderPullDoesNotConsumeMore)
+{
+    Parser parser({"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\n\r\nbody"});
+    ASSERT_STREQ(parser.conn->NextHeaderName(), "Host");
+    EXPECT_EQ(parser.conn->InspectRequestHead(), nullptr);
+    EXPECT_EQ(parser.conn->Error(), 0);
+    auto* value = parser.conn->ReadHeaderValue();
+    ASSERT_NE(value, nullptr);
+    EXPECT_EQ(std::string_view(static_cast<const char*>(value->data), value->size), "allowed.test");
+    EXPECT_EQ(parser.Body(), "body");
+    EXPECT_TRUE(parser.conn->Complete());
+}
 
 TEST(HttpServerParser, FixedLengthAtEveryTransportSplitPreservesPipeline)
 {
-    const std::string wire = "POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello" + next;
+    const std::string wire = "POST /upload HTTP/1.1\r\nContent-Length: 5\r\nHost: example.test\r\n\r\nhello" + next;
     for (size_t split = 1; split < wire.size(); ++split)
     {
         SCOPED_TRACE(split);
@@ -124,7 +455,7 @@ TEST(HttpServerParser, FixedLengthAtEveryTransportSplitPreservesPipeline)
 }
 TEST(HttpServerParser, ChunkedAtEverySplitPreservesBorrowedPayloadAndPipeline)
 {
-    const std::string wire = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    const std::string wire = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n"
                              "3;key=\"a\\\"b\"\r\nabc\r\n2\r\nde\r\n0\r\nX-End: yes\r\n\r\n" + next;
     for (size_t split = 1; split < wire.size(); ++split)
     {
@@ -142,7 +473,7 @@ TEST(HttpServerParser, ChunkedAtEverySplitPreservesBorrowedPayloadAndPipeline)
 }
 TEST(HttpServerParser, BodySpanIsReturnedBeforeReadingItsChunkDelimiter)
 {
-    Parser parser({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc",
+    Parser parser({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n3\r\nabc",
                    "\r\n0\r\n\r\n"});
     auto result = parser.conn->NextBody();
     ASSERT_TRUE(result);
@@ -153,7 +484,7 @@ TEST(HttpServerParser, BodySpanIsReturnedBeforeReadingItsChunkDelimiter)
 }
 TEST(HttpServerParser, EveryTruncatedRequestFailsAndCannotReset)
 {
-    const std::string wire = "POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    const std::string wire = "POST / HTTP/1.1\r\nContent-Length: 3\r\nHost: example.test\r\n\r\nabc";
     for (size_t length = 1; length < wire.size(); ++length)
     {
         SCOPED_TRACE(length);
@@ -171,7 +502,7 @@ TEST(HttpServerParser, EveryTruncatedRequestFailsAndCannotReset)
 }
 TEST(HttpServerParser, EveryTruncatedChunkAndTrailerFails)
 {
-    const std::string head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const std::string head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n";
     const std::string body = "3\r\nabc\r\n0\r\nTrailer: value\r\n\r\n";
     for (size_t length = 0; length < body.size(); ++length)
     {
@@ -185,7 +516,7 @@ TEST(HttpServerParser, EveryTruncatedChunkAndTrailerFails)
 }
 TEST(HttpServerParser, TransportErrorRemainsDistinctFromTruncation)
 {
-    Parser parser({"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\na"});
+    Parser parser({"POST / HTTP/1.1\r\nContent-Length: 3\r\nHost: example.test\r\n\r\na"});
     parser.script.terminal = -ETIMEDOUT;
     EXPECT_EQ(parser.Body(), "a");
     EXPECT_EQ(parser.conn->NextBody().Error(), -ETIMEDOUT);
@@ -204,22 +535,22 @@ TEST(HttpServerParser, ContentLengthOverflowAndAmbiguityRejected)
         EXPECT_NE(parser.script.sent.find("400"), std::string::npos);
         EXPECT_FALSE(parser.conn->Reset());
     }
-    Parser maximum({"POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n"});
+    Parser maximum({"POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\nHost: example.test\r\n\r\n"});
     EXPECT_EQ(maximum.conn->ContentLength(), INT64_MAX);
     EXPECT_EQ(maximum.conn->Error(), 0);
 }
 TEST(HttpServerParser, RepeatedAndCommaJoinedLengthsMustAgree)
 {
-    Parser parser(Bytes("POST / HTTP/1.1\r\nContent-Length: 03, 3\r\nContent-Length: 3\r\n\r\nabc"));
+    Parser parser(Bytes("POST / HTTP/1.1\r\nContent-Length: 03, 3\r\nContent-Length: 3\r\nHost: example.test\r\n\r\nabc"));
     EXPECT_EQ(parser.Body(), "abc");
     EXPECT_TRUE(parser.conn->Reusable());
-    Parser conflict({"POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n"});
+    Parser conflict({"POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n"});
     conflict.Body();
     EXPECT_EQ(conflict.conn->ParseError(), 400);
 }
 TEST(HttpServerParser, ConnectionTokensStreamWithoutFixedScratchLimit)
 {
-    Parser parser(Bytes("GET / HTTP/1.1\r\nConnection: " + std::string(600, 'x') + ", ClOsE\r\n\r\n"), 32);
+    Parser parser(Bytes("GET / HTTP/1.1\r\nHost: example.test\r\nConnection: " + std::string(600, 'x') + ", ClOsE\r\n\r\n"), 32);
     EXPECT_TRUE(parser.conn->SkipBody());
     EXPECT_FALSE(parser.conn->KeepAlive());
     EXPECT_FALSE(parser.conn->Reset());
@@ -244,7 +575,7 @@ TEST(HttpServerParser, Http10ResponseVersionSurvivesBufferMovement)
 }
 TEST(HttpServerParser, TransferCodingListsAreOpaqueUntilFinalChunked)
 {
-    Parser parser(Bytes("POST / HTTP/1.1\r\nTransfer-Encoding: gzip; p=\"opaque\", chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n"));
+    Parser parser(Bytes("POST / HTTP/1.1\r\nTransfer-Encoding: gzip; p=\"opaque\", chunked\r\nHost: example.test\r\n\r\n1\r\nx\r\n0\r\n\r\n"));
     EXPECT_EQ(parser.Body(), "x");
     EXPECT_TRUE(parser.conn->Complete());
     for (const std::string value : {"gzip", "chunked, gzip", "chunked, chunked", "chunked; x=y"})
@@ -257,8 +588,8 @@ TEST(HttpServerParser, TransferCodingListsAreOpaqueUntilFinalChunked)
 TEST(HttpServerParser, LimitsAreExplicitAndPersistAcrossReset)
 {
     coop::http::ServerParserOptions options;
-    options.maxHeaderCount = 0;
-    Parser parser({next + "GET / HTTP/1.1\r\nX: y\r\n\r\n"}, 128, options);
+    options.maxHeaderCount = 1;
+    Parser parser({next + "GET / HTTP/1.1\r\nX: y\r\nHost: example.test\r\n\r\n"}, 128, options);
     EXPECT_TRUE(parser.conn->SkipBody());
     ASSERT_TRUE(parser.conn->Reset());
     EXPECT_FALSE(parser.conn->SkipBody());
@@ -266,7 +597,7 @@ TEST(HttpServerParser, LimitsAreExplicitAndPersistAcrossReset)
     options.maxHeaderCount = SIZE_MAX;
     options.maxHeaderBytes = SIZE_MAX;
     options.maxChunkSize = SIZE_MAX;
-    std::string many = "GET / HTTP/1.1\r\n";
+    std::string many = "GET / HTTP/1.1\r\nHost: example.test\r\n";
     for (int i = 0; i < 150; ++i) many += "X: " + std::string(100, 'a') + "\r\n";
     Parser unlimited({many + "\r\n"}, 64, options);
     EXPECT_TRUE(unlimited.conn->SkipBody());
@@ -276,17 +607,17 @@ TEST(HttpServerParser, ChunkAndTrailerBudgetsAreEnforced)
 {
     coop::http::ServerParserOptions options;
     options.maxChunkSize = 2;
-    Parser chunk({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"}, 128, options);
+    Parser chunk({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n3\r\nabc\r\n0\r\n\r\n"}, 128, options);
     EXPECT_FALSE(chunk.conn->SkipBody());
     EXPECT_EQ(chunk.conn->ParseError(), 413);
-    options.maxHeaderCount = 1;
-    Parser trailer({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: y\r\n\r\n"}, 128, options);
+    options.maxHeaderCount = 2;
+    Parser trailer({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n0\r\nX: y\r\n\r\n"}, 128, options);
     EXPECT_FALSE(trailer.conn->SkipBody());
     EXPECT_EQ(trailer.conn->ParseError(), 431);
 }
 TEST(HttpServerParser, LongExtensionsAndTrailersStreamThroughSmallBuffer)
 {
-    Parser parser({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1;a=" + std::string(300, 'x') +
+    Parser parser({"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n1;a=" + std::string(300, 'x') +
                    "\r\nz\r\n0\r\nLong: " + std::string(300, 'v') + "\r\n\r\n"}, 32);
     EXPECT_EQ(parser.Body(), "z");
     EXPECT_TRUE(parser.conn->Complete());
@@ -295,7 +626,7 @@ TEST(HttpServerParser, CallerOwnsErrorResponseButCannotResumeParsing)
 {
     coop::http::ServerParserOptions options;
     options.errorResponse = coop::http::ParserErrorResponse::Caller;
-    Parser parser({"POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"}, 128, options);
+    Parser parser({"POST / HTTP/1.1\r\nContent-Length: nope\r\nHost: example.test\r\n\r\n"}, 128, options);
     EXPECT_FALSE(parser.conn->SkipBody());
     EXPECT_TRUE(parser.script.sent.empty());
     EXPECT_EQ(parser.conn->ParseError(), 400);
@@ -306,7 +637,7 @@ TEST(HttpServerParser, CallerOwnsErrorResponseButCannotResumeParsing)
 }
 TEST(HttpServerParser, ResetNeverDrainsIncompleteRequest)
 {
-    Parser parser({"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\n", "abc"});
+    Parser parser({"POST / HTTP/1.1\r\nContent-Length: 3\r\nHost: example.test\r\n\r\n", "abc"});
     EXPECT_EQ(parser.conn->ContentLength(), 3);
     size_t reads = parser.script.reads;
     EXPECT_FALSE(parser.conn->Reset());
@@ -326,8 +657,8 @@ TEST(HttpServerParser, SendFailureIsStickyAndPreventsReuse)
 }
 TEST(HttpServerParser, MalformedRequestLineAndHeaderGrammarFail)
 {
-    for (const std::string wire : {"BOGUS\r\n\r\n", "BOGUS\r\nX: hello world\r\n\r\n", "GET / HTTP/9.1\r\n\r\n", "GET / HTTP/1.1\r\nBad Name: v\r\n\r\n",
-                                  "GET / HTTP/1.1\r\nX: value\nwrong\r\n\r\n"})
+    for (const std::string wire : {"BOGUS\r\n\r\n", "BOGUS\r\nX: hello world\r\n\r\n", "GET / HTTP/9.1\r\n\r\n", "GET / HTTP/1.1\r\nBad Name: v\r\nHost: example.test\r\n\r\n",
+                                  "GET / HTTP/1.1\r\nX: value\nwrong\r\nHost: example.test\r\n\r\n"})
     {
         Parser parser({wire});
         EXPECT_FALSE(parser.conn->SkipBody());
@@ -363,7 +694,7 @@ TEST(HttpServerParser, FileSendSplitsCountsAndRejectsInvalidRangesBeforeFlush)
 }
 TEST(HttpServerParser, QueryFlagDoesNotTurnHttpVersionIntoAnotherArgument)
 {
-    Parser parser({"GET /?value=x&flag HTTP/1.1\r\nX: y\r\n\r\n"});
+    Parser parser({"GET /?value=x&flag HTTP/1.1\r\nX: y\r\nHost: example.test\r\n\r\n"});
     ASSERT_STREQ(parser.conn->NextArgName(), "value");
     auto* value = parser.conn->ReadArgValue();
     ASSERT_NE(value, nullptr);
@@ -376,11 +707,11 @@ TEST(HttpServerParser, QueryFlagDoesNotTurnHttpVersionIntoAnotherArgument)
 TEST(HttpServerParser, HeaderByteLimitCountsWireFieldsExactly)
 {
     coop::http::ServerParserOptions options;
-    options.maxHeaderBytes = 6; // X: y\r\n
-    Parser fits(Bytes("GET / HTTP/1.1\r\nX: y\r\n\r\n"), 32, options);
+    options.maxHeaderBytes = 26; // X: y\r\n and Host: example.test\r\n
+    Parser fits(Bytes("GET / HTTP/1.1\r\nX: y\r\nHost: example.test\r\n\r\n"), 32, options);
     EXPECT_TRUE(fits.conn->SkipBody());
-    options.maxHeaderBytes = 5;
-    Parser fails(Bytes("GET / HTTP/1.1\r\nX: y\r\n\r\n"), 32, options);
+    options.maxHeaderBytes = 25;
+    Parser fails(Bytes("GET / HTTP/1.1\r\nX: y\r\nHost: example.test\r\n\r\n"), 32, options);
     EXPECT_FALSE(fails.conn->SkipBody());
     EXPECT_EQ(fails.conn->ParseError(), 431);
 }
@@ -392,7 +723,7 @@ TEST(HttpServerParser, EmptyTransferEncodingFailsWithoutConsumingPipeline)
         for (int contentLength = 0; contentLength != 3; ++contentLength)
         {
             const std::string length = "Content-Length: 0\r\n";
-            const std::string wire = "POST / HTTP/1.1\r\n" +
+            const std::string wire = "POST / HTTP/1.1\r\nHost: example.test\r\n" +
                 (contentLength == 1 ? length : "") + "Transfer-Encoding:" + value + "\r\n" +
                 (contentLength == 2 ? length : "") + "\r\n" + next;
             SCOPED_TRACE(wire);
@@ -439,8 +770,8 @@ TEST(HttpServerParser, EmptyListMembersPreserveValidTransferCodingsAndReset)
         "Transfer-Encoding: chunked\r\nTransfer-Encoding: , \r\n"})
     {
         SCOPED_TRACE(fields);
-        const std::string wire = "POST / HTTP/1.1\r\n" + fields + "\r\n1\r\nx\r\n0\r\n\r\n" +
-            "POST /next HTTP/1.1\r\nContent-Length: 1\r\n\r\ny";
+        const std::string wire = "POST / HTTP/1.1\r\nHost: example.test\r\n" + fields + "\r\n1\r\nx\r\n0\r\n\r\n" +
+            "POST /next HTTP/1.1\r\nContent-Length: 1\r\nHost: example.test\r\n\r\ny";
         for (auto packets : {std::vector<std::string>{wire}, Bytes(wire)})
         {
             Parser parser(std::move(packets), 64);
@@ -462,7 +793,7 @@ TEST(HttpServerParser, ContentLengthQueriesPreserveAbsentZeroAndChunkedFraming)
         const bool chunked = fields.find("chunked") != std::string::npos;
         const int64_t expected = fields == "Content-Length: 0\r\n" ? 0 : -1;
         const std::string body = chunked ? "1\r\nx\r\n0\r\n\r\n" : "";
-        const std::string wire = "POST / HTTP/1.1\r\n" + fields + "\r\n" + body + next;
+        const std::string wire = "POST / HTTP/1.1\r\nHost: example.test\r\n" + fields + "\r\n" + body + next;
         for (size_t split = 1; split < wire.size(); ++split)
         {
             SCOPED_TRACE(split);
@@ -520,7 +851,7 @@ TEST(HttpServerParser, FileSendAdvancesByPartialProgress)
 
 TEST(HttpServerParser, StatusDispatchRejectsBodyBeforeSamplerResponse)
 {
-    Parser parser({"GET /api/sampler HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+    Parser parser({"GET /api/sampler HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: example.test\r\n\r\n",
                    "invalid chunk\r\n"});
     ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
     EXPECT_TRUE(coop::http::StatusDispatch(*parser.conn, "/api/sampler"));
@@ -543,7 +874,7 @@ TEST(HttpServerParser, NoBodyGuardPrecedesHandlerAndNeverReadsBody)
             SCOPED_TRACE(framing);
             coop::http::ServerParserOptions options;
             options.errorResponse = policy;
-            std::string head = "GET /no-body HTTP/1.1\r\n" + std::string(framing) + "\r\n";
+            std::string head = "GET /no-body HTTP/1.1\r\nHost: example.test\r\n" + std::string(framing) + "\r\n";
             Parser parser({head, "invalid chunk\r\n"}, 128, options);
             bool handlerRan = false;
             auto dispatch = [&]
@@ -574,7 +905,7 @@ TEST(HttpServerParser, NoBodyGuardAcceptsAbsentAndZeroLengthAndPreservesPipeline
 {
     for (const char* framing : {"", "Content-Length: 0\r\n"})
     {
-        std::string request = "GET /no-body HTTP/1.1\r\n" + std::string(framing) + "\r\n";
+        std::string request = "GET /no-body HTTP/1.1\r\nHost: example.test\r\n" + std::string(framing) + "\r\n";
         for (size_t split = 1; split < request.size(); ++split)
         {
             SCOPED_TRACE(split);
@@ -614,14 +945,14 @@ TEST(HttpServerParser, StatusQueryOptionsSurviveNoBodyValidation)
 {
     auto original = coop::perf::EnabledFamilies();
     coop::perf::SetFamilies({});
-    Parser enable({"GET /api/perf/enable?families=io HTTP/1.1\r\n\r\n"});
+    Parser enable({"GET /api/perf/enable?families=io HTTP/1.1\r\nHost: example.test\r\n\r\n"});
     ASSERT_NE(enable.conn->GetRequestLine(), nullptr);
     EXPECT_TRUE(coop::http::StatusDispatch(*enable.conn, "/api/perf/enable"));
     EXPECT_NE(enable.script.sent.find("200 OK\r\n"), std::string::npos);
 #if COOP_PERF_MODE == 2
     EXPECT_EQ(coop::perf::EnabledFamilies(), coop::perf::Family::IO);
 #endif
-    Parser disable({"GET /api/perf/disable?families=io HTTP/1.1\r\n\r\n"});
+    Parser disable({"GET /api/perf/disable?families=io HTTP/1.1\r\nHost: example.test\r\n\r\n"});
     ASSERT_NE(disable.conn->GetRequestLine(), nullptr);
     EXPECT_TRUE(coop::http::StatusDispatch(*disable.conn, "/api/perf/disable"));
     EXPECT_NE(disable.script.sent.find("200 OK\r\n"), std::string::npos);
@@ -633,7 +964,7 @@ TEST(HttpServerParser, StatusQueryOptionsSurviveNoBodyValidation)
 
 TEST(HttpServerParser, SymbolizeStatusRouteRetainsItsRequestBody)
 {
-    Parser parser({"POST /api/sampler/symbolize HTTP/1.1\r\nContent-Length: 3\r\n\r\n0x0"});
+    Parser parser({"POST /api/sampler/symbolize HTTP/1.1\r\nContent-Length: 3\r\nHost: example.test\r\n\r\n0x0"});
     ASSERT_NE(parser.conn->GetRequestLine(), nullptr);
     EXPECT_TRUE(coop::http::StatusDispatch(*parser.conn, "/api/sampler/symbolize"));
     EXPECT_NE(parser.script.sent.find("200 OK\r\n"), std::string::npos);
@@ -649,7 +980,7 @@ TEST(HttpServerParser, NoBodyGuardOwnsNewHeaderFailuresAndRestoresCallerPolicy)
         SCOPED_TRACE(framing);
         coop::http::ServerParserOptions options;
         options.errorResponse = coop::http::ParserErrorResponse::Caller;
-        Parser parser({"GET /no-body HTTP/1.1\r\n" + std::string(framing) + "\r\n",
+        Parser parser({"GET /no-body HTTP/1.1\r\nHost: example.test\r\n" + std::string(framing) + "\r\n",
                        "invalid chunk\r\n"}, 128, options);
         bool handlerRan = false;
         if (parser.conn->RequireNoBody()) handlerRan = true;
@@ -683,7 +1014,7 @@ TEST(HttpServerParser, NoBodyGuardPreservesExistingFailureAndAvoidsSecondRespons
 {
     coop::http::ServerParserOptions options;
     options.errorResponse = coop::http::ParserErrorResponse::Caller;
-    Parser failed({"GET / HTTP/1.1\r\nTransfer-Encoding:\r\n\r\n"}, 128, options);
+    Parser failed({"GET / HTTP/1.1\r\nTransfer-Encoding:\r\nHost: example.test\r\n\r\n"}, 128, options);
     failed.conn->SkipHeaders();
     ASSERT_EQ(failed.conn->ParseError(), 400);
     EXPECT_TRUE(failed.script.sent.empty());
@@ -708,7 +1039,7 @@ TEST(HttpServerParser, NoBodyGuardPreservesExistingFailureAndAvoidsSecondRespons
 
 TEST(HttpServerParser, LegacyNoBodyAdmissionDefaultsToRefusalWithoutReading)
 {
-    Parser parser({"GET / HTTP/1.1\r\n\r\n"});
+    Parser parser({"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"});
     EXPECT_FALSE(parser.conn->coop::http::ConnectionBase::RequireNoBody());
     EXPECT_FALSE(parser.conn->KeepAlive());
     EXPECT_EQ(parser.script.reads, 0);
@@ -788,7 +1119,7 @@ TEST(HttpServerParser, Http10EarlyFixedResponseChoosesClosureWithoutConsumingHea
 
 TEST(HttpServerParser, SendBorrowsAnExactTextView)
 {
-    Parser parser({"GET / HTTP/1.1\r\n\r\n"});
+    Parser parser({"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"});
     const char text[] = {'x', 'a', '\0', 'b', 'z'};
     coop::http::ConnectionBase& conn = *parser.conn;
     ASSERT_TRUE(conn.Send(200, "text/plain", std::string_view(text + 1, 3)));
@@ -799,7 +1130,7 @@ TEST(HttpServerParser, SendBorrowsAnExactTextView)
 
 TEST(HttpServerParser, SendBorrowsBinaryStorageWithoutAnOwningAdapter)
 {
-    Parser parser({"GET / HTTP/1.1\r\n\r\n"});
+    Parser parser({"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"});
     std::byte body[128]{};
     body[0] = std::byte{0xff};
     body[127] = std::byte{0x7f};

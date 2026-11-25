@@ -125,7 +125,7 @@ static void DrainFd(int fd)
 // ---------------------------------------------------------------------------
 
 static const char REQ_MINIMAL[] =
-    "GET / HTTP/1.1\r\n"
+    "GET / HTTP/1.1\r\nHost: example.test\r\n"
     "\r\n";
 
 static const char REQ_WITH_HEADERS[] =
@@ -145,7 +145,7 @@ static const char REQ_WITH_ARGS[] =
 
 static const char REQ_POST_BODY[] =
     "POST /data HTTP/1.1\r\n"
-    "Content-Length: 13\r\n"
+    "Content-Length: 13\r\nHost: example.test\r\n"
     "\r\n"
     "Hello, World!";
 

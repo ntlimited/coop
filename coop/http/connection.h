@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include "detail/parser_buffer.hpp"
 #include "types.h"
@@ -71,7 +72,8 @@ struct ConnectionBase
     virtual void SkipArgs() = 0;
 
     // Phase 3: Headers. Same pattern as args. Implicitly skips remaining args.
-    // Null name = no more headers.
+    // Null name = no more headers. Values omit leading and trailing SP/HTAB;
+    // interior whitespace is preserved, including across fragmented reads.
     //
     virtual const char* NextHeaderName() = 0;
     virtual Chunk* ReadHeaderValue() = 0;
@@ -203,6 +205,35 @@ struct ConnectionBase
     // Native connections return empty before parsing; the default preserves HTTP/1.1 adapters.
     //
     virtual std::string_view GetRequestVersion() const { return "HTTP/1.1"; }
+
+    // Snapshot the request line and all headers without consuming logical parser state or
+    // body bytes. Call before argument/header iteration; GetRequestLine may precede it.
+    // The explicit cap covers request-line and header wire bytes together. Inspection is
+    // opt-in and allocates bounded storage; it owns protocol-error responses (400/431).
+    // Views remain valid through body parsing until ReleaseRequestHead/Reset/destruction.
+    // Inspection can recycle earlier request-line views: re-fetch GetRequestLine afterwards.
+    // Late calls return nullptr without changing parser state. Implementations without support return nullptr.
+    //
+    virtual const RequestHead* InspectRequestHead(size_t = 16384) { return nullptr; }
+
+    // Invalidate every snapshot view and free its storage. Header replay retains only
+    // the parser copy until header completion. The server calls this after admission;
+    // a handler that explicitly inspects owns this call. Inspection cannot resume until Reset.
+    virtual void ReleaseRequestHead() {}
+
+    // Send a terminal status and close, without consuming an unread request body. If a
+    // response already began, only mark the request refused; the caller owns that response.
+    // Pass responseStarted=true after custom formatting so adapter defaults also skip sends.
+    // Invalid refusal statuses become 500. Repeated calls add no bytes. Native servers use
+    // bounded half-close/drain cleanup so the refusal can reach an uploading peer.
+    //
+    virtual bool RejectRequest(int status, bool responseStarted = false)
+    {
+        ForceClose();
+        if (responseStarted) return true;
+        return Send(status >= 400 && status <= 599 ? status : 500, "text/plain", "");
+    }
+    virtual bool RequestRejected() const { return false; }
 };
 
 // ConnectionImpl<Derived> is the CRTP parser implementation. All parser state lives here; buffer
@@ -252,12 +283,16 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     const ServerParserOptions& GetParserOptions() const override { return m_options; }
     bool SetParserOptions(ServerParserOptions options) override
     {
-        if (m_requestLineParsed || m_phase != REQUEST_LINE) return false;
+        if (m_requestLineParsed || m_phase != REQUEST_LINE || m_headReplayActive) return false;
         m_options = options;
         return true;
     }
     int64_t ContentLength() override;
     bool RequireNoBody() override;
+    const RequestHead* InspectRequestHead(size_t maxBytes = 16384) override;
+    void ReleaseRequestHead() override;
+    bool RejectRequest(int status, bool responseStarted = false) override;
+    bool RequestRejected() const override { return m_noBodyRejected; }
     int64_t ReadBodyToFile(int fileFd, off_t offset) override;
     using ConnectionBase::Send;
     bool Send(int status, const char* contentType, std::span<const std::byte> body) override;
@@ -349,7 +384,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     using detail::ParserBuffer<Derived>::m_parsePos;
     using detail::ParserBuffer<Derived>::m_bufEpoch;
 
-    using detail::ParserBuffer<Derived>::Compact;
+    void Compact();
     using detail::ParserBuffer<Derived>::Win;
 
     bool RecvAborted() const;
@@ -377,6 +412,8 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool FinishHeaders();
     bool FeedHeaderValue(const char* data, size_t size, bool final);
     bool FinishHeaderToken();
+    void ResetRequestParser();
+    void RestoreHeadTail();
 
     // Automatic parser failures and IO failures prohibit further response writes.
     // Caller-mode parser failures leave response generation under handler control.
@@ -430,6 +467,7 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool            m_responseBegun;
     size_t          m_headerCount;
     size_t          m_headerBytes;
+    bool            m_hostSeen = false;
     bool            m_haveContentLength;
     bool            m_haveTransferEncoding;
     bool            m_noBodyRejected;
@@ -442,6 +480,25 @@ struct ConnectionImpl : ConnectionBase, detail::ParserBuffer<Derived>
     bool            m_lastTokenChunked;
     bool            m_valueStarted;
     bool            m_needChunkCrlf;
+    // Only ambiguous OWS spanning receive windows needs temporary owning storage.
+    std::vector<char> m_headerOws;
+    bool m_headerOwsReturned = false;
+
+    // Allocated only by inspection. Raw bytes back the immutable views; replay bytes
+    // support the existing in-place query/header parser. The transport's body/pipeline
+    // window is retained separately until replay reaches the end of headers.
+    //
+    std::vector<char> m_headBytes;
+    std::vector<char> m_headReplay;
+    std::vector<RequestHeader> m_headHeaders;
+    RequestHead m_head{};
+    bool m_headReady = false;
+    bool m_headReleased = false;
+    bool m_headReplayActive = false;
+    bool m_headValidating = false;
+    char* m_headTailBase = nullptr;
+    size_t m_headTailLength = 0;
+    size_t m_headTailPosition = 0;
 };
 
 // Connection<Transport> is the final, concrete HTTP connection. The transport template parameter

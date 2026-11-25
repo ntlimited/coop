@@ -224,7 +224,8 @@ struct RefusalClose
 
     ~RefusalClose()
     {
-        if (!connection.ParseError() || connection.SendError()) return;
+        if ((!connection.ParseError() && !connection.RequestRejected()) ||
+            connection.SendError()) return;
         // A truncated streamed response has already selected an abortive close. A
         // half-close here could expose a clean FIN before that reset reaches the peer.
         //
@@ -320,14 +321,20 @@ struct ListenerRegistration
 // ever parking), monopolizing the cooperator.
 //
 bool HandleRequest(ConnectionBase& conn, RequestHandler handler, void* userData,
-                   ServerHandle::ConnNode* node)
+                   ServerHandle::ConnNode* node, RequestAdmissionHandler admission,
+                   size_t maxHeadBytes)
 {
     if (node) node->idle = true;
     auto* req = conn.GetRequestLine();
     if (node) node->idle = false;
     if (!req)
     {
-        if (conn.ParseError() != 0 &&
+        if (admission && conn.ParseError() != 0)
+        {
+            conn.RejectRequest(conn.ParseError());
+            return false;
+        }
+        if (!admission && conn.ParseError() != 0 &&
             conn.GetParserOptions().errorResponse == ParserErrorResponse::Caller)
         {
             handler(conn, userData);
@@ -344,11 +351,26 @@ bool HandleRequest(ConnectionBase& conn, RequestHandler handler, void* userData,
         return false;
     }
 
+    if (admission)
+    {
+        const auto* head = conn.InspectRequestHead(maxHeadBytes);
+        if (node) node->idle = false;
+        if (!head) return false;
+        int status = admission(conn, *head, userData);
+        conn.ReleaseRequestHead();
+        if (conn.RequestRejected() || conn.Error()) return false;
+        if (status != 0)
+        {
+            conn.RejectRequest(status);
+            return false;
+        }
+    }
+
     // Everything past parsing is the application's: matching, static serving, 404s. coop just
     // hands over the parsed connection.
     //
     handler(conn, userData);
-    return true;
+    return !conn.RequestRejected();
 }
 
 // -------------------------------------------------------------------------------------
@@ -364,12 +386,16 @@ struct HttpConnection : Launchable
                    ServerHandle* control = nullptr,
                    ServerParserOptions parserOptions = {},
                    ConnectionOpenHandler connectionOpen = nullptr,
-                   ConnectionCloseHandler connectionClose = nullptr)
+                   ConnectionCloseHandler connectionClose = nullptr,
+                   RequestAdmissionHandler requestAdmission = nullptr,
+                   size_t maxRequestHeadBytes = 16384)
     : Launchable(ctx)
     , m_registration(control)
     , m_parserOptions(parserOptions)
     , m_connectionOpen(connectionOpen)
     , m_connectionClose(connectionClose)
+    , m_requestAdmission(requestAdmission)
+    , m_maxRequestHeadBytes(maxRequestHeadBytes)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd, SHUT_RD)
     , m_co(co)
@@ -422,7 +448,8 @@ struct HttpConnection : Launchable
                 conn->ForceClose();
             }
             if (!HandleRequest(*conn, m_handler, m_userData,
-                               m_control ? &m_registration.node : nullptr)) return;
+                               m_control ? &m_registration.node : nullptr,
+                               m_requestAdmission, m_maxRequestHeadBytes)) return;
 
             if (conn->SendError()) return;
             // A completed close-delimited response cannot be reused. Do not turn
@@ -447,6 +474,8 @@ struct HttpConnection : Launchable
     ServerParserOptions m_parserOptions;
     ConnectionOpenHandler m_connectionOpen;
     ConnectionCloseHandler m_connectionClose;
+    RequestAdmissionHandler m_requestAdmission;
+    size_t m_maxRequestHeadBytes;
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
@@ -470,12 +499,16 @@ struct HttpTlsConnection : Launchable
                       ServerHandle* control = nullptr,
                       ServerParserOptions parserOptions = {},
                       ConnectionOpenHandler connectionOpen = nullptr,
-                      ConnectionCloseHandler connectionClose = nullptr)
+                      ConnectionCloseHandler connectionClose = nullptr,
+                      RequestAdmissionHandler requestAdmission = nullptr,
+                      size_t maxRequestHeadBytes = 16384)
     : Launchable(ctx)
     , m_registration(control)
     , m_parserOptions(parserOptions)
     , m_connectionOpen(connectionOpen)
     , m_connectionClose(connectionClose)
+    , m_requestAdmission(requestAdmission)
+    , m_maxRequestHeadBytes(maxRequestHeadBytes)
     , m_fd(fd)
     , m_shutdownGuard(ctx, m_fd, SHUT_RD)
     , m_co(co)
@@ -525,7 +558,8 @@ struct HttpTlsConnection : Launchable
         {
             if (m_control && m_control->IsDraining()) conn->ForceClose();
             if (!HandleRequest(*conn, m_handler, m_userData,
-                               m_control ? &m_registration.node : nullptr)) return;
+                               m_control ? &m_registration.node : nullptr,
+                               m_requestAdmission, m_maxRequestHeadBytes)) return;
 
             if (conn->SendError()) return;
             // A completed close-delimited response cannot be reused. Do not turn
@@ -550,6 +584,8 @@ struct HttpTlsConnection : Launchable
     ServerParserOptions m_parserOptions;
     ConnectionOpenHandler m_connectionOpen;
     ConnectionCloseHandler m_connectionClose;
+    RequestAdmissionHandler m_requestAdmission;
+    size_t m_maxRequestHeadBytes;
     io::Descriptor      m_fd;
     io::ShutdownOnKillGuard m_shutdownGuard;
     Cooperator*         m_co;
@@ -684,7 +720,8 @@ bool RunServer(Context* ctx, ServerConfiguration const& config)
         if (!co->Launch<HttpConnection>(spawn, fd, co, config.handler, config.userData,
                                        config.timeout, config.pbufRecv, config.control,
                                        config.parserOptions, config.connectionOpen,
-                                       config.connectionClose))
+                                       config.connectionClose, config.requestAdmission,
+                                       config.maxRequestHeadBytes))
         {
             ::close(fd);
         }
@@ -720,7 +757,8 @@ bool RunTlsServer(Context* ctx, ServerConfiguration const& config, io::ssl::Cont
         if (!co->Launch<HttpTlsConnection>(spawn, fd, co, config.handler, config.userData,
                                           sslCtx, config.timeout, config.control,
                                           config.parserOptions, config.connectionOpen,
-                                          config.connectionClose))
+                                          config.connectionClose, config.requestAdmission,
+                                          config.maxRequestHeadBytes))
         {
             ::close(fd);
         }

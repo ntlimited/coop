@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <string_view>
 
 namespace coop
@@ -19,6 +20,69 @@ struct RequestLine
     std::string_view query;     // after '?', empty if none
     std::string_view target;    // full request-target (path + '?' + query), verbatim for
                                 // forwarding — a proxy sends this as the upstream path
+};
+
+struct RequestHeader
+{
+    std::string_view name;
+    std::string_view value;
+};
+
+// Opt-in immutable request metadata. All views, including duplicate fields in wire order,
+// remain borrowed from the connection until ReleaseRequestHead, its next successful Reset or destruction.
+//
+struct RequestHead
+{
+    std::string_view method;
+    std::string_view version;
+    std::string_view path;
+    std::string_view query;
+    std::string_view target;
+    std::span<const RequestHeader> headers;
+
+    // ASCII case-insensitive first-only lookup. Security policies should use
+    // FindUniqueHeader or CountHeaders when duplicates have no defined meaning.
+    const RequestHeader* FindHeader(std::string_view name) const
+    {
+        for (const auto& field : headers)
+            if (HeaderNameEquals(field.name, name)) return &field;
+        return nullptr;
+    }
+
+    size_t CountHeaders(std::string_view name) const
+    {
+        size_t count = 0;
+        for (const auto& field : headers)
+            if (HeaderNameEquals(field.name, name)) ++count;
+        return count;
+    }
+
+    // nullptr means absent or ambiguous; CountHeaders distinguishes the two.
+    const RequestHeader* FindUniqueHeader(std::string_view name) const
+    {
+        const RequestHeader* found = nullptr;
+        for (const auto& field : headers)
+        {
+            if (!HeaderNameEquals(field.name, name)) continue;
+            if (found) return nullptr;
+            found = &field;
+        }
+        return found;
+    }
+
+private:
+    static bool HeaderNameEquals(std::string_view first, std::string_view second)
+    {
+        if (first.size() != second.size()) return false;
+        auto lower = [](unsigned char c)
+        {
+            return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+        };
+        for (size_t i = 0; i < first.size(); ++i)
+            if (lower(first[i]) != lower(second[i])) return false;
+        return true;
+    }
+
 };
 
 // Parsed HTTP response status line. String_view points into the recv buffer.

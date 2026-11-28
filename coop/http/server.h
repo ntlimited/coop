@@ -60,6 +60,13 @@ using ConnectionCloseHandler = void (*)(Context* ctx, void* userData, void* stat
 struct ServerConfiguration
 {
     int port = 8080;
+
+    // Select the local IPv4 interface; the default accepts on every interface.
+    // Borrowed null-terminated numeric address, retained through Run*Server.
+    // Null or malformed addresses refuse startup rather than falling back to wildcard.
+    //
+    const char* bindAddress = "0.0.0.0";
+
     int backlog = 512;
     bool reusePort = true;
     bool multishotAccept = false;
@@ -112,9 +119,9 @@ struct ServerConfiguration
 
 // Run an HTTP server. Binds, listens, and accepts connections in a loop, launching a context per
 // client that parses requests and calls config.handler. Returns false (with the failure logged)
-// when handler is null or the socket cannot be created, bound, or listened — callers must not
-// assume the server came up. Multiple callers on one port intentionally shard accepts via
-// SO_REUSEPORT.
+// when handler is null, bindAddress is invalid, or the socket cannot be created, bound, or
+// listened. Callers must check startup success. Multiple callers on one port intentionally shard
+// accepts via SO_REUSEPORT.
 //
 bool RunServer(Context* ctx, ServerConfiguration const& config);
 

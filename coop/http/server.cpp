@@ -4,6 +4,7 @@
 #include "tls_transport.h"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cerrno>
 #include <optional>
 #include <cstring>
@@ -604,6 +605,16 @@ struct HttpTlsConnection : Launchable
 //
 static int BindListen(ServerConfiguration const& config)
 {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(config.port);
+    if (!config.bindAddress || inet_pton(AF_INET, config.bindAddress, &addr.sin_addr) != 1)
+    {
+        spdlog::error("http server invalid IPv4 bind address: {}",
+                      config.bindAddress ? config.bindAddress : "(null)");
+        return -1;
+    }
+
     int serverFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (serverFd < 0)
     {
@@ -620,11 +631,6 @@ static int BindListen(ServerConfiguration const& config)
         close(serverFd);
         return -1;
     }
-
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(config.port);
-    addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(serverFd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in)) != 0)
     {

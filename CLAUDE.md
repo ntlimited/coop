@@ -445,7 +445,9 @@ parser-buffer bounce (TLS/chunked); keep-alive framing is preserved. `Sendfile` 
 `RunServer(ctx, config)` accepts connections in a loop, launches an `HttpConnection` (Launchable,
 32KB stack) per client, and calls `config.handler` (non-null required, else it logs and returns
 false). No method filtering, no path matching — handlers decide. `ServerConfiguration`
-declares the topology: `reusePort` (one-listener-per-cooperator sharding), `backlog`,
+declares the topology: `bindAddress` (borrowed numeric IPv4 address, default `0.0.0.0`
+for every interface; invalid input refuses startup), `reusePort` (one-listener-per-cooperator
+sharding), `backlog`,
 `multishotAccept` (ArmedAccept path with bounded pending queue), `maxPendingAccepts`,
 and `pbufRecv` (parse from provided-buffer-ring chunks via one armed multishot recv per
 connection — zero-copy heads, classic recv otherwise; see coop/http/CLAUDE.md).

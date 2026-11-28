@@ -1989,7 +1989,125 @@ void OkHandler(coop::http::ConnectionBase& conn, void*)
     conn.Send(200, "text/plain", "OK");
 }
 
+void ExerciseServerBindAddress(bool loopbackOnly, bool tls)
+{
+    test::RunInCooperator(
+        [&](coop::Context* ctx)
+        {
+            coop::http::ServerHandle control;
+            coop::io::ssl::Context sslContext{coop::io::ssl::Mode::Server};
+            coop::http::ServerConfiguration config;
+            config.port = 0;
+            if (loopbackOnly)
+                config.bindAddress = "127.0.0.1";
+            config.control = &control;
+            config.handler = &OkHandler;
+            config.timeout = std::chrono::milliseconds(500);
+            coop::Context::Handle listener;
+            bool returned = false;
+            EXPECT_TRUE(coop::Spawn(
+                {.stackSize = 65536},
+                [&](coop::Context* server)
+                {
+                    EXPECT_TRUE(tls ? coop::http::RunTlsServer(server, config, sslContext)
+                                    : coop::http::RunServer(server, config));
+                    returned = true;
+                },
+                &listener));
+            const auto port = control.Port();
+            EXPECT_NE(port, 0);
+            if (port != 0)
+            {
+                // Binding precedes TLS handshakes. TCP acceptance alone observes the
+                // interface restriction without needing certificates or HTTP traffic.
+                //
+                for (uint32_t host : {INADDR_LOOPBACK, INADDR_LOOPBACK + 1U})
+                {
+                    SCOPED_TRACE(host);
+                    coop::io::Descriptor client(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+                    EXPECT_GE(client.m_fd, 0);
+                    if (client.m_fd < 0)
+                        continue;
+                    sockaddr_in address{};
+                    address.sin_family = AF_INET;
+                    address.sin_addr.s_addr = htonl(host);
+                    address.sin_port = htons(port);
+                    int result =
+                        coop::io::ConnectKill(client, reinterpret_cast<sockaddr*>(&address),
+                                              sizeof(address), std::chrono::seconds(1));
+                    EXPECT_EQ(result, loopbackOnly && host != INADDR_LOOPBACK ? -ECONNREFUSED : 0);
+                }
+            }
+            EXPECT_TRUE(control.Drain(ctx, std::chrono::seconds(1)));
+            listener.Kill();
+            ctx->JoinChildren();
+            EXPECT_TRUE(returned);
+        },
+        {.stackSize = 65536});
+}
+
 } // end anonymous namespace
+
+TEST(HttpTest, BindAddressRestrictsPlaintextAndTlsListeners)
+{
+    for (bool tls : {false, true})
+    {
+        SCOPED_TRACE(tls);
+        ExerciseServerBindAddress(true, tls);
+    }
+}
+
+TEST(HttpTest, BindAddressDefaultPreservesWildcardListeners)
+{
+    for (bool tls : {false, true})
+    {
+        SCOPED_TRACE(tls);
+        ExerciseServerBindAddress(false, tls);
+    }
+}
+
+TEST(HttpTest, BindAddressRejectsInvalidInputWithoutListener)
+{
+    for (bool tls : {false, true})
+    {
+        SCOPED_TRACE(tls);
+        const char* invalidAddresses[] = {nullptr, "", "localhost", "127.0.0.999", "::1"};
+        for (const char* address : invalidAddresses)
+        {
+            SCOPED_TRACE(address ? address : "(null)");
+            test::RunInCooperator(
+                [&](coop::Context* ctx)
+                {
+                    coop::http::ServerHandle control;
+                    coop::io::ssl::Context sslContext{coop::io::ssl::Mode::Server};
+                    coop::http::ServerConfiguration config;
+                    config.port = 0;
+                    config.bindAddress = address;
+                    config.control = &control;
+                    config.handler = &OkHandler;
+                    coop::Context::Handle listener;
+                    bool returned = false;
+                    bool result = true;
+                    EXPECT_TRUE(coop::Spawn(
+                        {.stackSize = 65536},
+                        [&](coop::Context* server)
+                        {
+                            result = tls ? coop::http::RunTlsServer(server, config, sslContext)
+                                         : coop::http::RunServer(server, config);
+                            returned = true;
+                        },
+                        &listener));
+                    EXPECT_TRUE(returned);
+                    EXPECT_FALSE(result);
+                    EXPECT_FALSE(control.HasListener());
+                    EXPECT_EQ(control.Port(), 0);
+                    listener.Kill();
+                    ctx->JoinChildren();
+                },
+                {.stackSize = 65536});
+        }
+    }
+}
 
 TEST(HttpTest, RunServerMultishotAcceptRoundtrip)
 {
